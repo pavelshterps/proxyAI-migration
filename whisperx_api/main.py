@@ -1,1 +1,0 @@
-# WhisperX backend code placeholder

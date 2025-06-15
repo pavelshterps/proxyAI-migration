@@ -1,0 +1,12 @@
+fastapi
+uvicorn
+celery
+redis
+python-dotenv
+pydantic
+werkzeug
+ffmpeg-python
+torch>=1.13.1,<2.0.0
+torchaudio>=0.13.1,<2.0.0
+whisperx@git+https://github.com/m-bain/whisperx.git@v0.3.0
+pyannote.audio==2.1.1
