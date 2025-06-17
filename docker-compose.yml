@@ -1,9 +1,10 @@
 version: '3.8'
+
 services:
   redis:
     image: redis:6
     ports:
-      - "6379:6379"
+      - "6380:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -12,7 +13,8 @@ services:
 
   postgres:
     image: postgres:13
-    env_file: .env
+    env_file:
+      - .env
     environment:
       POSTGRES_DB: ${POSTGRES_DB}
       POSTGRES_USER: ${POSTGRES_USER}
@@ -28,75 +30,62 @@ services:
   tusd:
     image: tusproject/tusd:latest
     command:
-      - "-hooks-http-upload-complete-url"
-      - "http://api:8000/hooks/tus"
-      - "-data-dir" "/data"
+      - "--base-path"
+      - "/files"
+      - "--upload-dir"
+      - "/data"
     ports:
       - "1080:1080"
     volumes:
       - uploads:/data
-    runtime: nvidia
     depends_on:
-      redis:
-        condition: service_healthy
-      postgres:
-        condition: service_healthy
+      - redis
+      - postgres
 
   api:
     build: .
-    command: uvicorn main:app --host ${FASTAPI_HOST} --port ${FASTAPI_PORT} --workers ${API_WORKERS}
-    env_file: .env
-    environment:
-      - FASTAPI_HOST=${FASTAPI_HOST}
-      - FASTAPI_PORT=${FASTAPI_PORT}
-      - API_WORKERS=${API_WORKERS}
-      - TUS_ENDPOINT=${TUS_ENDPOINT}
-      - ALLOWED_ORIGINS=${ALLOWED_ORIGINS}
+    # включаем NVIDIA runtime для доступа к GPU внутри контейнера
     runtime: nvidia
-    volumes:
-      - uploads:/tmp/uploads
+    environment:
+
+      - WHISPER_DEVICE=cuda
+      - WHISPER_COMPUTE_TYPE=float16
+    env_file:
+      - .env
+    command: >
+      uvicorn main:app
+      --host ${FASTAPI_HOST}
+      --port ${FASTAPI_PORT}
+      --workers ${API_WORKERS}
+    ports:
+      - "${FASTAPI_PORT}:${FASTAPI_PORT}"
     depends_on:
       - redis
       - postgres
       - tusd
-    deploy:
-      resources:
-        limits:
-          memory: 2G
 
   worker:
     build: .
-    command: celery -A celery_app worker --loglevel=info --concurrency ${CELERY_CONCURRENCY}
-    env_file: .env
-    environment:
-      - CELERY_CONCURRENCY=${CELERY_CONCURRENCY}
     runtime: nvidia
-    volumes:
-      - uploads:/tmp/uploads
-    depends_on:
-      - redis
-      - postgres
-    deploy:
-      resources:
-        limits:
-          memory: 4G
-
-  beat:
-    build: .
-    command: celery -A celery_app beat --loglevel=info --concurrency ${CELERY_CONCURRENCY}
-    env_file: .env
-    runtime: nvidia
-    volumes:
-      - uploads:/tmp/uploads
+    env_file:
+      - .env
+    command: celery -A celery_app worker --loglevel=info
     depends_on:
       - redis
       - postgres
       - api
-    deploy:
-      resources:
-        limits:
-          memory: 1G
+
+  beat:
+    build: .
+    runtime: nvidia
+    env_file:
+      - .env
+    command: celery -A celery_app beat --loglevel=info
+    depends_on:
+      - redis
+      - postgres
+      - api
 
 volumes:
-  uploads:
   pgdata:
+  uploads:

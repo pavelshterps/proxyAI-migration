@@ -1,0 +1,24 @@
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.env            # если у вас есть локальный .env
+
+# Virtualenv
+venv/
+env/
+
+# Docker
+*.log
+docker-compose.override.yml
+
+# IDEs
+.vscode/
+.idea/
+
+# Data, модели
+/data/
+/models/
+
+# Jupyter
+.ipynb_checkpoints/
