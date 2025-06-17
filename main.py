@@ -31,7 +31,7 @@ app.add_middleware(
 @app.on_event("startup")
 def load_models():
     global whisper_model, align_model, metadata, diarization_pipeline
-    whisper_model = whisperx.load_model(settings.WHISPER_MODEL, DEVICE)
+    whisper_model = whisperx.load_model(settings.WHISPER_MODEL, DEVICE, compute_type="int8")
     align_model, metadata = whisperx.load_align_model(language_code=None, device=DEVICE)
     diarization_pipeline = Pipeline.from_pretrained(settings.PYANNOTE_PROTOCOL, use_auth_token=settings.HUGGINGFACE_TOKEN)
 

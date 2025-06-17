@@ -49,7 +49,7 @@ services:
     environment:
 
       - WHISPER_DEVICE=cuda
-      - WHISPER_COMPUTE_TYPE=float16
+      - WHISPER_COMPUTE_TYPE=int8
     env_file:
       - .env
     command: >

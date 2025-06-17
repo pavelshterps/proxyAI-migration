@@ -7,7 +7,7 @@ from config.settings import settings
 
 # Global model loading
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
-whisper_model = whisperx.load_model(settings.WHISPER_MODEL, DEVICE)
+whisper_model = whisperx.load_model(settings.WHISPER_MODEL, DEVICE, compute_type="int8")
 align_model, metadata = whisperx.load_align_model(language_code=None, device=DEVICE)
 diarization_pipeline = Pipeline.from_pretrained(settings.PYANNOTE_PROTOCOL, use_auth_token=settings.HUGGINGFACE_TOKEN)
 
