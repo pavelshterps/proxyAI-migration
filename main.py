@@ -6,6 +6,7 @@ import ffmpeg
 import torch
 import whisperx
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from starlette.responses import JSONResponse, Response
@@ -20,6 +21,11 @@ from config.settings import settings
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 app = FastAPI()
+
+@app.get("/health", tags=["health"])
+async def health_check():
+    return JSONResponse({"status": "ok"})
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.ALLOWED_ORIGINS,

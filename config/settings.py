@@ -1,4 +1,4 @@
-from pydantic import BaseSettings, AnyHttpUrl
+from pydantic import BaseSettings, AnyHttpUrl, Field
 from typing import List
 
 class Settings(BaseSettings):
@@ -22,9 +22,9 @@ class Settings(BaseSettings):
     SNIPPET_FORMAT: str = "wav"
 
     # Models & tokens
-    WHISPER_MODEL: str
-    WHISPER_DEVICE: str = "cuda"
-    WHISPER_COMPUTE_TYPE: str = "float16"
+    WHISPER_MODEL: str = "large-v3"
+    WHISPER_DEVICE: str = Field("cuda", env="DEVICE")
+    WHISPER_COMPUTE_TYPE: str = Field("int8", env="WHISPER_COMPUTE_TYPE")
     PYANNOTE_PROTOCOL: str
     HUGGINGFACE_TOKEN: str = ""
 

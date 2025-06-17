@@ -50,9 +50,15 @@ services:
 
       - WHISPER_DEVICE=cuda
       - WHISPER_COMPUTE_TYPE=int8
+
     env_file:
       - .env
-    command: >
+    healthcheck:
+      test: [ "CMD-SHELL", "curl -f http://localhost:${FASTAPI_PORT}/health || exit 1" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    command:
       uvicorn main:app
       --host ${FASTAPI_HOST}
       --port ${FASTAPI_PORT}

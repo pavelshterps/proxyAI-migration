@@ -5,16 +5,31 @@ from celery_app import app
 from datetime import datetime
 from config.settings import settings
 
-# Global model loading
+# Use lazy-loading for whisper model
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
-whisper_model = whisperx.load_model(settings.WHISPER_MODEL, DEVICE, compute_type="int8")
+whisper_model = None
+
+def get_whisper_model():
+    """
+    Lazy-load the whisper model on first request to avoid OOM at startup.
+    """
+    global whisper_model
+    if whisper_model is None:
+        whisper_model = whisperx.load_model(
+            settings.WHISPER_MODEL,
+            DEVICE,
+            compute_type="int8"
+        )
+    return whisper_model
+
 align_model, metadata = whisperx.load_align_model(language_code=None, device=DEVICE)
 diarization_pipeline = Pipeline.from_pretrained(settings.PYANNOTE_PROTOCOL, use_auth_token=settings.HUGGINGFACE_TOKEN)
 
 @app.task(bind=True, name='tasks.transcribe_task', max_retries=3, default_retry_delay=60)
 def transcribe_task(self, file_path: str):
     try:
-        result = whisper_model.transcribe(file_path)
+        model = get_whisper_model()
+        result = model.transcribe(file_path)
         # Alignment
         segments = result['segments']
         aligned = whisperx.align(segments, align_model, metadata, file_path, DEVICE)
