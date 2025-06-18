@@ -91,7 +91,7 @@ services:
   #            capabilities: [ gpu ]
     env_file:
       - .env
-    command: celery -A celery_app worker --loglevel=info
+    command: celery -A celery_app.celery worker --loglevel=info --concurrency ${CELERY_CONCURRENCY}
     depends_on:
       - redis
       - postgres

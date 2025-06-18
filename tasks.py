@@ -33,7 +33,7 @@ def get_whisper_model():
     if whisper_model is None:
         whisper_model = whisperx.load_model(
             settings.WHISPER_MODEL,
-            settings.DEVICE,
+            settings.DEVICE.lower(),
             compute_type=settings.WHISPER_COMPUTE_TYPE
         )
     return whisper_model
@@ -45,7 +45,7 @@ def get_align_model(language_code):
     try:
         align_model, align_metadata = whisperx.load_align_model(
             language_code=language_code,
-            device=settings.DEVICE
+            device=settings.DEVICE.lower()
         )
     except Exception as e:
         logging.warning(f"Align model for {language_code} could not be loaded: {e}")
@@ -91,7 +91,7 @@ def transcribe_task(self, file_path: str):
                     align_model,
                     align_metadata,
                     file_path,
-                    settings.DEVICE
+                    settings.DEVICE.lower()
                 )
             except Exception as e:
                 logging.warning(f"Align failed: {e}")
