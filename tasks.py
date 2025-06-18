@@ -1,23 +1,19 @@
 import os
-import glob
-import shutil
 import json
-import time
-import logging
-import torch
+import shutil
+import glob
+import psutil
 import whisperx
+import torch
+import datetime
+from celery import shared_task, Task
+from celery.utils.log import get_task_logger
 from pyannote.audio import Pipeline
-
-from celery_app import celery
 from config.settings import settings
 
-# ----- Configuration -----
-UPLOAD_DIR = settings.UPLOAD_FOLDER
-RETENTION_DAYS = settings.FILE_RETENTION_DAYS
-DEVICE = settings.DEVICE.lower()  # must be "cpu" or "cuda"
-# --------------------------
+logger = get_task_logger(__name__)
 
-# ---- Lazy singletons ----
+# Singleton-объекты (ленивая инициализация)
 _whisper_model = None
 _align_model = None
 _align_metadata = None
@@ -28,7 +24,7 @@ def get_whisper_model():
     if _whisper_model is None:
         _whisper_model = whisperx.load_model(
             settings.WHISPER_MODEL,
-            DEVICE,
+            settings.DEVICE,
             compute_type=settings.WHISPER_COMPUTE_TYPE
         )
     return _whisper_model
@@ -39,10 +35,10 @@ def get_align_model():
         try:
             _align_model, _align_metadata = whisperx.load_align_model(
                 language_code=settings.LANGUAGE_CODE,
-                device=DEVICE
+                device=settings.DEVICE
             )
-        except ValueError as e:
-            logging.warning(f"No align model for language {settings.LANGUAGE_CODE}: {e}")
+        except ValueError:
+            logger.warning(f"No align model for {settings.LANGUAGE_CODE}, skipping")
             _align_model, _align_metadata = None, None
     return _align_model, _align_metadata
 
@@ -55,93 +51,90 @@ def get_diarization_pipeline():
         )
     return _diarization_pipeline
 
-def get_file_path_by_task_id(task_id: str) -> str:
-    """
-    Finds the uploaded file path for a given Celery task ID.
-    Assumes files are named <task_id>_<originalname> inside UPLOAD_DIR/YYYY-MM-DD/.
-    """
-    pattern = os.path.join(UPLOAD_DIR, "*", f"{task_id}_*")
-    matches = glob.glob(pattern)
-    return matches[0] if matches else None
-
-# ---- Transcription Task ----
-@celery.task(bind=True, name="tasks.transcribe_task", max_retries=3, default_retry_delay=60)
+@shared_task(bind=True, max_retries=3, default_retry_delay=60)
 def transcribe_task(self, file_path: str):
+    """
+    Транскрипция + выравнивание + диаризация.
+    Результат сохраняется в JSON-файлы рядом с аудио.
+    """
     try:
         # 1) ASR
         model = get_whisper_model()
         result = model.transcribe(file_path)
         segments = result["segments"]
-        language = result.get("language")
+        lang = result.get("language")
 
-        # 2) Forced alignment (if available)
+        # 2) Forced-alignment (если есть модель)
         align_model, align_metadata = get_align_model()
-        if align_model is not None:
-            aligned = whisperx.align(
+        if align_model:
+            result = whisperx.align(
                 segments,
                 align_model,
                 align_metadata,
                 file_path,
-                device=DEVICE
+                settings.DEVICE
             )
-            segments = aligned["segments"]
+            segments = result["segments"]
 
-        # 3) Diarization
+        # 3) Speaker diarization
         diarizer = get_diarization_pipeline()
-        diar = diarizer(file_path)
-        diarization = []
-        for turn, _, speaker in diar.itertracks(yield_label=True):
-            diarization.append({
-                "start": turn.start,
-                "end":   turn.end,
-                "speaker": speaker
-            })
+        diarization = diarizer(file_path)
 
-        # 4) Save a default labels.json (identity mapping)
-        labels_path = os.path.splitext(file_path)[0] + "_labels.json"
-        mapping = {d["speaker"]: d["speaker"] for d in diarization}
-        with open(labels_path, "w", encoding="utf-8") as f:
-            json.dump(mapping, f, ensure_ascii=False, indent=2)
-
-        return {
-            "file_path":   file_path,
-            "language":    language,
-            "segments":    segments,
-            "diarization": diarization
+        # 4) Собираем вывод
+        output = {
+            "file_path": file_path,
+            "language": lang,
+            "transcription": [seg._asdict() for seg in segments],
+            "diarization": [
+                {"start": turn.start, "end": turn.end, "speaker": turn.label}
+                for turn in diarization.get_timeline()
+            ]
         }
 
+        # 5) Сохраняем в файлы
+        base = os.path.splitext(file_path)[0]
+        with open(f"{base}_transcript.json", "w", encoding="utf-8") as f:
+            json.dump(output, f, ensure_ascii=False, indent=2)
+        return output
+
     except Exception as exc:
-        logging.exception("Transcription failed")
+        logger.error(f"Transcription failed: {exc}", exc_info=True)
         raise self.retry(exc=exc)
 
-# ---- Cleanup Task ----
-@celery.task(name="tasks.cleanup_files")
+@shared_task
 def cleanup_files():
     """
-    Removes files older than RETENTION_DAYS, prunes empty folders,
-    and if disk free <25%, reschedules itself immediately.
+    Удаляет:
+     - все файлы старше FILE_RETENTION_DAYS
+     - запускается автоматически при низком свободном диске
     """
-    now = time.time()
-    cutoff = now - RETENTION_DAYS * 86400
+    folder = settings.UPLOAD_FOLDER
+    retention = settings.FILE_RETENTION_DAYS
+    cutoff = datetime.datetime.utcnow() - datetime.timedelta(days=retention)
 
-    # Walk UPLOAD_DIR
-    for root, dirs, files in os.walk(UPLOAD_DIR):
-        for fname in files:
-            path = os.path.join(root, fname)
-            try:
-                if os.path.getmtime(path) < cutoff:
-                    os.remove(path)
-            except Exception:
-                logging.warning(f"Could not remove {path}", exc_info=True)
-        # if folder now empty, remove it
-        if not os.listdir(root):
-            try:
-                shutil.rmtree(root)
-            except Exception:
-                logging.debug(f"Could not remove dir {root}", exc_info=True)
+    # 1) Удаляем старые
+    for path in glob.glob(os.path.join(folder, "*", "*_*")):
+        try:
+            mtime = datetime.datetime.utcfromtimestamp(os.path.getmtime(path))
+            if mtime < cutoff:
+                os.remove(path)
+                logger.info(f"Removed old file: {path}")
+        except Exception:
+            logger.exception(f"Error removing {path}")
 
-    # If disk nearly full, re-enqueue cleanup
-    stat = os.statvfs(UPLOAD_DIR)
-    free_ratio = stat.f_bavail / stat.f_blocks
-    if free_ratio < 0.25:
+    # 2) Если свободного места < 25%, шорткат: досрочный запуск
+    usage = psutil.disk_usage(folder)
+    free_pct = usage.free / usage.total * 100
+    if free_pct < 25:
+        logger.warning(f"Low disk space ({free_pct:.1f}%), re-running cleanup")
         cleanup_files.delay()
+
+def get_file_path_by_task_id(task_id: str) -> str | None:
+    """
+    Находит файл по task_id, основываясь на том, что мы сохраняем его путь в результатах.
+    """
+    # здесь предполагаем, что Celery хранит результат {"file_path": ...}
+    from celery.result import AsyncResult
+    res = AsyncResult(task_id)
+    data = res.result or {}
+    return data.get("file_path")
