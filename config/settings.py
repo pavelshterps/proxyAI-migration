@@ -26,9 +26,9 @@ class Settings(BaseSettings):
     # Optional default for forced-alignment (None = let the first ASR pass pick it up)
     LANGUAGE_CODE = os.getenv("LANGUAGE_CODE", None)
     WHISPER_MODEL = os.getenv("WHISPER_MODEL", "large-v3")
-    DEVICE        = os.getenv("DEVICE", "cuda")
+    DEVICE        = os.getenv("DEVICE", "cpu")
     WHISPER_COMPUTE_TYPE: str = Field("int8", env="WHISPER_COMPUTE_TYPE")
-    # if detection ever fails, fall back to English
+    # if detection ever fails, fall back to Russian
     LANGUAGE_CODE = os.getenv("LANGUAGE_CODE", "ru")
     PYANNOTE_PROTOCOL: str
     HUGGINGFACE_TOKEN: str = ""

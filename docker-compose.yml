@@ -45,19 +45,19 @@ services:
   api:
     build: .
     # включаем NVIDIA runtime для доступа к GPU внутри контейнера
-    runtime: nvidia
-    deploy:
-          resources:
-            reservations:
-              devices:
-                - driver: nvidia
-                  count: all
-                  capabilities: [ gpu ]
+    #runtime: nvidia
+    #deploy:
+    #      resources:
+    #        reservations:
+    #          devices:
+    #            - driver: nvidia
+    #              count: all
+    #              capabilities: [ gpu ]
         # if you need a hard memory cap in classic compose:
     #    mem_limit: 2g
     environment:
 
-      - WHISPER_DEVICE=cuda
+      - WHISPER_DEVICE=cpu
       - WHISPER_COMPUTE_TYPE=int8
 
     env_file:
@@ -81,14 +81,14 @@ services:
 
   worker:
     build: .
-    runtime: nvidia
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [ gpu ]
+  #  runtime: nvidia
+  #  deploy:
+  #    resources:
+  #      reservations:
+  #        devices:
+  #          - driver: nvidia
+  #            count: all
+  #            capabilities: [ gpu ]
     env_file:
       - .env
     command: celery -A celery_app worker --loglevel=info
@@ -99,14 +99,14 @@ services:
 
   beat:
     build: .
-    runtime: nvidia
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [ gpu ]
+#    runtime: nvidia
+#    deploy:
+#      resources:
+#        reservations:
+#          devices:
+#            - driver: nvidia
+#              count: all
+#              capabilities: [ gpu ]
     env_file:
       - .env
     command: celery -A celery_app beat --loglevel=info
