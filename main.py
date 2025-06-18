@@ -20,7 +20,12 @@ from config.settings import settings
 # Device selection
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
+
 app = FastAPI()
+
+@app.get("/health", tags=["health"])
+async def health_check():
+    return JSONResponse({"status": "ok"})
 
 @app.get("/health", tags=["health"])
 async def health_check():
@@ -38,7 +43,15 @@ app.add_middleware(
 def load_models():
     global whisper_model, align_model, metadata, diarization_pipeline
     whisper_model = whisperx.load_model(settings.WHISPER_MODEL, DEVICE, compute_type="int8")
-    align_model, metadata = whisperx.load_align_model(language_code=None, device=DEVICE)
+    try:
+        # attempt to load align model for configured or auto-detected language
+        align_model, metadata = whisperx.load_align_model(
+            language_code=settings.LANGUAGE_CODE,
+            device=DEVICE
+        )
+    except ValueError as e:
+        logging.warning(f"Align model not found for language {settings.LANGUAGE_CODE}: {e}")
+        align_model, metadata = None, None
     diarization_pipeline = Pipeline.from_pretrained(settings.PYANNOTE_PROTOCOL, use_auth_token=settings.HUGGINGFACE_TOKEN)
 
 class TaskResponse(BaseModel):

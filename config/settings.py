@@ -1,5 +1,6 @@
 from pydantic import BaseSettings, AnyHttpUrl, Field
 from typing import List
+import os
 
 class Settings(BaseSettings):
     # FastAPI
@@ -22,9 +23,13 @@ class Settings(BaseSettings):
     SNIPPET_FORMAT: str = "wav"
 
     # Models & tokens
-    WHISPER_MODEL: str = "large-v3"
-    WHISPER_DEVICE: str = Field("cuda", env="DEVICE")
+    # Optional default for forced-alignment (None = let the first ASR pass pick it up)
+    LANGUAGE_CODE = os.getenv("LANGUAGE_CODE", None)
+    WHISPER_MODEL = os.getenv("WHISPER_MODEL", "large-v3")
+    DEVICE        = os.getenv("DEVICE", "cuda")
     WHISPER_COMPUTE_TYPE: str = Field("int8", env="WHISPER_COMPUTE_TYPE")
+    # if detection ever fails, fall back to English
+    LANGUAGE_CODE = os.getenv("LANGUAGE_CODE", "ru")
     PYANNOTE_PROTOCOL: str
     HUGGINGFACE_TOKEN: str = ""
 
