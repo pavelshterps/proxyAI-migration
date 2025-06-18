@@ -104,15 +104,17 @@ services:
     environment:
       - BROKER_URL=${CELERY_BROKER_URL}
       - CELERY_RESULT_BACKEND=${CELERY_RESULT_BACKEND}
+    depends_on:
+      - redis
+    volumes:
+      - uploads:/tmp/uploads
     command: >
-      flower
+      celery -A celery_app.celery flower
       --address=0.0.0.0
       --port=5555
       --broker=${CELERY_BROKER_URL}
     ports:
       - "5555:5555"
-    depends_on:
-      - redis
 
 volumes:
   pgdata:
