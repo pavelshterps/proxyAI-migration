@@ -1,214 +1,147 @@
 import os
-import torch
-import logging
-import whisperx
 import glob
 import shutil
+import json
 import time
-from datetime import datetime, timedelta
+import logging
+import torch
+import whisperx
+from pyannote.audio import Pipeline
 
-from celery_app import celery as app
-from celery import Task
+from celery_app import celery
 from config.settings import settings
 
+# ----- Configuration -----
+UPLOAD_DIR = settings.UPLOAD_FOLDER
+RETENTION_DAYS = settings.FILE_RETENTION_DAYS
+DEVICE = settings.DEVICE.lower()  # must be "cpu" or "cuda"
+# --------------------------
 
-# Создание папки для загрузок на старте приложения
-os.makedirs(settings.UPLOAD_FOLDER, exist_ok=True)
-
-# ==============================
-# SUPPORTED FORMATS (расширяем по необходимости)
-# ==============================
-AUDIO_EXTENSIONS = {".wav", ".mp3", ".ogg", ".flac", ".m4a", ".aac", ".mp4", ".webm", ".opus", ".wma", ".alac", ".aiff"}
-
-# ==============================
-# SINGLETON HOLDERS
-# ==============================
-whisper_model = None
-align_model = None
-align_metadata = None
-diarization_pipeline = None
+# ---- Lazy singletons ----
+_whisper_model = None
+_align_model = None
+_align_metadata = None
+_diarization_pipeline = None
 
 def get_whisper_model():
-    global whisper_model
-    if whisper_model is None:
-        whisper_model = whisperx.load_model(
+    global _whisper_model
+    if _whisper_model is None:
+        _whisper_model = whisperx.load_model(
             settings.WHISPER_MODEL,
-            settings.DEVICE.lower(),
+            DEVICE,
             compute_type=settings.WHISPER_COMPUTE_TYPE
         )
-    return whisper_model
+    return _whisper_model
 
-def get_align_model(language_code):
-    global align_model, align_metadata
-    if align_model is not None and align_metadata is not None:
-        return align_model, align_metadata
-    try:
-        align_model, align_metadata = whisperx.load_align_model(
-            language_code=language_code,
-            device=settings.DEVICE.lower()
-        )
-    except Exception as e:
-        logging.warning(f"Align model for {language_code} could not be loaded: {e}")
-        align_model, align_metadata = None, None
-    return align_model, align_metadata
+def get_align_model():
+    global _align_model, _align_metadata
+    if _align_model is None:
+        try:
+            _align_model, _align_metadata = whisperx.load_align_model(
+                language_code=settings.LANGUAGE_CODE,
+                device=DEVICE
+            )
+        except ValueError as e:
+            logging.warning(f"No align model for language {settings.LANGUAGE_CODE}: {e}")
+            _align_model, _align_metadata = None, None
+    return _align_model, _align_metadata
 
 def get_diarization_pipeline():
-    global diarization_pipeline
-    if diarization_pipeline is not None:
-        return diarization_pipeline
-    try:
-        from pyannote.audio import Pipeline
-        diarization_pipeline = Pipeline.from_pretrained(
+    global _diarization_pipeline
+    if _diarization_pipeline is None:
+        _diarization_pipeline = Pipeline.from_pretrained(
             settings.PYANNOTE_PROTOCOL,
             use_auth_token=settings.HUGGINGFACE_TOKEN
         )
-    except Exception as e:
-        logging.warning(f"Could not load diarization pipeline: {e}")
-        diarization_pipeline = None
-    return diarization_pipeline
+    return _diarization_pipeline
 
-def is_audio_file(filename):
-    return os.path.splitext(filename)[1].lower() in AUDIO_EXTENSIONS
+def get_file_path_by_task_id(task_id: str) -> str:
+    """
+    Finds the uploaded file path for a given Celery task ID.
+    Assumes files are named <task_id>_<originalname> inside UPLOAD_DIR/YYYY-MM-DD/.
+    """
+    pattern = os.path.join(UPLOAD_DIR, "*", f"{task_id}_*")
+    matches = glob.glob(pattern)
+    return matches[0] if matches else None
 
-# ==============================
-# MAIN TASK
-# ==============================
-@app.task(bind=True, name='tasks.transcribe_task', max_retries=3, default_retry_delay=60)
+# ---- Transcription Task ----
+@celery.task(bind=True, name="tasks.transcribe_task", max_retries=3, default_retry_delay=60)
 def transcribe_task(self, file_path: str):
     try:
-        # 1. Transcribe
+        # 1) ASR
         model = get_whisper_model()
         result = model.transcribe(file_path)
-        segments = result.get("segments", [])
-        lang = result.get("language", settings.LANGUAGE_CODE)
+        segments = result["segments"]
+        language = result.get("language")
 
-        # 2. Alignment (optional)
-        align_model, align_metadata = get_align_model(lang)
-        if align_model and align_metadata and segments:
-            try:
-                result = whisperx.align(
-                    segments,
-                    align_model,
-                    align_metadata,
-                    file_path,
-                    settings.DEVICE.lower()
-                )
-            except Exception as e:
-                logging.warning(f"Align failed: {e}")
+        # 2) Forced alignment (if available)
+        align_model, align_metadata = get_align_model()
+        if align_model is not None:
+            aligned = whisperx.align(
+                segments,
+                align_model,
+                align_metadata,
+                file_path,
+                device=DEVICE
+            )
+            segments = aligned["segments"]
 
-        # 3. Diarization (optional)
+        # 3) Diarization
+        diarizer = get_diarization_pipeline()
+        diar = diarizer(file_path)
         diarization = []
-        diarization_pipeline = get_diarization_pipeline()
-        if diarization_pipeline:
-            try:
-                diarization_raw = diarization_pipeline(file_path)
-                diarization = [
-                    {
-                        "speaker": str(turn["label"]),
-                        "start": float(turn["start"]),
-                        "end": float(turn["end"])
-                    }
-                    for turn in diarization_raw.itertracks(yield_label=True)
-                ]
-            except Exception as e:
-                logging.warning(f"Diarization failed: {e}")
-                diarization = []
+        for turn, _, speaker in diar.itertracks(yield_label=True):
+            diarization.append({
+                "start": turn.start,
+                "end":   turn.end,
+                "speaker": speaker
+            })
 
-        # 4. Schedule file cleanup after 1 day (24 hours)
-        cleanup_files.apply_async(kwargs={'file_path': file_path}, eta=datetime.utcnow() + timedelta(days=1))
+        # 4) Save a default labels.json (identity mapping)
+        labels_path = os.path.splitext(file_path)[0] + "_labels.json"
+        mapping = {d["speaker"]: d["speaker"] for d in diarization}
+        with open(labels_path, "w", encoding="utf-8") as f:
+            json.dump(mapping, f, ensure_ascii=False, indent=2)
 
         return {
-            "segments": segments,
-            "language": lang,
-            "diarization": diarization,
-            "file_path": file_path,
+            "file_path":   file_path,
+            "language":    language,
+            "segments":    segments,
+            "diarization": diarization
         }
+
     except Exception as exc:
-        logging.error(f"Transcription failed: {exc}", exc_info=True)
+        logging.exception("Transcription failed")
         raise self.retry(exc=exc)
 
-# ==============================
-# CLEANUP TASK
-# ==============================
-@app.task
-def cleanup_files(file_path=None):
-    """Удаляет конкретный файл или чистит все старые и ненужные файлы в папке uploads."""
-    folder = settings.UPLOAD_FOLDER
-    cutoff = time.time() - 24 * 3600  # 1 day ago
+# ---- Cleanup Task ----
+@celery.task(name="tasks.cleanup_files")
+def cleanup_files():
+    """
+    Removes files older than RETENTION_DAYS, prunes empty folders,
+    and if disk free <25%, reschedules itself immediately.
+    """
+    now = time.time()
+    cutoff = now - RETENTION_DAYS * 86400
 
-    # Если конкретный файл - просто удалить
-    if file_path and os.path.exists(file_path):
-        try:
-            os.remove(file_path)
-            meta = os.path.splitext(file_path)[0] + "_labels.json"
-            if os.path.exists(meta):
-                os.remove(meta)
-        except Exception as e:
-            logging.warning(f"Failed to remove file {file_path}: {e}")
-        return
-
-    # Иначе -- чистим все старое
-    for root, dirs, files in os.walk(folder):
-        for f in files:
-            full_path = os.path.join(root, f)
-            if not is_audio_file(full_path) and not f.endswith("_labels.json"):
-                continue
+    # Walk UPLOAD_DIR
+    for root, dirs, files in os.walk(UPLOAD_DIR):
+        for fname in files:
+            path = os.path.join(root, fname)
             try:
-                if os.path.getmtime(full_path) < cutoff:
-                    os.remove(full_path)
-            except Exception as e:
-                logging.warning(f"Failed to remove {full_path}: {e}")
+                if os.path.getmtime(path) < cutoff:
+                    os.remove(path)
+            except Exception:
+                logging.warning(f"Could not remove {path}", exc_info=True)
+        # if folder now empty, remove it
+        if not os.listdir(root):
+            try:
+                shutil.rmtree(root)
+            except Exception:
+                logging.debug(f"Could not remove dir {root}", exc_info=True)
 
-    # Чистка если мало места
-    if get_disk_free_ratio() < 0.25:
-        logging.warning("Disk space critically low (<25%). Forcing additional cleanup.")
-        remove_oldest_files(folder, keep_ratio=0.25)
-
-def get_disk_free_ratio():
-    """Возвращает долю свободного места (0..1) на диске с UPLOAD_FOLDER."""
-    total, used, free = shutil.disk_usage(settings.UPLOAD_FOLDER)
-    return free / total if total else 0.0
-
-def remove_oldest_files(folder, keep_ratio=0.25):
-    """Удаляет самые старые файлы, пока не освободится >= keep_ratio места."""
-    files = []
-    for root, dirs, filenames in os.walk(folder):
-        for f in filenames:
-            full_path = os.path.join(root, f)
-            if is_audio_file(full_path) or f.endswith("_labels.json"):
-                try:
-                    mtime = os.path.getmtime(full_path)
-                    files.append((mtime, full_path))
-                except Exception:
-                    continue
-    files.sort()  # Старые первыми
-    while get_disk_free_ratio() < keep_ratio and files:
-        _, file_to_delete = files.pop(0)
-        try:
-            os.remove(file_to_delete)
-        except Exception as e:
-            logging.warning(f"Failed to remove {file_to_delete}: {e}")
-
-# ==============================
-# FILE FINDER BY TASK ID
-# ==============================
-def get_file_path_by_task_id(task_id: str):
-    """
-    Возвращает путь к файлу по task_id (ищет по маске).
-    Например: uploads/2024-06-19/{task_id}_*.*
-    """
-    base_folder = settings.UPLOAD_FOLDER
-    for date_folder in os.listdir(base_folder):
-        folder_path = os.path.join(base_folder, date_folder)
-        if not os.path.isdir(folder_path):
-            continue
-        # Ищем по маске uuid_*.ext
-        for f in os.listdir(folder_path):
-            if f.startswith(task_id + "_"):
-                return os.path.join(folder_path, f)
-    # Если не нашли — глобальный поиск по маске
-    for root, dirs, files in os.walk(base_folder):
-        for f in files:
-            if f.startswith(task_id + "_"):
-                return os.path.join(root, f)
-    return None
+    # If disk nearly full, re-enqueue cleanup
+    stat = os.statvfs(UPLOAD_DIR)
+    free_ratio = stat.f_bavail / stat.f_blocks
+    if free_ratio < 0.25:
+        cleanup_files.delay()
