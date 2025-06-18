@@ -4,6 +4,9 @@ FROM pytorch/pytorch:1.13.1-cuda11.6-cudnn8-runtime
 # Добавляем непривилегированного пользователя
 RUN useradd --create-home appuser
 
+# Уже есть создание пользователя appuser
+RUN mkdir -p /tmp/uploads && chmod -R 777 /tmp/uploads
+
 # Устанавливаем рабочую директорию
 WORKDIR /app
 
