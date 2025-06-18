@@ -7,7 +7,8 @@ import shutil
 import time
 from datetime import datetime, timedelta
 
-from celery import shared_task, Task
+from celery_app import celery as app
+from celery import Task
 from config.settings import settings
 
 
@@ -72,7 +73,7 @@ def is_audio_file(filename):
 # ==============================
 # MAIN TASK
 # ==============================
-@shared_task(bind=True, name='tasks.transcribe_task', max_retries=3, default_retry_delay=60)
+@app.task(bind=True, name='tasks.transcribe_task', max_retries=3, default_retry_delay=60)
 def transcribe_task(self, file_path: str):
     try:
         # 1. Transcribe
@@ -129,7 +130,7 @@ def transcribe_task(self, file_path: str):
 # ==============================
 # CLEANUP TASK
 # ==============================
-@shared_task
+@app.task
 def cleanup_files(file_path=None):
     """Удаляет конкретный файл или чистит все старые и ненужные файлы в папке uploads."""
     folder = settings.UPLOAD_FOLDER
