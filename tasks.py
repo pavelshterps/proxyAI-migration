@@ -5,12 +5,11 @@ from celery_app import app
 from datetime import datetime
 from config.settings import settings
 
-# Use lazy-loading for whisper model
+# Device and lazy model initializations
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 whisper_model = None
-# we'll only load align_model *after* we know the file's language:
 align_model = None
-metadata    = None
+metadata = None
 diarization_pipeline = None
 
 def get_whisper_model():
@@ -43,7 +42,7 @@ def transcribe_task(self, file_path: str):
                 device=DEVICE
             )
             aligned = whisperx.align(segments, align_model, metadata, file_path, DEVICE)
-        except ValueError as e:
+        except Exception as e:
             logging.warning(f"No align model for '{lang}': {e}")
             aligned = segments
 
@@ -98,7 +97,6 @@ def cleanup_files():
         if low_disk and removed >= 1:
             break
     return {'removed': removed}
-
 
 def get_file_path_by_task_id(task_id: str):
     from celery.result import AsyncResult
