@@ -1,32 +1,27 @@
-# Используем официальный образ PyTorch с поддержкой CUDA (или замените на CPU-образ, если нужно)
 FROM pytorch/pytorch:1.13.1-cuda11.6-cudnn8-runtime
 
-# Добавляем непривилегированного пользователя
-RUN useradd --create-home appuser
-
-# Уже есть создание пользователя appuser
-RUN mkdir -p /tmp/uploads && chmod -R 777 /tmp/uploads
-
-# Устанавливаем рабочую директорию
-WORKDIR /app
-
-# Устанавливаем системные зависимости
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
-       git \
-       ffmpeg \
-       libsndfile1 \
+# Установка зависимостей системы (git, ffmpeg, и всё что требуется для работы аудио и Python)
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    git \
+    ffmpeg \
+    build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# Копируем файл зависимостей и ставим Python-библиотеки
+# Установка Python зависимостей
+WORKDIR /app
 COPY requirements.txt .
-RUN pip install --no-cache-dir "ctranslate2[cuda11]" \
-    && pip install --no-cache-dir -r requirements.txt
+RUN pip install --upgrade pip
+RUN pip install --no-cache-dir "ctranslate2[cuda11]"
+RUN pip install --no-cache-dir -r requirements.txt
 
-
-
-# Копируем весь код приложения
+# Копирование проекта
 COPY . .
 
-# Переключаемся на непривилегированного пользователя
-USER appuser
+# Разрешение на запись в /tmp/uploads для всех
+RUN mkdir -p /tmp/uploads && chmod -R 777 /tmp/uploads
+
+# Убедись что весь код копируется под /app, WORKDIR /app уже установлен
+
+# По умолчанию ничего не запускаем (каждый сервис прописывает свою команду в docker-compose)
+CMD [ "bash" ]
