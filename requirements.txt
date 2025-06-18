@@ -21,9 +21,9 @@ git+https://github.com/m-bain/whisperx.git@main
 # аудио/трансформеры
 pyannote.audio>=3.3.2
 faster-whisper>=1.1.1
-transformers==4.31.0
+transformers==4.48.0
 huggingface-hub<1.0,>=0.14.1
-tokenizers<0.14,>=0.11.1
+tokenizers>=0.14,<0.20
 
 # Torch-стек
 torch>=2.5.1
