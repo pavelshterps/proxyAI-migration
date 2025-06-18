@@ -20,21 +20,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir "ctranslate2[cuda11]" \
     && pip install --no-cache-dir -r requirements.txt
 
-# Правим импорты в whisperx и transformers для совместимости
-RUN COMMON_VISION_FILE=$(python -c "import transformers, os; print(os.path.join(os.path.dirname(transformers.__file__), 'models', 'common_vision.py'))") && \
-    if [ -f "$COMMON_VISION_FILE" ]; then \
-      sed -i \
-        -e "s/NEAREST_EXACT/NEAREST/" \
-        -e "s/BICUBIC_EXACT/BICUBIC/" \
-        "$COMMON_VISION_FILE"; \
-    else \
-      echo "transformers common_vision.py not found, skipping patch"; \
-    fi
 
-RUN sed -i \
-      -e "s/NEAREST_EXACT/NEAREST/" \
-      -e "s/BICUBIC_EXACT/BICUBIC/" \
-      $(python -c "import transformers, os; print(os.path.join(os.path.dirname(transformers.__file__), 'models', 'common_vision.py'))")
 
 # Копируем весь код приложения
 COPY . .
