@@ -1,20 +1,28 @@
 import os
 from celery import Celery
-from celery.schedules import crontab
 from config.settings import settings
 
-app = Celery('whisperx',
-             broker=settings.CELERY_BROKER_URL,
-             backend=settings.CELERY_RESULT_BACKEND)
+# Настройка пути для celery, чтобы tasks корректно импортировались
+os.environ.setdefault("C_FORCE_ROOT", "true")
+os.environ.setdefault("CELERY_CONFIG_MODULE", "config.settings")
 
-app.conf.task_routes = {'tasks.transcribe_task': {'queue': 'transcribe'}}
-app.conf.task_acks_late = True
-app.conf.worker_prefetch_multiplier = 1
-app.conf.task_time_limit = 3600
-app.conf.beat_schedule = {
-    'cleanup-old-uploads': {
-        'task': 'tasks.cleanup_files',
-        'schedule': crontab(hour=0, minute=0),
-    },
-}
-app.conf.timezone = settings.CELERY_TIMEZONE
+celery = Celery(
+    "whisperx",
+    broker=settings.CELERY_BROKER_URL,
+    backend=settings.CELERY_RESULT_BACKEND,
+    include=["tasks"],  # Явно указываем tasks для регистрации всех задач
+)
+
+# Опционально — настройки из объекта settings
+celery.conf.update(
+    task_serializer="json",
+    result_serializer="json",
+    accept_content=["json"],
+    timezone=settings.CELERY_TIMEZONE,
+    enable_utc=True,
+    worker_max_tasks_per_child=10,  # Для безопасности
+    broker_connection_retry_on_startup=True,
+)
+
+# Необязательно: но можно оставить ручной импорт для совместимости
+# import tasks
