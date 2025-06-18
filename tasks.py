@@ -11,7 +11,7 @@ whisper_model = None
 # we'll only load align_model *after* we know the file's language:
 align_model = None
 metadata    = None
-diarization_pipeline = Pipeline.from_pretrained(settings.PYANNOTE_PROTOCOL, use_auth_token=settings.HUGGINGFACE_TOKEN)
+diarization_pipeline = None
 
 @app.task(bind=True, name='tasks.transcribe_task', max_retries=3, default_retry_delay=60)
 def transcribe_task(self, file_path: str):
@@ -29,12 +29,26 @@ def transcribe_task(self, file_path: str):
         except ValueError as e:
             logging.warning(f"No align model for '{lang}': {e}")
             aligned = segments
+        # ensure diarization pipeline is loaded (lazy + with token)
+        global diarization_pipeline
+        if diarization_pipeline is None:
+            try:
+                diarization_pipeline = Pipeline.from_pretrained(
+                    settings.PYANNOTE_PROTOCOL,
+                    use_auth_token=settings.HUGGINGFACE_TOKEN
+                )
+            except Exception as e:
+                logging.warning(f"Failed to load diarization pipeline: {e}")
+                diarization_pipeline = None
         # Diarization
-        diar = diarization_pipeline(file_path)
-        diar_out = [
-            {'start': seg.start, 'end': seg.end, 'speaker': spk}
-            for seg, _, spk in diar.itertracks(yield_label=True)
-        ]
+        if diarization_pipeline:
+            diar = diarization_pipeline(file_path)
+            diar_out = [
+                {'start': seg.start, 'end': seg.end, 'speaker': spk}
+                for seg, _, spk in diar.itertracks(yield_label=True)
+            ]
+        else:
+            diar_out = []
         return {
             'text': result['text'],
             'segments': [s._asdict() for s in aligned],
