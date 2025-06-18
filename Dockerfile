@@ -21,9 +21,11 @@ RUN pip install --no-cache-dir "ctranslate2[cuda11]" \
     && pip install --no-cache-dir -r requirements.txt
 
 # Правим импорты в whisperx и transformers для совместимости
-RUN sed -i \
-      "s|from transformers import Pipeline|from transformers.pipelines.base import Pipeline|" \
-      $(python -c "import whisperx, os; print(os.path.join(os.path.dirname(whisperx.__file__), 'asr', 'transforms.py'))")
+RUN if [ -f "$(python -c "import whisperx, os; print(os.path.join(os.path.dirname(whisperx.__file__), 'asr', 'transforms.py'))")" ]; then \
+      sed -i "s|from transformers import Pipeline|from transformers.pipelines.base import Pipeline|" "$(python -c "import whisperx, os; print(os.path.join(os.path.dirname(whisperx.__file__), 'asr', 'transforms.py'))")"; \
+    else \
+      echo "whisperx transforms.py not found, skipping patch"; \
+    fi
 
 RUN sed -i \
       -e "s/NEAREST_EXACT/NEAREST/" \
