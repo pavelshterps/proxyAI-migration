@@ -4,7 +4,6 @@ import json
 import logging
 import ffmpeg
 import torch
-import whisperx
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -17,15 +16,14 @@ from tasks import transcribe_task, cleanup_files
 from tasks import get_file_path_by_task_id
 from config.settings import settings
 
-# Device selection
+
+# Создание папки для загрузок на старте приложения
+os.makedirs(settings.UPLOAD_FOLDER, exist_ok=True)
+
+# Device selection (used for info/debug only here)
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-
 app = FastAPI()
-
-@app.get("/health", tags=["health"])
-async def health_check():
-    return JSONResponse({"status": "ok"})
 
 @app.get("/health", tags=["health"])
 async def health_check():
@@ -38,21 +36,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-@app.on_event("startup")
-def load_models():
-    global whisper_model, align_model, metadata, diarization_pipeline
-    whisper_model = whisperx.load_model(settings.WHISPER_MODEL, DEVICE, compute_type="int8")
-    try:
-        # attempt to load align model for configured or auto-detected language
-        align_model, metadata = whisperx.load_align_model(
-            language_code=settings.LANGUAGE_CODE,
-            device=DEVICE
-        )
-    except ValueError as e:
-        logging.warning(f"Align model not found for language {settings.LANGUAGE_CODE}: {e}")
-        align_model, metadata = None, None
-    diarization_pipeline = Pipeline.from_pretrained(settings.PYANNOTE_PROTOCOL, use_auth_token=settings.HUGGINGFACE_TOKEN)
 
 class TaskResponse(BaseModel):
     task_id: str
@@ -128,7 +111,7 @@ async def tus_hook(request: Request):
     dst = os.path.join(folder, f"{uuid.uuid4()}_{secure_filename(file_id)}")
     os.replace(src, dst)
     transcribe_task.delay(dst)
-    return {"status":"ok"}
+    return {"status": "ok"}
 
 @app.get("/snippet/{task_id}")
 def snippet(task_id: str, start: float, end: float):
@@ -154,4 +137,4 @@ def label(task_id: str, req: LabelRequest):
     meta_path = os.path.splitext(path)[0] + "_labels.json"
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(req.mapping, f, ensure_ascii=False, indent=2)
-    return {"status":"labels saved"}
+    return {"status": "labels saved"}
