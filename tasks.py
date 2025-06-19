@@ -22,9 +22,10 @@ _diarization_pipeline = None
 def get_whisper_model():
     global _whisper_model
     if _whisper_model is None:
+        device = settings.DEVICE.lower() if isinstance(settings.DEVICE, str) else settings.DEVICE
         _whisper_model = whisperx.load_model(
             settings.WHISPER_MODEL,
-            settings.DEVICE,
+            device,
             compute_type=settings.WHISPER_COMPUTE_TYPE
         )
     return _whisper_model
@@ -33,9 +34,10 @@ def get_align_model():
     global _align_model, _align_metadata
     if _align_model is None:
         try:
+            device = settings.DEVICE.lower() if isinstance(settings.DEVICE, str) else settings.DEVICE
             _align_model, _align_metadata = whisperx.load_align_model(
                 language_code=settings.LANGUAGE_CODE,
-                device=settings.DEVICE
+                device=device
             )
         except ValueError:
             logger.warning(f"No align model for {settings.LANGUAGE_CODE}, skipping")
