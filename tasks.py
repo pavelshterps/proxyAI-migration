@@ -46,14 +46,14 @@ def get_whisper_model():
     """
     global _whisper_model, _whisper_processor
     if _whisper_model is None:
-        # normalize device string
+        # нормализуем DEVICE
         dev = settings.DEVICE.lower()
         if dev == 'gpu':
             dev = 'cuda'
         if dev not in ('cpu', 'cuda'):
             dev = 'cpu'
 
-        # prepare quantization config without unsupported max_memory
+        # собираем конфиг для quantization без max_memory
         bnb_config = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_quant_type="nf4",
@@ -91,7 +91,6 @@ def get_align_model():
     """
     global _align_model, _align_metadata
     if _align_model is None or _align_metadata is None:
-        # normalize device string
         dev = settings.DEVICE.lower()
         if dev == 'gpu':
             dev = 'cuda'
@@ -123,7 +122,6 @@ def transcribe_chunk(self, chunk_path: str, offset: float):
     model, processor = get_whisper_model()
     align_model, align_metadata = get_align_model()
 
-    # Load and resample audio to 16kHz
     audio = AudioSegment.from_file(chunk_path)
     audio = audio.set_frame_rate(16000)
     sr = 16000
@@ -131,14 +129,12 @@ def transcribe_chunk(self, chunk_path: str, offset: float):
     samples = np.array(audio.get_array_of_samples()).astype(np.float32)
     audio_array = samples / (1 << (8 * audio.sample_width - 1))
 
-    # ASR
     inputs = processor(audio_array, return_tensors="pt", sampling_rate=sr).to(model.device)
     tokens = model.generate(**inputs)
     text = processor.batch_decode(tokens, skip_special_tokens=True)[0]
 
     segments = [{"start": 0.0, "end": len(audio_array) / sr, "text": text}]
 
-    # Alignment
     aligned = whisperx.align(
         segments,
         processor.tokenizer,
@@ -148,7 +144,6 @@ def transcribe_chunk(self, chunk_path: str, offset: float):
         device=model.device
     )
 
-    # Shift timestamps and collect
     out = []
     for seg in aligned["segments"]:
         out.append({
@@ -158,7 +153,6 @@ def transcribe_chunk(self, chunk_path: str, offset: float):
             "text": seg.text
         })
 
-    # Clean up chunk file
     try:
         os.remove(chunk_path)
     except OSError:
@@ -170,22 +164,12 @@ def transcribe_chunk(self, chunk_path: str, offset: float):
 
 @celery.task
 def merge_chunks(results_list, audio_path: str):
-    """
-    Chord callback: merge, sort and return final transcription payload.
-    """
     merged = [seg for sub in results_list for seg in sub]
     merged.sort(key=lambda x: x["start"])
     return {"segments": merged, "audio_filepath": audio_path}
 
 @celery.task(bind=True)
 def transcribe_task(self, audio_path: str):
-    """
-    Orchestrator:
-      1. Split on silence into chunks
-      2. Dispatch transcribe_chunk for each chunk
-      3. Run chord with merge_chunks
-      4. Return merge_task_id
-    """
     start_ts = time.time()
     estimate = estimate_processing_time(audio_path)
     logger.info(f"Starting overall transcription: {audio_path}, estimated ~{estimate:.1f}s")
@@ -200,7 +184,7 @@ def transcribe_task(self, audio_path: str):
 
     tasks = []
     elapsed_ms = 0
-    chunk_ms = 3 * 60 * 1000  # 3 minutes
+    chunk_ms = 3 * 60 * 1000
     for chunk in raw_chunks:
         start_ms = 0
         while start_ms < len(chunk):
@@ -217,14 +201,12 @@ def transcribe_task(self, audio_path: str):
 
 @celery.task
 def cleanup_files(path: str):
-    """Remove file at path."""
     try:
         os.remove(path)
     except OSError:
         pass
 
 def get_file_path_by_task_id(task_id: str) -> str:
-    """Return audio_filepath from a finished task, else None."""
     res = AsyncResult(task_id, app=celery)
     if res.state == 'SUCCESS':
         return res.get().get('audio_filepath')
