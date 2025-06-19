@@ -9,8 +9,15 @@ from tasks import estimate_processing_time
 
 app = FastAPI()
 
-# Раздаём статику (index.html и др.)
-app.mount("/", StaticFiles(directory="static", html=True), name="static")
+# Serve the main index page at root
+@app.get("/", response_class=HTMLResponse)
+async def root():
+    # Serve the main index page
+    index_path = os.path.join("static", "index.html")
+    return HTMLResponse(content=open(index_path, encoding="utf-8").read())
+
+# Serve static files under /static
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
 @app.get("/health")
 async def health():
