@@ -1,8 +1,7 @@
-# шаблонизатор
+# requirements.txt
 Jinja2>=3.1.0
 MarkupSafe>=2.1.1
 
-# основы
 wheel
 fastapi==0.115.12
 uvicorn==0.34.3
@@ -15,24 +14,21 @@ ffmpeg-python==0.2.0
 aiofiles==24.1.0
 python-multipart>=0.0.5
 
-# Git-зависимость
 git+https://github.com/m-bain/whisperx.git@main
 
-# аудио/трансформеры
 pyannote.audio>=3.3.2
 faster-whisper>=1.1.1
 transformers==4.48.0
 huggingface-hub<1.0,>=0.14.1
 bitsandbytes>=0.39.0
 accelerate>=0.20.3
+pydub>=0.25.1
 
-# Torch-стек
 torch>=2.5.1
 torchaudio>=2.5.1
 onnxruntime>=1.19
 ctranslate2<4.5.0
 
-# вспомогательное
 nltk>=3.9.1
 pandas>=2.2.3
 starlette<0.47.0,>=0.40.0
@@ -48,9 +44,7 @@ click-repl>=0.2.0
 vine<6.0,>=5.1.0
 async-timeout>=4.0.3
 future==0.18.2
-pydub>=0.25.1
 
-# дополнительные аудио/метрики
 pyannote.database>=5.0.1
 soundfile>=0.12.1
 speechbrain>=1.0.0

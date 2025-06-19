@@ -1,3 +1,4 @@
+# docker-compose.yml
 version: '3.8'
 
 services:
@@ -33,9 +34,10 @@ services:
       context: .
       dockerfile: Dockerfile
     image: proxyai-api:latest
+    runtime: nvidia
     environment:
-      - WHISPER_DEVICE=cpu
-      - WHISPER_COMPUTE_TYPE=int8
+      - WHISPER_DEVICE=cuda
+      - WHISPER_COMPUTE_TYPE=float16
     env_file: .env
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost:${FASTAPI_PORT}/health || exit 1"]
@@ -58,7 +60,11 @@ services:
 
   worker:
     image: proxyai-api:latest
+    runtime: nvidia
     env_file: .env
+    environment:
+      - WHISPER_DEVICE=cuda
+      - WHISPER_COMPUTE_TYPE=float16
     volumes:
       - uploads:/tmp/uploads
     command: >
@@ -72,7 +78,11 @@ services:
 
   beat:
     image: proxyai-api:latest
+    runtime: nvidia
     env_file: .env
+    environment:
+      - WHISPER_DEVICE=cuda
+      - WHISPER_COMPUTE_TYPE=float16
     volumes:
       - uploads:/tmp/uploads
     command: >
@@ -93,7 +103,6 @@ services:
       - redis
     ports:
       - "5555:5555"
-    # uploads volume не обязателен тут, если flower не пишет/читает в uploads
 
 volumes:
   pgdata:

@@ -1,4 +1,5 @@
-FROM python:3.10-slim
+# Dockerfile
+FROM pytorch/pytorch:2.6.0-cuda11.8-cudnn8-runtime
 
 # Install build tools required for compiling bitsandbytes and other native extensions
 RUN apt-get update && apt-get install -y --no-install-recommends \

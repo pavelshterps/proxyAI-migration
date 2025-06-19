@@ -1,3 +1,4 @@
+# tasks.py
 import os
 import logging
 
@@ -32,7 +33,9 @@ def get_whisper_model():
             load_in_4bit=True,
             bnb_4bit_quant_type="nf4",
             device_map="auto",
-            torch_dtype=torch.float16
+            torch_dtype=torch.float16,
+            offload_state_dict=True,
+            offload_folder="offload"
         )
         _whisper_processor = WhisperProcessor.from_pretrained(settings.WHISPER_MODEL)
     return _whisper_model, _whisper_processor
@@ -72,7 +75,7 @@ def transcribe_chunk(self, chunk_path: str, offset: float):
     # Prepare single segment for alignment
     segment = [{"start": 0.0, "end": len(audio_array)/sr, "text": text}]
 
-    # Alignment (no duplicate 'device' arg)
+    # Alignment
     device = settings.DEVICE.lower() if isinstance(settings.DEVICE, str) else settings.DEVICE
     aligned = whisperx.align(
         segment,
