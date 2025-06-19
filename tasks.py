@@ -1,3 +1,5 @@
+from celery.result import AsyncResult
+from celery_app import celery
 import os
 import logging
 
@@ -92,3 +94,16 @@ def cleanup_files(path: str):
         os.remove(path)
     except OSError:
         pass
+
+
+# Restore get_file_path_by_task_id for main.py import
+def get_file_path_by_task_id(task_id: str) -> str:
+    """
+    Retrieve the audio file path for a completed transcription task.
+    Returns the file path if the task succeeded, or None if not.
+    """
+    res = AsyncResult(task_id, app=celery)
+    if res.state == 'SUCCESS':
+        payload = res.get()
+        return payload.get('audio_filepath')
+    return None
