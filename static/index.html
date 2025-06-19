@@ -26,18 +26,19 @@
   <script>
     // Helper: format seconds to MM:SS
     function formatTime(sec) {
+      if (!sec || sec <= 0) return '00:00';
       const m = Math.floor(sec / 60);
       const s = Math.round(sec % 60);
       return `${m.toString().padStart(2,'0')}:${s.toString().padStart(2,'0')}`;
     }
 
     const fileInput = document.getElementById('fileInput');
-    const uploadBtn = document.getElementById('uploadBtn');
-    const progress = document.getElementById('progress');
-    const bar = document.getElementById('bar');
-    const status = document.getElementById('status');
-    const player = document.getElementById('player');
-    const results = document.getElementById('results');
+    const uploadBtn  = document.getElementById('uploadBtn');
+    const progress   = document.getElementById('progress');
+    const bar        = document.getElementById('bar');
+    const status     = document.getElementById('status');
+    const player     = document.getElementById('player');
+    const results    = document.getElementById('results');
 
     uploadBtn.onclick = () => {
       if (!fileInput.files.length) {
@@ -47,9 +48,12 @@
       const form = new FormData();
       form.append('file', file);
 
+      // reset UI
       progress.hidden = false;
       bar.style.width = '0%';
-      status.textContent = 'Загрузка...';
+      status.textContent = 'Загрузка…';
+      results.innerHTML = '';
+      player.hidden = true;
 
       const xhr = new XMLHttpRequest();
       xhr.open('POST', '/transcribe');
@@ -61,13 +65,16 @@
         if (xhr.status !== 200) {
           return alert('Ошибка загрузки');
         }
-        const { task_id, estimate } = JSON.parse(xhr.responseText);
+        const { merge_task_id, estimate } = JSON.parse(xhr.responseText);
+
+        // Показываем корректное ожидаемое время
         status.textContent = 'Обработка… Ожидаемое время: ' + formatTime(estimate);
         bar.style.width = '100%';
 
+        // Опрашиваем /result/{merge_task_id}
         const iv = setInterval(async () => {
-          const res = await fetch('/result/' + task_id);
-          const json = await res.json();
+          const res   = await fetch('/result/' + merge_task_id);
+          const json  = await res.json();
           status.textContent = 'Статус: ' + json.status;
           if (json.status === 'SUCCESS') {
             clearInterval(iv);
@@ -83,9 +90,11 @@
     };
 
     function showResult(data) {
+      // Плейер
       player.hidden = false;
-      player.src = '/files/' + encodeURIComponent(data.audio_file);
+      player.src = '/files/' + encodeURIComponent(data.audio_filepath);
 
+      // Сегменты
       results.innerHTML = '';
       data.segments.forEach(seg => {
         const div = document.createElement('div');

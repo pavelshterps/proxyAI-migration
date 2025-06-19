@@ -5,7 +5,7 @@ import logging
 import whisperx
 import torch
 import numpy as np
-from celery import group
+from celery import group, chord
 from celery_app import celery
 from celery.result import AsyncResult
 from config.settings import settings
@@ -37,13 +37,13 @@ def estimate_processing_time(audio_path: str, speed_factor: float = 1.0) -> floa
 def get_whisper_model():
     """
     Загрузка (или кэш) 4-bit quantized модели Whisper + процессора.
-    Передаём use_auth_token для приватных реп.
+    Передаём token для приватных репозиториев HF.
     """
     global _whisper_model, _whisper_processor
     if _whisper_model is None:
         _whisper_model = WhisperForConditionalGeneration.from_pretrained(
-            settings.WHISPER_MODEL,
-            use_auth_token=settings.HUGGINGFACE_TOKEN,
+            settings.WHISPER_MODEL,             # должен быть "openai/whisper-large-v3"
+            token=settings.HUGGINGFACE_TOKEN,    # используем token вместо deprecated use_auth_token
             load_in_4bit=True,
             bnb_4bit_quant_type="nf4",
             device_map="auto",
@@ -54,7 +54,7 @@ def get_whisper_model():
     if _whisper_processor is None:
         _whisper_processor = WhisperProcessor.from_pretrained(
             settings.WHISPER_MODEL,
-            use_auth_token=settings.HUGGINGFACE_TOKEN
+            token=settings.HUGGINGFACE_TOKEN     # аналогично для процессора
         )
     return _whisper_model, _whisper_processor
 
@@ -126,13 +126,23 @@ def transcribe_chunk(self, chunk_path: str, offset: float):
     logger.info(f"Finished chunk transcription: {chunk_path} in {elapsed:.1f}s")
     return out
 
+
+# Merge callback for chord
+@celery.task
+def merge_chunks(results_list, audio_path: str):
+    """Merge, sort and return the final transcription payload."""
+    # Flatten and sort
+    merged = [seg for sub in results_list for seg in sub]
+    merged.sort(key=lambda x: x["start"])
+    return {"segments": merged, "audio_filepath": audio_path}
+
 @celery.task(bind=True)
 def transcribe_task(self, audio_path: str):
     """
     Основная задача:
-    1. Разбить аудио на silent-based чанки
-    2. Ещё на 3-мин отрезки, экспорт и dispatch subtasks
-    3. Собрать результаты, отсортировать и вернуть
+      1. Разбить аудио на silent-based чанки
+      2. На 3-минутные подчанки, экспорт и dispatch subtasks
+      3. Собрать результаты, отсортировать и вернуть
     """
     start_ts = time.time()
     estimate = estimate_processing_time(audio_path)
@@ -159,21 +169,10 @@ def transcribe_task(self, audio_path: str):
             start_ms += max_len
         elapsed_ms += len(chunk)
 
-    # Запускаем все чанки параллельно
-    job = group(tasks)
-    result = job.apply_async()
-    chunk_results = result.get()  # здесь можно «разрешить», если CeleryQ поддерживает native join
-
-    # Объединяем и сортируем
-    merged = [seg for sub in chunk_results for seg in sub]
-    merged.sort(key=lambda x: x["start"])
-
-    total = time.time() - start_ts
-    logger.info(f"Completed overall transcription: {audio_path} in {total:.1f}s")
-    return {
-        "segments": merged,
-        "audio_filepath": audio_path
-    }
+    # Run a chord: transcribe_chunk over each subtask, then merge_chunks
+    task_result = chord(tasks)(merge_chunks.s(audio_path))
+    logger.info(f"Dispatched chord with id {task_result.id}")
+    return {"merge_task_id": task_result.id}
 
 @celery.task
 def cleanup_files(path: str):

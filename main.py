@@ -1,153 +1,62 @@
 import os
-import uuid
-import json
-import logging
-import ffmpeg
-import torch
-from fastapi import FastAPI, UploadFile, File, HTTPException, Request
-from fastapi.responses import JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from starlette.responses import JSONResponse, Response
-from werkzeug.utils import secure_filename
-from datetime import datetime
-from celery.result import AsyncResult
-from tasks import transcribe_task, cleanup_files
-from tasks import get_file_path_by_task_id
-from config.settings import settings
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.responses import JSONResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
-import aiofiles
 
-
-# Создание папки для загрузок на старте приложения
-os.makedirs(settings.UPLOAD_FOLDER, exist_ok=True)
-
-# Device selection (used for info/debug only here)
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+from celery_app import celery
+from config.settings import settings
+from tasks import estimate_processing_time
 
 app = FastAPI()
 
-# Serve static frontend
-app.mount('/static', StaticFiles(directory='static'), name='static')
+# Раздаём статику (index.html и др.)
+app.mount("/", StaticFiles(directory="static", html=True), name="static")
 
-@app.get("/health", tags=["health"])
-async def health_check():
-    return JSONResponse({"status": "ok"})
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=settings.ALLOWED_ORIGINS,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-class TaskResponse(BaseModel):
-    task_id: str
-
-@app.post("/transcribe", response_model=TaskResponse)
-async def transcribe(request: Request, file: UploadFile = File(...)):
-    if not file.content_type.startswith("audio/"):
-        raise HTTPException(status_code=415, detail="Unsupported Media Type")
-    filename = secure_filename(file.filename)
-    ext = os.path.splitext(filename)[1].lower()
-    if ext not in [".wav", ".mp3", ".ogg", ".flac", ".m4a", ".aac"]:
-        raise HTTPException(status_code=415, detail="Unsupported file extension")
-
-    date_folder = datetime.utcnow().strftime("%Y-%m-%d")
-    folder = os.path.join(settings.UPLOAD_FOLDER, date_folder)
-    os.makedirs(folder, exist_ok=True)
-
-    temp_path = os.path.join(folder, f"tmp_{filename}")
-    size = 0
-    try:
-        import aiofiles
-        async with aiofiles.open(temp_path, "wb") as out:
-            while True:
-                chunk = await file.read(1024*1024)
-                if not chunk:
-                    break
-                size += len(chunk)
-                if size > settings.MAX_FILE_SIZE:
-                    await out.close()
-                    os.remove(temp_path)
-                    raise HTTPException(status_code=413, detail="File too large")
-                await out.write(chunk)
-    except OSError as e:
-        logging.error(f"Disk error: {e}", exc_info=True)
-        cleanup_files.delay()
-        raise HTTPException(status_code=503, detail="Server storage full, try later")
-
-    final_name = f"{uuid.uuid4()}_{filename}"
-    final_path = os.path.join(folder, final_name)
-    os.replace(temp_path, final_path)
-
-    task = transcribe_task.delay(final_path)
-    return TaskResponse(task_id=task.id)
-
-@app.get("/result/{task_id}")
-def result(task_id: str):
-    res = AsyncResult(task_id)
-    if res.status == 'SUCCESS':
-        data = res.result or {}
-        file_path = data.get('file_path')
-        if file_path:
-            labels_path = os.path.splitext(file_path)[0] + "_labels.json"
-            if os.path.exists(labels_path):
-                mapping = json.load(open(labels_path))
-                for seg in data.get('diarization', []):
-                    seg['speaker'] = mapping.get(seg['speaker'], seg['speaker'])
-        return JSONResponse({"task_id": task_id, "status": res.status, "result": data})
-    elif res.status == 'PENDING':
-        return JSONResponse({"task_id": task_id, "status": res.status})
-    else:
-        return JSONResponse({"task_id": task_id, "status": res.status, "result": str(res.result)})
-
-@app.post("/hooks/tus")
-async def tus_hook(request: Request):
-    data = await request.json()
-    file_id = data.get("FileID")
-    if not file_id:
-        raise HTTPException(status_code=400, detail="No FileID")
-    date_folder = datetime.utcnow().strftime("%Y-%m-%d")
-    folder = os.path.join(settings.UPLOAD_FOLDER, date_folder)
-    os.makedirs(folder, exist_ok=True)
-    src = os.path.join(settings.UPLOAD_FOLDER, file_id)
-    dst = os.path.join(folder, f"{uuid.uuid4()}_{secure_filename(file_id)}")
-    os.replace(src, dst)
-    transcribe_task.delay(dst)
+@app.get("/health")
+async def health():
     return {"status": "ok"}
 
-@app.get("/snippet/{task_id}")
-def snippet(task_id: str, start: float, end: float):
-    path = get_file_path_by_task_id(task_id)
-    if not path or not os.path.exists(path):
-        raise HTTPException(status_code=404, detail="File not found")
-    out, _ = (
-        ffmpeg
-        .input(path, ss=start, to=end)
-        .output("pipe:", format=settings.SNIPPET_FORMAT)
-        .run(capture_stdout=True)
-    )
-    return Response(content=out, media_type=f"audio/{settings.SNIPPET_FORMAT}")
+@app.post("/transcribe")
+async def start_transcription(file: UploadFile = File(...)):
+    """
+    Принимает аудиофайл, сохраняет и запускает Celery-таску.
+    Возвращает merge_task_id для последующего polling и estimate.
+    """
+    # Сохраняем файл
+    upload_folder = settings.UPLOAD_FOLDER
+    os.makedirs(upload_folder, exist_ok=True)
+    file_path = os.path.join(upload_folder, file.filename)
+    try:
+        contents = await file.read()
+        with open(file_path, "wb") as f:
+            f.write(contents)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Ошибка сохранения файла: {e}")
 
-class LabelRequest(BaseModel):
-    mapping: dict
+    # Запускаем task, который создаёт chord и возвращает merge_task_id
+    task = celery.send_task("tasks.transcribe_task", args=[file_path])
+    estimate = estimate_processing_time(file_path)
+    return JSONResponse({"merge_task_id": task.id, "estimate": estimate})
 
-@app.post("/label/{task_id}")
-def label(task_id: str, req: LabelRequest):
-    path = get_file_path_by_task_id(task_id)
-    if not path:
-        raise HTTPException(status_code=404, detail="File not found")
-    meta_path = os.path.splitext(path)[0] + "_labels.json"
-    with open(meta_path, "w", encoding="utf-8") as f:
-        json.dump(req.mapping, f, ensure_ascii=False, indent=2)
-    return {"status": "labels saved"}
+@app.get("/result/{task_id}")
+async def get_result(task_id: str):
+    """
+    Проверка состояния merge-задачи.
+    Если SUCCESS, возвращаем уже готовый результат с сегментами.
+    """
+    res = celery.AsyncResult(task_id)
+    state = res.state
 
-@app.get('/', response_class=HTMLResponse)
-async def serve_frontend():
-    # Return the static HTML UI
-    async with aiofiles.open('static/index.html', 'r', encoding='utf-8') as f:
-        content = await f.read()
-    return HTMLResponse(content)
+    if state == "SUCCESS":
+        payload = res.get()
+        # payload = {"segments": [...], "audio_filepath": "..."}
+        return {"status": state, **payload}
+
+    if state in ("PENDING", "STARTED", "RETRY"):
+        return {"status": state}
+
+    # FAILURE и прочие
+    info = res.info
+    return {"status": state, "error": str(info)}
+
+# Приложение раздаёт index.html автоматически через StaticFiles
