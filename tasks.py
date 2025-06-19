@@ -11,8 +11,11 @@ from celery.result import AsyncResult
 from config.settings import settings
 from pydub import AudioSegment
 from pydub.silence import split_on_silence
-from transformers import WhisperForConditionalGeneration, WhisperProcessor
-from transformers import BitsAndBytesConfig
+from transformers import (
+    WhisperForConditionalGeneration,
+    WhisperProcessor,
+    BitsAndBytesConfig,
+)
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -27,8 +30,7 @@ def estimate_processing_time(audio_path: str, speed_factor: float = 1.0) -> floa
     """
     Оценка времени обработки (сек) по длине аудио.
     speed_factor=1.0 — реальное время, <1 — быстрее, >1 — медленнее.
-    Здесь len(audio) даёт миллисекунды, делим на 1000 → секунды.
-    Никаких лишних конвертаций нет.
+    len(audio) даёт миллисекунды, делим на 1000 → секунды.
     """
     try:
         audio = AudioSegment.from_file(audio_path)
@@ -40,23 +42,22 @@ def estimate_processing_time(audio_path: str, speed_factor: float = 1.0) -> floa
 def get_whisper_model():
     """
     Load (and cache) the 4-bit quantized Whisper model and processor.
-    Map settings.DEVICE ('gpu'→'cuda'), catch OOM and fallback to CPU int8.
+    Map settings.DEVICE ('gpu'→'cuda'), catch OOM or internal errors and fallback to CPU int8.
     """
     global _whisper_model, _whisper_processor
     if _whisper_model is None:
-        # normalize device
+        # normalize device string
         dev = settings.DEVICE.lower()
         if dev == 'gpu':
             dev = 'cuda'
         if dev not in ('cpu', 'cuda'):
             dev = 'cpu'
 
-        # prepare quantization config
+        # prepare quantization config without unsupported max_memory
         bnb_config = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_quant_type="nf4",
             llm_int8_threshold=6.0,
-            max_memory={0: "3.2GiB"} if dev == 'cuda' else None,
         )
         try:
             _whisper_model = WhisperForConditionalGeneration.from_pretrained(
@@ -66,7 +67,7 @@ def get_whisper_model():
                 device_map="auto",
                 torch_dtype=torch.float16,
             )
-        except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
+        except (RuntimeError, torch.cuda.OutOfMemoryError, AttributeError) as e:
             logger.warning(f"Quantized GPU load failed ({e}); falling back to CPU int8.")
             _whisper_model = WhisperForConditionalGeneration.from_pretrained(
                 settings.WHISPER_MODEL,
@@ -74,23 +75,24 @@ def get_whisper_model():
                 load_in_8bit=True,
                 device_map="cpu"
             )
+
     if _whisper_processor is None:
         _whisper_processor = WhisperProcessor.from_pretrained(
             settings.WHISPER_MODEL,
             token=settings.HUGGINGFACE_TOKEN
         )
+
     return _whisper_model, _whisper_processor
 
 def get_align_model():
     """
-    Загрузка (или кэш) WhisperX align-модели + метаданных.
-    Правильный маппинг settings.DEVICE: 'gpu'→'cuda', остальные → cpu/cuda.
-    При ошибках (OOM, неверный device) — падаем обратно на CPU.
+    Load (and cache) the WhisperX align model and its metadata.
+    Converts settings.DEVICE='gpu'→'cuda', falls back to CPU on error.
     """
     global _align_model, _align_metadata
     if _align_model is None or _align_metadata is None:
-        # Normalize device string
-        dev = settings.DEVICE.lower() if isinstance(settings.DEVICE, str) else settings.DEVICE
+        # normalize device string
+        dev = settings.DEVICE.lower()
         if dev == 'gpu':
             dev = 'cuda'
         if dev not in ('cpu', 'cuda'):
@@ -102,17 +104,18 @@ def get_align_model():
                 device=dev
             )
         except RuntimeError as e:
-            logger.warning(f"Failed to load align model on device '{dev}': {e}; falling back to CPU.")
+            logger.warning(f"Failed to load align model on '{dev}': {e}; falling back to CPU.")
             _align_model, _align_metadata = whisperx.load_align_model(
                 language_code=settings.LANGUAGE_CODE,
                 device='cpu'
             )
+
     return _align_model, _align_metadata
 
 @celery.task(bind=True, max_retries=3, default_retry_delay=60)
 def transcribe_chunk(self, chunk_path: str, offset: float):
     """
-    Транскрибирует и выравнивает один чанк, сдвигая тайминги на offset.
+    Transcribe and align a single audio chunk, shifting timestamps by offset.
     """
     start_ts = time.time()
     logger.info(f"Starting chunk transcription: {chunk_path} (offset {offset}s)")
@@ -120,11 +123,11 @@ def transcribe_chunk(self, chunk_path: str, offset: float):
     model, processor = get_whisper_model()
     align_model, align_metadata = get_align_model()
 
-    # Загрузка и нормализация аудио
+    # Load and resample audio to 16kHz
     audio = AudioSegment.from_file(chunk_path)
-    # ensure correct sampling rate for WhisperFeatureExtractor
     audio = audio.set_frame_rate(16000)
     sr = 16000
+
     samples = np.array(audio.get_array_of_samples()).astype(np.float32)
     audio_array = samples / (1 << (8 * audio.sample_width - 1))
 
@@ -145,7 +148,7 @@ def transcribe_chunk(self, chunk_path: str, offset: float):
         device=model.device
     )
 
-    # Сдвиг таймингов и сбор результата
+    # Shift timestamps and collect
     out = []
     for seg in aligned["segments"]:
         out.append({
@@ -155,7 +158,7 @@ def transcribe_chunk(self, chunk_path: str, offset: float):
             "text": seg.text
         })
 
-    # Удаляем временный файл
+    # Clean up chunk file
     try:
         os.remove(chunk_path)
     except OSError:
@@ -168,7 +171,7 @@ def transcribe_chunk(self, chunk_path: str, offset: float):
 @celery.task
 def merge_chunks(results_list, audio_path: str):
     """
-    Merge callback for chord: объединяет и сортирует результаты всех чанков.
+    Chord callback: merge, sort and return final transcription payload.
     """
     merged = [seg for sub in results_list for seg in sub]
     merged.sort(key=lambda x: x["start"])
@@ -177,11 +180,11 @@ def merge_chunks(results_list, audio_path: str):
 @celery.task(bind=True)
 def transcribe_task(self, audio_path: str):
     """
-    Основная задача:
-      1. Режем по тишине на подчанки
-      2. Генерируем subtasks transcribe_chunk для каждого
-      3. Запускаем chord с коллбэком merge_chunks
-      4. Возвращаем merge_task_id
+    Orchestrator:
+      1. Split on silence into chunks
+      2. Dispatch transcribe_chunk for each chunk
+      3. Run chord with merge_chunks
+      4. Return merge_task_id
     """
     start_ts = time.time()
     estimate = estimate_processing_time(audio_path)
@@ -197,15 +200,15 @@ def transcribe_task(self, audio_path: str):
 
     tasks = []
     elapsed_ms = 0
-    max_len = 3 * 60 * 1000  # 3 минуты в мс
+    chunk_ms = 3 * 60 * 1000  # 3 minutes
     for chunk in raw_chunks:
         start_ms = 0
         while start_ms < len(chunk):
-            sub = chunk[start_ms:start_ms + max_len]
+            sub = chunk[start_ms:start_ms + chunk_ms]
             cp = f"{audio_path}.chunk_{elapsed_ms + start_ms}.wav"
             sub.export(cp, format="wav")
             tasks.append(transcribe_chunk.s(cp, (elapsed_ms + start_ms) / 1000.0))
-            start_ms += max_len
+            start_ms += chunk_ms
         elapsed_ms += len(chunk)
 
     task_result = chord(tasks)(merge_chunks.s(audio_path))
@@ -214,14 +217,14 @@ def transcribe_task(self, audio_path: str):
 
 @celery.task
 def cleanup_files(path: str):
-    """Удалить файл по пути."""
+    """Remove file at path."""
     try:
         os.remove(path)
     except OSError:
         pass
 
 def get_file_path_by_task_id(task_id: str) -> str:
-    """Вернуть audio_filepath из результата задачи (если SUCCESS)."""
+    """Return audio_filepath from a finished task, else None."""
     res = AsyncResult(task_id, app=celery)
     if res.state == 'SUCCESS':
         return res.get().get('audio_filepath')
