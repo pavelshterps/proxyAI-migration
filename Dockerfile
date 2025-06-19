@@ -1,4 +1,4 @@
-FROM python:3.10-slim
+FROM pytorch/pytorch:2.0.1-cuda11.7-cudnn8-runtime
 
 # Установим инструменты сборки и runtime-зависимости для pydub/ffmpeg и bitsandbytes
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -15,6 +15,7 @@ WORKDIR /app
 COPY requirements.txt /app/
 RUN pip install --upgrade pip
 RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir bitsandbytes
 
 # Скопируем приложение
 COPY . /app
