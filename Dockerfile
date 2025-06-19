@@ -1,5 +1,8 @@
 FROM pytorch/pytorch:2.0.1-cuda11.7-cudnn8-runtime
 
+ARG DEBIAN_FRONTEND=noninteractive
+ENV TZ=Etc/UTC
+
 # Установим инструменты сборки и runtime-зависимости для pydub/ffmpeg и bitsandbytes
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
@@ -15,7 +18,7 @@ WORKDIR /app
 COPY requirements.txt /app/
 RUN pip install --upgrade pip
 RUN pip install --no-cache-dir -r requirements.txt
-RUN pip install --no-cache-dir bitsandbytes
+RUN pip install --no-cache-dir bitsandbytes-cuda117
 
 # Скопируем приложение
 COPY . /app
