@@ -1,9 +1,11 @@
+# Use the official PyTorch CUDA image so bitsandbytes can build its GPU kernels
 FROM pytorch/pytorch:2.0.1-cuda11.7-cudnn8-runtime
 
+# Suppress tzdata prompts and set timezone
 ARG DEBIAN_FRONTEND=noninteractive
 ENV TZ=Etc/UTC
 
-# Установим инструменты сборки и runtime-зависимости для pydub/ffmpeg и bitsandbytes
+# Install system libraries for audio processing, pydub/ffmpeg and bitsandbytes build
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     cmake \
@@ -14,18 +16,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Установим Python-зависимости
+# Copy and install Python dependencies
 COPY requirements.txt /app/
-RUN pip install --upgrade pip
-RUN pip install --no-cache-dir -r requirements.txt
-RUN pip install --no-cache-dir bitsandbytes-cuda117
+RUN pip install --upgrade pip \
+ && pip install --no-cache-dir -r requirements.txt \
+ # Install bitsandbytes (GPU-enabled) after torch is present
+ && pip install --no-cache-dir bitsandbytes
 
-# Скопируем приложение
+# Copy the rest of the application code
 COPY . /app
 
-# Папка для загрузок
+# Ensure upload directory exists and is writable
 RUN mkdir -p /tmp/uploads && chmod -R 777 /tmp/uploads
 
+# Expose FastAPI port
 EXPOSE 8000
 
+# Launch the app
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
