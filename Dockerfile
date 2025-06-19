@@ -1,27 +1,27 @@
-FROM pytorch/pytorch:1.13.1-cuda11.6-cudnn8-runtime
+FROM python:3.10-slim
 
-# Установка зависимостей системы (git, ffmpeg, и всё что требуется для работы аудио и Python)
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-    git \
-    ffmpeg \
+# Install build tools required for compiling bitsandbytes and other native extensions
+RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
-    && rm -rf /var/lib/apt/lists/*
+    cmake \
+    git \
+ && rm -rf /var/lib/apt/lists/*
 
-# Установка Python зависимостей
 WORKDIR /app
-COPY requirements.txt .
+
+# Copy and install Python dependencies
+COPY requirements.txt /app/
 RUN pip install --upgrade pip
-RUN pip install --no-cache-dir "ctranslate2[cuda11]"
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Копирование проекта
-COPY . .
+# Copy application code into the container
+COPY . /app
 
-# Разрешение на запись в /tmp/uploads для всех
+# Ensure upload directory exists and is writable
 RUN mkdir -p /tmp/uploads && chmod -R 777 /tmp/uploads
 
-# Убедись что весь код копируется под /app, WORKDIR /app уже установлен
+# Expose the FastAPI port
+EXPOSE 8000
 
-# По умолчанию ничего не запускаем (каждый сервис прописывает свою команду в docker-compose)
-CMD [ "bash" ]
+# Launch the application
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
