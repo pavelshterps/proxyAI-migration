@@ -68,12 +68,13 @@ def get_whisper_model():
                 torch_dtype=torch.float16,
             )
         except (RuntimeError, torch.cuda.OutOfMemoryError, AttributeError) as e:
-            logger.warning(f"Quantized GPU load failed ({e}); falling back to CPU int8.")
+            logger.warning(f"Quantized GPU load failed ({e}); falling back to full CPU model.")
+            # Load full-precision model on CPU to avoid BNB validation errors
             _whisper_model = WhisperForConditionalGeneration.from_pretrained(
                 settings.WHISPER_MODEL,
                 token=settings.HUGGINGFACE_TOKEN,
-                load_in_8bit=True,
-                device_map="cpu"
+                device_map="cpu",
+                torch_dtype=torch.float32
             )
 
     if _whisper_processor is None:
