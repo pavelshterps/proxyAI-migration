@@ -1,11 +1,14 @@
 # Dockerfile
 FROM pytorch/pytorch:2.0.1-cuda11.7-cudnn8-runtime
 
+ENV DEBIAN_FRONTEND=noninteractive
+
 # Install build tools required for compiling bitsandbytes and other native extensions
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     cmake \
     git \
+    tzdata \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
