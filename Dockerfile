@@ -1,5 +1,5 @@
 # Dockerfile
-FROM pytorch/pytorch:2.1.0-cuda11.7-cudnn8-runtime
+FROM pytorch/pytorch:2.0.1-cuda11.7-cudnn8-runtime
 
 # Install build tools required for compiling bitsandbytes and other native extensions
 RUN apt-get update && apt-get install -y --no-install-recommends \
