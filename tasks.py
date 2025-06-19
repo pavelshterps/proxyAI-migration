@@ -5,7 +5,7 @@ import logging
 import whisperx
 import torch
 import numpy as np
-from celery import group, chord
+from celery import chord
 from celery_app import celery
 from celery.result import AsyncResult
 from config.settings import settings
@@ -26,10 +26,12 @@ def estimate_processing_time(audio_path: str, speed_factor: float = 1.0) -> floa
     """
     Оценка времени обработки (сек) по длине аудио.
     speed_factor=1.0 — реальное время, <1 — быстрее, >1 — медленнее.
+    Здесь len(audio) даёт миллисекунды, делим на 1000 → секунды.
+    Никаких лишних конвертаций нет.
     """
     try:
         audio = AudioSegment.from_file(audio_path)
-        duration = len(audio) / 1000.0
+        duration = len(audio) / 1000.0  # секунды
         return duration * speed_factor
     except Exception:
         return 0.0
@@ -42,8 +44,8 @@ def get_whisper_model():
     global _whisper_model, _whisper_processor
     if _whisper_model is None:
         _whisper_model = WhisperForConditionalGeneration.from_pretrained(
-            settings.WHISPER_MODEL,             # должен быть "openai/whisper-large-v3"
-            token=settings.HUGGINGFACE_TOKEN,    # используем token вместо deprecated use_auth_token
+            settings.WHISPER_MODEL,             # "openai/whisper-large-v3"
+            token=settings.HUGGINGFACE_TOKEN,    # modern HF auth
             load_in_4bit=True,
             bnb_4bit_quant_type="nf4",
             device_map="auto",
@@ -54,21 +56,36 @@ def get_whisper_model():
     if _whisper_processor is None:
         _whisper_processor = WhisperProcessor.from_pretrained(
             settings.WHISPER_MODEL,
-            token=settings.HUGGINGFACE_TOKEN     # аналогично для процессора
+            token=settings.HUGGINGFACE_TOKEN
         )
     return _whisper_model, _whisper_processor
 
 def get_align_model():
     """
     Загрузка (или кэш) WhisperX align-модели + метаданных.
+    Правильный маппинг settings.DEVICE: 'gpu'→'cuda', остальные → cpu/cuda.
+    При ошибках (OOM, неверный device) — падаем обратно на CPU.
     """
     global _align_model, _align_metadata
     if _align_model is None or _align_metadata is None:
-        device = settings.DEVICE.lower() if isinstance(settings.DEVICE, str) else settings.DEVICE
-        _align_model, _align_metadata = whisperx.load_align_model(
-            language_code=settings.LANGUAGE_CODE,
-            device=device
-        )
+        # Normalize device string
+        dev = settings.DEVICE.lower() if isinstance(settings.DEVICE, str) else settings.DEVICE
+        if dev == 'gpu':
+            dev = 'cuda'
+        if dev not in ('cpu', 'cuda'):
+            dev = 'cpu'
+
+        try:
+            _align_model, _align_metadata = whisperx.load_align_model(
+                language_code=settings.LANGUAGE_CODE,
+                device=dev
+            )
+        except RuntimeError as e:
+            logger.warning(f"Failed to load align model on device '{dev}': {e}; falling back to CPU.")
+            _align_model, _align_metadata = whisperx.load_align_model(
+                language_code=settings.LANGUAGE_CODE,
+                device='cpu'
+            )
     return _align_model, _align_metadata
 
 @celery.task(bind=True, max_retries=3, default_retry_delay=60)
@@ -96,17 +113,16 @@ def transcribe_chunk(self, chunk_path: str, offset: float):
     segments = [{"start": 0.0, "end": len(audio_array) / sr, "text": text}]
 
     # Alignment
-    device = settings.DEVICE.lower() if isinstance(settings.DEVICE, str) else settings.DEVICE
     aligned = whisperx.align(
         segments,
         processor.tokenizer,
         chunk_path,
         align_model,
         align_metadata,
-        device=device
+        device=model.device
     )
 
-    # Сдвиг таймингов
+    # Сдвиг таймингов и сбор результата
     out = []
     for seg in aligned["segments"]:
         out.append({
@@ -126,12 +142,11 @@ def transcribe_chunk(self, chunk_path: str, offset: float):
     logger.info(f"Finished chunk transcription: {chunk_path} in {elapsed:.1f}s")
     return out
 
-
-# Merge callback for chord
 @celery.task
 def merge_chunks(results_list, audio_path: str):
-    """Merge, sort and return the final transcription payload."""
-    # Flatten and sort
+    """
+    Merge callback for chord: объединяет и сортирует результаты всех чанков.
+    """
     merged = [seg for sub in results_list for seg in sub]
     merged.sort(key=lambda x: x["start"])
     return {"segments": merged, "audio_filepath": audio_path}
@@ -140,9 +155,10 @@ def merge_chunks(results_list, audio_path: str):
 def transcribe_task(self, audio_path: str):
     """
     Основная задача:
-      1. Разбить аудио на silent-based чанки
-      2. На 3-минутные подчанки, экспорт и dispatch subtasks
-      3. Собрать результаты, отсортировать и вернуть
+      1. Режем по тишине на подчанки
+      2. Генерируем subtasks transcribe_chunk для каждого
+      3. Запускаем chord с коллбэком merge_chunks
+      4. Возвращаем merge_task_id
     """
     start_ts = time.time()
     estimate = estimate_processing_time(audio_path)
@@ -158,7 +174,7 @@ def transcribe_task(self, audio_path: str):
 
     tasks = []
     elapsed_ms = 0
-    max_len = 3 * 60 * 1000
+    max_len = 3 * 60 * 1000  # 3 минуты в мс
     for chunk in raw_chunks:
         start_ms = 0
         while start_ms < len(chunk):
@@ -169,7 +185,6 @@ def transcribe_task(self, audio_path: str):
             start_ms += max_len
         elapsed_ms += len(chunk)
 
-    # Run a chord: transcribe_chunk over each subtask, then merge_chunks
     task_result = chord(tasks)(merge_chunks.s(audio_path))
     logger.info(f"Dispatched chord with id {task_result.id}")
     return {"merge_task_id": task_result.id}
