@@ -1,15 +1,14 @@
-from celery.result import AsyncResult
-from celery_app import celery
 import os
 import logging
 
 import whisperx
 from celery_app import celery
+from celery.result import AsyncResult
 from config.settings import settings
 
 logger = logging.getLogger(__name__)
 
-# Кэши моделей, чтобы не пере-загружать их на каждый вызов
+# Cache models to avoid reloading on every task
 _whisper_model = None
 _align_model = None
 _align_metadata = None
@@ -19,7 +18,6 @@ def get_whisper_model():
     if _whisper_model is None:
         # Normalize DEVICE to lower-case for WhisperX
         device = settings.DEVICE.lower() if isinstance(settings.DEVICE, str) else settings.DEVICE
-        # settings.WHISPER_MODEL берётся из .env, можно установить large-v3
         _whisper_model = whisperx.load_model(
             settings.WHISPER_MODEL,
             device,
@@ -40,24 +38,22 @@ def get_align_model():
 @celery.task(bind=True, max_retries=3, default_retry_delay=60)
 def transcribe_task(self, audio_path: str):
     """
-    1) Загружает модель (large-v3, если в settings.WHISPER_MODEL)
-    2) Транскрибирует файл
-    3) Выравнивает сегменты с помощью Pyannote
-    4) Возвращает список сегментов для frontend
+    1) Load WhisperX model (e.g., large-v3 via settings.WHISPER_MODEL)
+    2) Transcribe the audio file
+    3) Align (diarize) segments with Pyannote
+    4) Return segments list for frontend
     """
-    # Ещё раз нормализуем DEVICE
     device = settings.DEVICE.lower() if isinstance(settings.DEVICE, str) else settings.DEVICE
-
     try:
         model = get_whisper_model()
         align_model, align_metadata = get_align_model()
 
-        # 1) ASR
+        # 1) Automatic speech recognition
         result = model.transcribe(audio_path)
 
-        # 2) Alignment (diarization)
+        # 2) Alignment/diarization
         aligned = whisperx.align(
-            result["segments"],
+            result['segments'],
             model.tokenizer,
             audio_path,
             align_model,
@@ -65,30 +61,29 @@ def transcribe_task(self, audio_path: str):
             device=device
         )
 
-        # 3) Формируем итоговый список сегментов
+        # 3) Format segments
         segments = []
-        for seg in aligned["segments"]:
+        for seg in aligned['segments']:
             segments.append({
-                "start": seg.start,
-                "end": seg.end,
-                "speaker": getattr(seg, "speaker", seg.speaker_label),
-                "text": seg.text
+                'start': seg.start,
+                'end': seg.end,
+                'speaker': getattr(seg, 'speaker', seg.speaker_label),
+                'text': seg.text,
             })
 
         return {
-            "segments": segments,
-            "audio_filepath": audio_path
+            'segments': segments,
+            'audio_filepath': audio_path
         }
-
     except Exception as exc:
         logger.error(f"Transcription failed: {exc}")
-        # Повторяем до 3 раз с задержкой в 60s
+        # Retry up to 3 times with 60s delay
         raise self.retry(exc=exc)
 
 @celery.task
 def cleanup_files(path: str):
     """
-    Удаляет временные файлы после обработки
+    Remove temporary files after processing
     """
     try:
         os.remove(path)
@@ -96,7 +91,6 @@ def cleanup_files(path: str):
         pass
 
 
-# Restore get_file_path_by_task_id for main.py import
 def get_file_path_by_task_id(task_id: str) -> str:
     """
     Retrieve the audio file path for a completed transcription task.

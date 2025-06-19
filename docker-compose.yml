@@ -32,6 +32,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+    image: proxyai-api:latest
     environment:
       - WHISPER_DEVICE=cpu
       - WHISPER_COMPUTE_TYPE=int8
@@ -56,9 +57,7 @@ services:
       - tusd
 
   worker:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    image: proxyai-api:latest
     env_file: .env
     volumes:
       - uploads:/tmp/uploads
@@ -72,9 +71,7 @@ services:
       - api
 
   beat:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    image: proxyai-api:latest
     env_file: .env
     volumes:
       - uploads:/tmp/uploads
