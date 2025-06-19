@@ -135,8 +135,13 @@ def transcribe_chunk(self, chunk_path: str, offset: float):
     samples = np.array(audio.get_array_of_samples()).astype(np.float32)
     audio_array = samples / (1 << (8 * audio.sample_width - 1))
 
-    # ASR inference
-    inputs = processor(audio_array, return_tensors="pt", sampling_rate=sr).to(model.device)
+    # Prepare model inputs and cast to model's dtype
+    inputs = processor(audio_array, return_tensors="pt", sampling_rate=sr)
+    # Move to correct device and dtype
+    model_dtype = next(model.parameters()).dtype
+    for k, v in inputs.items():
+        inputs[k] = v.to(device=model.device, dtype=model_dtype)
+
     tokens = model.generate(**inputs)
     text = processor.batch_decode(tokens, skip_special_tokens=True)[0]
 
