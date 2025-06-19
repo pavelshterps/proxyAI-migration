@@ -15,6 +15,9 @@ from celery.result import AsyncResult
 from tasks import transcribe_task, cleanup_files
 from tasks import get_file_path_by_task_id
 from config.settings import settings
+from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
+import aiofiles
 
 
 # Создание папки для загрузок на старте приложения
@@ -24,6 +27,9 @@ os.makedirs(settings.UPLOAD_FOLDER, exist_ok=True)
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 app = FastAPI()
+
+# Serve static frontend
+app.mount('/static', StaticFiles(directory='static'), name='static')
 
 @app.get("/health", tags=["health"])
 async def health_check():
@@ -138,3 +144,10 @@ def label(task_id: str, req: LabelRequest):
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(req.mapping, f, ensure_ascii=False, indent=2)
     return {"status": "labels saved"}
+
+@app.get('/', response_class=HTMLResponse)
+async def serve_frontend():
+    # Return the static HTML UI
+    async with aiofiles.open('static/index.html', 'r', encoding='utf-8') as f:
+        content = await f.read()
+    return HTMLResponse(content)

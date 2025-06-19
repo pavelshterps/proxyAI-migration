@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Speech2Text Uploader</title>
+  <style>
+    body { font-family: sans-serif; margin: 2rem; }
+    #progress { width: 100%; height: 1rem; background: #eee; margin-top: 1rem; }
+    #bar { width: 0%; height: 100%; background: #68f; }
+    .segment { margin: 0.5rem 0; padding: 0.5rem; border: 1px solid #ccc; }
+    .speaker { font-weight: bold; }
+  </style>
+</head>
+<body>
+  <h1>Upload Audio for Transcription</h1>
+  <input type="file" id="fileInput" accept="audio/*" />
+  <button id="uploadBtn">Загрузить</button>
+
+  <div id="progress" hidden><div id="bar"></div></div>
+  <p id="status"></p>
+
+  <audio id="player" controls hidden></audio>
+  <div id="results"></div>
+
+  <script>
+    const fileInput = document.getElementById('fileInput');
+    const uploadBtn = document.getElementById('uploadBtn');
+    const progress = document.getElementById('progress');
+    const bar = document.getElementById('bar');
+    const status = document.getElementById('status');
+    const player = document.getElementById('player');
+    const results = document.getElementById('results');
+
+    uploadBtn.onclick = () => {
+      if (!fileInput.files.length) return alert('Выберите файл!');
+      const file = fileInput.files[0];
+      const form = new FormData();
+      form.append('file', file);
+
+      // Upload with progress
+      progress.hidden = false;
+      bar.style.width = '0%';
+      status.textContent = 'Загрузка...';
+
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', '/transcribe');
+      xhr.upload.onprogress = e => {
+        const pct = Math.round(e.loaded / e.total * 100);
+        bar.style.width = pct + '%';
+      };
+      xhr.onload = () => {
+        if (xhr.status!==200) return alert('Ошибка загрузки');
+        const { task_id } = JSON.parse(xhr.responseText);
+        status.textContent = 'Обработка...';
+        bar.style.width = '100%';
+
+        // Poll for result
+        const iv = setInterval(async () => {
+          const res = await fetch('/result/' + task_id);
+          const json = await res.json();
+          if (json.status === 'SUCCESS') {
+            clearInterval(iv);
+            status.textContent = '';
+            showResult(json);
+          } else {
+            status.textContent = 'Статус: ' + json.status;
+          }
+        }, 2000);
+      };
+      xhr.send(form);
+    };
+
+    function showResult(data) {
+      // Show audio player
+      player.hidden = false;
+      player.src = '/files/' + encodeURIComponent(data.audio_file);
+
+      // Show segments
+      results.innerHTML = '';
+      data.segments.forEach(seg => {
+        const div = document.createElement('div');
+        div.className = 'segment';
+        div.innerHTML = `
+          <span class="speaker">${seg.speaker}:</span>
+          <span>${seg.text}</span>
+          <button>▶️</button>
+        `;
+        const btn = div.querySelector('button');
+        btn.onclick = () => {
+          player.currentTime = seg.start;
+          player.play();
+          setTimeout(() => player.pause(), (seg.end - seg.start)*1000);
+        };
+        results.appendChild(div);
+      });
+    }
+  </script>
+</body>
+</html>
