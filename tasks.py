@@ -12,6 +12,7 @@ from config.settings import settings
 from pydub import AudioSegment
 from pydub.silence import split_on_silence
 from transformers import WhisperForConditionalGeneration, WhisperProcessor
+from transformers import BitsAndBytesConfig
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -38,21 +39,41 @@ def estimate_processing_time(audio_path: str, speed_factor: float = 1.0) -> floa
 
 def get_whisper_model():
     """
-    Загрузка (или кэш) 4-bit quantized модели Whisper + процессора.
-    Передаём token для приватных репозиториев HF.
+    Load (and cache) the 4-bit quantized Whisper model and processor.
+    Map settings.DEVICE ('gpu'→'cuda'), catch OOM and fallback to CPU int8.
     """
     global _whisper_model, _whisper_processor
     if _whisper_model is None:
-        _whisper_model = WhisperForConditionalGeneration.from_pretrained(
-            settings.WHISPER_MODEL,             # "openai/whisper-large-v3"
-            token=settings.HUGGINGFACE_TOKEN,    # modern HF auth
+        # normalize device
+        dev = settings.DEVICE.lower()
+        if dev == 'gpu':
+            dev = 'cuda'
+        if dev not in ('cpu', 'cuda'):
+            dev = 'cpu'
+
+        # prepare quantization config
+        bnb_config = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_quant_type="nf4",
-            device_map="auto",
-            torch_dtype=torch.float16,
-            offload_state_dict=True,
-            offload_folder="offload"
+            llm_int8_threshold=6.0,
+            max_memory={0: "3.2GiB"} if dev == 'cuda' else None,
         )
+        try:
+            _whisper_model = WhisperForConditionalGeneration.from_pretrained(
+                settings.WHISPER_MODEL,
+                token=settings.HUGGINGFACE_TOKEN,
+                quantization_config=bnb_config,
+                device_map="auto",
+                torch_dtype=torch.float16,
+            )
+        except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
+            logger.warning(f"Quantized GPU load failed ({e}); falling back to CPU int8.")
+            _whisper_model = WhisperForConditionalGeneration.from_pretrained(
+                settings.WHISPER_MODEL,
+                token=settings.HUGGINGFACE_TOKEN,
+                load_in_8bit=True,
+                device_map="cpu"
+            )
     if _whisper_processor is None:
         _whisper_processor = WhisperProcessor.from_pretrained(
             settings.WHISPER_MODEL,
@@ -101,7 +122,9 @@ def transcribe_chunk(self, chunk_path: str, offset: float):
 
     # Загрузка и нормализация аудио
     audio = AudioSegment.from_file(chunk_path)
-    sr = audio.frame_rate
+    # ensure correct sampling rate for WhisperFeatureExtractor
+    audio = audio.set_frame_rate(16000)
+    sr = 16000
     samples = np.array(audio.get_array_of_samples()).astype(np.float32)
     audio_array = samples / (1 << (8 * audio.sample_width - 1))
 
