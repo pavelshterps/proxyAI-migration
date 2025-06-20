@@ -24,11 +24,12 @@ RUN pip install --upgrade pip \
 RUN python - << 'EOF'
 import whisperx
 for lang in ("english","russian"):
+    # Preload alignment models by positional args to match API signature
     whisperx.load_align_model(
-        model_name_or_path="whisper-large",
-        device="cpu",
-        language=lang,
-        beam_size=5
+        "whisper-large",
+        "cpu",
+        lang,
+        5
     )
 EOF
 
