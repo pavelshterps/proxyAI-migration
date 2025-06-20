@@ -138,17 +138,17 @@ def transcribe_chunk(self, chunk_path: str, offset: float):
 
     # Prepare model inputs and cast to model's dtype
     inputs = processor(audio_array, return_tensors="pt", sampling_rate=sr)
-    # Move to correct device and dtype
     model_dtype = next(model.parameters()).dtype
     for k, v in inputs.items():
         inputs[k] = v.to(device=model.device, dtype=model_dtype)
 
+    # ASR inference
     tokens = model.generate(**inputs)
     text = processor.batch_decode(tokens, skip_special_tokens=True)[0]
 
     segments = [{"start": 0.0, "end": len(audio_array) / sr, "text": text}]
 
-    # Alignment
+    # Alignment (positional arguments, passing file path)
     aligned = whisperx.align(
         segments,
         processor.tokenizer,
@@ -168,7 +168,7 @@ def transcribe_chunk(self, chunk_path: str, offset: float):
             "text": seg.text
         })
 
-    # Clean up the chunk file
+    # Clean up chunk file
     try:
         os.remove(chunk_path)
     except OSError:
