@@ -1,4 +1,3 @@
-# docker-compose.yml
 version: "3.8"
 
 services:
@@ -57,16 +56,12 @@ services:
       - CELERY_BROKER_URL=redis://redis:6379/0
 
   flower:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    image: mher/flower:2.0.1
     container_name: proxyai-flower
-    env_file:
-      - .env
-    depends_on:
-      - redis
     ports:
       - "5555:5555"
+    depends_on:
+      - redis
     command: >
       flower
       --broker=redis://redis:6379/0
