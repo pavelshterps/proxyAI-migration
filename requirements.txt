@@ -4,7 +4,7 @@ uvicorn==0.34.3
 aiofiles==24.1.0
 python-multipart>=0.0.5
 
-# Templating (если у вас Jinja используется в front-end)
+# Templating (если используется)
 Jinja2>=3.1.0
 MarkupSafe>=2.1.1
 
@@ -20,10 +20,10 @@ ffmpeg-python==0.2.0
 pydub>=0.25.1
 soundfile>=0.12.1
 
-# WhisperX (from GitHub) + Whisper inference
+# WhisperX & Whisper inference
 git+https://github.com/m-bain/whisperx.git@main
 
-# Faster inference Whisper alternative (optional)
+# Faster Whisper (опционально)
 faster-whisper>=1.1.1
 
 # Model serving & quantization
@@ -37,12 +37,12 @@ ctranslate2<4.5.0
 torch>=2.5.1
 torchaudio>=2.5.1
 
-# Pyannote (speaker diarization)
+# Pyannote (диаризация)
 pyannote.audio>=3.3.2
 pyannote.database>=5.0.1
 pyannote.core>=5.0.0
 pyannote.metrics>=3.2
 pyannote.pipeline>=3.0.1
 
-# Utilities
+# Утилиты
 numpy>=2.0.2

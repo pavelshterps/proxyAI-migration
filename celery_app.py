@@ -1,24 +1,23 @@
 import os
 from celery import Celery
 
-# читаем настройки из окружения
-CELERY_BROKER_URL = os.getenv("CELERY_BROKER_URL")
-CELERY_RESULT_BACKEND = os.getenv("CELERY_RESULT_BACKEND")
-CELERY_TIMEZONE = os.getenv("CELERY_TIMEZONE", "UTC")
+# Настройки из окружения
+broker = os.getenv("CELERY_BROKER_URL")
+backend = os.getenv("CELERY_RESULT_BACKEND")
+tz      = os.getenv("CELERY_TIMEZONE", "UTC")
 
 celery_app = Celery(
     __name__,
-    broker=CELERY_BROKER_URL,
-    backend=CELERY_RESULT_BACKEND,
+    broker=broker,
+    backend=backend,
 )
 
-# основные настройки
 celery_app.conf.update(
     task_serializer="json",
     result_serializer="json",
     accept_content=["json"],
-    timezone=CELERY_TIMEZONE,
+    timezone=tz,
 )
 
-# автопоиск всех @celery_app.task в модуле tasks.py
+# Autodiscover tasks in tasks.py without circular import
 celery_app.autodiscover_tasks(["tasks"])

@@ -1,45 +1,56 @@
-from fastapi import FastAPI, UploadFile, BackgroundTasks
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import JSONResponse
-from celery.result import AsyncResult
-import uuid
 import os
+import uuid
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import JSONResponse, HTMLResponse
+from celery.result import AsyncResult
 
 from celery_app import celery_app
-from settings import FASTAPI_HOST, FASTAPI_PORT, UPLOAD_FOLDER, TUS_ENDPOINT
-from tasks import transcribe_task
+from settings import UPLOAD_FOLDER, FASTAPI_HOST, FASTAPI_PORT
 
 app = FastAPI()
 
-# раздаём загруженные файлы и tusd-файлы по единому пути
+# Статика для файловых отдач
 app.mount("/files", StaticFiles(directory=UPLOAD_FOLDER), name="files")
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+@app.get("/", response_class=HTMLResponse)
+async def root():
+    try:
+        with open("static/index.html", encoding="utf-8") as f:
+            return HTMLResponse(f.read())
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/transcribe")
-async def api_transcribe(file: UploadFile):
-    # сохраняем файл
+async def start_transcription(file: UploadFile = File(...)):
+    os.makedirs(UPLOAD_FOLDER, exist_ok=True)
     ext = os.path.splitext(file.filename)[1]
-    dest = os.path.join(UPLOAD_FOLDER, f"{uuid.uuid4()}{ext}")
+    dest = os.path.join(UPLOAD_FOLDER, f"{uuid.uuid4().hex}{ext}")
     with open(dest, "wb") as f:
         f.write(await file.read())
 
-    # запускаем фоновую задачу
-    result = transcribe_task.delay(dest)
-    return JSONResponse({
-        "task_id": result.id,
-        "estimate": None  # тут фронт сразу подставит своё UI
-    }, status_code=202)
+    job = celery_app.send_task("tasks.transcribe_task", args=[dest])
+    # estimate можно возвращать из задачи, но для UI — сразу ноль
+    return JSONResponse({"task_id": job.id, "estimate": 0}, status_code=202)
 
 @app.get("/result/{task_id}")
-def api_result(task_id: str):
-    """Возвращает статус, а когда merge_chunks отработает — JSON с segments и audio_filepath."""
-    merge_id = AsyncResult(task_id, app=celery_app).get(propagate=False)
-    if isinstance(merge_id, dict):
-        # это сразу результат merge_chunks
-        return merge_id
-    else:
-        res = AsyncResult(task_id, app=celery_app)
-        return {"status": res.status}
+async def get_result(task_id: str):
+    wrapper = AsyncResult(task_id, app=celery_app)
+    state = wrapper.state
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("app.main:app", host=FASTAPI_HOST, port=FASTAPI_PORT, workers=1)
+    if state == "SUCCESS":
+        payload = wrapper.get()
+        merge_id = payload.get("merge_task_id")
+        if merge_id:
+            merge = AsyncResult(merge_id, app=celery_app)
+            if merge.state == "SUCCESS":
+                final = merge.get()
+                return final
+            return {"status": merge.state}
+        return {"status": state}
+
+    if state in ("PENDING", "STARTED", "RETRY"):
+        return {"status": state}
+
+    return {"status": state, "error": str(wrapper.info)}

@@ -4,7 +4,7 @@ services:
   redis:
     image: "redis:7-alpine"
     container_name: proxyai-redis
-    # Чтобы не конфликтовать с локальным 6379, пробрасываем на 6380
+    # Чтобы не конфликтовать с локальным Redis на 6379
     ports:
       - "6380:6379"
     volumes:
@@ -26,11 +26,11 @@ services:
     container_name: proxyai-api
     env_file:
       - .env
-    ports:
-      - "${FASTAPI_PORT}:${FASTAPI_PORT}"
     depends_on:
       - redis
       - tusd
+    ports:
+      - "${FASTAPI_PORT}:${FASTAPI_PORT}"
     volumes:
       - upload-data:/tmp/uploads
     command: >
@@ -52,6 +52,22 @@ services:
     command: >
       celery -A celery_app worker
       --loglevel=info
+
+  flower:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: proxyai-flower
+    env_file:
+      - .env
+    depends_on:
+      - redis
+    ports:
+      - "5555:5555"
+    command: >
+      celery -A celery_app flower
+      --address=0.0.0.0
+      --port=5555
 
 volumes:
   redis-data:

@@ -1,46 +1,43 @@
 import os
-import time
 import numpy as np
 import whisperx
 from celery import chord, Task
 from celery.utils.log import get_task_logger
 from celery_app import celery_app
-from config.settings import DEVICE, WHISPER_MODEL_NAME, WHISPER_COMPUTE_TYPE, ALIGN_MODEL_NAME, ALIGN_BEAM_SIZE, HUGGINGFACE_TOKEN
-from utils import load_audio, save_segments_to_db  # ваши утилиты
+from settings import DEVICE, WHISPER_MODEL_NAME, WHISPER_COMPUTE_TYPE, ALIGN_MODEL_NAME, ALIGN_BEAM_SIZE, HUGGINGFACE_TOKEN
+from utils import load_audio, save_segments_to_db
 
 log = get_task_logger(__name__)
 
-# кеш моделей выравнивания по языку
-_align_model_cache: dict[str, tuple] = {}
+# Кэш моделей по языку
+_align_cache: dict[str, tuple] = {}
 
 def get_align_model(language: str):
-    """Кэширование whisperx.align-модели по языку."""
-    if language in _align_model_cache:
-        return _align_model_cache[language]
+    if language in _align_cache:
+        return _align_cache[language]
 
-    device = DEVICE if DEVICE == "cuda" else "cpu"
+    dev = DEVICE if DEVICE == "cuda" else "cpu"
     try:
         model, metadata = whisperx.load_align_model(
-            model_name_or_path=ALIGN_MODEL_NAME,
-            device=device,
-            language=language,
-            beam_size=ALIGN_BEAM_SIZE,
+            ALIGN_MODEL_NAME,
+            dev,
+            language,
+            ALIGN_BEAM_SIZE,
             token=HUGGINGFACE_TOKEN or None
         )
     except Exception as e:
-        log.warning(f"align-model load failed on {device}, fallback to cpu: {e}")
+        log.warning(f"Fallback to CPU for align-model ({e})")
         model, metadata = whisperx.load_align_model(
-            model_name_or_path=ALIGN_MODEL_NAME,
-            device="cpu",
-            language=language,
-            beam_size=ALIGN_BEAM_SIZE,
+            ALIGN_MODEL_NAME,
+            "cpu",
+            language,
+            ALIGN_BEAM_SIZE,
         )
-    _align_model_cache[language] = (model, metadata)
+    _align_cache[language] = (model, metadata)
     return model, metadata
 
-def estimate_processing_time(duration_sec: float, model_size: str) -> float:
-    """Возвращает оценку времени в секундах (не мс)."""
-    # грубая оценка: 1s аудио ~= 2s на GPU, 6s на CPU
+def estimate_processing_time(duration_sec: float) -> float:
+    # секунда аудио → 2s на GPU или 6s на CPU
     factor = 2 if DEVICE == "cuda" else 6
     return duration_sec * factor
 
@@ -49,25 +46,22 @@ def transcribe_chunk(self: Task, audio_array: np.ndarray, start: float, end: flo
     model, metadata = get_align_model(language)
     try:
         aligned = whisperx.align(
-            audio_array,        # сначала массив (np.ndarray)
-            model,              # потом модель
+            audio_array,
+            model,
             metadata,
             device=DEVICE,
         )
         return aligned
     except Exception as exc:
         log.error(f"align failed: {exc}", exc_info=True)
-        # повтор через 30s, максимум 3 попытки
         raise self.retry(exc=exc, countdown=30, max_retries=3)
 
 @celery_app.task(name="tasks.transcribe_task")
 def transcribe_task(filepath: str):
-    # 1) загрузить аудио и оценить длительность
     audio_array, sr = load_audio(filepath)
     duration = audio_array.shape[0] / sr
-    estimate = estimate_processing_time(duration, WHISPER_MODEL_NAME)
+    estimate = estimate_processing_time(duration)
 
-    # 2) первичное транскрибирование сегментов
     segments = whisperx.transcribe(
         model=WHISPER_MODEL_NAME,
         compute_type=WHISPER_COMPUTE_TYPE,
@@ -75,7 +69,6 @@ def transcribe_task(filepath: str):
         device=DEVICE,
     )["segments"]
 
-    # 3) разбить на чанки и запустить выравнивание параллельно
     subtasks = [
         transcribe_chunk.s(
             audio_array[int(seg.start * sr):int(seg.end * sr)],
@@ -85,22 +78,20 @@ def transcribe_task(filepath: str):
         )
         for seg in segments
     ]
-    callback = merge_chunks.s(filepath)
-    chord_id = chord(subtasks)(callback).id
+    merge_id = chord(subtasks)(merge_chunks.s(filepath)).id
 
     return {
         "task_id": transcribe_task.request.id,
         "estimate": estimate,
-        "merge_task_id": chord_id
+        "merge_task_id": merge_id
     }
 
 @celery_app.task(name="tasks.merge_chunks")
 def merge_chunks(aligned_results: list, filepath: str):
-    # объединить результаты, сохранить в БД и сформировать ответ
     final_segments = save_segments_to_db(aligned_results, filepath)
-    audio_url = os.path.basename(filepath)
+    filename = os.path.basename(filepath)
     return {
         "status": "SUCCESS",
         "segments": final_segments,
-        "audio_filepath": f"/files/{audio_url}"
+        "audio_filepath": f"/files/{filename}"
     }

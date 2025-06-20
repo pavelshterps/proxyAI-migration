@@ -17,6 +17,7 @@
   <div id="status"></div>
   <div id="segments"></div>
 
+<script src="https://cdn.jsdelivr.net/npm/axios/dist/axios.min.js"></script>
 <script>
 const api = axios.create({ baseURL: "" });
 document.getElementById("btn").onclick = async () => {
@@ -25,8 +26,7 @@ document.getElementById("btn").onclick = async () => {
   document.getElementById("status").innerText = "Загрузка...";
   const { data } = await api.post("/transcribe", fd, {
     onUploadProgress: e => {
-      const pct = Math.round(e.loaded / e.total * 100);
-      document.getElementById("bar").style.width = pct + "%";
+      document.getElementById("bar").style.width = Math.round(e.loaded/e.total*100)+"%";
     }
   });
   pollResult(data.task_id);
@@ -37,9 +37,9 @@ async function pollResult(task_id) {
   let res;
   while (true) {
     res = (await api.get(`/result/${task_id}`)).data;
-    if (res.status === "SUCCESS") break;
+    if (res.status === "SUCCESS" || res.segments) break;
     document.getElementById("status").innerText = res.status;
-    await new Promise(r => setTimeout(r, 2000));
+    await new Promise(r=>setTimeout(r,2000));
   }
   showSegments(res);
 }
@@ -47,20 +47,17 @@ async function pollResult(task_id) {
 function showSegments({ segments, audio_filepath }) {
   document.getElementById("status").innerText = "Готово";
   const cont = document.getElementById("segments");
-  segments.forEach((seg, idx) => {
+  segments.forEach(seg => {
     const div = document.createElement("div");
     div.className = "segment";
     const audio = document.createElement("audio");
     audio.controls = true;
     audio.src = `${audio_filepath}#t=${seg.start},${seg.end}`;
     div.appendChild(audio);
-    const span = document.createElement("span");
-    span.innerText = ` [${seg.start.toFixed(2)}–${seg.end.toFixed(2)}] ${seg.text}`;
-    div.appendChild(span);
+    div.appendChild(document.createTextNode(` [${seg.start.toFixed(2)}–${seg.end.toFixed(2)}] ${seg.text}`));
     cont.appendChild(div);
   });
 }
 </script>
-<script src="https://cdn.jsdelivr.net/npm/axios/dist/axios.min.js"></script>
 </body>
 </html>
