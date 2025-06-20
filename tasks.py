@@ -5,7 +5,7 @@ import whisperx
 from celery import chord, Task
 from celery.utils.log import get_task_logger
 from celery_app import celery_app
-from settings import DEVICE, WHISPER_MODEL_NAME, WHISPER_COMPUTE_TYPE, ALIGN_MODEL_NAME, ALIGN_BEAM_SIZE, HUGGINGFACE_TOKEN
+from config.settings import DEVICE, WHISPER_MODEL_NAME, WHISPER_COMPUTE_TYPE, ALIGN_MODEL_NAME, ALIGN_BEAM_SIZE, HUGGINGFACE_TOKEN
 from utils import load_audio, save_segments_to_db  # ваши утилиты
 
 log = get_task_logger(__name__)
@@ -40,7 +40,7 @@ def get_align_model(language: str):
 
 def estimate_processing_time(duration_sec: float, model_size: str) -> float:
     """Возвращает оценку времени в секундах (не мс)."""
-    # грубая оценка: 1s аудио ~= 2s на модели large-v3 на GPU, 6s на CPU
+    # грубая оценка: 1s аудио ~= 2s на GPU, 6s на CPU
     factor = 2 if DEVICE == "cuda" else 6
     return duration_sec * factor
 
@@ -57,15 +57,17 @@ def transcribe_chunk(self: Task, audio_array: np.ndarray, start: float, end: flo
         return aligned
     except Exception as exc:
         log.error(f"align failed: {exc}", exc_info=True)
+        # повтор через 30s, максимум 3 попытки
         raise self.retry(exc=exc, countdown=30, max_retries=3)
 
 @celery_app.task(name="tasks.transcribe_task")
 def transcribe_task(filepath: str):
-    # 1. загрузить и разбить на отрезки
+    # 1) загрузить аудио и оценить длительность
     audio_array, sr = load_audio(filepath)
     duration = audio_array.shape[0] / sr
     estimate = estimate_processing_time(duration, WHISPER_MODEL_NAME)
 
+    # 2) первичное транскрибирование сегментов
     segments = whisperx.transcribe(
         model=WHISPER_MODEL_NAME,
         compute_type=WHISPER_COMPUTE_TYPE,
@@ -73,11 +75,15 @@ def transcribe_task(filepath: str):
         device=DEVICE,
     )["segments"]
 
-    # 2. Запустить выравнивание по частям
+    # 3) разбить на чанки и запустить выравнивание параллельно
     subtasks = [
-        transcribe_chunk.s(audio_array[slice_.start:slice_.end], slice_.start, slice_.end, seg.language)
+        transcribe_chunk.s(
+            audio_array[int(seg.start * sr):int(seg.end * sr)],
+            seg.start,
+            seg.end,
+            seg.language
+        )
         for seg in segments
-        for slice_ in [seg.time_frame]  # время сегмента
     ]
     callback = merge_chunks.s(filepath)
     chord_id = chord(subtasks)(callback).id
@@ -90,7 +96,7 @@ def transcribe_task(filepath: str):
 
 @celery_app.task(name="tasks.merge_chunks")
 def merge_chunks(aligned_results: list, filepath: str):
-    # объединить результаты, сохранить в БД и файл
+    # объединить результаты, сохранить в БД и сформировать ответ
     final_segments = save_segments_to_db(aligned_results, filepath)
     audio_url = os.path.basename(filepath)
     return {

@@ -1,30 +1,24 @@
 import os
 from celery import Celery
-import config.settings as settings
 
-# Настройка пути для celery, чтобы tasks корректно импортировались
-os.environ.setdefault("C_FORCE_ROOT", "true")
-os.environ.setdefault("CELERY_CONFIG_MODULE", "config.settings")
+# читаем настройки из окружения
+CELERY_BROKER_URL = os.getenv("CELERY_BROKER_URL")
+CELERY_RESULT_BACKEND = os.getenv("CELERY_RESULT_BACKEND")
+CELERY_TIMEZONE = os.getenv("CELERY_TIMEZONE", "UTC")
 
-celery = Celery(
-    "whisperx",
-    broker=settings.CELERY_BROKER_URL,
-    backend=settings.CELERY_RESULT_BACKEND,
-    include=["tasks"],  # Явно указываем tasks для регистрации всех задач
+celery_app = Celery(
+    __name__,
+    broker=CELERY_BROKER_URL,
+    backend=CELERY_RESULT_BACKEND,
 )
 
-# Опционально — настройки из объекта settings
-celery.conf.update(
+# основные настройки
+celery_app.conf.update(
     task_serializer="json",
     result_serializer="json",
     accept_content=["json"],
-    timezone=settings.CELERY_TIMEZONE,
-    enable_utc=True,
-    worker_max_tasks_per_child=10,  # Для безопасности
-    broker_connection_retry_on_startup=True,
+    timezone=CELERY_TIMEZONE,
 )
 
-# Необязательно: но можно оставить ручной импорт для совместимости
-# import tasks
-# Чтобы воркер «увидел» все таски
-import tasks  # noqa: E402,F401
+# автопоиск всех @celery_app.task в модуле tasks.py
+celery_app.autodiscover_tasks(["tasks"])
