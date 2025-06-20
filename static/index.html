@@ -1,164 +1,66 @@
 <!DOCTYPE html>
 <html lang="ru">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>ProxyAI Uploader</title>
+  <meta charset="UTF-8">
+  <title>Transcribe UI</title>
   <style>
-    body { font-family: sans-serif; margin: 2rem; }
-    #progress { width: 100%; height: 1rem; background: #eee; margin-top: 1rem; }
-    #bar { width: 0%; height: 100%; background: #68f; }
-    .segment { margin: 0.5rem 0; padding: 0.5rem; border: 1px solid #ccc; }
-    .speaker { font-weight: bold; margin-right: 0.5rem; }
-    #speakerMapping { margin: 1rem 0; }
-    #speakerMapping label { margin-right: 1rem; }
-    button { margin-left: 0.5rem; }
+    #progress { width: 100%; height: 20px; background: #eee; margin-top: 1em; }
+    #bar { height: 100%; width: 0; background: #6a5af9; }
+    .segment { margin: 0.5em 0; }
   </style>
 </head>
 <body>
   <h1>Загрузите аудио для транскрипции</h1>
-  <input type="file" id="fileInput" accept="audio/*" />
-  <button id="uploadBtn">Загрузить</button>
+  <input type="file" id="fileInput">
+  <button id="btn">Загрузить</button>
+  <div id="progress"><div id="bar"></div></div>
+  <div id="status"></div>
+  <div id="segments"></div>
 
-  <div id="progress" hidden><div id="bar"></div></div>
-  <p id="status"></p>
-
-  <audio id="player" controls hidden style="width:100%; margin-top:1rem;"></audio>
-
-  <!-- Блок для переименования спикеров -->
-  <div id="speakerMapping"></div>
-
-  <!-- Здесь будут сегменты транскрипта -->
-  <div id="results"></div>
-
-  <script>
-    let speakerMap = {};
-
-    function formatTime(sec) {
-      if (!sec || sec <= 0) return '00:00';
-      const m = Math.floor(sec / 60);
-      const s = Math.round(sec % 60);
-      return `${m.toString().padStart(2,'0')}:${s.toString().padStart(2,'0')}`;
+<script>
+const api = axios.create({ baseURL: "" });
+document.getElementById("btn").onclick = async () => {
+  const file = document.getElementById("fileInput").files[0];
+  const fd = new FormData(); fd.append("file", file);
+  document.getElementById("status").innerText = "Загрузка...";
+  const { data } = await api.post("/transcribe", fd, {
+    onUploadProgress: e => {
+      const pct = Math.round(e.loaded / e.total * 100);
+      document.getElementById("bar").style.width = pct + "%";
     }
+  });
+  pollResult(data.task_id);
+};
 
-    const fileInput  = document.getElementById('fileInput');
-    const uploadBtn  = document.getElementById('uploadBtn');
-    const progress   = document.getElementById('progress');
-    const bar        = document.getElementById('bar');
-    const status     = document.getElementById('status');
-    const player     = document.getElementById('player');
-    const results    = document.getElementById('results');
-    const mappingDiv = document.getElementById('speakerMapping');
+async function pollResult(task_id) {
+  document.getElementById("status").innerText = "Ожидание...";
+  let res;
+  while (true) {
+    res = (await api.get(`/result/${task_id}`)).data;
+    if (res.status === "SUCCESS") break;
+    document.getElementById("status").innerText = res.status;
+    await new Promise(r => setTimeout(r, 2000));
+  }
+  showSegments(res);
+}
 
-    uploadBtn.onclick = () => {
-      if (!fileInput.files.length) {
-        alert('Выберите файл!');
-        return;
-      }
-      const file = fileInput.files[0];
-      const form = new FormData();
-      form.append('file', file);
-
-      progress.hidden = false;
-      bar.style.width = '0%';
-      status.textContent = 'Загрузка…';
-      results.innerHTML = '';
-      mappingDiv.innerHTML = '';
-      player.hidden = true;
-
-      const xhr = new XMLHttpRequest();
-      xhr.open('POST', '/transcribe');
-      xhr.upload.onprogress = e => {
-        const pct = e.lengthComputable ? (e.loaded / e.total * 100) : 0;
-        bar.style.width = pct + '%';
-      };
-      xhr.onload = () => {
-        if (xhr.status !== 200) {
-          alert('Ошибка загрузки');
-          return;
-        }
-        const { task_id, estimate } = JSON.parse(xhr.responseText);
-        status.textContent = 'Обработка… ≈' + formatTime(estimate);
-        bar.style.width = '100%';
-
-        const iv = setInterval(async () => {
-          const res  = await fetch('/result/' + task_id);
-          const json = await res.json();
-          status.textContent = 'Статус: ' + json.status;
-          if (json.status === 'SUCCESS') {
-            clearInterval(iv);
-            status.textContent = 'Готово';
-            showResult(json);
-          } else if (json.status === 'FAILURE') {
-            clearInterval(iv);
-            status.textContent = 'Ошибка обработки';
-          }
-        }, 2000);
-      };
-      xhr.send(form);
-    };
-
-    function showResult(data) {
-      player.hidden = false;
-      player.src = data.audio_filepath;
-      player.load();
-
-      renderMapping(data.segments);
-
-      results.innerHTML = '';
-      data.segments.forEach(seg => {
-        const div = document.createElement('div');
-        div.className = 'segment';
-        div.dataset.origSpeaker = seg.speaker;
-
-        const speakerLabel = document.createElement('span');
-        speakerLabel.className = 'speaker';
-        speakerLabel.textContent = speakerMap[seg.speaker] + ':';
-
-        const textSpan = document.createElement('span');
-        textSpan.textContent = seg.text;
-
-        const btn = document.createElement('button');
-        btn.textContent = '▶️';
-        btn.onclick = () => {
-          player.currentTime = seg.start;
-          player.play();
-          setTimeout(() => player.pause(), (seg.end - seg.start) * 1000);
-        };
-
-        div.append(speakerLabel, textSpan, btn);
-        results.appendChild(div);
-      });
-    }
-
-    function renderMapping(segments) {
-      speakerMap = {};
-      segments.forEach(seg => {
-        if (!(seg.speaker in speakerMap)) {
-          speakerMap[seg.speaker] = seg.speaker;
-        }
-      });
-      mappingDiv.innerHTML = '<h3>Переименовать спикеров:</h3>';
-      Object.keys(speakerMap).forEach(orig => {
-        const label = document.createElement('label');
-        label.innerHTML = orig + ': ';
-        const input = document.createElement('input');
-        input.value = speakerMap[orig];
-        input.onchange = e => {
-          speakerMap[orig] = e.target.value;
-          updateLabels();
-        };
-        label.appendChild(input);
-        mappingDiv.appendChild(label);
-      });
-    }
-
-    function updateLabels() {
-      document.querySelectorAll('.segment').forEach(div => {
-        const orig = div.dataset.origSpeaker;
-        div.querySelector('.speaker').textContent = speakerMap[orig] + ':';
-      });
-    }
-  </script>
+function showSegments({ segments, audio_filepath }) {
+  document.getElementById("status").innerText = "Готово";
+  const cont = document.getElementById("segments");
+  segments.forEach((seg, idx) => {
+    const div = document.createElement("div");
+    div.className = "segment";
+    const audio = document.createElement("audio");
+    audio.controls = true;
+    audio.src = `${audio_filepath}#t=${seg.start},${seg.end}`;
+    div.appendChild(audio);
+    const span = document.createElement("span");
+    span.innerText = ` [${seg.start.toFixed(2)}–${seg.end.toFixed(2)}] ${seg.text}`;
+    div.appendChild(span);
+    cont.appendChild(div);
+  });
+}
+</script>
+<script src="https://cdn.jsdelivr.net/npm/axios/dist/axios.min.js"></script>
 </body>
 </html>

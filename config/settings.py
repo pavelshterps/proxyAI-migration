@@ -1,62 +1,55 @@
-from pydantic import BaseSettings
+import os
 
-def parse_origins(val: str) -> list[str]:
-    """
-    Parse a JSON-style string from .env into a Python list.
-    e.g. '["*"]' → ["*"]
-    """
-    import json
-    try:
-        return json.loads(val)
-    except Exception:
-        return []
+# === FastAPI ===
+FASTAPI_HOST = os.getenv("FASTAPI_HOST", "0.0.0.0")
+FASTAPI_PORT = int(os.getenv("FASTAPI_PORT", "8000"))
+API_WORKERS = int(os.getenv("API_WORKERS", "1"))
 
-class Settings(BaseSettings):
-    # FastAPI
-    FASTAPI_HOST: str = '0.0.0.0'
-    FASTAPI_PORT: int = 8000
-    API_WORKERS: int = 1
+# CORS
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", '["*"]')
 
-    # CORS
-    ALLOWED_ORIGINS: list[str] = []
+# === Celery & Redis ===
+CELERY_BROKER_URL    = os.getenv("CELERY_BROKER_URL", "redis://redis:6379/0")
+CELERY_RESULT_BACKEND= os.getenv("CELERY_RESULT_BACKEND", "redis://redis:6379/1")
+CELERY_CONCURRENCY   = int(os.getenv("CELERY_CONCURRENCY", "1"))
+CELERY_TIMEZONE      = os.getenv("CELERY_TIMEZONE", "UTC")
 
-    # Celery & Redis
-    CELERY_BROKER_URL: str
-    CELERY_RESULT_BACKEND: str
-    CELERY_CONCURRENCY: int = 4
-    CELERY_TIMEZONE: str = 'UTC'
+# === File upload / retention ===
+UPLOAD_FOLDER       = os.getenv("UPLOAD_FOLDER", "/tmp/uploads")
+FILE_RETENTION_DAYS = int(os.getenv("FILE_RETENTION_DAYS", "7"))
+MAX_FILE_SIZE       = int(os.getenv("MAX_FILE_SIZE", "1073741824"))
+TUS_ENDPOINT        = os.getenv("TUS_ENDPOINT", "http://tusd:1080/files/")
+SNIPPET_FORMAT      = os.getenv("SNIPPET_FORMAT", "wav")
 
-    # File uploads
-    UPLOAD_FOLDER: str
-    FILE_RETENTION_DAYS: int = 7
-    MAX_FILE_SIZE: int = 1073741824  # bytes
-    TUS_ENDPOINT: str
-    SNIPPET_FORMAT: str = 'wav'
+# === Device mapping ===
+_raw_device = os.getenv("DEVICE", "cpu").lower()
+if _raw_device in ("gpu", "cuda"):
+    DEVICE = "cuda"
+else:
+    DEVICE = "cpu"
 
-    # Models & authentication
-    DEVICE: str = 'cpu'
-    WHISPER_COMPUTE_TYPE: str = 'int8'
-    WHISPER_MODEL: str            # e.g. "openai/whisper-large-v3"
-    HUGGINGFACE_TOKEN: str
-    PYANNOTE_PROTOCOL: str
-    LANGUAGE_CODE: str = 'en'
+# === Whisper settings ===
+WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
+WHISPER_MODEL_NAME   = os.getenv("WHISPER_MODEL", os.getenv("WHISPER_MODEL_NAME", "openai/whisper-large-v3"))
 
-    # Postgres
-    POSTGRES_DB: str
-    POSTGRES_USER: str
-    POSTGRES_PASSWORD: str
+# === Alignment (whisperx) settings ===
+ALIGN_MODEL_NAME = os.getenv("ALIGN_MODEL_NAME", WHISPER_MODEL_NAME)
+ALIGN_BEAM_SIZE  = int(os.getenv("ALIGN_BEAM_SIZE", "5"))
 
-    # SQLAlchemy / full DB URL
-    DATABASE_URL: str
+# === Speaker diarization protocol ===
+PYANNOTE_PROTOCOL = os.getenv("PYANNOTE_PROTOCOL", "pyannote/speaker-diarization")
 
-    # Redis (if your code uses REDIS_URL)
-    REDIS_URL: str
+# === HuggingFace auth ===
+HUGGINGFACE_TOKEN = os.getenv("HUGGINGFACE_TOKEN", "")
 
-    class Config:
-        env_file = '.env'
-        env_file_encoding = 'utf-8'
-        # Use custom JSON loader for ALLOWED_ORIGINS
-        json_loads = parse_origins
+# === Postgres / SQLAlchemy ===
+POSTGRES_DB       = os.getenv("POSTGRES_DB", "whisperx")
+POSTGRES_USER     = os.getenv("POSTGRES_USER", "whisperx")
+POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD", "secret")
+DATABASE_URL      = os.getenv(
+    "DATABASE_URL",
+    f"postgresql://{POSTGRES_USER}:{POSTGRES_PASSWORD}@postgres:5432/{POSTGRES_DB}"
+)
 
-# Global settings instance
-settings = Settings()
+# === Redis URL (for custom usage) ===
+REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379")

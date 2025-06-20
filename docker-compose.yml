@@ -1,114 +1,47 @@
-version: '3.8'
+version: "3.8"
 
 services:
   redis:
-    image: redis:6
-    ports:
-      - "6380:6379"
-
-  postgres:
-    image: postgres:13
-    env_file: .env
-    environment:
-      POSTGRES_DB: ${POSTGRES_DB}
-      POSTGRES_USER: ${POSTGRES_USER}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    image: "redis:7-alpine"
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      - redis-data:/data
 
   tusd:
-    image: tusproject/tusd:latest
-    command:
-      - "--base-path"
-      - "/files"
-      - "--upload-dir"
-      - "/data"
+    image: "tusproject/tusd:latest"
+    command: ["tusd", "--dir", "/files", "--no-implicit-create-dir"]
     ports:
       - "1080:1080"
     volumes:
-      - uploads:/data
+      - upload-data:/files
 
   api:
     build:
       context: .
       dockerfile: Dockerfile
-    image: proxyai-api:latest
-    runtime: nvidia
-    environment:
-      - WHISPER_DEVICE=cuda
-      - WHISPER_COMPUTE_TYPE=float16
-    env_file: .env
-    healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:${FASTAPI_PORT}/health || exit 1"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-    command: >
-      uvicorn main:app
-      --host ${FASTAPI_HOST}
-      --port ${FASTAPI_PORT}
-      --workers ${API_WORKERS}
+    container_name: proxyai-api
+    env_file:
+      - .env
     ports:
       - "${FASTAPI_PORT}:${FASTAPI_PORT}"
-    volumes:
-      - uploads:/tmp/uploads
     depends_on:
       - redis
-      - postgres
       - tusd
+    volumes:
+      - upload-data:/tmp/uploads
 
   worker:
-    image: proxyai-api:latest
-    runtime: nvidia
-    env_file: .env
-    environment:
-      - WHISPER_DEVICE=cuda
-      - WHISPER_COMPUTE_TYPE=float16
-      # Avoid GPU fragmentation
-      - PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128
-      # Lower concurrency to avoid OOM
-      - CELERY_CONCURRENCY=1
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: proxyai-worker
+    env_file:
+      - .env
+    command: celery -A app.celery_app worker --loglevel=info
+    depends_on:
+      - redis
     volumes:
-      - uploads:/tmp/uploads
-    command: >
-      celery -A celery_app.celery worker
-      --loglevel=info
-      --concurrency ${CELERY_CONCURRENCY}
-    depends_on:
-      - redis
-      - postgres
-      - api
-
-  beat:
-    image: proxyai-api:latest
-    runtime: nvidia
-    env_file: .env
-    environment:
-      - WHISPER_DEVICE=cuda
-      - WHISPER_COMPUTE_TYPE=float16
-      - PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128
-      - CELERY_CONCURRENCY=1
-    volumes:
-      - uploads:/tmp/uploads
-    command: >
-      celery -A celery_app.celery beat
-      --loglevel=info
-    depends_on:
-      - redis
-      - postgres
-      - api
-
-  flower:
-    image: mher/flower:latest
-    env_file: .env
-    environment:
-      - BROKER_URL=${CELERY_BROKER_URL}
-      - CELERY_RESULT_BACKEND=${CELERY_RESULT_BACKEND}
-    depends_on:
-      - redis
-    ports:
-      - "5555:5555"
+      - upload-data:/tmp/uploads
 
 volumes:
-  pgdata:
-  uploads:
+  redis-data:
+  upload-data:
