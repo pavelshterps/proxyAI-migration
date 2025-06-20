@@ -58,6 +58,7 @@ def get_whisper_model():
         bnb_config = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.float16,
             llm_int8_threshold=6.0,
         )
 
@@ -154,7 +155,7 @@ def transcribe_chunk(self, chunk_path: str, offset: float):
         chunk_path,
         align_model,
         align_metadata,
-        device=model.device
+        model.device
     )
 
     # Shift timestamps and collect results
