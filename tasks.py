@@ -1,5 +1,3 @@
-# tasks.py
-
 import torch
 from celery_app import celery_app
 from config.settings import (
@@ -14,19 +12,22 @@ from config.settings import (
 from transformers import (
     AutoTokenizer,
     WhisperForConditionalGeneration,
+    WhisperProcessor,
 )
-# (если вы используете аудиопрепроцессинг)
-# from transformers import WhisperProcessor
+import librosa
 
 @celery_app.task(name="tasks.transcribe_task")
 def transcribe_task(filepath: str) -> dict:
     """
-    1) Загружает модель Whisper (8-bit на GPU, иначе full-precision на CPU)
-    2) Прогоняет аудиофайл через модель
-    3) Возвращает текст
+    Принимает путь к аудиофайлу, прогоняет через Whisper (8-bit на GPU или full-precision на CPU),
+    возвращает результат в формате:
+      {
+        "text": "...",
+        "merge_task_id": None
+      }
     """
 
-    # Инициализация токенизатора и модели
+    # 1) Загрузка модели
     tokenizer = AutoTokenizer.from_pretrained(
         WHISPER_MODEL_NAME,
         use_auth_token=HUGGINGFACE_TOKEN
@@ -40,14 +41,21 @@ def transcribe_task(filepath: str) -> dict:
     )
     model.to(DEVICE)
 
-    # Подготовка входа
-    inputs = tokenizer(
-        filepath,
-        return_tensors="pt",
-        sampling_rate=16000
+    # 2) Инициализация процессора
+    processor = WhisperProcessor.from_pretrained(
+        WHISPER_MODEL_NAME,
+        use_auth_token=HUGGINGFACE_TOKEN
+    )
+
+    # 3) Загрузка и препроцессинг аудио
+    audio, sr = librosa.load(filepath, sr=16000)
+    inputs = processor(
+        audio,
+        sampling_rate=sr,
+        return_tensors="pt"
     ).to(DEVICE)
 
-    # Генерация транскрипции
+    # 4) Генерация транскрипта
     with torch.no_grad():
         predicted_ids = model.generate(**inputs)
         transcription = tokenizer.batch_decode(predicted_ids, skip_special_tokens=True)[0]
