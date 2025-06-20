@@ -3,11 +3,15 @@ version: "3.8"
 services:
   redis:
     image: "redis:7-alpine"
+    container_name: proxyai-redis
+    ports:
+      - "6379:6379"
     volumes:
       - redis-data:/data
 
   tusd:
     image: "tusproject/tusd:latest"
+    container_name: proxyai-tusd
     command: ["tusd", "--dir", "/files", "--no-implicit-create-dir"]
     ports:
       - "1080:1080"
@@ -28,6 +32,10 @@ services:
       - tusd
     volumes:
       - upload-data:/tmp/uploads
+    command: >
+      uvicorn main:app
+      --host 0.0.0.0
+      --port ${FASTAPI_PORT}
 
   worker:
     build:
@@ -36,11 +44,13 @@ services:
     container_name: proxyai-worker
     env_file:
       - .env
-    command: celery -A app.celery_app worker --loglevel=info
     depends_on:
       - redis
     volumes:
       - upload-data:/tmp/uploads
+    command: >
+      celery -A celery_app worker
+      --loglevel=info
 
 volumes:
   redis-data:

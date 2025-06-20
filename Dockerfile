@@ -51,4 +51,4 @@ RUN mkdir -p /tmp/uploads && chmod -R 777 /tmp/uploads
 EXPOSE 8000
 
 # Запуск по-умолчанию (API)
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
