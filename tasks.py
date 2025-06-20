@@ -150,12 +150,12 @@ def transcribe_chunk(self, chunk_path: str, offset: float):
 
     # Alignment
     aligned = whisperx.align(
-        segments,
-        processor.tokenizer,
-        chunk_path,
-        align_model,
-        align_metadata,
-        model.device
+        segments=segments,
+        tokenizer=processor.tokenizer,
+        audio=audio_array,
+        align_model=align_model,
+        align_metadata=align_metadata,
+        device=model.device
     )
 
     # Shift timestamps and collect results
