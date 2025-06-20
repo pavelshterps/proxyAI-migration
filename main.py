@@ -5,9 +5,9 @@ from celery.result import AsyncResult
 import uuid
 import os
 
-from .celery_app import celery_app
-from .settings import FASTAPI_HOST, FASTAPI_PORT, UPLOAD_FOLDER, TUS_ENDPOINT
-from .tasks import transcribe_task
+from celery_app import celery_app
+from settings import FASTAPI_HOST, FASTAPI_PORT, UPLOAD_FOLDER, TUS_ENDPOINT
+from tasks import transcribe_task
 
 app = FastAPI()
 
