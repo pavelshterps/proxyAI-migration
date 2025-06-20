@@ -4,12 +4,9 @@ import numpy as np
 import whisperx
 from celery import chord, Task
 from celery.utils.log import get_task_logger
-from .celery_app import celery_app
-from .settings import (
-    DEVICE, WHISPER_MODEL_NAME, WHISPER_COMPUTE_TYPE,
-    ALIGN_MODEL_NAME, ALIGN_BEAM_SIZE, HUGGINGFACE_TOKEN
-)
-from .utils import load_audio, save_segments_to_db  # ваши утилиты
+from celery_app import celery_app
+from settings import DEVICE, WHISPER_MODEL_NAME, WHISPER_COMPUTE_TYPE, ALIGN_MODEL_NAME, ALIGN_BEAM_SIZE, HUGGINGFACE_TOKEN
+from utils import load_audio, save_segments_to_db  # ваши утилиты
 
 log = get_task_logger(__name__)
 
