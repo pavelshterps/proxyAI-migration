@@ -6,7 +6,7 @@ from fastapi.responses import JSONResponse, HTMLResponse
 from celery.result import AsyncResult
 
 from celery_app import celery_app
-from settings import UPLOAD_FOLDER, FASTAPI_HOST, FASTAPI_PORT
+from config.settings import UPLOAD_FOLDER, FASTAPI_HOST, FASTAPI_PORT
 
 app = FastAPI()
 
