@@ -4,6 +4,7 @@ services:
   redis:
     image: "redis:7-alpine"
     container_name: proxyai-redis
+    # Чтобы не конфликтовать с локальным 6379, пробрасываем на 6380
     ports:
       - "6380:6379"
     volumes:

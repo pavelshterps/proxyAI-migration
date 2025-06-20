@@ -1,6 +1,6 @@
 import os
 from celery import Celery
-from config.settings import settings
+import config.settings as settings
 
 # Настройка пути для celery, чтобы tasks корректно импортировались
 os.environ.setdefault("C_FORCE_ROOT", "true")
