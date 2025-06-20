@@ -20,17 +20,25 @@ COPY requirements.txt /app/
 RUN pip install --upgrade pip \
  && pip install --no-cache-dir -r requirements.txt
 
-# Прогреваем кеш моделей выравнивания для английского и русского
+# Pre-warm whisperx alignment models for English and Russian
 RUN python - << 'EOF'
-import whisperx
-for lang in ("english","russian"):
-    # Preload alignment models by positional args to match API signature
-    whisperx.load_align_model(
-        "whisper-large",
-        "cpu",
-        lang,
-        5
-    )
+import os, whisperx
+# read settings from env (fall back to these defaults)
+ALIGN_MODEL = os.getenv("ALIGN_MODEL_NAME", "jonatasgrosman/wav2vec2-large-xlsr-53-english")
+DEVICE = os.getenv("DEVICE", "cpu")
+COMPUTE = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
+BEAM = int(os.getenv("ALIGN_BEAM_SIZE", "5"))
+for lang in ("english", "russian"):
+    try:
+        whisperx.load_align_model(
+            ALIGN_MODEL,
+            DEVICE,
+            COMPUTE,
+            lang,
+            BEAM
+        )
+    except Exception:
+        pass
 EOF
 
 # Копируем весь код
