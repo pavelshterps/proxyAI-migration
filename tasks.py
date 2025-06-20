@@ -46,11 +46,15 @@ def transcribe_task(filepath: str) -> dict:
 
     # Шаг 1: загрузка и препроцессинг аудио
     audio, sr = librosa.load(filepath, sr=16000)
+    print(f"Audio loaded: {len(audio)} samples at {sr} Hz")
+    # Preprocess audio into model inputs
     inputs = processor(
         audio,
         sampling_rate=sr,
         return_tensors="pt"
-    ).to(DEVICE)
+    )
+    # Move all tensors to the correct device
+    inputs = {k: v.to(DEVICE) for k, v in inputs.items()}
 
     # Шаг 2: инференс
     print("Running model.generate")
