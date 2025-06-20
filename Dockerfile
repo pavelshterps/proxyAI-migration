@@ -1,4 +1,6 @@
-# ─── Базовый образ с поддержкой CUDA и PyTorch ───
+# Dockerfile
+
+# ─── Базовый образ с CUDA и PyTorch ───
 FROM docker.io/pytorch/pytorch:2.0.1-cuda11.7-cudnn8-runtime
 
 # Отключаем интерактивные запросы и настраиваем часовой пояс
@@ -15,39 +17,24 @@ RUN apt-get update \
  && dpkg-reconfigure --frontend noninteractive tzdata \
  && rm -rf /var/lib/apt/lists/*
 
+# Рабочая директория приложения
 WORKDIR /app
 
-# ─── Устанавливаем Python-зависимости ───
-COPY requirements.txt /app/
-RUN pip install --upgrade pip \
- && pip install --no-cache-dir -r requirements.txt
-
-# ─── Копируем весь код проекта ───
+# Копируем весь проект (включая папку config) в /app
 COPY . /app
 
-# ─── Прогреваем кеш whisperx-align моделей для English и Russian ───
-RUN python - << 'EOF'
-import whisperx
-for lang in ("english","russian"):
-    try:
-        whisperx.load_align_model(
-            "whisper-large",  # ALIGN_MODEL_NAME по умолчанию
-            "cpu",            # кешируем на CPU
-            lang,
-            5                 # ALIGN_BEAM_SIZE по умолчанию
-        )
-    except Exception:
-        pass
-EOF
+# Папка для загрузок и права
+RUN mkdir -p /tmp/uploads \
+ && chmod -R 777 /tmp/uploads
 
-# ─── Папка для загрузок ───
-RUN mkdir -p /tmp/uploads && chmod -R 777 /tmp/uploads
-
-# ─── Чтобы Python видел модули в /app ───
+# Чтобы Python видел package config и другие модули
 ENV PYTHONPATH=/app
 
-# ─── Экспонируем порт FastAPI ───
+# Устанавливаем зависимости
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Порт FastAPI
 EXPOSE 8000
 
-# ─── Запуск FastAPI ───
+# Запуск приложения
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
