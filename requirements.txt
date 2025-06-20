@@ -1,3 +1,4 @@
+# requirements.txt
 # FastAPI & Uvicorn
 fastapi==0.115.12
 uvicorn==0.34.3
@@ -10,6 +11,7 @@ MarkupSafe>=2.1.1
 
 # Celery & Redis
 celery==5.5.3
+flower==1.9.0
 redis==6.2.0
 
 # .env support
@@ -19,6 +21,7 @@ python-dotenv==1.1.0
 ffmpeg-python==0.2.0
 pydub>=0.25.1
 soundfile>=0.12.1
+librosa>=0.10.0
 
 # WhisperX & Whisper inference
 git+https://github.com/m-bain/whisperx.git@main
@@ -46,5 +49,3 @@ pyannote.pipeline>=3.0.1
 
 # Утилиты
 numpy>=2.0.2
-soundfile>=0.12.1
-librosa>=0.10.0

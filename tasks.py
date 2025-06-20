@@ -1,53 +1,50 @@
+# tasks.py
+
 import torch
+import librosa
 from celery_app import celery_app
 from config.settings import (
     DEVICE,
     LOAD_IN_8BIT,
     WHISPER_MODEL_NAME,
     WHISPER_COMPUTE_TYPE,
-    ALIGN_MODEL_NAME,
-    ALIGN_BEAM_SIZE,
     HUGGINGFACE_TOKEN,
 )
-from transformers import (
-    AutoTokenizer,
-    WhisperForConditionalGeneration,
-    WhisperProcessor,
+from transformers import WhisperProcessor, AutoTokenizer, WhisperForConditionalGeneration
+
+# Инициализация процессора, токенизатора и модели при импорте модуля
+processor = WhisperProcessor.from_pretrained(
+    WHISPER_MODEL_NAME,
+    use_auth_token=HUGGINGFACE_TOKEN
 )
-import librosa
+tokenizer = AutoTokenizer.from_pretrained(
+    WHISPER_MODEL_NAME,
+    use_auth_token=HUGGINGFACE_TOKEN
+)
+model = WhisperForConditionalGeneration.from_pretrained(
+    WHISPER_MODEL_NAME,
+    device_map="auto" if LOAD_IN_8BIT else None,
+    load_in_8bit=LOAD_IN_8BIT,
+    torch_dtype=getattr(torch, WHISPER_COMPUTE_TYPE),
+    use_auth_token=HUGGINGFACE_TOKEN
+)
+model.to(DEVICE)
 
 @celery_app.task(name="tasks.transcribe_task")
 def transcribe_task(filepath: str) -> dict:
     """
-    Принимает путь к аудиофайлу, прогоняет через Whisper (8-bit на GPU или full-precision на CPU),
-    возвращает результат в формате:
+    Принимает путь к аудиофайлу, прогоняет его через Whisper:
+    - 8-битный режим на GPU (если доступно)
+    - иначе full-precision на CPU
+    Возвращает словарь:
       {
-        "text": "...",
+        "text": "<транскрипт>",
         "merge_task_id": None
       }
     """
+    print(f"Starting transcription for {filepath}")
 
-    # 1) Загрузка модели
-    tokenizer = AutoTokenizer.from_pretrained(
-        WHISPER_MODEL_NAME,
-        use_auth_token=HUGGINGFACE_TOKEN
-    )
-    model = WhisperForConditionalGeneration.from_pretrained(
-        WHISPER_MODEL_NAME,
-        device_map="auto" if LOAD_IN_8BIT else None,
-        load_in_8bit=LOAD_IN_8BIT,
-        torch_dtype=getattr(torch, WHISPER_COMPUTE_TYPE),
-        use_auth_token=HUGGINGFACE_TOKEN
-    )
-    model.to(DEVICE)
-
-    # 2) Инициализация процессора
-    processor = WhisperProcessor.from_pretrained(
-        WHISPER_MODEL_NAME,
-        use_auth_token=HUGGINGFACE_TOKEN
-    )
-
-    # 3) Загрузка и препроцессинг аудио
+    # Шаг 1: загрузка и препроцессинг аудио
     audio, sr = librosa.load(filepath, sr=16000)
     inputs = processor(
         audio,
@@ -55,10 +52,14 @@ def transcribe_task(filepath: str) -> dict:
         return_tensors="pt"
     ).to(DEVICE)
 
-    # 4) Генерация транскрипта
+    # Шаг 2: инференс
+    print("Running model.generate")
     with torch.no_grad():
         predicted_ids = model.generate(**inputs)
-        transcription = tokenizer.batch_decode(predicted_ids, skip_special_tokens=True)[0]
+
+    # Декодируем результат
+    transcription = tokenizer.batch_decode(predicted_ids, skip_special_tokens=True)[0]
+    print(f"Transcription completed: {transcription[:50]}{'...' if len(transcription) > 50 else ''}")
 
     return {
         "text": transcription,
