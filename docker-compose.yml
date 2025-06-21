@@ -109,7 +109,6 @@ services:
       - CELERY_RESULT_BACKEND=redis://redis:6379/1
     mem_limit: 8g
     cpus: 1.0
-    gpus: 1
 
   flower:
     image: mher/flower:2.0.1
