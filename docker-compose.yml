@@ -21,7 +21,7 @@ services:
     container_name: proxyai-tusd
     restart: on-failure
     healthcheck:
-      test: ["CMD-SHELL", "curl -f -X OPTIONS http://localhost:1080/files || exit 1"]
+      test: ["CMD-SHELL", "curl -f http://localhost:1080/ || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
