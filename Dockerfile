@@ -1,40 +1,45 @@
-# Dockerfile
+# syntax=docker/dockerfile:1.3
+# ─── Stage 1: сборка зависимостей ───
+FROM python:3.10-slim AS builder
 
-# ─── Базовый образ с CUDA и PyTorch ───
-FROM docker.io/pytorch/pytorch:2.0.1-cuda11.7-cudnn8-runtime
-
-# Отключаем интерактивные запросы и настраиваем часовой пояс
-ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      tzdata \
       build-essential \
-      cmake \
-      git \
-      ffmpeg \
+      python3-dev \
       libsndfile1 \
- && ln -fs /usr/share/zoneinfo/Etc/UTC /etc/localtime \
- && dpkg-reconfigure --frontend noninteractive tzdata \
+      ffmpeg \
+      git \
  && rm -rf /var/lib/apt/lists/*
 
-# Рабочая директория приложения
+WORKDIR /app
+COPY requirements.txt .
+
+# Используем BuildKit cache для pip
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --no-cache-dir -r requirements.txt
+
+# ─── Stage 2: runtime с поддержкой CUDA ───
+FROM docker.io/pytorch/pytorch:2.0.1-cuda11.7-cudnn8-runtime-slim
+
+# создаём непривилегированного пользователя
+RUN groupadd -r appuser && useradd -r -g appuser appuser
+
 WORKDIR /app
 
-# Копируем весь проект (включая папку config) в /app
+# копируем зависимости и код
+COPY --from=builder /usr/local/lib/python3.10/site-packages /usr/local/lib/python3.10/site-packages
+COPY --from=builder /usr/local/bin /usr/local/bin
 COPY . /app
 
-# Папка для загрузок и права
-RUN mkdir -p /tmp/uploads \
- && chmod -R 777 /tmp/uploads
+# права на директорию загрузок
+RUN mkdir -p /tmp/uploads /tmp/chunks \
+ && chown -R appuser:appuser /tmp/uploads /tmp/chunks /app
 
-# Чтобы Python видел package config и другие модули
-ENV PYTHONPATH=/app
+USER appuser
 
-# Устанавливаем зависимости
-RUN pip install --no-cache-dir -r requirements.txt
-
-# Порт FastAPI
 EXPOSE 8000
 
-# Запуск приложения
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+  CMD curl -f http://localhost:8000/health || exit 1
+
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]

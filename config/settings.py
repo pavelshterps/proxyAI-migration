@@ -1,29 +1,19 @@
-# config/settings.py
-
 import os
 import torch
 
-# Папка для загруженных файлов
-UPLOAD_FOLDER = os.getenv("UPLOAD_FOLDER", "/tmp/uploads")
+# Celery
+BROKER_URL        = os.getenv('CELERY_BROKER_URL',    'redis://redis:6379/0')
+RESULT_BACKEND    = os.getenv('CELERY_RESULT_BACKEND','redis://redis:6379/1')
 
-# Настройки FastAPI
-FASTAPI_HOST = os.getenv("FASTAPI_HOST", "0.0.0.0")
-FASTAPI_PORT = int(os.getenv("FASTAPI_PORT", "8000"))
+# FastAPI
+UPLOAD_FOLDER     = os.getenv('UPLOAD_FOLDER',        '/tmp/uploads')
+FASTAPI_HOST      = os.getenv('FASTAPI_HOST',         '0.0.0.0')
+FASTAPI_PORT      = int(os.getenv('FASTAPI_PORT',     '8000'))
+MAX_FILE_SIZE_MB  = int(os.getenv('MAX_FILE_SIZE_MB','600'))
 
-# Проверяем доступность GPU
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# Device
+DEVICE            = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+LOAD_IN_8BIT      = torch.cuda.is_available()
 
-# Если есть CUDA — загружаем модель в 8-битном режиме через bitsandbytes
-LOAD_IN_8BIT = torch.cuda.is_available()
-
-# Параметры моделей и токен
-WHISPER_MODEL_NAME   = os.getenv("WHISPER_MODEL_NAME", "openai/whisper-small")
-WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "float16")
-
-ALIGN_MODEL_NAME     = os.getenv(
-    "ALIGN_MODEL_NAME",
-    "jonatasgrosman/wav2vec2-large-xlsr-53-russian"
-)
-ALIGN_BEAM_SIZE      = int(os.getenv("ALIGN_BEAM_SIZE", "5"))
-
-HUGGINGFACE_TOKEN    = os.getenv("HUGGINGFACE_TOKEN", None)
+WHISPER_MODEL_NAME = os.getenv('WHISPER_MODEL_NAME',   'openai/whisper-small')
+ALIGN_BEAM_SIZE    = int(os.getenv('ALIGN_BEAM_SIZE',  '5'))

@@ -1,51 +1,31 @@
-# requirements.txt
-# FastAPI & Uvicorn
+# Web API
 fastapi==0.115.12
 uvicorn==0.34.3
 aiofiles==24.1.0
 python-multipart>=0.0.5
 
-# Templating (если используется)
-Jinja2>=3.1.0
-MarkupSafe>=2.1.1
-
-# Celery & Redis
+# Celery & monitoring
 celery==5.5.3
 flower==2.0.1
 redis==6.2.0
-
-# .env support
 python-dotenv==1.1.0
 
 # Audio I/O
 ffmpeg-python==0.2.0
-pydub>=0.25.1
+pydub==0.25.1
 soundfile>=0.12.1
-librosa>=0.10.0
 
-# WhisperX & Whisper inference
-git+https://github.com/m-bain/whisperx.git@main
-
-# Faster Whisper (опционально)
-faster-whisper>=1.1.1
-
-# Model serving & quantization
-transformers==4.48.0
-huggingface-hub<1.0,>=0.14.1
-bitsandbytes>=0.39.0
-accelerate>=0.20.3
-ctranslate2<4.5.0
-
-# PyTorch + audio
-torch>=2.5.1
-torchaudio>=2.5.1
-
-# Pyannote (диаризация)
+# Diarization
 pyannote.audio>=3.3.2
 pyannote.database>=5.0.1
 pyannote.core>=5.0.0
-pyannote.metrics>=3.2
-pyannote.pipeline>=3.0.1
 
-# Утилиты
+# Faster Whisper (GPU-optimized)
+faster-whisper>=1.1.1
+
+# PyTorch runtime
+torch>=2.5.1
+torchaudio>=2.5.1
+
+# Utilities
 numpy>=2.0.2

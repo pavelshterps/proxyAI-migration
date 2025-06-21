@@ -1,71 +1,106 @@
-# tasks.py
-
+import os
+import glob
+import logging
 import torch
-import librosa
 from celery_app import celery_app
-from config.settings import (
-    DEVICE,
-    LOAD_IN_8BIT,
-    WHISPER_MODEL_NAME,
-    WHISPER_COMPUTE_TYPE,
-    HUGGINGFACE_TOKEN,
-)
-from transformers import WhisperProcessor, AutoTokenizer, WhisperForConditionalGeneration
+from config.settings import LOAD_IN_8BIT, WHISPER_MODEL_NAME, ALIGN_BEAM_SIZE
+from faster_whisper import WhisperModel
+from pyannote.audio import Pipeline as DiarizationPipeline
+from pydub import AudioSegment
 
-# Инициализация процессора, токенизатора и модели при импорте модуля
-processor = WhisperProcessor.from_pretrained(
-    WHISPER_MODEL_NAME,
-    use_auth_token=HUGGINGFACE_TOKEN
-)
-tokenizer = AutoTokenizer.from_pretrained(
-    WHISPER_MODEL_NAME,
-    use_auth_token=HUGGINGFACE_TOKEN
-)
-model = WhisperForConditionalGeneration.from_pretrained(
-    WHISPER_MODEL_NAME,
-    device_map="auto" if LOAD_IN_8BIT else None,
-    load_in_8bit=LOAD_IN_8BIT,
-    torch_dtype=getattr(torch, WHISPER_COMPUTE_TYPE),
-    use_auth_token=HUGGINGFACE_TOKEN
-)
-model.to(DEVICE)
+logger = logging.getLogger(__name__)
 
-@celery_app.task(name="tasks.transcribe_task")
-def transcribe_task(filepath: str) -> dict:
-    """
-    Принимает путь к аудиофайлу, прогоняет его через Whisper:
-    - 8-битный режим на GPU (если доступно)
-    - иначе full-precision на CPU
-    Возвращает словарь:
-      {
-        "text": "<транскрипт>",
-        "merge_task_id": None
-      }
-    """
-    print(f"Starting transcription for {filepath}")
+# Инициализация моделей
+diarizer = DiarizationPipeline.from_pretrained("pyannote/speaker-diarization")
+whisper_model = WhisperModel(
+    WHISPER_MODEL_NAME,
+    device="cuda" if torch.cuda.is_available() else "cpu",
+    compute_type="int8" if LOAD_IN_8BIT else "float32"
+)
 
-    # Шаг 1: загрузка и препроцессинг аудио
-    audio, sr = librosa.load(filepath, sr=16000)
-    print(f"Audio loaded: {len(audio)} samples at {sr} Hz")
-    # Preprocess audio into model inputs
-    inputs = processor(
-        audio,
-        sampling_rate=sr,
-        return_tensors="pt"
+@celery_app.task(
+    name="tasks.diarize_task",
+    queue="preprocess",
+    autoretry_for=(Exception,),
+    retry_backoff=True,
+    retry_kwargs={'max_retries': 3},
+)
+def diarize_task(filepath: str):
+    logger.info("Task %s: starting diarization", diarize_task.request.id)
+    segments = diarizer(filepath)
+    result = [
+        {"start": turn.start, "end": turn.end, "speaker": speaker}
+        for turn, _, speaker in segments.itertracks(yield_label=True)
+    ]
+    logger.info("Task %s: diarization done, %d segments", diarize_task.request.id, len(result))
+    return result
+
+@celery_app.task(
+    name="tasks.chunk_by_diarization",
+    queue="preprocess",
+    autoretry_for=(Exception,),
+    retry_backoff=True,
+    retry_kwargs={'max_retries': 3},
+)
+def chunk_by_diarization(filepath: str, segments):
+    logger.info("Task %s: chunking %d segments", chunk_by_diarization.request.id, len(segments))
+    audio = AudioSegment.from_file(filepath)
+    out_paths = []
+    os.makedirs("/tmp/chunks", exist_ok=True)
+    for seg in segments:
+        start_ms = int(seg["start"] * 1000)
+        end_ms   = int(seg["end"]   * 1000)
+        chunk = audio[start_ms:end_ms]
+        out = f"/tmp/chunks/{start_ms}_{end_ms}.wav"
+        chunk.export(out, format="wav")
+        out_paths.append(out)
+    logger.info("Task %s: chunking done, %d files", chunk_by_diarization.request.id, len(out_paths))
+    return out_paths
+
+@celery_app.task(
+    name="tasks.inference_task",
+    queue="inference",
+    autoretry_for=(Exception,),
+    retry_backoff=True,
+    retry_kwargs={'max_retries': 5},
+)
+def inference_task(chunk_path: str):
+    logger.info("Task %s: inferring %s", inference_task.request.id, chunk_path)
+    segments, _ = whisper_model.transcribe(
+        chunk_path,
+        beam_size=ALIGN_BEAM_SIZE,
+        word_timestamps=False
     )
-    # Move all tensors to the correct device
-    inputs = {k: v.to(DEVICE) for k, v in inputs.items()}
+    text = "".join(seg.text for seg in segments)
+    logger.info("Task %s: inference done", inference_task.request.id)
+    return {"chunk": chunk_path, "text": text}
 
-    # Шаг 2: инференс
-    print("Running model.generate")
-    with torch.no_grad():
-        predicted_ids = model.generate(**inputs)
+@celery_app.task(
+    name="tasks.merge_results",
+    queue="preprocess",
+)
+def merge_results(results, original_filepath: str):
+    logger.info("Task %s: merging %d results", merge_results.request.id, len(results))
+    full_text = "\n".join(r["text"] for r in results)
+    # Cleanup temp files
+    for f in glob.glob("/tmp/chunks/*.wav"):
+        try: os.remove(f)
+        except: pass
+    try: os.remove(original_filepath)
+    except: pass
+    logger.info("Task %s: cleanup done", merge_results.request.id)
+    return {"text": full_text}
 
-    # Декодируем результат
-    transcription = tokenizer.batch_decode(predicted_ids, skip_special_tokens=True)[0]
-    print(f"Transcription completed: {transcription[:50]}{'...' if len(transcription) > 50 else ''}")
-
-    return {
-        "text": transcription,
-        "merge_task_id": None
-    }
+@celery_app.task(
+    name="tasks.transcribe_full",
+    queue="preprocess",
+)
+def transcribe_full(filepath: str):
+    logger.info("Task %s: orchestrator started", transcribe_full.request.id)
+    segments  = diarize_task.s(filepath)()
+    chunks    = chunk_by_diarization.s(filepath, segments)()
+    header    = [inference_task.s(path) for path in chunks]
+    callback  = merge_results.s(filepath)
+    chord_res = celery_app.group(header).chord(callback)()
+    logger.info("Task %s: dispatched inference chord, callback id %s", transcribe_full.request.id, chord_res.id)
+    return {"callback_task_id": chord_res.id}

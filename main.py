@@ -1,56 +1,67 @@
 import os
 import uuid
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.staticfiles import StaticFiles
+import logging
+from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi.middleware.cors import CORSMiddleware
 from celery.result import AsyncResult
-
 from celery_app import celery_app
-from config.settings import UPLOAD_FOLDER, FASTAPI_HOST, FASTAPI_PORT
+from config.settings import UPLOAD_FOLDER, FASTAPI_PORT, MAX_FILE_SIZE_MB
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("app")
 
 app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-# Статика для файловых отдач
-app.mount("/files", StaticFiles(directory=UPLOAD_FOLDER), name="files")
-app.mount("/static", StaticFiles(directory="static"), name="static")
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
 
 @app.get("/", response_class=HTMLResponse)
 async def root():
     try:
-        with open("static/index.html", encoding="utf-8") as f:
-            return HTMLResponse(f.read())
+        return HTMLResponse(open("index.html", encoding="utf-8").read())
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error("Error serving index.html: %s", e)
+        raise HTTPException(500, str(e))
 
-@app.post("/transcribe")
-async def start_transcription(file: UploadFile = File(...)):
+def cleanup_upload(path: str):
+    try: os.remove(path)
+    except: pass
+
+@app.post("/transcribe", status_code=202)
+async def start_transcription(
+    background: BackgroundTasks,
+    file: UploadFile = File(...)
+):
+    contents = await file.read()
+    if len(contents) > MAX_FILE_SIZE_MB * 1024 * 1024:
+        raise HTTPException(413, f"File too large (max {MAX_FILE_SIZE_MB} MB)")
     os.makedirs(UPLOAD_FOLDER, exist_ok=True)
     ext = os.path.splitext(file.filename)[1]
     dest = os.path.join(UPLOAD_FOLDER, f"{uuid.uuid4().hex}{ext}")
     with open(dest, "wb") as f:
-        f.write(await file.read())
-
-    job = celery_app.send_task("tasks.transcribe_task", args=[dest])
-    # estimate можно возвращать из задачи, но для UI — сразу ноль
-    return JSONResponse({"task_id": job.id, "estimate": 0}, status_code=202)
+        f.write(contents)
+    # schedule removal if something goes wrong
+    background.add_task(cleanup_upload, dest)
+    res = celery_app.send_task("tasks.transcribe_full", args=[dest])
+    logger.info("Submitted transcribe_full, task_id=%s", res.id)
+    return JSONResponse({"transcription_task_id": res.id})
 
 @app.get("/result/{task_id}")
 async def get_result(task_id: str):
-    wrapper = AsyncResult(task_id, app=celery_app)
-    state = wrapper.state
-
-    if state == "SUCCESS":
-        payload = wrapper.get()
-        merge_id = payload.get("merge_task_id")
-        if merge_id:
-            merge = AsyncResult(merge_id, app=celery_app)
-            if merge.state == "SUCCESS":
-                final = merge.get()
-                return final
-            return {"status": merge.state}
-        return {"status": state}
-
+    async_res = AsyncResult(task_id, app=celery_app)
+    state = async_res.state
     if state in ("PENDING", "STARTED", "RETRY"):
-        return {"status": state}
-
-    return {"status": state, "error": str(wrapper.info)}
+        return JSONResponse({"status": state}, status_code=202)
+    if state == "SUCCESS":
+        data = async_res.get()
+        return JSONResponse({"status": state, **data}, status_code=200)
+    logger.error("Task %s failed: %s", task_id, async_res.info)
+    return JSONResponse({"status": state, "error": str(async_res.info)}, status_code=500)
