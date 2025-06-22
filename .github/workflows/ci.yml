@@ -10,6 +10,11 @@ jobs:
   smoke-test:
     runs-on: ubuntu-latest
 
+    # export env vars so compose ports and broker URL aren’t empty
+    env:
+      FASTAPI_PORT: 8000
+      CELERY_BROKER_URL: redis://redis:6379/0
+
     services:
       redis:
         image: redis:7-alpine
@@ -29,11 +34,11 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v3
 
-      - name: Set up Docker Compose
+      - name: Set up Docker Compose plugin
         run: docker compose version
 
       - name: Build all images
-        run: docker compose build
+        run: docker compose build --no-cache
 
       - name: Start all services
         run: docker compose up -d --remove-orphans
@@ -41,8 +46,9 @@ jobs:
       - name: Wait for API to be healthy
         run: |
           for i in {1..15}; do
-            if curl -fs http://localhost:8000/health; then
-              echo "API is up"; exit 0;
+            if curl -fs http://localhost:${FASTAPI_PORT}/health; then
+              echo "API is up"
+              exit 0
             fi
             sleep 2
           done
@@ -51,18 +57,18 @@ jobs:
 
       - name: Run smoke-test transcription
         run: |
-          # Отправляем тестовый файл и получаем task_id
-          RESPONSE=$(curl -s -F "file=@tests/fixtures/sample.wav" http://localhost:8000/transcribe)
+          # send test file, capture task_id
+          RESPONSE=$(curl -s -F "file=@tests/fixtures/sample.wav" http://localhost:${FASTAPI_PORT}/transcribe)
           echo "Response: $RESPONSE"
           TASK_ID=$(echo "$RESPONSE" | jq -r .task_id)
           echo "Got task_id: $TASK_ID"
 
-          # Ожидаем результата не более 60 секунд
+          # poll for up to 60 seconds
           for i in {1..30}; do
-            STATUS=$(curl -s http://localhost:8000/result/$TASK_ID | jq -r .status)
+            STATUS=$(curl -s http://localhost:${FASTAPI_PORT}/result/${TASK_ID} | jq -r .status)
             echo "Attempt $i: status=$STATUS"
             if [ "$STATUS" = "SUCCESS" ]; then
-              curl -s http://localhost:8000/result/$TASK_ID | jq .
+              curl -s http://localhost:${FASTAPI_PORT}/result/${TASK_ID} | jq .
               echo "✅ Transcription succeeded"
               exit 0
             fi
