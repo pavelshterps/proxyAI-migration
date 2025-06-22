@@ -3,7 +3,7 @@
 ############################
 # Stage 1: build dependencies
 ############################
-FROM python:3.10-slim AS builder
+FROM pytorch/pytorch:2.0.1-cuda11.7-cudnn8-runtime AS builder
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
@@ -17,27 +17,27 @@ RUN apt-get update \
 WORKDIR /app
 COPY requirements.txt .
 
-# Use BuildKit cache for pip
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install --no-cache-dir -r requirements.txt
+# Устанавливаем все Python-зависимости (включая celery, uvicorn и т.д.)
+RUN pip install --no-cache-dir -r requirements.txt
 
 ############################
-# Stage 2: runtime with CUDA
+# Stage 2: runtime
 ############################
 FROM pytorch/pytorch:2.0.1-cuda11.7-cudnn8-runtime
 
-# Create non-root user
+# Создаём непривилегированного пользователя
 RUN groupadd -r appuser && useradd -r -g appuser appuser
 
 WORKDIR /app
 
-# Copy only Python site-packages; do NOT copy /usr/local/bin
+# Копируем пакеты и CLI-инструменты из builder-стадии
 COPY --from=builder /usr/local/lib/python3.10/site-packages /usr/local/lib/python3.10/site-packages
+COPY --from=builder /usr/local/bin /usr/local/bin
 
-# Copy application code
+# Копируем код приложения
 COPY . /app
 
-# Prepare upload and chunk dirs
+# Готовим директории для загрузок и чанков, устанавливаем права
 RUN mkdir -p /tmp/uploads /tmp/chunks \
  && chown -R appuser:appuser /tmp/uploads /tmp/chunks /app
 
