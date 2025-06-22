@@ -29,8 +29,17 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 ############################
 FROM pytorch/pytorch:2.0.1-cuda11.7-cudnn8-runtime
 
-# Create non-root user
-RUN groupadd -r appuser && useradd -r -g appuser appuser
+#
+# Create non-root user with home directory and set permissions
+RUN groupadd -r appuser \
+ && useradd -r -g appuser -m -d /home/appuser appuser \
+ && mkdir -p /home/appuser /tmp/uploads /tmp/chunks /tmp/hf_cache \
+ && chown -R appuser:appuser /home/appuser /tmp/uploads /tmp/chunks /tmp/hf_cache
+
+# Force HF and Matplotlib caches into writable tmp dirs
+ENV HOME=/home/appuser
+ENV MPLCONFIGDIR=/tmp
+ENV HF_HOME=/tmp/hf_cache
 
 WORKDIR /app
 
