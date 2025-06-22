@@ -1,23 +1,38 @@
 import os
 import uuid
 import logging
-from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
-from fastapi.responses import JSONResponse, HTMLResponse
+
+from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, Request
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
+
 from celery.result import AsyncResult
 from celery_app import celery_app
 from config.settings import UPLOAD_FOLDER, FASTAPI_PORT, MAX_FILE_SIZE_MB
 
-logging.basicConfig(level=logging.INFO)
+# Set up structured JSON logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='{"time":"%(asctime)s","level":"%(levelname)s","task":"%(name)s","message":"%(message)s"}'
+)
 logger = logging.getLogger("app")
 
 app = FastAPI()
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+# Serve JS/CSS/etc from the static folder
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+@app.middleware("http")
+async def add_cors_and_metrics(request: Request, call_next):
+    # (You can re-add your Prometheus middleware here)
+    return await call_next(request)
+
+@app.get("/metrics")
+def metrics():
+    # (Your Prometheus generate_latest call here)
+    return StreamingResponse(b"", media_type="text/plain")
 
 @app.get("/health")
 async def health():
@@ -25,43 +40,38 @@ async def health():
 
 @app.get("/", response_class=HTMLResponse)
 async def root():
-    try:
-        return HTMLResponse(open("index.html", encoding="utf-8").read())
-    except Exception as e:
-        logger.error("Error serving index.html: %s", e)
-        raise HTTPException(500, str(e))
-
-def cleanup_upload(path: str):
-    try: os.remove(path)
-    except: pass
+    # Always serve the bundled static/index.html
+    index_path = os.path.join(os.path.dirname(__file__), "static", "index.html")
+    if not os.path.isfile(index_path):
+        raise HTTPException(status_code=500, detail=f"Index not found: {index_path}")
+    return HTMLResponse(content=open(index_path, "r", encoding="utf-8").read())
 
 @app.post("/transcribe", status_code=202)
 async def start_transcription(
     background: BackgroundTasks,
     file: UploadFile = File(...)
 ):
-    contents = await file.read()
-    if len(contents) > MAX_FILE_SIZE_MB * 1024 * 1024:
+    data = await file.read()
+    if len(data) > MAX_FILE_SIZE_MB * 1024 * 1024:
         raise HTTPException(413, f"File too large (max {MAX_FILE_SIZE_MB} MB)")
     os.makedirs(UPLOAD_FOLDER, exist_ok=True)
     ext = os.path.splitext(file.filename)[1]
     dest = os.path.join(UPLOAD_FOLDER, f"{uuid.uuid4().hex}{ext}")
-    with open(dest, "wb") as f:
-        f.write(contents)
-    # schedule removal if something goes wrong
-    background.add_task(cleanup_upload, dest)
-    res = celery_app.send_task("tasks.transcribe_full", args=[dest])
-    logger.info("Submitted transcribe_full, task_id=%s", res.id)
-    return JSONResponse({"transcription_task_id": res.id})
+    with open(dest, "wb") as out:
+        out.write(data)
+    background.add_task(lambda p=dest: os.remove(p))
+    job = celery_app.send_task("tasks.transcribe_full", args=[dest])
+    logger.info("Submitted transcribe_full task_id=%s", job.id)
+    return JSONResponse({"task_id": job.id})
 
 @app.get("/result/{task_id}")
 async def get_result(task_id: str):
-    async_res = AsyncResult(task_id, app=celery_app)
-    state = async_res.state
+    ar = AsyncResult(task_id, app=celery_app)
+    state = ar.state
     if state in ("PENDING", "STARTED", "RETRY"):
-        return JSONResponse({"status": state}, status_code=202)
+        return JSONResponse({"status": state}, 202)
     if state == "SUCCESS":
-        data = async_res.get()
-        return JSONResponse({"status": state, **data}, status_code=200)
-    logger.error("Task %s failed: %s", task_id, async_res.info)
-    return JSONResponse({"status": state, "error": str(async_res.info)}, status_code=500)
+        data = ar.get()
+        return JSONResponse({"status": state, "text": data["text"]})
+    logger.error("task failed %s: %s", task_id, ar.info)
+    return JSONResponse({"status": state, "error": str(ar.info)}, 500)
