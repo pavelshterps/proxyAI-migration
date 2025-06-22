@@ -43,6 +43,9 @@ RUN mkdir -p /tmp/uploads /tmp/chunks \
 
 USER appuser
 
+# Ensure pip-installed console scripts are in PATH for non-root
+ENV PATH="/usr/local/bin:${PATH}"
+
 EXPOSE 8000
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
