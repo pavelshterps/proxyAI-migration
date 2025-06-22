@@ -5,6 +5,9 @@
 ############################
 FROM pytorch/pytorch:2.0.1-cuda11.7-cudnn8-runtime AS builder
 
+ARG DEBIAN_FRONTEND=noninteractive
+ENV TZ=UTC
+
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       build-essential \
