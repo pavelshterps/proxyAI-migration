@@ -21,13 +21,17 @@ services:
     container_name: proxyai-tusd
     restart: on-failure
     healthcheck:
-      # HEAD /files returns 204 No Content when empty, so curl -f will succeed
-      test: ["CMD-SHELL", "curl -f -I http://localhost:1080/files || exit 1"]
+      # HEAD /files/ returns 204 No Content when empty
+      test: ["CMD-SHELL", "curl -f -I http://localhost:1080/files/ || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 5s
-    command: ["tusd", "--dir", "/files", "--no-implicit-create-dir"]
+    command:
+      - tusd
+      - --dir
+      - /files
+      - --no-implicit-create-dir
     ports:
       - "1080:1080"
     volumes:
@@ -60,6 +64,9 @@ services:
       uvicorn main:app
       --host 0.0.0.0
       --port ${FASTAPI_PORT}
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/1
 
   cpu-worker:
     build:
