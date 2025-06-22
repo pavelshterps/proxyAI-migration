@@ -1,4 +1,4 @@
-version: "3.9"
+version: "3.8"
 
 services:
   redis:
@@ -21,6 +21,7 @@ services:
     container_name: proxyai-tusd
     restart: on-failure
     healthcheck:
+      # HEAD /files returns 204 No Content when empty, so curl -f will succeed
       test: ["CMD-SHELL", "curl -f -I http://localhost:1080/files || exit 1"]
       interval: 30s
       timeout: 10s
@@ -59,9 +60,6 @@ services:
       uvicorn main:app
       --host 0.0.0.0
       --port ${FASTAPI_PORT}
-    environment:
-      - CELERY_BROKER_URL=redis://redis:6379/0
-      - CELERY_RESULT_BACKEND=redis://redis:6379/1
 
   cpu-worker:
     build:
@@ -86,9 +84,6 @@ services:
       --concurrency=4
       --loglevel=info
       -E
-    environment:
-      - CELERY_BROKER_URL=redis://redis:6379/0
-      - CELERY_RESULT_BACKEND=redis://redis:6379/1
     mem_limit: 4g
     cpus: "2.0"
 
@@ -115,9 +110,6 @@ services:
       --concurrency=1
       --loglevel=info
       -E
-    environment:
-      - CELERY_BROKER_URL=redis://redis:6379/0
-      - CELERY_RESULT_BACKEND=redis://redis:6379/1
     mem_limit: 8g
     cpus: "1.0"
 
