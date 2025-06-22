@@ -17,7 +17,7 @@ RUN apt-get update \
 WORKDIR /app
 COPY requirements.txt .
 
-# use BuildKit cache to speed up pip installs
+# Use BuildKit cache for pip
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --no-cache-dir -r requirements.txt
 
@@ -26,16 +26,18 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 ############################
 FROM pytorch/pytorch:2.0.1-cuda11.7-cudnn8-runtime
 
-# create non-root user
+# Create non-root user
 RUN groupadd -r appuser && useradd -r -g appuser appuser
 
 WORKDIR /app
 
-# copy dependencies and app code
+# Copy only Python site-packages; do NOT copy /usr/local/bin
 COPY --from=builder /usr/local/lib/python3.10/site-packages /usr/local/lib/python3.10/site-packages
+
+# Copy application code
 COPY . /app
 
-# prepare upload + chunk dirs
+# Prepare upload and chunk dirs
 RUN mkdir -p /tmp/uploads /tmp/chunks \
  && chown -R appuser:appuser /tmp/uploads /tmp/chunks /app
 
