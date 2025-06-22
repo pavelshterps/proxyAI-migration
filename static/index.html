@@ -1,52 +1,66 @@
 <!DOCTYPE html>
-<html lang="ru">
+<html lang="en">
 <head>
-  <meta charset="UTF-8">
-  <title>Transcribe UI</title>
+  <meta charset="UTF-8" />
+  <title>Audio Transcription</title>
   <style>
-    #progress{width:100%;height:20px;background:#eee;margin-top:1em}
-    #bar{height:100%;width:0;background:#6a5af9}
-    pre{white-space:pre-wrap;background:#f7f7f7;padding:1em}
+    body { font-family: sans-serif; margin: 2rem; }
+    #status { margin-top: 1rem; font-weight: bold; }
+    #output { white-space: pre-wrap; margin-top: 1rem; background: #f5f5f5; padding: 1rem; border-radius: 4px; }
   </style>
 </head>
 <body>
-  <h1>Загрузите аудио</h1>
-  <input type="file" id="fileInput"><button id="btn">Загрузить</button>
-  <div id="progress"><div id="bar" role="progressbar" aria-valuemin="0" aria-valuemax="100"></div></div>
-  <div id="status"></div><pre id="transcript"></pre>
-  <script src="https://cdn.jsdelivr.net/npm/axios/dist/axios.min.js"></script>
+  <h1>Загрузите аудио для транскрипции</h1>
+  <input type="file" id="audioFile" accept="audio/*" />
+  <button id="uploadBtn">Загрузить</button>
+  <div id="status"></div>
+  <pre id="output"></pre>
+
   <script>
-    const api = axios.create();
-    document.getElementById("btn").onclick = async ()=>{
-      const file = document.getElementById("fileInput").files[0];
-      if(!file) return alert("Выберите файл");
-      const fd = new FormData(); fd.append("file",file);
-      document.getElementById("status").innerText="Загрузка...";
-      try{
-        const {data} = await api.post("/transcribe",fd,{
-          onUploadProgress:e=>{
-            const pct = Math.round(e.loaded/e.total*100);
-            const bar = document.getElementById("bar");
-            bar.style.width=`${pct}%`;
-            bar.setAttribute("aria-valuenow",pct);
-          }
-        });
-        poll(data.transcription_task_id);
-      }catch(err){
-        alert(err.response?.data?.detail||err);
+    const uploadBtn = document.getElementById('uploadBtn');
+    const audioFile = document.getElementById('audioFile');
+    const statusDiv = document.getElementById('status');
+    const output = document.getElementById('output');
+    let taskId = null;
+
+    uploadBtn.addEventListener('click', async () => {
+      if (!audioFile.files.length) {
+        alert('Пожалуйста, выберите аудиофайл.');
+        return;
       }
-    };
-    async function poll(id){
-      document.getElementById("status").innerText="Ожидание...";
-      while(true){
-        const res=await api.get(`/result/${id}`);
-        if(res.status===200){
-          document.getElementById("status").innerText="Готово";
-          document.getElementById("transcript").innerText=res.data.text;
-          break;
-        }
-        document.getElementById("status").innerText=res.data.status;
-        await new Promise(r=>setTimeout(r,2000));
+      statusDiv.textContent = 'Загрузка и запуск транскрипции…';
+      output.textContent = '';
+
+      const formData = new FormData();
+      formData.append('file', audioFile.files[0]);
+
+      const resp = await fetch('/transcribe', {
+        method: 'POST',
+        body: formData
+      });
+      if (!resp.ok) {
+        statusDiv.textContent = 'Ошибка при отправке файла';
+        return;
+      }
+
+      const data = await resp.json();
+      taskId = data.task_id;
+      statusDiv.textContent = `Задача запущена: ${taskId}. Ожидание результата…`;
+      pollResult();
+    });
+
+    async function pollResult() {
+      const res = await fetch(`/result/${taskId}`);
+      const data = await res.json();
+
+      if (data.status === 'SUCCESS') {
+        statusDiv.textContent = 'Готово!';
+        output.textContent = data.text;
+      } else if (data.status === 'FAILED') {
+        statusDiv.textContent = `Ошибка: ${data.error || 'неизвестная'}`;
+      } else {
+        statusDiv.textContent = `Статус: ${data.status}…`;
+        setTimeout(pollResult, 2000);
       }
     }
   </script>
