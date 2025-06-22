@@ -1,4 +1,4 @@
-version: "3.8"
+version: "3.9"
 
 services:
   redis:
@@ -21,7 +21,7 @@ services:
     container_name: proxyai-tusd
     restart: on-failure
     healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:1080/ || exit 1"]
+      test: ["CMD-SHELL", "curl -f -I http://localhost:1080/files || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
