@@ -1,4 +1,2 @@
-FROM tusproject/tusd:latest
-USER root
-RUN apk add --no-cache netcat-openbsd
-USER 65532
+tusd:
+    command: ["sh", "-c", "chown -R 65532:65532 /files && exec tusd --dir /files --no-implicit-create-dir"]
