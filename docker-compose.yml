@@ -21,17 +21,13 @@ services:
     container_name: proxyai-tusd
     restart: on-failure
     healthcheck:
-      # HEAD /files/ returns 204 No Content when empty
-      test: ["CMD-SHELL", "curl -f -I http://localhost:1080/files/ || exit 1"]
+      # TCP check on port 1080 instead of HTTP
+      test: ["CMD", "nc", "-z", "localhost", "1080"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 5s
-    command:
-      - tusd
-      - --dir
-      - /files
-      - --no-implicit-create-dir
+    command: ["tusd", "--dir", "/files", "--no-implicit-create-dir"]
     ports:
       - "1080:1080"
     volumes:
