@@ -20,34 +20,35 @@ RUN apt-get update \
 WORKDIR /app
 COPY requirements.txt .
 
-# Устанавливаем все Python-зависимости (включая celery, uvicorn и т.д.)
-RUN pip install --no-cache-dir -r requirements.txt
+# Install Python dependencies using pip in this image's conda environment
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --no-cache-dir -r requirements.txt
 
 ############################
 # Stage 2: runtime
 ############################
 FROM pytorch/pytorch:2.0.1-cuda11.7-cudnn8-runtime
 
-# Создаём непривилегированного пользователя
+# Create non-root user
 RUN groupadd -r appuser && useradd -r -g appuser appuser
 
 WORKDIR /app
 
-# Копируем пакеты и CLI-инструменты из builder-стадии
-COPY --from=builder /usr/local/lib/python3.10/site-packages /usr/local/lib/python3.10/site-packages
-COPY --from=builder /usr/local/bin /usr/local/bin
+# Copy installed Python packages and console scripts from builder
+COPY --from=builder /opt/conda/lib/python3.10/site-packages /opt/conda/lib/python3.10/site-packages
+COPY --from=builder /opt/conda/bin /opt/conda/bin
 
-# Копируем код приложения
+# Copy application code
 COPY . /app
 
-# Готовим директории для загрузок и чанков, устанавливаем права
+# Prepare upload and chunk directories and set permissions
 RUN mkdir -p /tmp/uploads /tmp/chunks \
  && chown -R appuser:appuser /tmp/uploads /tmp/chunks /app
 
 USER appuser
 
-# Ensure pip-installed console scripts are in PATH for non-root
-ENV PATH="/usr/local/bin:${PATH}"
+# Ensure pip-installed console scripts are in PATH
+ENV PATH="/opt/conda/bin:${PATH}"
 
 EXPOSE 8000
 
