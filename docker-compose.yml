@@ -17,11 +17,12 @@ services:
       - redis-data:/data
 
   tusd:
-    image: "tusproject/tusd:latest"
+    build:
+      context: .
+      dockerfile: Dockerfile.tusd
     container_name: proxyai-tusd
     restart: on-failure
     healthcheck:
-      # TCP check on port 1080 instead of HTTP
       test: ["CMD", "nc", "-z", "localhost", "1080"]
       interval: 30s
       timeout: 10s

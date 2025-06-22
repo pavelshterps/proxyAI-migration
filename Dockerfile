@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.3
 
 ############################
-# Stage 1: Build Stage
+# Stage 1: build dependencies
 ############################
 FROM python:3.10-slim AS builder
 
@@ -17,26 +17,26 @@ RUN apt-get update \
 WORKDIR /app
 COPY requirements.txt .
 
-# Use BuildKit cache for pip
+# use BuildKit cache to speed up pip installs
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --no-cache-dir -r requirements.txt
 
 ############################
-# Stage 2: Runtime Stage
+# Stage 2: runtime with CUDA
 ############################
 FROM pytorch/pytorch:2.0.1-cuda11.7-cudnn8-runtime
 
-# Create a non-root user
+# create non-root user
 RUN groupadd -r appuser && useradd -r -g appuser appuser
 
 WORKDIR /app
 
-# Copy dependencies and application code
+# copy dependencies and app code
 COPY --from=builder /usr/local/lib/python3.10/site-packages /usr/local/lib/python3.10/site-packages
 COPY --from=builder /usr/local/bin /usr/local/bin
 COPY . /app
 
-# Prepare upload/chunk directories and set permissions
+# prepare upload + chunk dirs
 RUN mkdir -p /tmp/uploads /tmp/chunks \
  && chown -R appuser:appuser /tmp/uploads /tmp/chunks /app
 
@@ -47,5 +47,4 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
   CMD curl -f http://localhost:8000/health || exit 1
 
-# Start Uvicorn with graceful shutdown and max-requests limits
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--graceful-timeout", "30", "--limit-max-requests", "1000"]
