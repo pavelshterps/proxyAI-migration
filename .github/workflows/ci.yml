@@ -1,0 +1,73 @@
+name: CI Smoke Test
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  smoke-test:
+    runs-on: ubuntu-latest
+
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    defaults:
+      run:
+        working-directory: ${{ github.workspace }}
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v3
+
+      - name: Set up Docker Compose
+        run: docker-compose version
+
+      - name: Build all images
+        run: docker-compose build
+
+      - name: Start all services
+        run: docker-compose up -d
+
+      - name: Wait for API to be healthy
+        run: |
+          for i in {1..15}; do
+            if curl -fs http://localhost:8000/health; then
+              echo "API is up"; exit 0;
+            fi
+            sleep 2
+          done
+          echo "API did not become healthy" >&2
+          exit 1
+
+      - name: Run smoke-test transcription
+        run: |
+          # Отправляем тестовый файл и получаем task_id
+          RESPONSE=$(curl -s -F "file=@tests/fixtures/sample.wav" http://localhost:8000/transcribe)
+          echo "Response: $RESPONSE"
+          TASK_ID=$(echo "$RESPONSE" | jq -r .task_id)
+          echo "Got task_id: $TASK_ID"
+
+          # Ожидаем результата не более 60 секунд
+          for i in {1..30}; do
+            STATUS=$(curl -s http://localhost:8000/result/$TASK_ID | jq -r .status)
+            echo "Attempt $i: status=$STATUS"
+            if [ "$STATUS" = "SUCCESS" ]; then
+              curl -s http://localhost:8000/result/$TASK_ID | jq .
+              echo "✅ Transcription succeeded"
+              exit 0
+            fi
+            sleep 2
+          done
+
+          echo "❌ Transcription did not complete in time" >&2
+          exit 1
