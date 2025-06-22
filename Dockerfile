@@ -32,13 +32,13 @@ FROM pytorch/pytorch:2.0.1-cuda11.7-cudnn8-runtime
 ARG DEBIAN_FRONTEND=noninteractive
 ENV TZ=UTC
 
-# Create non-root user with a home directory
+# Create non-root user with home directory and set permissions
 RUN groupadd -r appuser \
  && useradd -r -g appuser -m -d /home/appuser appuser \
- && mkdir -p /tmp/uploads /tmp/chunks /tmp/hf_cache \
- && chown -R appuser:appuser /tmp/uploads /tmp/chunks /tmp/hf_cache /home/appuser
+ && mkdir -p /home/appuser /tmp/uploads /tmp/chunks /tmp/hf_cache \
+ && chown -R appuser:appuser /home/appuser /tmp/uploads /tmp/chunks /tmp/hf_cache
 
-# Force HF and Matplotlib caches into writable tmp dirs
+# Force caches into writable tmp dirs
 ENV HOME=/home/appuser
 ENV MPLCONFIGDIR=/tmp
 ENV HF_HOME=/tmp/hf_cache
@@ -49,10 +49,10 @@ WORKDIR /app
 COPY --from=builder /opt/conda/lib/python3.10/site-packages /opt/conda/lib/python3.10/site-packages
 COPY --from=builder /opt/conda/bin /opt/conda/bin
 
-# Copy application code
+# Copy application code and static assets
 COPY . /app
 
-# Ensure our UI entrypoint is in place and owned
+# Ensure index.html is in place for root endpoint
 RUN cp static/index.html index.html \
  && chown -R appuser:appuser /app
 
