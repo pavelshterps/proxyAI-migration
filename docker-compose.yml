@@ -2,7 +2,7 @@ version: "3.8"
 
 services:
   redis:
-    image: "redis:7-alpine"
+    image: redis:7-alpine
     container_name: proxyai-redis
     restart: on-failure
     healthcheck:
@@ -10,17 +10,16 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 5s
     ports:
       - "6380:6379"
     volumes:
       - redis-data:/data
 
   tusd:
-    image: "tusproject/tusd:latest"
+    image: tusproject/tusd:latest
     container_name: proxyai-tusd
     restart: on-failure
-    # healthcheck removed to avoid startup failures
+    # убрали healthcheck — иногда мешает стартапу
     command: ["tusd", "--dir", "/files", "--no-implicit-create-dir"]
     ports:
       - "1080:1080"
