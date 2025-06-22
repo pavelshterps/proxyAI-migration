@@ -1,2 +1,8 @@
-tusd:
-    command: ["sh", "-c", "chown -R 65532:65532 /files && exec tusd --dir /files --no-implicit-create-dir"]
+FROM tusproject/tusd:latest
+USER root
+RUN apk add --no-cache netcat-openbsd
+COPY docker-entrypoint.sh /docker-entrypoint.sh
+RUN chmod +x /docker-entrypoint.sh
+USER 65532
+ENTRYPOINT ["/docker-entrypoint.sh"]
+CMD ["tusd", "--dir", "/files", "--no-implicit-create-dir"]
