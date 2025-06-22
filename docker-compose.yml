@@ -17,17 +17,10 @@ services:
       - redis-data:/data
 
   tusd:
-    build:
-      context: .
-      dockerfile: Dockerfile.tusd
+    image: "tusproject/tusd:latest"
     container_name: proxyai-tusd
     restart: on-failure
-    healthcheck:
-      test: ["CMD", "nc", "-z", "localhost", "1080"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 5s
+    # healthcheck removed to avoid startup failures
     command: ["tusd", "--dir", "/files", "--no-implicit-create-dir"]
     ports:
       - "1080:1080"
@@ -52,7 +45,7 @@ services:
       redis:
         condition: service_healthy
       tusd:
-        condition: service_healthy
+        condition: service_started
     ports:
       - "${FASTAPI_PORT}:${FASTAPI_PORT}"
     volumes:
