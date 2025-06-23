@@ -1,28 +1,6 @@
+version: "3.9"
+
 services:
-  redis:
-    image: redis:7-alpine
-    container_name: proxyai-redis
-    restart: on-failure
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-    ports:
-      - "6380:6379"
-    volumes:
-      - redis-data:/data
-
-  tusd:
-    image: tusproject/tusd:latest
-    container_name: proxyai-tusd
-    restart: on-failure
-    command: ["tusd", "--dir", "/files", "--no-implicit-create-dir"]
-    ports:
-      - "1080:1080"
-    volumes:
-      - upload-data:/files
-
   api:
     build:
       context: .
@@ -32,25 +10,20 @@ services:
     env_file:
       - .env
       - .env.example
+    ports:
+      - "8000:8000"
     depends_on:
       redis:
         condition: service_healthy
       tusd:
         condition: service_started
-    ports:
-      - "${FASTAPI_PORT}:${FASTAPI_PORT}"
-    volumes:
-      - upload-data:/tmp/uploads
-    command: >
-      uvicorn main:app
-      --host 0.0.0.0
-      --port ${FASTAPI_PORT}
     healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:${FASTAPI_PORT}/health || exit 1"]
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/health || exit 1"]
       interval: 30s
       timeout: 10s
-      retries: 3
-      start_period: 5s
+      retries: 5
+    volumes:
+      - upload-data:/tmp/uploads
 
   cpu-worker:
     build:
@@ -60,7 +33,7 @@ services:
     restart: on-failure
     env_file:
       - .env
-    #  - .env.example
+      - .env.example
     environment:
       - DEVICE=cpu
       - WHISPER_COMPUTE_TYPE=float32
@@ -74,11 +47,13 @@ services:
       --loglevel=info
       -E
     healthcheck:
-      test: [ "CMD-SHELL", "pgrep -f 'celery.*worker' || exit 1" ]
+      test: ["CMD-SHELL", "pgrep -f 'celery.*worker' || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 5s
+    volumes:
+      - upload-data:/tmp/uploads
 
   gpu-worker:
     build:
@@ -89,18 +64,16 @@ services:
     runtime: nvidia
     env_file:
       - .env
-  #    - .env.example
+      - .env.example
     environment:
       - DEVICE=cuda
       - WHISPER_COMPUTE_TYPE=float16
     depends_on:
       redis:
         condition: service_healthy
-    volumes:
-      - upload-data:/tmp/uploads
     command: >
       celery -A celery_app worker
-      -Q inference
+      -Q preprocess
       --concurrency=1
       --loglevel=info
       -E
@@ -110,9 +83,13 @@ services:
       timeout: 10s
       retries: 3
       start_period: 5s
+    volumes:
+      - upload-data:/tmp/uploads
 
   flower:
-    image: mher/flower:2.0.1
+    build:
+      context: .
+      dockerfile: Dockerfile
     container_name: proxyai-flower
     restart: on-failure
     env_file:
@@ -121,15 +98,31 @@ services:
     depends_on:
       redis:
         condition: service_healthy
+    command: >
+      celery -A celery_app flower
+      --port=5555
     ports:
       - "5555:5555"
-    command: >
-      celery flower
-      --broker=${CELERY_BROKER_URL}
-      --address=0.0.0.0
-      --port=5555
-      --enable-events
+
+  redis:
+    image: redis:7-alpine
+    container_name: proxyai-redis
+    restart: on-failure
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    volumes:
+      - redis-data:/data
+
+  tusd:
+    image: tusproject/tusd:v1.1.7
+    container_name: proxyai-tusd
+    restart: on-failure
+    ports:
+      - "1080:1080"
 
 volumes:
-  redis-data:
   upload-data:
+  redis-data:
