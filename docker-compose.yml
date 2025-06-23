@@ -118,6 +118,9 @@ services:
     restart: on-failure
     ports:
       - "1080:1080"
+    volumes:
+      - upload-data:/tmp/uploads
+
 
 volumes:
   upload-data:
