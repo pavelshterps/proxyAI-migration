@@ -2,18 +2,18 @@ from celery import Celery
 from dotenv import load_dotenv
 import os
 
-# Загружаем переменные окружения из .env
+# Load environment variables from .env
 load_dotenv()
 
-# Создаём объект Celery и явно включаем модуль tasks.py
+# Create the Celery application, including our tasks module
 celery_app = Celery(
     "proxyai",
     broker=os.getenv("CELERY_BROKER_URL"),
     backend=os.getenv("CELERY_RESULT_BACKEND"),
-    include=["tasks"],  # явно импортируем tasks.py для регистрации всех задач
+    include=["tasks"],  # ensures tasks.py is imported
 )
 
-# Общая конфигурация Celery
+# Basic Celery configuration
 celery_app.conf.update(
     result_extended=True,
     accept_content=["json"],
@@ -23,11 +23,7 @@ celery_app.conf.update(
     timezone=os.getenv("CELERY_TIMEZONE", "UTC"),
 )
 
-# Явные маршруты задач по очередям
+# Route only the transcribe_full task onto the preprocess queue
 celery_app.conf.task_routes = {
-    "tasks.transcribe_full":       {"queue": "preprocess"},
-    "tasks.diarize_task":          {"queue": "preprocess"},
-    "tasks.chunk_by_diarization":  {"queue": "preprocess"},
-    "tasks.merge_results":         {"queue": "preprocess"},
-    "tasks.inference_task":        {"queue": "inference"},
+    "tasks.transcribe_full": {"queue": "preprocess"},
 }

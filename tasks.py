@@ -1,125 +1,70 @@
-from typing import List, Dict
 import os
 import glob
 import logging
 
-from celery import chord, group
+from typing import Dict
 from celery_app import celery_app
 from config.settings import (
     HUGGINGFACE_TOKEN,
     HF_CACHE_DIR,
     PYANNOTE_PROTOCOL,
-    ALIGN_BEAM_SIZE,
+    WHISPER_MODEL_NAME,
+    WHISPER_COMPUTE_TYPE,
+    DEVICE,
 )
-from faster_whisper import WhisperModel
 from pyannote.audio import Pipeline
-from pydub import AudioSegment
+from faster_whisper import WhisperModel
+import librosa
 
 logger = logging.getLogger(__name__)
 
-# Lazy singleton loaders
-_diarizer = None
-_whisper = None
-
-def get_diarizer():
-    global _diarizer
-    if _diarizer is None:
-        _diarizer = Pipeline.from_pretrained(
-            PYANNOTE_PROTOCOL,
-            use_auth_token=HUGGINGFACE_TOKEN,
-            cache_dir=HF_CACHE_DIR
-        )
-    return _diarizer
-
-def get_whisper():
-    global _whisper
-    if _whisper is None:
-        _whisper = WhisperModel(
-            os.getenv("WHISPER_MODEL"),
-            device=os.getenv("DEVICE", "cpu"),
-            compute_type=os.getenv("WHISPER_COMPUTE_TYPE", "float32"),
-            cache_dir=HF_CACHE_DIR
-        )
-    return _whisper
-
-@celery_app.task(name="tasks.diarize_task", queue="preprocess")
-def diarize_task(filepath: str) -> List[Dict]:
-    logger.info("Diarization start: %s", filepath)
-    diarizer = get_diarizer()
-    segments = diarizer(filepath)
-    # return list of {start,end}
-    result = [{"start": s.start, "end": s.end} for s, _, _ in segments.itertracks(yield_label=True)]
-    logger.info("Diarization done: %d segments", len(result))
-    return result
-
-@celery_app.task(name="tasks.chunk_task", queue="preprocess")
-def chunk_task(filepath_segments) -> List[str]:
-    filepath, segments = filepath_segments
-    logger.info("Chunking %s into %d parts", filepath, len(segments))
-    audio = AudioSegment.from_file(filepath)
-    out_paths = []
-    os.makedirs("/tmp/chunks", exist_ok=True)
-    for seg in segments:
-        start_ms = int(seg["start"] * 1000)
-        end_ms   = int(seg["end"]   * 1000)
-        chunk = audio[start_ms:end_ms]
-        out_file = f"/tmp/chunks/{start_ms}_{end_ms}.wav"
-        chunk.export(out_file, format="wav")
-        out_paths.append(out_file)
-    logger.info("Chunking done: %d files", len(out_paths))
-    return out_paths
-
-@celery_app.task(name="tasks.inference_task", queue="inference")
-def inference_task(chunk_path: str) -> Dict:
-    logger.info("Inference on %s", chunk_path)
-    model = get_whisper()
-    segments, _ = model.transcribe(
-        chunk_path,
-        beam_size=ALIGN_BEAM_SIZE,
-        word_timestamps=False,
-    )
-    text = "".join(seg.text for seg in segments)
-    return {"chunk_path": chunk_path, "text": text}
-
-@celery_app.task(name="tasks.merge_results", queue="preprocess")
-def merge_results(results: List[Dict], original: str) -> Dict:
-    logger.info("Merging %d results for %s", len(results), original)
-    # collect & sort by chunk_path
-    texts = [r["text"] for r in sorted(results, key=lambda r: r["chunk_path"])]
-    full = "\n".join(texts)
-    # cleanup
-    for f in glob.glob("/tmp/chunks/*.wav"):
-        try: os.remove(f)
-        except: pass
-    try: os.remove(original)
-    except: pass
-    return {"text": full}
+# Initialize singletons at import
+diarizer = Pipeline.from_pretrained(
+    PYANNOTE_PROTOCOL,
+    use_auth_token=HUGGINGFACE_TOKEN,
+    cache_dir=HF_CACHE_DIR
+)
+model = WhisperModel(
+    WHISPER_MODEL_NAME,
+    device=DEVICE,
+    compute_type=WHISPER_COMPUTE_TYPE,
+    cache_dir=HF_CACHE_DIR
+)
 
 @celery_app.task(name="tasks.transcribe_full", queue="preprocess")
-def transcribe_full(filepath: str) -> str:
+def transcribe_full(filepath: str) -> Dict:
     """
-    1) diarize → 2) chunk → 3) parallel inference → 4) merge → returns merge_task_id
+    Full pipeline in one task:
+    1) speaker diarization
+    2) load audio segments via librosa
+    3) whisper transcription
+    Clean up files after.
     """
-    logger.info("Orchestrating full transcription: %s", filepath)
+    logger.info("Starting full transcription: %s", filepath)
+    try:
+        # 1. Diarize
+        diarization = diarizer(filepath)
+        segments = [(turn.start, turn.end) for turn, _, _ in diarization.itertracks(yield_label=True)]
 
-    # chain preprocess: get segments
-    diag = diarize_task.s(filepath)
+        # 2. Transcribe each segment
+        full_text = []
+        for start, end in segments:
+            audio, sr = librosa.load(filepath, sr=16000, offset=start, duration=end - start)
+            transcribed_segments, _ = model.transcribe(audio)
+            full_text.append(" ".join(seg.text for seg in transcribed_segments))
 
-    # then chunk: we need both filepath and segments
-    chnk = chunk_task.s(filepath)
+        result = {"text": "\n".join(full_text)}
 
-    # inference group on each chunk
-    inf_group = group(inference_task.s() for _ in range(0))  # placeholder
+    except Exception as e:
+        logger.exception("Error in transcription pipeline")
+        result = {"error": str(e)}
 
-    # but Celery chord needs to know number of elements;
-    # instead we use chord in callback of chunk:
-    def build_chord(chunks):
-        return chord(
-            group(inference_task.s(p) for p in chunks),
-            merge_results.s(filepath)
-        )()
-    # use .then on chunk task result
-    ev = chnk.apply_async(link=build_chord)
+    # Cleanup: remove any leftover chunk files and the original
+    try:
+        for f in glob.glob("/tmp/chunks/*.wav"):
+            os.remove(f)
+        os.remove(filepath)
+    except Exception:
+        pass
 
-    logger.info("Dispatched chord callback, id=%s", ev.id)
-    return ev.id
+    return result
