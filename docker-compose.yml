@@ -1,5 +1,4 @@
 version: "3.8"
-
 services:
   redis:
     image: redis:7-alpine
@@ -10,114 +9,83 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
-    ports:
-      - "6380:6379"
-    volumes:
-      - redis-data:/data
+    ports: ["6380:6379"]
+    volumes: ["redis-data:/data"]
 
   tusd:
     image: tusproject/tusd:latest
     container_name: proxyai-tusd
     restart: on-failure
-    # убрали healthcheck — иногда мешает стартапу
-    command: ["tusd", "--dir", "/files", "--no-implicit-create-dir"]
-    ports:
-      - "1080:1080"
-    volumes:
-      - upload-data:/files
+    command: ["tusd","--dir","/files","--no-implicit-create-dir"]
+    ports: ["1080:1080"]
+    volumes: ["upload-data:/files"]
 
   api:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    build: { context: ., dockerfile: Dockerfile }
     container_name: proxyai-api
     restart: on-failure
-    healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:${FASTAPI_PORT}/health || exit 1"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 5s
-    env_file:
-      - .env
+    env_file: [.env]
     depends_on:
-      redis:
-        condition: service_healthy
-      tusd:
-        condition: service_started
-    ports:
-      - "${FASTAPI_PORT}:${FASTAPI_PORT}"
-    volumes:
-      - upload-data:/tmp/uploads
+      redis: { condition: service_healthy }
+      tusd:  { condition: service_started }
+    ports: ["${FASTAPI_PORT}:${FASTAPI_PORT}"]
+    volumes: ["upload-data:/tmp/uploads"]
     command: >
       uvicorn main:app
       --host 0.0.0.0
       --port ${FASTAPI_PORT}
-    environment:
-      - CELERY_BROKER_URL=redis://redis:6379/0
-      - CELERY_RESULT_BACKEND=redis://redis:6379/1
-
-  cpu-worker:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: proxyai-cpu-worker
-    restart: on-failure
     healthcheck:
-      test: ["CMD-SHELL", "pgrep -f 'celery.*worker' || exit 1"]
+      test: ["CMD-SHELL","curl -f http://localhost:${FASTAPI_PORT}/health || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 5s
-    env_file:
-      - .env
-    depends_on:
-      redis:
-        condition: service_healthy
+
+  cpu-worker:
+    build: { context: ., dockerfile: Dockerfile }
+    container_name: proxyai-cpu-worker
+    restart: on-failure
+    env_file: [.env]
+    depends_on: { redis: { condition: service_healthy } }
     command: >
       celery -A celery_app worker
       -Q preprocess
-      --concurrency=4
+      --concurrency=${CELERY_CONCURRENCY}
       --loglevel=info
       -E
-    mem_limit: 4g
-    cpus: "2.0"
-
-  gpu-worker:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: proxyai-gpu-worker
-    restart: on-failure
     healthcheck:
-      test: ["CMD-SHELL", "pgrep -f 'celery.*worker' || exit 1"]
+      test: ["CMD-SHELL","pgrep -f 'celery.*worker' || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 5s
-    env_file:
-      - .env
-    depends_on:
-      redis:
-        condition: service_healthy
+
+  gpu-worker:
+    build: { context: ., dockerfile: Dockerfile }
+    container_name: proxyai-gpu-worker
+    restart: on-failure
+    env_file: [.env]
+    depends_on: { redis: { condition: service_healthy } }
     command: >
       celery -A celery_app worker
       -Q inference
       --concurrency=1
       --loglevel=info
       -E
-    mem_limit: 8g
-    cpus: "1.0"
+    healthcheck:
+      test: ["CMD-SHELL","pgrep -f 'celery.*worker' || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
 
   flower:
     image: mher/flower:2.0.1
     container_name: proxyai-flower
     restart: on-failure
-    depends_on:
-      redis:
-        condition: service_healthy
-    ports:
-      - "5555:5555"
+    env_file: [.env]
+    depends_on: { redis: { condition: service_healthy } }
+    ports: ["5555:5555"]
     command: >
       celery flower
       --broker=${CELERY_BROKER_URL}
