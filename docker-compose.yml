@@ -9,7 +9,6 @@ services:
     restart: on-failure
     env_file:
       - .env
-      - .env.example
     ports:
       - "8000:8000"
     depends_on:
@@ -33,7 +32,6 @@ services:
     restart: on-failure
     env_file:
       - .env
-    #  - .env.example
     environment:
       - DEVICE=cpu
       - WHISPER_COMPUTE_TYPE=float32
@@ -64,7 +62,6 @@ services:
     runtime: nvidia
     env_file:
       - .env
-    #  - .env.example
     environment:
       - DEVICE=cuda
       - WHISPER_COMPUTE_TYPE=float16
@@ -94,7 +91,6 @@ services:
     restart: on-failure
     env_file:
       - .env
-      - .env.example
     depends_on:
       redis:
         condition: service_healthy
