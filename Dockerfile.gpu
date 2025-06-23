@@ -2,8 +2,10 @@
 # Базовый образ с CUDA 12.2.2 и cuDNN8 на Ubuntu 22.04
 FROM nvidia/cuda:12.2.2-cudnn8-runtime-ubuntu22.04
 
-# Системные зависимости для аудио
+# Устанавливаем Python 3, pip и системные зависимости для аудио
 RUN apt-get update && apt-get install -y \
+    python3 \
+    python3-pip \
     ffmpeg \
     libsndfile1 \
     libjpeg-dev \
@@ -12,11 +14,11 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-# Установка Python-зависимостей
+# Установка Python-зависимостей через pip3
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip3 install --no-cache-dir -r requirements.txt
 
-# Копируем исходники
+# Копируем приложение
 COPY . .
 
 # Запуск GPU-воркера Celery
