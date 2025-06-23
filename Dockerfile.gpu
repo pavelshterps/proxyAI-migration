@@ -1,6 +1,6 @@
 # Dockerfile.gpu
-# Базовый образ с CUDA 12.2 и cuDNN8 на Ubuntu 22.04
-FROM nvidia/cuda:12.2.0-cudnn8-runtime-ubuntu22.04
+# Базовый образ с CUDA 12.2.2 и cuDNN8 на Ubuntu 22.04
+FROM nvidia/cuda:12.2.2-cudnn8-runtime-ubuntu22.04
 
 # Системные зависимости для аудио
 RUN apt-get update && apt-get install -y \
