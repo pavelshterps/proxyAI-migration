@@ -29,3 +29,5 @@ torchaudio>=2.5.1
 
 # Utilities
 numpy>=2.0.2
+
+librosa
