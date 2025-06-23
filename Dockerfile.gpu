@@ -1,0 +1,23 @@
+# Dockerfile.gpu
+# Базовый образ с CUDA 12.2 и cuDNN8 на Ubuntu 22.04
+FROM nvidia/cuda:12.2.0-cudnn8-runtime-ubuntu22.04
+
+# Системные зависимости для аудио
+RUN apt-get update && apt-get install -y \
+    ffmpeg \
+    libsndfile1 \
+    libjpeg-dev \
+    libpng-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Установка Python-зависимостей
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Копируем исходники
+COPY . .
+
+# Запуск GPU-воркера Celery
+CMD ["celery", "-A", "celery_app", "worker", "-Q", "inference", "--concurrency=1", "--loglevel=info"]

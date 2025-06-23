@@ -80,15 +80,21 @@ services:
   gpu-worker:
     build:
       context: .
-      dockerfile: Dockerfile
+      dockerfile: Dockerfile.gpu
     container_name: proxyai-gpu-worker
     restart: on-failure
+    runtime: nvidia
     env_file:
       - .env
       - .env.example
+    environment:
+      - DEVICE=cuda
+      - WHISPER_COMPUTE_TYPE=float16
     depends_on:
       redis:
         condition: service_healthy
+    volumes:
+      - upload-data:/tmp/uploads
     command: >
       celery -A celery_app worker
       -Q inference
