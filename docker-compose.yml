@@ -9,6 +9,8 @@ services:
     restart: on-failure
     env_file:
       - .env
+    environment:
+      - HF_CACHE_DIR=/hf_cache
     ports:
       - "8000:8000"
     depends_on:
@@ -23,6 +25,7 @@ services:
       retries: 5
     volumes:
       - upload-data:/tmp/uploads
+      - hf-cache:/hf_cache
 
   cpu-worker:
     build:
@@ -35,6 +38,7 @@ services:
     environment:
       - DEVICE=cpu
       - WHISPER_COMPUTE_TYPE=float32
+      - HF_CACHE_DIR=/hf_cache
     depends_on:
       redis:
         condition: service_healthy
@@ -52,6 +56,7 @@ services:
       start_period: 5s
     volumes:
       - upload-data:/tmp/uploads
+      - hf-cache:/hf_cache
 
   gpu-worker:
     build:
@@ -65,6 +70,7 @@ services:
     environment:
       - DEVICE=cuda
       - WHISPER_COMPUTE_TYPE=float16
+      - HF_CACHE_DIR=/hf_cache
     depends_on:
       redis:
         condition: service_healthy
@@ -82,6 +88,7 @@ services:
       start_period: 5s
     volumes:
       - upload-data:/tmp/uploads
+      - hf-cache:/hf_cache
 
   flower:
     build:
@@ -96,9 +103,14 @@ services:
         condition: service_healthy
     command: >
       celery -A celery_app flower
+      --address=0.0.0.0
       --port=5555
     ports:
       - "5555:5555"
+    environment:
+      - HF_CACHE_DIR=/hf_cache
+    volumes:
+      - hf-cache:/hf_cache
 
   redis:
     image: redis:7-alpine
@@ -118,10 +130,8 @@ services:
     restart: on-failure
     ports:
       - "1080:1080"
-    volumes:
-      - upload-data:/tmp/uploads
-
 
 volumes:
   upload-data:
   redis-data:
+  hf-cache:

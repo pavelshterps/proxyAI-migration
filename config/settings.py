@@ -17,30 +17,28 @@ CELERY_TIMEZONE: str       = os.getenv("CELERY_TIMEZONE", "UTC")
 # Uploads
 UPLOAD_FOLDER: str       = os.getenv("UPLOAD_FOLDER", "/tmp/uploads")
 FILE_RETENTION_DAYS: int = int(os.getenv("FILE_RETENTION_DAYS", "7"))
-MAX_FILE_SIZE: int       = int(os.getenv("MAX_FILE_SIZE", str(1024*1024*1024)))
+MAX_FILE_SIZE: int       = int(os.getenv("MAX_FILE_SIZE", str(1024 * 1024 * 1024)))
 MAX_FILE_SIZE_MB: int    = MAX_FILE_SIZE // (1024 * 1024)
 
 TUS_ENDPOINT: str   = os.getenv("TUS_ENDPOINT", "http://tusd:1080/files/")
 SNIPPET_FORMAT: str = os.getenv("SNIPPET_FORMAT", "wav")
 
-# Huggingface & caching
+# Hugging Face & caching
 HUGGINGFACE_TOKEN: str = os.getenv("HUGGINGFACE_TOKEN", "")
-HF_CACHE_DIR: str      = os.getenv("HF_HOME", "/tmp/hf_cache")
-MPLCONFIGDIR: str      = os.getenv("MPLCONFIGDIR", "/tmp")
+HF_CACHE_DIR: str      = os.getenv("HF_CACHE_DIR", "/hf_cache")
 
-# Model params
-WHISPER_MODEL_NAME: str   = os.getenv("WHISPER_MODEL", "openai/whisper-large-v2")
+# Model parameters
+WHISPER_MODEL_NAME: str   = os.getenv("WHISPER_MODEL", "Systran/faster-whisper-large-v3")
 ALIGN_MODEL_NAME: str     = os.getenv("ALIGN_MODEL_NAME", "whisper-large")
 ALIGN_BEAM_SIZE: int      = int(os.getenv("ALIGN_BEAM_SIZE", "5"))
-LOAD_IN_8BIT: bool        = os.getenv("LOAD_IN_8BIT", "false").lower() in ("1", "true", "yes")
 
-# Device and compute type for Whisper
+# Device and compute for Whisper
 DEVICE: str               = os.getenv("DEVICE", "cpu")
 WHISPER_COMPUTE_TYPE: str = os.getenv("WHISPER_COMPUTE_TYPE", "float32")
 
 # Pyannote protocol
 PYANNOTE_PROTOCOL: str    = os.getenv("PYANNOTE_PROTOCOL", "pyannote/speaker-diarization")
 
-# Database & other
+# Database & Redis URLs
 DATABASE_URL: str = os.getenv("DATABASE_URL", "")
 REDIS_URL: str    = os.getenv("REDIS_URL", "redis://redis:6379")
