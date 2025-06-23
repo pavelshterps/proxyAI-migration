@@ -60,7 +60,7 @@ services:
     restart: on-failure
     env_file:
       - .env
-      - .env.example
+    #  - .env.example
     environment:
       - DEVICE=cpu
       - WHISPER_COMPUTE_TYPE=float32
@@ -89,7 +89,7 @@ services:
     runtime: nvidia
     env_file:
       - .env
-      - .env.example
+  #    - .env.example
     environment:
       - DEVICE=cuda
       - WHISPER_COMPUTE_TYPE=float16
