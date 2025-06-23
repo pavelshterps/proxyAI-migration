@@ -61,6 +61,9 @@ services:
     env_file:
       - .env
       - .env.example
+    environment:
+      - DEVICE=cpu
+      - WHISPER_COMPUTE_TYPE=float32
     depends_on:
       redis:
         condition: service_healthy
@@ -71,7 +74,7 @@ services:
       --loglevel=info
       -E
     healthcheck:
-      test: ["CMD-SHELL", "pgrep -f 'celery.*worker' || exit 1"]
+      test: [ "CMD-SHELL", "pgrep -f 'celery.*worker' || exit 1" ]
       interval: 30s
       timeout: 10s
       retries: 3
