@@ -117,7 +117,7 @@ services:
       - redis-data:/data
 
   tusd:
-    image: tusproject/tusd:v1.1.7
+    image: tus/tusd:latest
     container_name: proxyai-tusd
     restart: on-failure
     ports:
