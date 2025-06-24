@@ -12,7 +12,7 @@ from celery_app import celery_app
 from config.settings import UPLOAD_FOLDER, FASTAPI_PORT, MAX_FILE_SIZE
 from tasks import diarize_full
 
-# Логирование
+# Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("app")
 
@@ -37,6 +37,7 @@ async def start_transcription(file: UploadFile = File(...)):
     dest_path = os.path.join(UPLOAD_FOLDER, filename)
     async with aiofiles.open(dest_path, 'wb') as out_file:
         await out_file.write(data)
+    # Запускаем диаризацию на CPU-воркере
     task = diarize_full.apply_async((dest_path,), queue="preprocess_cpu")
     logger.info("Submitted diarization task %s for file %s", task.id, dest_path)
     return JSONResponse({"task_id": task.id})
@@ -51,11 +52,14 @@ async def get_result(task_id: str):
         return JSONResponse({"status": "FAILURE", "error": str(ar.result)}, status_code=500)
 
     result = ar.result
-    if isinstance(result, dict):
-        return {"status": "SUCCESS", **result}
+    # Если результат диаризации — список сегментов
     if isinstance(result, list):
-        return {"status": "SUCCESS", "segments": result}
-    return {"status": "SUCCESS", "data": result}
+        return JSONResponse({"status": "SUCCESS", "segments": result})
+    # Если результат транскрипции — словарь с текстом и спикерами
+    if isinstance(result, dict):
+        return JSONResponse({"status": "SUCCESS", **result})
+    # Любой другой тип результата
+    return JSONResponse({"status": "SUCCESS", "data": result})
 
 @app.get("/health")
 def health_check():
