@@ -1,8 +1,7 @@
 import os
 import uuid
 import logging
-
-# Ensure Matplotlib has a writable config directory
+# гарантируем Writable MPLCONFIGDIR
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/.config/matplotlib")
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
@@ -13,9 +12,8 @@ import aiofiles
 
 from celery_app import celery_app
 from config.settings import UPLOAD_FOLDER, FASTAPI_PORT, MAX_FILE_SIZE
-from tasks import diarize_full
+from tasks import transcribe_full
 
-# Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("app")
 
@@ -26,7 +24,7 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 async def root():
     index_path = os.path.join("static", "index.html")
     if not os.path.isfile(index_path):
-        raise HTTPException(status_code=500, detail="Index not found")
+        raise HTTPException(status_code=500, detail="Index file not found")
     return HTMLResponse(open(index_path, "r", encoding="utf-8").read())
 
 @app.post("/transcribe", status_code=202)
@@ -37,11 +35,11 @@ async def start_transcription(file: UploadFile = File(...)):
     os.makedirs(UPLOAD_FOLDER, exist_ok=True)
     ext = os.path.splitext(file.filename)[1] or ".wav"
     filename = f"{uuid.uuid4().hex}{ext}"
-    dest_path = os.path.join(UPLOAD_FOLDER, filename)
-    async with aiofiles.open(dest_path, 'wb') as out_file:
-        await out_file.write(data)
-    task = diarize_full.apply_async((dest_path,), queue="preprocess_cpu")
-    logger.info("Submitted diarization task %s for file %s", task.id, dest_path)
+    dest = os.path.join(UPLOAD_FOLDER, filename)
+    async with aiofiles.open(dest, "wb") as f:
+        await f.write(data)
+    task = transcribe_full.apply_async((dest,), queue="default")
+    logger.info("Submitted transcription task %s for file %s", task.id, dest)
     return JSONResponse({"task_id": task.id})
 
 @app.get("/result/{task_id}")
@@ -54,13 +52,13 @@ async def get_result(task_id: str):
         return JSONResponse({"status": "FAILURE", "error": str(ar.result)}, status_code=500)
 
     result = ar.result
-    # If diarization result (list of segments)
-    if isinstance(result, list):
-        return JSONResponse({"status": "SUCCESS", "segments": result})
-    # If transcription result (dict with text)
+    # если результат – словарь (финальная транскрипция)
     if isinstance(result, dict):
         return JSONResponse({"status": "SUCCESS", **result})
-    # Fallback for other types
+    # если это список (только диаризация)
+    if isinstance(result, list):
+        return JSONResponse({"status": "SUCCESS", "segments": result})
+    # fallback
     return JSONResponse({"status": "SUCCESS", "data": result})
 
 @app.get("/health")

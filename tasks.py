@@ -1,103 +1,70 @@
 import os
-import logging
-from typing import List, Tuple, Dict
-
 from celery_app import celery_app
 from config.settings import (
-    HUGGINGFACE_TOKEN,
-    PYANNOTE_PROTOCOL,
-    WHISPER_MODEL_NAME,
     DEVICE,
-    WHISPER_COMPUTE_TYPE
+    WHISPER_COMPUTE_TYPE,
+    WHISPER_MODEL,
+    ALIGN_BEAM_SIZE,
+    PYANNOTE_PROTOCOL,
 )
-from pyannote.audio import Pipeline
 from faster_whisper import WhisperModel
-from huggingface_hub import snapshot_download
-import librosa
+from pyannote.audio import Pipeline
 
-logger = logging.getLogger(__name__)
-
-# Кешируем загрузку моделей
+# однократные загрузки моделей
 _diarizer = None
-_model = None
+_whisper_model = None
 
-def get_diarizer() -> Pipeline:
+def get_diarizer():
     global _diarizer
     if _diarizer is None:
-        logger.info("Loading diarization model '%s'", PYANNOTE_PROTOCOL)
-        _diarizer = Pipeline.from_pretrained(
-            PYANNOTE_PROTOCOL,
-            use_auth_token=HUGGINGFACE_TOKEN
-        )
+        token = os.getenv("HUGGINGFACE_TOKEN")
+        _diarizer = Pipeline.from_pretrained(PYANNOTE_PROTOCOL, use_auth_token=token)
     return _diarizer
 
-def get_model() -> WhisperModel:
-    global _model
-    if _model is None:
-        # Скачиваем модель в кэш один раз
-        logger.info("Downloading Whisper model '%s' via HuggingFace Hub", WHISPER_MODEL_NAME)
-        model_path = snapshot_download(
-            WHISPER_MODEL_NAME,
-            use_auth_token=HUGGINGFACE_TOKEN
-        )
-        logger.info(
-            "Loading Whisper model from '%s' on %s (compute_type=%s)",
-            model_path, DEVICE, WHISPER_COMPUTE_TYPE
-        )
-        _model = WhisperModel(
-            model_path,
+def get_whisper_model():
+    global _whisper_model
+    if _whisper_model is None:
+        cache_dir = os.getenv("HF_HOME", "/tmp/hf_cache")
+        _whisper_model = WhisperModel(
+            WHISPER_MODEL,
             device=DEVICE,
-            device_index=0,
             compute_type=WHISPER_COMPUTE_TYPE,
-            tensor_parallel=False
+            cache_dir=cache_dir
         )
-    return _model
+    return _whisper_model
 
-@celery_app.task(name="tasks.diarize_full", queue="preprocess_cpu")
-def diarize_full(filepath: str) -> List[Tuple[float, float]]:
-    """
-    Делает диаризацию всего файла, возвращает сегменты,
-    и ставит задачу транскрипции на GPU.
-    """
-    diarizer = get_diarizer()
-    diarization = diarizer(filepath)
-    segments = [(t.start, t.end) for t, _, _ in diarization.itertracks(yield_label=True)]
-    # запустить транскрипцию в GPU-очереди
-    transcribe_segments.apply_async((filepath, segments), queue="preprocess_gpu")
+@celery_app.task
+def diarize_full(filepath):
+    pipeline = get_diarizer()
+    output = pipeline(filepath)
+    segments = []
+    for turn, _, speaker in output.itertracks(yield_label=True):
+        segments.append({
+            "start": turn.start,
+            "end": turn.end,
+            "speaker": speaker
+        })
     return segments
 
-@celery_app.task(name="tasks.transcribe_segments", queue="preprocess_gpu")
-def transcribe_segments(filepath: str, segments: List[Tuple[float, float]]) -> Dict:
-    """
-    Делит каждый сегмент на куски по 30 секунд и транскрибирует на GPU.
-    Возвращает полный текст и удаляет файл.
-    """
-    model = get_model()
-    texts: List[str] = []
+@celery_app.task
+def transcribe_segments(filepath):
+    model = get_whisper_model()
+    text_segments, _ = model.transcribe(filepath, beam_size=ALIGN_BEAM_SIZE)
+    return {"text": " ".join([seg.text for seg in text_segments])}
 
-    for start, end in segments:
-        remaining = end - start
-        offset = start
-        while remaining > 0:
-            chunk_dur = min(remaining, 30.0)
-            audio, _ = librosa.load(
-                filepath,
-                sr=16000,
-                offset=offset,
-                duration=chunk_dur
-            )
-            segment_result, _ = model.transcribe(audio)
-            texts.append(" ".join(s.text for s in segment_result))
-            offset += chunk_dur
-            remaining -= chunk_dur
-
-    full_text = "\n".join(texts)
-    result = {"text": full_text}
-
-    # Удаляем файл после обработки, чтобы не разрастался диск
-    try:
-        os.remove(filepath)
-    except Exception:
-        logger.exception("Failed to delete %s", filepath)
-
-    return result
+@celery_app.task
+def transcribe_full(filepath):
+    # Сначала диаризация
+    segments = diarize_full(filepath)
+    model = get_whisper_model()
+    full_text = []
+    for seg in segments:
+        start, end = seg["start"], seg["end"]
+        text_segments, _ = model.transcribe(
+            filepath,
+            beam_size=ALIGN_BEAM_SIZE,
+            segment_timestamps=[(start, end)]
+        )
+        # добавляем первый (и единственный) фрагмент
+        full_text.append(text_segments[0].text)
+    return {"text": " ".join(full_text), "segments": segments}
