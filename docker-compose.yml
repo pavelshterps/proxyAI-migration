@@ -35,7 +35,7 @@ services:
   gpu-worker:
     build:
       context: .
-      target: gpu-worker
+      dockerfile: Dockerfile.gpu
     restart: always
     env_file: .env
     user: "1000:1000"
