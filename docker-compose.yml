@@ -1,137 +1,69 @@
-version: "3.9"
+version: "3.8"
 
 services:
+  redis:
+    image: redis:7-alpine
+    restart: always
+
   api:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: proxyai-api
-    restart: on-failure
-    env_file:
-      - .env
-    environment:
-      - HF_CACHE_DIR=/hf_cache
+    restart: always
+    env_file: .env
+    volumes:
+      - upload-data:/tmp/uploads
     ports:
       - "8000:8000"
     depends_on:
-      redis:
-        condition: service_healthy
-      tusd:
-        condition: service_started
-    healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:8000/health || exit 1"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-    volumes:
-      - upload-data:/tmp/uploads
-      - hf-cache:/hf_cache
+      - redis
 
   cpu-worker:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: proxyai-cpu-worker
-    restart: on-failure
-    env_file:
-      - .env
+    restart: always
+    env_file: .env
     environment:
       - DEVICE=cpu
-      - WHISPER_COMPUTE_TYPE=float32
-      - HF_CACHE_DIR=/hf_cache
+    volumes:
+      - upload-data:/tmp/uploads
     depends_on:
-      redis:
-        condition: service_healthy
+      - redis
     command: >
       celery -A celery_app worker
-      -Q preprocess
+      -Q preprocess_cpu
       --concurrency=${CELERY_CONCURRENCY}
       --loglevel=info
       -E
-    healthcheck:
-      test: ["CMD-SHELL", "pgrep -f 'celery.*worker' || exit 1"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 5s
-    volumes:
-      - upload-data:/tmp/uploads
-      - hf-cache:/hf_cache
 
   gpu-worker:
     build:
       context: .
       dockerfile: Dockerfile.gpu
-    container_name: proxyai-gpu-worker
-    restart: on-failure
-    runtime: nvidia
-    env_file:
-      - .env
+    restart: always
+    env_file: .env
     environment:
       - DEVICE=cuda
-      - WHISPER_COMPUTE_TYPE=float16
-      - HF_CACHE_DIR=/hf_cache
+    volumes:
+      - upload-data:/tmp/uploads
     depends_on:
-      redis:
-        condition: service_healthy
+      - redis
     command: >
       celery -A celery_app worker
-      -Q preprocess
+      -Q preprocess_gpu
       --concurrency=1
       --loglevel=info
       -E
-    healthcheck:
-      test: ["CMD-SHELL", "pgrep -f 'celery.*worker' || exit 1"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 5s
-    volumes:
-      - upload-data:/tmp/uploads
-      - hf-cache:/hf_cache
 
   flower:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: proxyai-flower
-    restart: on-failure
-    env_file:
-      - .env
-    depends_on:
-      redis:
-        condition: service_healthy
-    command: >
-      celery -A celery_app flower
-      --address=0.0.0.0
-      --port=5555
+    image: mher/flower
+    restart: always
     ports:
       - "5555:5555"
-    environment:
-      - HF_CACHE_DIR=/hf_cache
-    volumes:
-      - hf-cache:/hf_cache
-
-  redis:
-    image: redis:7-alpine
-    container_name: proxyai-redis
-    restart: on-failure
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-    volumes:
-      - redis-data:/data
-
-  tusd:
-    image: tusproject/tusd:latest
-    container_name: proxyai-tusd
-    restart: on-failure
-    ports:
-      - "1080:1080"
+    command: >
+      flower
+      --broker=redis://redis:6379/0
 
 volumes:
   upload-data:
-  redis-data:
-  hf-cache:

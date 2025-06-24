@@ -1,29 +1,27 @@
 from celery import Celery
-from dotenv import load_dotenv
-import os
+from kombu import Exchange, Queue
+from config.settings import (
+    CELERY_BROKER_URL,
+    CELERY_RESULT_BACKEND,
+    CELERY_CONCURRENCY,
+    CELERY_TIMEZONE,
+)
 
-# Load environment variables from .env
-load_dotenv()
-
-# Create the Celery application, including our tasks module
 celery_app = Celery(
-    "proxyai",
-    broker=os.getenv("CELERY_BROKER_URL"),
-    backend=os.getenv("CELERY_RESULT_BACKEND"),
-    include=["tasks"],  # ensures tasks.py is imported
+    'proxyai',
+    broker=CELERY_BROKER_URL,
+    backend=CELERY_RESULT_BACKEND,
 )
 
-# Basic Celery configuration
 celery_app.conf.update(
-    result_extended=True,
-    accept_content=["json"],
-    task_serializer="json",
-    result_serializer="json",
-    enable_utc=True,
-    timezone=os.getenv("CELERY_TIMEZONE", "UTC"),
+    timezone=CELERY_TIMEZONE,
+    worker_prefetch_multiplier=1,
+    task_acks_late=True,
+    worker_concurrency=CELERY_CONCURRENCY,
 )
 
-# Route only the transcribe_full task onto the preprocess queue
-celery_app.conf.task_routes = {
-    "tasks.transcribe_full": {"queue": "preprocess"},
-}
+# Определяем две очереди: для CPU-задач и для GPU-задач
+celery_app.conf.task_queues = (
+    Queue('preprocess_cpu', Exchange('preprocess_cpu'), routing_key='preprocess_cpu'),
+    Queue('preprocess_gpu', Exchange('preprocess_gpu'), routing_key='preprocess_gpu'),
+)

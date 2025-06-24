@@ -27,15 +27,11 @@ async def root():
 
 @app.post("/transcribe", status_code=202)
 async def start_transcription(file: UploadFile = File(...)):
-    # Read and check file size
     data = await file.read()
     if len(data) > MAX_FILE_SIZE_MB * 1024 * 1024:
         raise HTTPException(413, "File too large")
 
-    # Ensure upload folder exists
     os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-
-    # Save file with a unique name in shared volume
     ext = os.path.splitext(file.filename)[1]
     filename = f"{uuid.uuid4().hex}{ext}"
     dest_path = os.path.join(UPLOAD_FOLDER, filename)
@@ -43,8 +39,8 @@ async def start_transcription(file: UploadFile = File(...)):
     async with aiofiles.open(dest_path, 'wb') as out_file:
         await out_file.write(data)
 
-    # Enqueue Celery task
-    task = transcribe_full.delay(dest_path)
+    # Отправляем задачу в очередь GPU
+    task = transcribe_full.apply_async((dest_path,), queue="preprocess_gpu")
     logger.info("Submitted transcription task ID %s for file %s", task.id, dest_path)
 
     return JSONResponse({"task_id": task.id})
@@ -59,7 +55,6 @@ async def get_result(task_id: str):
         result = ar.get()
         text = result.get("text") if isinstance(result, dict) else str(result)
         return {"status": state, "text": text}
-    # FAILURE or other states
     return JSONResponse({"status": state, "error": str(ar.info)}, status_code=500)
 
 @app.get("/health")
