@@ -1,10 +1,16 @@
-import os, uuid, logging
-from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
+import os
+import uuid
+import logging
+
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from celery.result import AsyncResult
+
 from celery_app import celery_app
 from config.settings import UPLOAD_FOLDER, FASTAPI_PORT, MAX_FILE_SIZE_MB
+from tasks import transcribe_full
+import aiofiles
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("app")
@@ -14,36 +20,52 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 
 @app.get("/", response_class=HTMLResponse)
 async def root():
-    path = os.path.join("static", "index.html")
-    if not os.path.isfile(path):
-        raise HTTPException(500, f"Index not found")
-    return HTMLResponse(open(path).read())
+    index_path = os.path.join("static", "index.html")
+    if not os.path.isfile(index_path):
+        raise HTTPException(500, "Index not found")
+    return HTMLResponse(open(index_path, "r").read())
 
 @app.post("/transcribe", status_code=202)
-async def start(file: UploadFile = File(...), background: BackgroundTasks = None):
+async def start_transcription(file: UploadFile = File(...)):
+    # Read and check file size
     data = await file.read()
     if len(data) > MAX_FILE_SIZE_MB * 1024 * 1024:
         raise HTTPException(413, "File too large")
+
+    # Ensure upload folder exists
     os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
+    # Save file with a unique name in shared volume
     ext = os.path.splitext(file.filename)[1]
-    dest = os.path.join(UPLOAD_FOLDER, f"{uuid.uuid4().hex}{ext}")
-    with open(dest, "wb") as f:
-        f.write(data)
-    if background:
-        background.add_task(lambda p=dest: os.remove(p))
-    job = celery_app.send_task("tasks.transcribe_full", args=[dest])
-    logger.info("Submitted task %s", job.id)
-    return JSONResponse({"task_id": job.id})
+    filename = f"{uuid.uuid4().hex}{ext}"
+    dest_path = os.path.join(UPLOAD_FOLDER, filename)
+
+    async with aiofiles.open(dest_path, 'wb') as out_file:
+        await out_file.write(data)
+
+    # Enqueue Celery task
+    task = transcribe_full.delay(dest_path)
+    logger.info("Submitted transcription task ID %s for file %s", task.id, dest_path)
+
+    return JSONResponse({"task_id": task.id})
 
 @app.get("/result/{task_id}")
-async def result(task_id: str):
+async def get_result(task_id: str):
     ar = AsyncResult(task_id, app=celery_app)
-    st = ar.state
-    if st in ("PENDING","STARTED"):
-        return JSONResponse({"status": st}, 202)
-    if st == "SUCCESS":
-        data = ar.get()
-        # merge_results now returns {"text":...}
-        text = data.get("text") if isinstance(data, dict) else str(data)
-        return {"status": st, "text": text}
-    return JSONResponse({"status": st, "error": str(ar.info)}, 500)
+    state = ar.state
+    if state in ("PENDING", "STARTED"):
+        return JSONResponse({"status": state}, status_code=202)
+    if state == "SUCCESS":
+        result = ar.get()
+        text = result.get("text") if isinstance(result, dict) else str(result)
+        return {"status": state, "text": text}
+    # FAILURE or other states
+    return JSONResponse({"status": state, "error": str(ar.info)}, status_code=500)
+
+@app.get("/health")
+def health_check():
+    return {"status": "ok"}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=FASTAPI_PORT)
