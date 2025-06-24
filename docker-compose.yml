@@ -57,13 +57,13 @@ services:
       -E
 
   flower:
-    image: mher/flower
+    image: mher/flower:0.9.7
     restart: always
     ports:
       - "5555:5555"
-    command: >
-      flower
-      --broker=redis://redis:6379/0
+    command:
+      - flower
+      - --broker=redis://redis:6379/0
 
 volumes:
   upload-data:
