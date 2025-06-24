@@ -17,7 +17,7 @@ import librosa
 
 logger = logging.getLogger(__name__)
 
-# Ленивые глобальные инстансы
+# Глобальные ленивые инстансы
 _diarizer = None
 _model = None
 
@@ -38,17 +38,20 @@ def get_model():
             "Loading Whisper model '%s' on %s with compute_type=%s",
             WHISPER_MODEL_NAME, DEVICE, WHISPER_COMPUTE_TYPE
         )
+        # Ограничиваем потоки, чтобы не вываливаться с OOM/SIGSEGV
         _model = WhisperModel(
             WHISPER_MODEL_NAME,
             device=DEVICE,
-            compute_type=WHISPER_COMPUTE_TYPE
+            compute_type=WHISPER_COMPUTE_TYPE,
+            inter_threads=1,
+            intra_threads=1
         )
     return _model
 
 @celery_app.task(name="tasks.diarize_full", queue="preprocess_cpu")
 def diarize_full(filepath: str) -> List[Tuple[float, float]]:
     """
-    Запускает полную диаризацию на CPU и ставит в очередь транскрипцию.
+    Диаризация на всём файле на CPU, затем отправка задачи транскрипции.
     Возвращает список сегментов (start, end).
     """
     logger.info("Diarization on CPU for %s", filepath)
@@ -58,23 +61,28 @@ def diarize_full(filepath: str) -> List[Tuple[float, float]]:
         (turn.start, turn.end)
         for turn, _, _ in diarization.itertracks(yield_label=True)
     ]
-    # Далее — транскрипция на GPU
+    # Ставим транскрипцию в очередь GPU
     transcribe_segments.apply_async((filepath, segments), queue="preprocess_gpu")
     return segments
 
 @celery_app.task(name="tasks.transcribe_segments", queue="preprocess_gpu")
 def transcribe_segments(filepath: str, segments: List[Tuple[float, float]]) -> Dict:
     """
-    Запускает Whisper chunked-транскрипцию на GPU для переданных сегментов.
-    В конце удаляет файл.
+    Чанк-транскрипция на GPU для переданных сегментов.
+    Удаляет исходный файл после обработки.
     """
     logger.info("Transcription on GPU for %s (%d segments)", filepath, len(segments))
     result: Dict = {}
     try:
         model = get_model()
-        texts = []
+        texts: List[str] = []
         for start, end in segments:
-            audio, _ = librosa.load(filepath, sr=16000, offset=start, duration=end - start)
+            audio, _ = librosa.load(
+                filepath,
+                sr=16000,
+                offset=start,
+                duration=end - start
+            )
             segments_text, _ = model.transcribe(audio)
             texts.append(" ".join(seg.text for seg in segments_text))
         result = {"text": "\n".join(texts)}
@@ -82,10 +90,9 @@ def transcribe_segments(filepath: str, segments: List[Tuple[float, float]]) -> D
         logger.exception("Error during transcription for %s", filepath)
         result = {"error": "Transcription failed"}
     finally:
-        # Убираем исходный файл
+        # Удаляем файл после обработки
         try:
-            if os.path.exists(filepath):
-                os.remove(filepath)
+            os.remove(filepath)
         except Exception:
-            pass
+            logger.exception("Failed to delete %s", filepath)
     return result
