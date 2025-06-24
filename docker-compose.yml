@@ -49,6 +49,8 @@ services:
       - upload-data:/tmp/uploads
     depends_on:
       - redis
+    # Передаём все GPU в контейнер
+    gpus: all
     command: >
       celery -A celery_app worker
       -Q preprocess_gpu
