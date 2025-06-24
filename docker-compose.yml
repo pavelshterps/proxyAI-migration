@@ -54,6 +54,10 @@ services:
     depends_on:
       - redis
     runtime: nvidia
+    deploy:
+      resources:
+        limits:
+          memory: 4g
     command:
       - celery
       - -A
