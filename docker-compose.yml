@@ -45,7 +45,6 @@ services:
       - upload-data:/tmp/uploads
     depends_on:
       - redis
-    gpus: all
     command: celery -A celery_app worker --loglevel=info --concurrency=1 -Q preprocess_gpu
 
   flower:
