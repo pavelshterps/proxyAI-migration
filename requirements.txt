@@ -32,4 +32,3 @@ numpy>=2.0.2
 
 # Audio processing
 librosa
-ctranslate2==3.27.0
