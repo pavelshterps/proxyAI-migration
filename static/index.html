@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <title>Audio Transcription</title>
+  <title>ProxyAI Transcription</title>
   <style>
     body { font-family: sans-serif; margin: 2rem; }
     #status { margin-top: 1rem; font-weight: bold; }
@@ -11,58 +11,66 @@
 </head>
 <body>
   <h1>Загрузите аудио для транскрипции</h1>
-  <input type="file" id="audioFile" accept="audio/*" />
-  <button id="uploadBtn">Загрузить</button>
+  <form id="upload-form">
+    <input type="file" id="audioFile" accept="audio/*" required />
+    <button type="submit">Загрузить и транскрибировать</button>
+  </form>
   <div id="status"></div>
   <pre id="output"></pre>
 
   <script>
-    const uploadBtn = document.getElementById('uploadBtn');
-    const audioFile = document.getElementById('audioFile');
+    const form = document.getElementById('upload-form');
     const statusDiv = document.getElementById('status');
     const output = document.getElementById('output');
-    let taskId = null;
 
-    uploadBtn.addEventListener('click', async () => {
-      if (!audioFile.files.length) {
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const fileInput = document.getElementById('audioFile');
+      if (!fileInput.files.length) {
         alert('Пожалуйста, выберите аудиофайл.');
         return;
       }
-      statusDiv.textContent = 'Загрузка и запуск транскрипции…';
+
+      statusDiv.textContent = 'Загрузка и создание задачи транскрипции…';
       output.textContent = '';
 
       const formData = new FormData();
-      formData.append('file', audioFile.files[0]);
+      formData.append('file', fileInput.files[0]);
 
       const resp = await fetch('/transcribe', {
         method: 'POST',
         body: formData
       });
+
       if (!resp.ok) {
-        statusDiv.textContent = 'Ошибка при отправке файла';
+        statusDiv.textContent = `Ошибка при отправке: ${resp.status} ${resp.statusText}`;
         return;
       }
 
-      const data = await resp.json();
-      taskId = data.task_id;
-      statusDiv.textContent = `Задача запущена: ${taskId}. Ожидание результата…`;
-      pollResult();
-    });
+      const { task_id } = await resp.json();
+      statusDiv.textContent = `Задача запущена (ID: ${task_id}). Ожидание результата…`;
 
-    async function pollResult() {
-      const res = await fetch(`/result/${taskId}`);
-      const data = await res.json();
-
-      if (data.status === 'SUCCESS') {
-        statusDiv.textContent = 'Готово!';
-        output.textContent = data.text;
-      } else if (data.status === 'FAILED') {
-        statusDiv.textContent = `Ошибка: ${data.error || 'неизвестная'}`;
-      } else {
-        statusDiv.textContent = `Статус: ${data.status}…`;
-        setTimeout(pollResult, 2000);
+      // Poll for result
+      async function poll() {
+        const r = await fetch(`/result/${task_id}`);
+        if (r.status === 202) {
+          statusDiv.textContent = 'Статус: в процессе…';
+          setTimeout(poll, 2000);
+        } else if (r.ok) {
+          const data = await r.json();
+          if (data.status === 'SUCCESS') {
+            statusDiv.textContent = 'Готово!';
+            output.textContent = data.text;
+          } else {
+            statusDiv.textContent = `Ошибка: ${data.error || 'неизвестная'}`;
+          }
+        } else {
+          statusDiv.textContent = `Ошибка при получении результата: ${r.status} ${r.statusText}`;
+        }
       }
-    }
+
+      poll();
+    });
   </script>
 </body>
 </html>
