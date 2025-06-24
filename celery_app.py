@@ -1,7 +1,6 @@
 import os
 from celery import Celery
 
-# Считываем настройки
 from config.settings import CELERY_BROKER_URL, CELERY_RESULT_BACKEND
 
 celery_app = Celery("proxyai")
@@ -17,3 +16,6 @@ celery_app.conf.update(
         "tasks.transcribe_segments": {"queue": "preprocess_gpu"},
     },
 )
+
+# Import tasks so they get registered with Celery
+import tasks  # noqa: F401
