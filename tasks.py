@@ -42,7 +42,9 @@ def get_model():
         _model = WhisperModel(
             WHISPER_MODEL_NAME,
             device=DEVICE,
-            compute_type=WHISPER_COMPUTE_TYPE
+            device_index=0,
+            compute_type=WHISPER_COMPUTE_TYPE,
+            tensor_parallel=False
         )
     return _model
 
