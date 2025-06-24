@@ -30,12 +30,16 @@ services:
       - upload-data:/tmp/uploads
     depends_on:
       - redis
-    command: >
-      celery -A celery_app worker
-      -Q preprocess_cpu
-      --concurrency=3        # 3 потока на 4-ядерном CPU
-      --loglevel=info
-      -E
+    command:
+      - celery
+      - -A
+      - celery_app
+      - worker
+      - -Q
+      - preprocess_cpu
+      - --concurrency=3
+      - --loglevel=info
+      - -E
 
   gpu-worker:
     build:
@@ -49,13 +53,17 @@ services:
       - upload-data:/tmp/uploads
     depends_on:
       - redis
-    runtime: nvidia          # пропускаем GPU внутрь контейнера
-    command: >
-      celery -A celery_app worker
-      -Q preprocess_gpu
-      --concurrency=1        # 1 процесс на 4 ГБ vGPU L4
-      --loglevel=info
-      -E
+    runtime: nvidia
+    command:
+      - celery
+      - -A
+      - celery_app
+      - worker
+      - -Q
+      - preprocess_gpu
+      - --concurrency=1
+      - --loglevel=info
+      - -E
 
   flower:
     image: mher/flower:0.9.7
