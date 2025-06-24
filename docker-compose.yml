@@ -48,7 +48,7 @@ services:
     command: celery -A celery_app worker --loglevel=info --concurrency=1 -Q preprocess_gpu
 
   flower:
-    image: mher/flower:1.0.0
+    image: mher/flower:latest
     restart: always
     ports:
       - "5555:5555"
