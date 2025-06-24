@@ -38,13 +38,11 @@ def get_model():
             "Loading Whisper model '%s' on %s with compute_type=%s",
             WHISPER_MODEL_NAME, DEVICE, WHISPER_COMPUTE_TYPE
         )
-        # Ограничиваем потоки, чтобы не вываливаться с OOM/SIGSEGV
+        # Только три аргумента, без inter_threads/intra_threads
         _model = WhisperModel(
             WHISPER_MODEL_NAME,
             device=DEVICE,
-            compute_type=WHISPER_COMPUTE_TYPE,
-            inter_threads=1,
-            intra_threads=1
+            compute_type=WHISPER_COMPUTE_TYPE
         )
     return _model
 
