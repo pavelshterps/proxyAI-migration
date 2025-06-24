@@ -8,9 +8,10 @@ services:
   api:
     build:
       context: .
-      dockerfile: Dockerfile
+      target: api
     restart: always
     env_file: .env
+    user: "1000:1000"
     volumes:
       - upload-data:/tmp/uploads
     ports:
@@ -21,34 +22,23 @@ services:
   cpu-worker:
     build:
       context: .
-      dockerfile: Dockerfile
+      target: cpu-worker
     restart: always
     env_file: .env
-    environment:
-      - DEVICE=cpu
+    user: "1000:1000"
     volumes:
       - upload-data:/tmp/uploads
     depends_on:
       - redis
-    command:
-      - celery
-      - -A
-      - celery_app
-      - worker
-      - -Q
-      - preprocess_cpu
-      - --concurrency=3
-      - --loglevel=info
-      - -E
+    command: celery -A celery_app worker --loglevel=info --concurrency=${CELERY_CONCURRENCY} -Q preprocess_cpu
 
   gpu-worker:
     build:
       context: .
-      dockerfile: Dockerfile.gpu
+      target: gpu-worker
     restart: always
     env_file: .env
-    environment:
-      - DEVICE=cuda
+    user: "1000:1000"
     volumes:
       - upload-data:/tmp/uploads
     depends_on:
@@ -58,25 +48,14 @@ services:
       resources:
         limits:
           memory: 4g
-    command:
-      - celery
-      - -A
-      - celery_app
-      - worker
-      - -Q
-      - preprocess_gpu
-      - --concurrency=1
-      - --loglevel=info
-      - -E
+    command: celery -A celery_app worker --loglevel=info --concurrency=1 -Q preprocess_gpu
 
   flower:
     image: mher/flower:0.9.7
     restart: always
     ports:
       - "5555:5555"
-    command:
-      - flower
-      - --broker=redis://redis:6379/0
+    command: ["flower", "--broker=redis://redis:6379/0"]
 
 volumes:
   upload-data:

@@ -12,6 +12,7 @@ from config.settings import (
 )
 from pyannote.audio import Pipeline
 from faster_whisper import WhisperModel
+from huggingface_hub import snapshot_download
 import librosa
 
 logger = logging.getLogger(__name__)
@@ -33,29 +34,23 @@ def get_diarizer() -> Pipeline:
 def get_model() -> WhisperModel:
     global _model
     if _model is None:
-        logger.info(
-            "Loading Whisper model '%s' on %s (compute_type=%s)",
-            WHISPER_MODEL_NAME, DEVICE, WHISPER_COMPUTE_TYPE
+        # Скачиваем модель в кэш один раз
+        logger.info("Downloading Whisper model '%s' via HuggingFace Hub", WHISPER_MODEL_NAME)
+        model_path = snapshot_download(
+            WHISPER_MODEL_NAME,
+            use_auth_token=HUGGINGFACE_TOKEN
         )
-        try:
-            _model = WhisperModel(
-                WHISPER_MODEL_NAME,
-                device=DEVICE,
-                device_index=0,
-                compute_type=WHISPER_COMPUTE_TYPE,
-                tensor_parallel=False,
-                use_auth_token=HUGGINGFACE_TOKEN,
-                cache_dir=os.getenv("HF_CACHE_DIR", None)
-            )
-        except Exception:
-            logger.exception("Auth failed, loading without token")
-            _model = WhisperModel(
-                WHISPER_MODEL_NAME,
-                device=DEVICE,
-                device_index=0,
-                compute_type=WHISPER_COMPUTE_TYPE,
-                tensor_parallel=False
-            )
+        logger.info(
+            "Loading Whisper model from '%s' on %s (compute_type=%s)",
+            model_path, DEVICE, WHISPER_COMPUTE_TYPE
+        )
+        _model = WhisperModel(
+            model_path,
+            device=DEVICE,
+            device_index=0,
+            compute_type=WHISPER_COMPUTE_TYPE,
+            tensor_parallel=False
+        )
     return _model
 
 @celery_app.task(name="tasks.diarize_full", queue="preprocess_cpu")
