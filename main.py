@@ -2,6 +2,9 @@ import os
 import uuid
 import logging
 
+# Ensure Matplotlib has a writable config directory
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/.config/matplotlib")
+
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -37,7 +40,6 @@ async def start_transcription(file: UploadFile = File(...)):
     dest_path = os.path.join(UPLOAD_FOLDER, filename)
     async with aiofiles.open(dest_path, 'wb') as out_file:
         await out_file.write(data)
-    # Запускаем диаризацию на CPU-воркере
     task = diarize_full.apply_async((dest_path,), queue="preprocess_cpu")
     logger.info("Submitted diarization task %s for file %s", task.id, dest_path)
     return JSONResponse({"task_id": task.id})
@@ -52,13 +54,13 @@ async def get_result(task_id: str):
         return JSONResponse({"status": "FAILURE", "error": str(ar.result)}, status_code=500)
 
     result = ar.result
-    # Если результат диаризации — список сегментов
+    # If diarization result (list of segments)
     if isinstance(result, list):
         return JSONResponse({"status": "SUCCESS", "segments": result})
-    # Если результат транскрипции — словарь с текстом и спикерами
+    # If transcription result (dict with text)
     if isinstance(result, dict):
         return JSONResponse({"status": "SUCCESS", **result})
-    # Любой другой тип результата
+    # Fallback for other types
     return JSONResponse({"status": "SUCCESS", "data": result})
 
 @app.get("/health")
