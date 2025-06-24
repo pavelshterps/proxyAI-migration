@@ -8,7 +8,6 @@ services:
   api:
     build:
       context: .
-      target: api
     restart: always
     env_file: .env
     user: "1000:1000"
@@ -22,7 +21,6 @@ services:
   cpu-worker:
     build:
       context: .
-      target: cpu-worker
     restart: always
     env_file: .env
     user: "1000:1000"
