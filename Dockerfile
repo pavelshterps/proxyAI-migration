@@ -1,27 +1,34 @@
-# syntax=docker/dockerfile:1
-FROM python:3.10-slim AS base
+# Dockerfile (multi‐stage)
 
-# Устанавливаем системные зависимости и pip3
+### Stage 1: build all Python deps ###
+FROM python:3.10-slim AS builder
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-      python3 python3-pip ffmpeg && \
-    ln -sf /usr/bin/python3 /usr/bin/python && \
-    ln -sf /usr/bin/pip3 /usr/bin/pip && \
+      python3-pip ffmpeg git && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-
-# Кэшируем установку Python-зависимостей
 COPY requirements.txt .
 RUN pip3 install --no-cache-dir -r requirements.txt
 
-# Общие ресурсы приложения
+### Stage 2a: API & CPU worker ###
+FROM python:3.10-slim AS cpu
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY --from=builder /usr/local/lib/python3.10/site-packages /usr/local/lib/python3.10/site-packages
 COPY . .
-
-# Точка входа для API
-FROM base AS api
+ENV UPLOAD_FOLDER=/tmp/uploads HF_HOME=/hf_cache
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
 
-# Точка входа для CPU-воркера
-FROM base AS cpu-worker
-CMD ["celery", "-A", "celery_app", "worker", "--concurrency=4", "--queues=preprocess_cpu"]
+### Stage 2b: GPU worker ###
+FROM nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04 AS gpu
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+      python3-pip ffmpeg && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY --from=builder /usr/local/lib/python3.10/site-packages /usr/local/lib/python3.10/site-packages
+COPY . .
+ENV UPLOAD_FOLDER=/tmp/uploads HF_HOME=/hf_cache
+ENTRYPOINT ["celery", "-A", "celery_app.celery_app", "worker"]

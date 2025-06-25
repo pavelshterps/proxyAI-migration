@@ -1,96 +1,39 @@
 version: "3.8"
-
 services:
-  tusd:
-    image: tusproject/tusd:latest
-    ports:
-      - "1080:1080"
-
-  redis:
-    image: redis:7-alpine
-    ports:
-      - "6379:6379"
-
   api:
     build:
       context: .
-      dockerfile: Dockerfile
-    depends_on:
-      - redis
-      - tusd
-    environment:
-      FASTAPI_HOST: "${FASTAPI_HOST}"
-      FASTAPI_PORT: "${FASTAPI_PORT}"
-      API_WORKERS: "${API_WORKERS}"
-      CELERY_BROKER_URL: "${CELERY_BROKER_URL}"
-      CELERY_RESULT_BACKEND: "${CELERY_RESULT_BACKEND}"
-      UPLOAD_FOLDER: "${UPLOAD_FOLDER}"
-      DEVICE: "${DEVICE}"
-      WHISPER_MODEL: "${WHISPER_MODEL}"
-      WHISPER_COMPUTE_TYPE: "${WHISPER_COMPUTE_TYPE}"
-      ALIGN_MODEL_NAME: "${ALIGN_MODEL_NAME}"
-      ALIGN_BEAM_SIZE: "${ALIGN_BEAM_SIZE}"
-      PYANNOTE_PROTOCOL: "${PYANNOTE_PROTOCOL}"
-      HUGGINGFACE_TOKEN: "${HUGGINGFACE_TOKEN}"
-      DATABASE_URL: "${DATABASE_URL}"
-      REDIS_URL: "${REDIS_URL}"
+      target: cpu
     ports:
-      - "${FASTAPI_PORT}:${FASTAPI_PORT}"
+      - "${API_PORT}:8000"
 
   cpu-worker:
     build:
       context: .
-      dockerfile: Dockerfile
-    depends_on:
-      - api
-      - redis
-    command: >
-      celery -A celery_app.celery_app worker
-      --loglevel=INFO
-      --queues=preprocess_cpu
-      --concurrency=${CELERY_CONCURRENCY}
-    environment:
-      CELERY_BROKER_URL: "${CELERY_BROKER_URL}"
-      CELERY_RESULT_BACKEND: "${CELERY_RESULT_BACKEND}"
-      DEVICE: "${DEVICE}"
-      WHISPER_MODEL: "${WHISPER_MODEL}"
-      WHISPER_COMPUTE_TYPE: "${WHISPER_COMPUTE_TYPE}"
-      PYANNOTE_PROTOCOL: "${PYANNOTE_PROTOCOL}"
-      HUGGINGFACE_TOKEN: "${HUGGINGFACE_TOKEN}"
+      target: cpu
+    command: celery -A celery_app.celery_app worker --queue=preprocess_cpu --concurrency=${CELERY_CONCURRENCY}
 
   gpu-worker:
     build:
       context: .
-      dockerfile: Dockerfile.gpu
-    depends_on:
-      - api
-      - redis
-    command: >
-      celery -A celery_app.celery_app worker
-      --loglevel=INFO
-      --queues=preprocess_gpu
-      --concurrency=1
-    environment:
-      CELERY_BROKER_URL: "${CELERY_BROKER_URL}"
-      CELERY_RESULT_BACKEND: "${CELERY_RESULT_BACKEND}"
-      DEVICE: "${DEVICE}"
-      WHISPER_MODEL: "${WHISPER_MODEL}"
-      WHISPER_COMPUTE_TYPE: "${WHISPER_COMPUTE_TYPE}"
-      PYANNOTE_PROTOCOL: "${PYANNOTE_PROTOCOL}"
-      HUGGINGFACE_TOKEN: "${HUGGINGFACE_TOKEN}"
+      target: gpu
     runtime: nvidia
+    command: celery -A celery_app.celery_app worker --queue=preprocess_gpu --concurrency=1
+
+  redis:
+    image: redis:7-alpine
+
+  tusd:
+    image: tus/tusd:latest
+    ports:
+      - "1080:1080"
 
   flower:
     image: mher/flower:latest
-    depends_on:
-      - redis
-    command: >
-      celery -A celery_app.celery_app flower
-      --broker=${CELERY_BROKER_URL}
-      --port=${FLOWER_PORT:-5555}
+    command: flower --broker=${CELERY_BROKER_URL}
     ports:
-      - "${FLOWER_PORT:-5555}:${FLOWER_PORT:-5555}"
+      - "5555:5555"
 
 volumes:
-  upload-data:
   hf_cache:
+    driver: local

@@ -1,26 +1,28 @@
+# config/settings.py
 from pydantic_settings import BaseSettings
-from pydantic import Field
-
 
 class Settings(BaseSettings):
-    # Путь, куда сохраняются загруженные файлы
-    UPLOAD_FOLDER: str = Field(..., env="UPLOAD_FOLDER")
+    # path
+    UPLOAD_FOLDER: str
+    HF_HOME: str = "/hf_cache"
 
-    # Настройки Celery
-    CELERY_BROKER_URL: str = Field(..., env="CELERY_BROKER_URL")
-    CELERY_RESULT_BACKEND: str = Field(..., env="CELERY_RESULT_BACKEND")
+    # Celery
+    CELERY_BROKER_URL: str
+    CELERY_RESULT_BACKEND: str
+    CELERY_CONCURRENCY: int = 4
 
-    # Модель и токен для pyannote (диаризация)
-    PYANNOTE_MODEL: str = Field(..., env="PYANNOTE_MODEL")
-    HF_TOKEN: str = Field(..., env="HF_TOKEN")
+    # Pyannote diarization
+    PYANNOTE_MODEL: str
+    HUGGINGFACE_TOKEN: str
 
-    # Модель и настройки Whisper (транскрипция)
-    WHISPER_MODEL: str = Field(..., env="WHISPER_MODEL")
-    WHISPER_COMPUTE_TYPE: str = Field("float16", env="WHISPER_COMPUTE_TYPE")
+    # Whisper
+    WHISPER_MODEL: str
+    WHISPER_COMPUTE_TYPE: str = "float16"
+    ALIGN_BEAM_SIZE: int = 5
 
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
-
+    model_config = {
+      "env_file": ".env",
+      "extra": "ignore"
+    }
 
 settings = Settings()

@@ -1,11 +1,8 @@
 fastapi>=0.95.0
-uvicorn[standard]>=0.23.0       # стандартный Uvicorn с extra-приложениями
-python-multipart               # Multipart для UploadFile
-python-dotenv
+uvicorn[standard]>=0.23.0
 celery[redis]>=5.3.0
 faster-whisper>=1.1.1
 pyannote.audio>=3.3.2
-huggingface-hub
-pydantic-settings>=2.10.1
-pydantic>=2.10.1
-ffmpeg-python
+pydantic-settings>=2.10.0
+python-dotenv
+python-multipart
