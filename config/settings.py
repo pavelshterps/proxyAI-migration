@@ -2,7 +2,7 @@ from typing import List
 
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
-from pydantic import SettingsConfigDict
+from pydantic_settings import SettingsConfigDict
 
 
 class Settings(BaseSettings):
