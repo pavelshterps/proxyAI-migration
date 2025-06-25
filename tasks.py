@@ -1,80 +1,79 @@
 import os
-import tempfile
 from celery_app import app
-from config.settings import (
-    DEVICE,
-    WHISPER_MODEL,
-    WHISPER_COMPUTE_TYPE,
-    ALIGN_BEAM_SIZE,
-    PYANNOTE_PROTOCOL,
-    HUGGINGFACE_TOKEN
-)
-from faster_whisper import WhisperModel
+import config.settings as settings
 from pyannote.audio import Pipeline
+from faster_whisper import WhisperModel
 
-_diarizer = None
-_transcriber = None
+# Singletons so we only load each big model once per worker process
+_diarization_pipeline = None
+_whisper_model = None
 
-def get_diarizer():
-    global _diarizer
-    if _diarizer is None:
-        _diarizer = Pipeline.from_pretrained(
-            PYANNOTE_PROTOCOL,
-            use_auth_token=HUGGINGFACE_TOKEN,
-            cache_dir=os.getenv("HF_HOME")
+def get_diarization_pipeline():
+    global _diarization_pipeline
+    if _diarization_pipeline is None:
+        _diarization_pipeline = Pipeline.from_pretrained(
+            settings.PYANNOTE_PROTOCOL,
+            use_auth_token=settings.HUGGINGFACE_TOKEN
         )
-    return _diarizer
+    return _diarization_pipeline
 
-def get_transcriber():
-    global _transcriber
-    if _transcriber is None:
-        _transcriber = WhisperModel(
-            model_size_or_path=WHISPER_MODEL,
-            device=DEVICE,
+def get_whisper_model():
+    global _whisper_model
+    if _whisper_model is None:
+        _whisper_model = WhisperModel(
+            settings.WHISPER_MODEL,
+            device=settings.DEVICE,
+            compute_type=settings.WHISPER_COMPUTE_TYPE,
             device_index=0,
-            compute_type=WHISPER_COMPUTE_TYPE,
             inter_threads=1,
             intra_threads=1,
-            cache_dir=os.getenv("HF_HOME")
         )
-    return _transcriber
+    return _whisper_model
 
 @app.task(name="tasks.diarize_full", queue="preprocess_cpu")
-def diarize_full(path: str):
-    pipeline = get_diarizer()
-    output = pipeline(path)
-    segments = []
-    for turn in output.get_timeline().support():
-        segments.append({
-            "start": turn.start,
-            "end": turn.end,
-            "speaker": turn.label
-        })
-    # enqueue transcription stage
-    app.send_task(
-        "tasks.transcribe_segments",
-        args=[path, segments],
-        queue="preprocess_gpu",
-        task_id=diarize_full.request.id
-    )
-    return segments
+def diarize_full(filepath: str):
+    """
+    Run pyannote speaker‐diarization on the entire file.
+    """
+    pipeline = get_diarization_pipeline()
+    return pipeline({"audio": filepath})
 
-@app.task(name="tasks.transcribe_segments")
-def transcribe_segments(path: str, segments: list):
-    transcriber = get_transcriber()
+@app.task(name="tasks.transcribe_segments", queue="preprocess_gpu")
+def transcribe_segments(diarization_result, filepath: str):
+    """
+    For each segment from diarization, run Whisper only on that slice.
+    """
+    model = get_whisper_model()
     results = []
-    for seg in segments:
-        start, end = seg["start"], seg["end"]
-        # cut chunk
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-            tmp_path = tmp.name
-        os.system(f"ffmpeg -y -i {path} -ss {start} -to {end} {tmp_path}")
-        # transcribe chunk
-        txt_segs, _ = transcriber.transcribe(
-            tmp_path,
-            beam_size=ALIGN_BEAM_SIZE
+    timeline = diarization_result.get_timeline()
+    for segment in timeline.segments:
+        start, end = segment.start, segment.end
+        # faster-whisper returns {"segments": [...]}
+        transcription = model.transcribe(
+            filepath,
+            beam_size=settings.ALIGN_BEAM_SIZE,
+            start=start,
+            end=end
         )
-        text = " ".join([s.text for s in txt_segs])
-        results.append({**seg, "text": text})
-        os.remove(tmp_path)
+        text = " ".join(s.text for s in transcription["segments"])
+        results.append({
+            "start": start,
+            "end": end,
+            "text": text
+        })
     return results
+
+@app.task(name="tasks.transcribe_full", queue="preprocess_gpu")
+def transcribe_full(filepath: str):
+    """
+    Chunked Whisper on the whole file (if you ever want a single-pass fallback).
+    """
+    model = get_whisper_model()
+    transcription = model.transcribe(
+        filepath,
+        beam_size=settings.ALIGN_BEAM_SIZE
+    )
+    return [
+        {"start": seg.start, "end": seg.end, "text": seg.text}
+        for seg in transcription["segments"]
+    ]

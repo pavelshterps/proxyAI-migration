@@ -1,59 +1,41 @@
-# main.py
 import os
 import uuid
-from fastapi import FastAPI, UploadFile, HTTPException
-from fastapi.staticfiles import StaticFiles
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse, RedirectResponse
 from celery.result import AsyncResult
+import config.settings as settings
+from tasks import diarize_full, transcribe_segments
 
-from config.settings import settings
-from celery_app import app as celery_app
+app = FastAPI()
 
-# runtime‐create uploads folder
-os.makedirs(settings.UPLOAD_FOLDER, exist_ok=True)
+@app.get("/", include_in_schema=False)
+def root():
+    return RedirectResponse(url="/static/index.html")
 
-api = FastAPI(
-    title="ProxyAI",
-    description="Upload audio → speaker diarization → Whisper transcription",
-)
+@app.post("/transcribe")
+async def submit_transcription(file: UploadFile = File(...)):
+    ext = file.filename.split(".")[-1].lower()
+    if ext not in ["wav", "mp3", "m4a", "flac"]:
+        raise HTTPException(status_code=400, detail="Unsupported file format")
+    uid = str(uuid.uuid4())
+    dest = os.path.join(settings.UPLOAD_FOLDER, f"{uid}.{ext}")
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    with open(dest, "wb") as f:
+        f.write(await file.read())
 
-# serve only at /static
-api.mount("/static", StaticFiles(directory="static"), name="static")
+    # Chain tasks: diarize_full -> transcribe_segments
+    chain = diarize_full.s(dest) | transcribe_segments.s(dest)
+    result = chain.apply_async()
+    return {"task_id": result.id}
 
-@api.get("/", include_in_schema=False)
-async def _root():
-    # redirect root to OpenAPI docs
-    return RedirectResponse(url="/docs")
-
-@api.post("/transcribe")
-async def transcribe(file: UploadFile):
-    data = await file.read()
-    if len(data) > settings.MAX_FILE_SIZE:
-        raise HTTPException(413, "File too large")
-    task_id = str(uuid.uuid4())
-    fname = f"{task_id}.wav"
-    path = os.path.join(settings.UPLOAD_FOLDER, fname)
-    with open(path, "wb") as f:
-        f.write(data)
-
-    celery_app.send_task(
-        "tasks.diarize_full",
-        args=[path],
-        queue="preprocess_cpu",
-        task_id=task_id
-    )
-    return {"task_id": task_id}
-
-@api.get("/result/{task_id}")
-async def get_result(task_id: str):
-    res = AsyncResult(task_id, app=celery_app)
-    if res.state in ("PENDING", "STARTED"):
-        return JSONResponse(status_code=202, content={"status": res.state})
-    if res.failed:
+@app.get("/result/{task_id}")
+def get_result(task_id: str):
+    res = AsyncResult(task_id)
+    if not res.ready():
+        return JSONResponse({"status": "PENDING"}, status_code=202)
+    if res.failed():
         return JSONResponse(
-            status_code=500,
-            content={"status": "FAILURE", "error": str(res.result)}
+            {"status": "FAILURE", "error": str(res.result)},
+            status_code=500
         )
-    # successful result is a list of segments
-    segments = res.result
-    return {"status": "SUCCESS", "segments": segments}
+    return {"status": "SUCCESS", "data": res.result}
