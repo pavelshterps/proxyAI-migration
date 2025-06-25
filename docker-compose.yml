@@ -11,8 +11,6 @@ services:
       dockerfile: Dockerfile
     restart: always
     env_file: .env
-    environment:
-      - MPLCONFIGDIR=/tmp/.config/matplotlib
     user: "1000:1000"
     volumes:
       - upload-data:/tmp/uploads
@@ -33,10 +31,11 @@ services:
       - upload-data:/tmp/uploads
     depends_on:
       - redis
-    command: celery -A celery_app.app worker \
-      --loglevel=info \
-      --concurrency=${CELERY_CONCURRENCY} \
-      --queues preprocess_cpu
+    command: >
+      celery -A celery_app.celery_app worker
+      --loglevel=info
+      --concurrency=${CELERY_CONCURRENCY}
+      --queues=preprocess_cpu
 
   gpu-worker:
     build:
@@ -49,20 +48,12 @@ services:
       - upload-data:/tmp/uploads
     depends_on:
       - redis
+    # для локального docker-compose: даём runtime и лимит памяти
+    runtime: nvidia
     deploy:
       resources:
         limits:
           memory: 4g
-
-        reservations:
-            devices:
-              - driver: nvidia
-                count: 1
-                capabilities: [ gpu ]
-    command: celery -A celery_app.app worker \
-      --loglevel=info \
-      --concurrency=1 \
-      --queues preprocess_gpu
 
   flower:
     image: mher/flower:0.9.7

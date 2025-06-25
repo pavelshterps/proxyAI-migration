@@ -1,47 +1,35 @@
-import os
-import shutil
-from uuid import uuid4
-
 from fastapi import FastAPI, UploadFile, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-
-from celery_app import app as celery_app
-from config.settings import UPLOAD_FOLDER, ALLOWED_ORIGINS
+from uuid import uuid4
+import shutil, os
+from celery_app import celery_app
+from config.settings import settings
 
 app = FastAPI()
 
-# CORS
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
 @app.post("/transcribe")
 async def start_transcription(file: UploadFile):
-    # генерируем UUID и сохраняем файл во временную папку
+    if not file.filename.lower().endswith((".wav", ".mp3")):
+        raise HTTPException(status_code=400, detail="Invalid audio format")
     uid = str(uuid4())
-    dest_dir = os.path.abspath(UPLOAD_FOLDER)
-    os.makedirs(dest_dir, exist_ok=True)
-    dest = os.path.join(dest_dir, f"{uid}.wav")
-
-    try:
-        with open(dest, "wb") as out:
-            shutil.copyfileobj(file.file, out)
-    except Exception as e:
-        raise HTTPException(500, f"Failed to save upload: {e}")
-
-    # сразу ставим задачу диаризации
-    celery_app.send_task("tasks.diarize_full", args=(dest,), kwargs={})
+    dest = os.path.join(settings.UPLOAD_FOLDER, f"{uid}.wav")
+    os.makedirs(settings.UPLOAD_FOLDER, exist_ok=True)
+    with open(dest, "wb") as out:
+        shutil.copyfileobj(file.file, out)
+    # отправляем first-stage задачу с task_id=uid
+    celery_app.send_task(
+        "tasks.diarize_full",
+        args=(dest,),
+        task_id=uid,
+        queue="preprocess_cpu"
+    )
     return {"job_id": uid}
 
 @app.get("/result/{job_id}")
-async def get_result(job_id: str):
-    # результат хранится в бэкенде Celery
-    result = celery_app.backend.get(job_id)
-    if result is None:
-        return {"status": "PENDING"}
-    # отдаём список сегментов
-    return {"status": "SUCCESS", "segments": result}
+def get_result(job_id: str):
+    async_res = celery_app.AsyncResult(job_id)
+    if async_res.state in ("PENDING", "RECEIVED"):
+        return {"status": async_res.state}
+    if async_res.state == "SUCCESS":
+        return {"status": "SUCCESS", "segments": async_res.result}
+    # FAIL / RETRY / ERROR
+    return {"status": async_res.state, "detail": str(async_res.result)}
