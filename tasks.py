@@ -1,64 +1,67 @@
+import os
+import tempfile
+import ffmpeg
 from celery_app import celery_app
 from config.settings import settings
-from faster_whisper import WhisperModel
 from pyannote.audio import Pipeline
+from faster_whisper import WhisperModel
 
-_diarizer = None
-_model = None
-
-def get_diarizer():
-    global _diarizer
-    if _diarizer is None:
-        _diarizer = Pipeline.from_pretrained(
-            settings.PYANNOTE_PROTOCOL,
-            use_auth_token=settings.HUGGINGFACE_TOKEN,
-            device="cpu"
-        )
-    return _diarizer
-
-def get_model():
-    global _model
-    if _model is None:
-        _model = WhisperModel(
-            settings.WHISPER_MODEL,
-            device=settings.DEVICE,
-            device_index=0,
-            compute_type=settings.WHISPER_COMPUTE_TYPE,
-            inter_threads=settings.INTER_THREADS,
-            intra_threads=settings.INTRA_THREADS,
-            cache_dir="/hf_cache"
-        )
-    return _model
+# Диаризация на весь файл (CPU)
+diarizer = Pipeline.from_pretrained(
+    settings.PYANNOTE_PROTOCOL,
+    use_auth_token=settings.HUGGINGFACE_TOKEN,
+)
 
 @celery_app.task(name="tasks.diarize_full", queue="preprocess_cpu")
-def diarize_full(filepath: str) -> list[dict]:
-    diarizer = get_diarizer()
+def diarize_full(filepath: str):
     diarization = diarizer(filepath)
     segments = []
     for turn, _, speaker in diarization.itertracks(yield_label=True):
         segments.append({
-            "start": turn.start,
-            "end": turn.end,
+            "start": float(turn.start),
+            "end": float(turn.end),
             "speaker": speaker,
         })
+    # отсылаем каждый сегмент на GPU-транскрибуцию
+    for seg in segments:
+        transcribe_segments.apply_async(
+            args=(filepath, seg["start"], seg["end"], seg["speaker"])
+        )
     return segments
 
-@celery_app.task(name="tasks.transcribe_full", queue="preprocess_gpu")
-def transcribe_full(filepath: str, segments: list[dict]) -> dict:
-    model = get_model()
-    results = []
-    for seg in segments:
-        start, end = seg["start"], seg["end"]
-        text_segs, _ = model.transcribe(
-            filepath,
-            beam_size=settings.ALIGN_BEAM_SIZE,
-            segment=[start, end],
+# Ленивая инициализация WhisperModel
+_whisper_model = None
+def get_whisper_model():
+    global _whisper_model
+    if _whisper_model is None:
+        _whisper_model = WhisperModel(
+            settings.WHISPER_MODEL,
+            device=settings.DEVICE,
+            compute_type=settings.WHISPER_COMPUTE_TYPE,
+            device_index=0,
+            inter_threads=1,
+            intra_threads=1,
         )
-        text = "".join([t.text for t in text_segs])
-        results.append({
-            "start": start,
-            "end": end,
-            "speaker": seg["speaker"],
-            "text": text,
-        })
-    return {"segments": results}
+    return _whisper_model
+
+# Транскрипция отдельных сегментов (GPU)
+@celery_app.task(name="tasks.transcribe_segments", queue="preprocess_gpu")
+def transcribe_segments(filepath: str, start: float, end: float, speaker: str):
+    model = get_whisper_model()
+    # вырезаем сегмент во временный файл
+    snippet = tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name
+    (
+        ffmpeg
+        .input(filepath, ss=start, to=end)
+        .output(snippet, format="wav", acodec="pcm_s16le")
+        .run(quiet=True, overwrite_output=True)
+    )
+    result, _ = model.transcribe(
+        snippet,
+        beam_size=settings.ALIGN_BEAM_SIZE,
+    )
+    # пофильтруем и добавим спикера в каждый кусочек
+    for r in result:
+        r["speaker"] = speaker
+    os.remove(snippet)
+    return result

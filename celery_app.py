@@ -1,18 +1,14 @@
+import os
 from celery import Celery
 from config.settings import settings
+
+# заставляем HF-hub кешировать в нашем volume
+os.environ.setdefault("HF_HOME", "/hf_cache")
+os.environ.setdefault("TRANSFORMERS_CACHE", "/hf_cache")
 
 celery_app = Celery(
     "proxyai",
     broker=settings.CELERY_BROKER_URL,
     backend=settings.CELERY_RESULT_BACKEND,
 )
-
-celery_app.conf.update(
-    task_serializer="json",
-    accept_content=["json"],
-    result_serializer="json",
-    result_expires=3600,
-)
-
-# чтобы Celery увидел наши задачи
-import tasks  # noqa
+celery_app.conf.timezone = settings.CELERY_TIMEZONE

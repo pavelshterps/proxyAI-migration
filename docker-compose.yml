@@ -1,76 +1,105 @@
-version: '3.8'
+version: "3.8"
+
+volumes:
+  upload-data:
+  hf_cache:
 
 services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+
+  tusd:
+    image: tusd/tusd:v1.1.1
+    ports:
+      - "1080:1080"
+    volumes:
+      - upload-data:/data
+
   api:
     build:
       context: .
       dockerfile: Dockerfile
-    image: proxyai-api
-    env_file: .env
     ports:
       - "8000:8000"
-    volumes:
-      - upload-data:/tmp/uploads
-      - hf_cache:/hf_cache
-    command: uvicorn main:app --host 0.0.0.0 --port 8000 --workers 1
+    environment:
+      - FASTAPI_HOST=0.0.0.0
+      - FASTAPI_PORT=8000
+      - API_WORKERS=1
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/1
+      - CELERY_CONCURRENCY=1
+      - CELERY_TIMEZONE=UTC
+      - UPLOAD_FOLDER=/tmp/uploads
+      - FILE_RETENTION_DAYS=7
+      - MAX_FILE_SIZE=1073741824
+      - TUS_ENDPOINT=http://tusd:1080/files/
+      - SNIPPET_FORMAT=wav
+      - DEVICE=cuda
+      - WHISPER_MODEL=Systran/faster-whisper-large-v2
+      - WHISPER_COMPUTE_TYPE=float16
+      - ALIGN_MODEL_NAME=whisper-large
+      - ALIGN_BEAM_SIZE=5
+      - PYANNOTE_PROTOCOL=pyannote/speaker-diarization
+      - HUGGINGFACE_TOKEN=hf_your_real_token
+      - POSTGRES_DB=whisperx
+      - POSTGRES_USER=whisperx
+      - POSTGRES_PASSWORD=secret
+      - DATABASE_URL=postgresql://whisperx:secret@postgres:5432/whisperx
+      - REDIS_URL=redis://redis:6379
+    depends_on:
+      - redis
+      - tusd
 
   cpu-worker:
     build:
       context: .
       dockerfile: Dockerfile
-    image: proxyai-cpu-worker
-    env_file: .env
     volumes:
       - upload-data:/tmp/uploads
       - hf_cache:/hf_cache
     environment:
-      HF_HOME: /hf_cache
-      TRANSFORMERS_CACHE: /hf_cache
-      HF_DATASETS_CACHE: /hf_cache
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/1
+      - HUGGINGFACE_TOKEN=hf_your_real_token
     command: >
       celery -A celery_app.celery_app worker
-        --loglevel=info
-        --concurrency 4
-        --hostname cpu-worker
-        --queues preprocess_cpu
+      --loglevel=info
+      --concurrency=4
+      --hostname=cpu-worker
+      --queues preprocess_cpu
+    depends_on:
+      - redis
+      - tusd
 
   gpu-worker:
     build:
       context: .
       dockerfile: Dockerfile.gpu
-    image: proxyai-gpu-worker
-    env_file: .env
     runtime: nvidia
-    deploy:
-      resources:
-        limits:
-          memory: 4g
     volumes:
       - upload-data:/tmp/uploads
       - hf_cache:/hf_cache
     environment:
-      HF_HOME: /hf_cache
-      TRANSFORMERS_CACHE: /hf_cache
-      HF_DATASETS_CACHE: /hf_cache
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/1
+      - HUGGINGFACE_TOKEN=hf_your_real_token
     command: >
       celery -A celery_app.celery_app worker
-        --loglevel=info
-        --concurrency 1
-        --hostname gpu-worker
-        --queues preprocess_gpu
+      --loglevel=info
+      --concurrency=1
+      --hostname=gpu-worker
+      --queues preprocess_gpu
+    depends_on:
+      - redis
+      - tusd
 
   flower:
     image: mher/flower:latest
-    env_file: .env
     ports:
       - "5555:5555"
-    command:
-      - celery
-      - --broker=${CELERY_BROKER_URL}
-      - flower
-      - --address=0.0.0.0
-      - --port=5555
-
-volumes:
-  upload-data:
-  hf_cache:
+    command: >
+      flower
+      --broker=redis://redis:6379/0
+      --address=0.0.0.0
+      --port=5555

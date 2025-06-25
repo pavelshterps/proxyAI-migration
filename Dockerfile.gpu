@@ -1,19 +1,19 @@
 FROM nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04
 
-COPY static ./static
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+      python3.10 python3-pip ffmpeg git build-essential libsndfile1 && \
+    rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
-
-# системные зависимости + python
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3.10 python3-pip ffmpeg git build-essential libsndfile1 \
-  && rm -rf /var/lib/apt/lists/*
-
-# python-зависимости
 COPY requirements.txt .
 RUN pip3 install --no-cache-dir -r requirements.txt
 
-# приложение
 COPY . .
 
-# команда по умолчанию (docker-compose её переопределит)
-CMD ["celery", "-A", "celery_app.celery_app", "worker", "--loglevel=info", "--concurrency", "1", "--hostname", "gpu-worker", "--queues", "preprocess_gpu"]
+# GPU-воркер
+CMD ["celery", "-A", "celery_app.celery_app", "worker",
+     "--loglevel=info",
+     "--concurrency", "1",
+     "--hostname", "gpu-worker",
+     "--queues", "preprocess_gpu"]
