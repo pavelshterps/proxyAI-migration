@@ -1,81 +1,86 @@
-version: "3.8"
-
-volumes:
-  hf_cache:
-  upload-data:
-
+version: '3.8'
 services:
-  redis:
-    image: redis:7-alpine
-
   api:
+    image: proxyai-api
     build:
       context: .
       dockerfile: Dockerfile
     env_file: .env
-    environment:
-      - HF_CACHE_DIR=/hf_cache
-    volumes:
-      - upload-data:/tmp/uploads
-      - hf_cache:/hf_cache
     ports:
       - "8000:8000"
-    depends_on:
-      - redis
-    # здесь переменные подставляются корректно
-    command: >
-      uvicorn main:app
-      --host 0.0.0.0
-      --port 8000
-      --workers ${API_WORKERS}
+    volumes:
+      - upload-data:/tmp/uploads
+      - hf_cache:/hf_cache
+    command:
+      - uvicorn
+      - main:app
+      - --host
+      - "0.0.0.0"
+      - --port
+      - "8000"
+      - --workers
+      - "${API_WORKERS}"
 
   cpu-worker:
+    image: proxyai-cpu-worker
     build:
       context: .
       dockerfile: Dockerfile
     env_file: .env
-    environment:
-      - HF_CACHE_DIR=/hf_cache
     volumes:
       - upload-data:/tmp/uploads
       - hf_cache:/hf_cache
-    depends_on:
-      - redis
-    command: >
-      celery -A celery_app.celery_app worker
-      --loglevel=info
-      --concurrency ${CELERY_CONCURRENCY}
-      --hostname cpu-worker
-      --queues preprocess_cpu
+    command:
+      - celery
+      - -A
+      - celery_app.celery_app
+      - worker
+      - --loglevel=info
+      - --concurrency
+      - "${CELERY_CONCURRENCY}"
+      - --hostname
+      - cpu-worker
+      - --queues
+      - preprocess_cpu
 
   gpu-worker:
+    image: proxyai-gpu-worker
     build:
       context: .
       dockerfile: Dockerfile.gpu
-    runtime: nvidia
-    environment:
-      - NVIDIA_VISIBLE_DEVICES=all
-      - HF_CACHE_DIR=/hf_cache
     env_file: .env
+    runtime: nvidia
+    deploy:
+      resources:
+        limits:
+          memory: 4g
     volumes:
       - upload-data:/tmp/uploads
       - hf_cache:/hf_cache
-    depends_on:
-      - redis
-    command: >
-      celery -A celery_app.celery_app worker
-      --loglevel=info
-      --concurrency 1
-      --hostname gpu-worker
-      --queues preprocess_gpu
+    command:
+      - celery
+      - -A
+      - celery_app.celery_app
+      - worker
+      - --loglevel=info
+      - --concurrency
+      - "1"
+      - --hostname
+      - gpu-worker
+      - --queues
+      - preprocess_gpu
 
   flower:
-    image: mher/flower:0.9.7
+    image: mher/flower:latest
     env_file: .env
-    environment:
-      - BROKER_URL=${CELERY_BROKER_URL}
-      - HF_CACHE_DIR=/hf_cache
     ports:
       - "5555:5555"
-    depends_on:
-      - redis
+    command:
+      - flower
+      - --broker=${CELERY_BROKER_URL}
+      - --address=0.0.0.0
+      - --port=5555
+
+volumes:
+  upload-data:
+  hf_cache:
