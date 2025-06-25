@@ -1,28 +1,25 @@
-# config/settings.py
+from pydantic import BaseSettings, Field
 
-from pydantic_settings import BaseSettings
 
 class Settings(BaseSettings):
-    # где-то здесь уже есть ваши поля, например:
-    UPLOAD_FOLDER: str = "/tmp/uploads"
-    CELERY_BROKER_URL: str
-    CELERY_RESULT_BACKEND: str
+    # Путь, куда сохраняются загруженные файлы
+    UPLOAD_FOLDER: str = Field(..., env="UPLOAD_FOLDER")
 
-    # ----------------------------------------
-    # Добавляем недостающие для pyannote.audio:
-    PYANNOTE_MODEL: str = "pyannote/speaker-diarization"
-    HF_TOKEN: str
-    # ----------------------------------------
+    # Настройки Celery
+    CELERY_BROKER_URL: str = Field(..., env="CELERY_BROKER_URL")
+    CELERY_RESULT_BACKEND: str = Field(..., env="CELERY_RESULT_BACKEND")
 
-    # и ваши остальные поля:
-    WHISPER_MODEL: str
-    WHISPER_COMPUTE_TYPE: str = "float16"
-    API_WORKERS: int = 1
-    # ...
+    # Модель и токен для pyannote (диаризация)
+    PYANNOTE_MODEL: str = Field(..., env="PYANNOTE_MODEL")
+    HF_TOKEN: str = Field(..., env="HF_TOKEN")
+
+    # Модель и настройки Whisper (транскрипция)
+    WHISPER_MODEL: str = Field(..., env="WHISPER_MODEL")
+    WHISPER_COMPUTE_TYPE: str = Field("float16", env="WHISPER_COMPUTE_TYPE")
 
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"
 
-# экземпляр настроек
+
 settings = Settings()
