@@ -1,31 +1,16 @@
 from celery import Celery
-from config.settings import (
-    CELERY_BROKER_URL,
-    CELERY_RESULT_BACKEND,
-    CELERY_TIMEZONE,
-    CELERY_CONCURRENCY,
-)
+from config.settings import settings
 
-# Создаем Celery-приложение с именем "proxyai"
+# Имя приложения и настройки брокера/бека
 app = Celery(
     "proxyai",
-    broker=CELERY_BROKER_URL,
-    backend=CELERY_RESULT_BACKEND,
+    broker=settings.CELERY_BROKER_URL,
+    backend=settings.CELERY_RESULT_BACKEND,
 )
 
-# Настройки Celery
+# обновляем конфиг celery (concurrency, timezone и т.п.)
 app.conf.update(
-    timezone=CELERY_TIMEZONE,
-    enable_utc=True,
-    task_serializer="json",
-    accept_content=["json"],
-    result_serializer="json",
-    worker_concurrency=int(CELERY_CONCURRENCY),
+    result_backend=settings.CELERY_RESULT_BACKEND,
+    timezone=settings.CELERY_TIMEZONE,
+    worker_concurrency=settings.CELERY_CONCURRENCY,
 )
-
-# Маршрутизация задач по очередям
-app.conf.task_routes = {
-    "tasks.diarize_full": {"queue": "preprocess_cpu"},
-    "tasks.transcribe_segments": {"queue": "preprocess_gpu"},
-    "tasks.transcribe_full": {"queue": "preprocess_cpu"},
-}
