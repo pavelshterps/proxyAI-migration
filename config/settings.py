@@ -1,4 +1,5 @@
-from pydantic import BaseSettings
+# was: from pydantic import BaseSettings
+from pydantic_settings import BaseSettings
 from typing import List
 
 class Settings(BaseSettings):

@@ -3,5 +3,5 @@ uvicorn[standard]
 celery[redis]
 faster-whisper>=1.1.1
 pyannote.audio>=3.3.2
-pydantic
+pydantic-settings
 python-dotenv
