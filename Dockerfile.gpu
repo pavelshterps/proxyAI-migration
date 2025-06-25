@@ -6,14 +6,10 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
+
 COPY requirements.txt .
 RUN pip3 install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-# GPU-воркер
-CMD ["celery", "-A", "celery_app.celery_app", "worker",
-     "--loglevel=info",
-     "--concurrency", "1",
-     "--hostname", "gpu-worker",
-     "--queues", "preprocess_gpu"]
+CMD ["celery", "-A", "celery_app.celery_app", "worker", "--loglevel=info", "--concurrency", "1", "--hostname", "gpu-worker", "--queues", "preprocess_gpu"]
