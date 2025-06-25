@@ -39,7 +39,7 @@ def get_transcriber():
         )
     return _transcriber
 
-@app.task(name="tasks.diarize_full")
+@app.task(name="tasks.diarize_full", queue="preprocess_cpu")
 def diarize_full(path: str):
     pipeline = get_diarizer()
     output = pipeline(path)

@@ -33,12 +33,10 @@ services:
       - upload-data:/tmp/uploads
     depends_on:
       - redis
-    command: >
-      celery -A celery_app.app worker
-      --loglevel=info
-      --concurrency=${CELERY_CONCURRENCY}
-      -Q preprocess_cpu
-      --hostname=cpu@%h
+    command: celery -A celery_app.app worker \
+      --loglevel=info \
+      --concurrency=${CELERY_CONCURRENCY} \
+      --queues preprocess_cpu
 
   gpu-worker:
     build:
@@ -55,13 +53,16 @@ services:
       resources:
         limits:
           memory: 4g
-    runtime: nvidia
-    command: >
-      celery -A celery_app.app worker
-      --loglevel=info
-      --concurrency=1
-      -Q preprocess_gpu
-      --hostname=gpu@%h
+
+        reservations:
+            devices:
+              - driver: nvidia
+                count: 1
+                capabilities: [ gpu ]
+    command: celery -A celery_app.app worker \
+      --loglevel=info \
+      --concurrency=1 \
+      --queues preprocess_gpu
 
   flower:
     image: mher/flower:0.9.7
