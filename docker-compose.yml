@@ -1,63 +1,96 @@
-version: "3.9"
+version: "3.8"
+
 services:
-  api:
-    build: .
-    command: uvicorn main:app --host 0.0.0.0 --port ${FASTAPI_PORT:-8000} --workers ${API_WORKERS:-1}
-    env_file: .env
+  tusd:
+    image: tusproject/tusd:latest
     ports:
-      - "${FASTAPI_PORT:-8000}:${FASTAPI_PORT:-8000}"
+      - "1080:1080"
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
     depends_on:
       - redis
-    # не монтируем static/, он уже скопирован в образ
+      - tusd
+    environment:
+      FASTAPI_HOST: "${FASTAPI_HOST}"
+      FASTAPI_PORT: "${FASTAPI_PORT}"
+      API_WORKERS: "${API_WORKERS}"
+      CELERY_BROKER_URL: "${CELERY_BROKER_URL}"
+      CELERY_RESULT_BACKEND: "${CELERY_RESULT_BACKEND}"
+      UPLOAD_FOLDER: "${UPLOAD_FOLDER}"
+      DEVICE: "${DEVICE}"
+      WHISPER_MODEL: "${WHISPER_MODEL}"
+      WHISPER_COMPUTE_TYPE: "${WHISPER_COMPUTE_TYPE}"
+      ALIGN_MODEL_NAME: "${ALIGN_MODEL_NAME}"
+      ALIGN_BEAM_SIZE: "${ALIGN_BEAM_SIZE}"
+      PYANNOTE_PROTOCOL: "${PYANNOTE_PROTOCOL}"
+      HUGGINGFACE_TOKEN: "${HUGGINGFACE_TOKEN}"
+      DATABASE_URL: "${DATABASE_URL}"
+      REDIS_URL: "${REDIS_URL}"
+    ports:
+      - "${FASTAPI_PORT}:${FASTAPI_PORT}"
 
   cpu-worker:
     build:
       context: .
-      target: cpu-worker
-    command: >
-      celery -A celery_app worker
-      --concurrency=${CELERY_CONCURRENCY:-1}
-      --queues=preprocess_cpu
-    env_file: .env
+      dockerfile: Dockerfile
     depends_on:
+      - api
       - redis
+    command: >
+      celery -A celery_app.celery_app worker
+      --loglevel=INFO
+      --queues=preprocess_cpu
+      --concurrency=${CELERY_CONCURRENCY}
+    environment:
+      CELERY_BROKER_URL: "${CELERY_BROKER_URL}"
+      CELERY_RESULT_BACKEND: "${CELERY_RESULT_BACKEND}"
+      DEVICE: "${DEVICE}"
+      WHISPER_MODEL: "${WHISPER_MODEL}"
+      WHISPER_COMPUTE_TYPE: "${WHISPER_COMPUTE_TYPE}"
+      PYANNOTE_PROTOCOL: "${PYANNOTE_PROTOCOL}"
+      HUGGINGFACE_TOKEN: "${HUGGINGFACE_TOKEN}"
 
   gpu-worker:
     build:
       context: .
       dockerfile: Dockerfile.gpu
-    command: >
-      celery -A celery_app worker
-      --concurrency=1
-      --queues=preprocess_gpu
-    env_file: .env
-    # для docker-compose v1.29+:
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
-    volumes:
-      - hf_cache:/hf_cache
     depends_on:
+      - api
       - redis
+    command: >
+      celery -A celery_app.celery_app worker
+      --loglevel=INFO
+      --queues=preprocess_gpu
+      --concurrency=1
+    environment:
+      CELERY_BROKER_URL: "${CELERY_BROKER_URL}"
+      CELERY_RESULT_BACKEND: "${CELERY_RESULT_BACKEND}"
+      DEVICE: "${DEVICE}"
+      WHISPER_MODEL: "${WHISPER_MODEL}"
+      WHISPER_COMPUTE_TYPE: "${WHISPER_COMPUTE_TYPE}"
+      PYANNOTE_PROTOCOL: "${PYANNOTE_PROTOCOL}"
+      HUGGINGFACE_TOKEN: "${HUGGINGFACE_TOKEN}"
+    runtime: nvidia
+
   flower:
     image: mher/flower:latest
+    depends_on:
+      - redis
     command: >
       celery -A celery_app.celery_app flower
-      --port=5555
       --broker=${CELERY_BROKER_URL}
+      --port=${FLOWER_PORT:-5555}
     ports:
-      - "5555:5555"
-      -
-  redis:
-    image: redis:7.0-alpine
-
-  tusd:
-    image: tusproject/tusd:v1.12.0
-    # если нужна более новая версия, проверьте тег на Docker Hub
+      - "${FLOWER_PORT:-5555}:${FLOWER_PORT:-5555}"
 
 volumes:
+  upload-data:
   hf_cache:
