@@ -20,7 +20,7 @@ services:
       - --port
       - "8000"
       - --workers
-      - "1"                                # <- hard-code to avoid ${API_WORKERS} interpolation gotchas
+      - "1"                      # жёстко, чтобы избежать проблем с "${API_WORKERS}"
 
   cpu-worker:
     build:
@@ -32,7 +32,7 @@ services:
       - upload-data:/tmp/uploads
       - hf_cache:/hf_cache
     environment:
-      HF_HOME: /hf_cache                 # <- force HF cache dir
+      HF_HOME:       /hf_cache
       TRANSFORMERS_CACHE: /hf_cache
       HF_DATASETS_CACHE: /hf_cache
     command:
@@ -42,7 +42,7 @@ services:
       - worker
       - --loglevel=info
       - --concurrency
-      - "4"                               # or however many CPUs you want to dedicate
+      - "4"                     # под 4-ядерный CPU
       - --hostname
       - cpu-worker
       - --queues
@@ -58,14 +58,10 @@ services:
     deploy:
       resources:
         limits:
-          memory: 4g
+          memory: 4g           # ограничение 4 GB
     volumes:
       - upload-data:/tmp/uploads
       - hf_cache:/hf_cache
-    environment:
-      HF_HOME: /hf_cache
-      TRANSFORMERS_CACHE: /hf_cache
-      HF_DATASETS_CACHE: /hf_cache
     command:
       - celery
       - -A
@@ -73,7 +69,7 @@ services:
       - worker
       - --loglevel=info
       - --concurrency
-      - "1"                               # GPU concurrency = 1 to stay inside 4 GB
+      - "1"                     # GPU concurrency = 1 (L4-4Q 4 GB)
       - --hostname
       - gpu-worker
       - --queues
