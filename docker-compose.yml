@@ -64,11 +64,12 @@ services:
     env_file: .env
     ports:
       - "5555:5555"
-    command: >
-      flower
-        --broker=${CELERY_BROKER_URL}
-        --address=0.0.0.0
-        --port=5555
+    command:
+      - celery
+      - --broker=${CELERY_BROKER_URL}
+      - flower
+      - --address=0.0.0.0
+      - --port=5555
 
 volumes:
   upload-data:
