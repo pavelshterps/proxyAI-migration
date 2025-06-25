@@ -1,41 +1,47 @@
 import os
-import uuid
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.responses import JSONResponse, RedirectResponse
-from celery.result import AsyncResult
-import config.settings as settings
-from tasks import diarize_full, transcribe_segments
+import shutil
+from uuid import uuid4
+
+from fastapi import FastAPI, UploadFile, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+
+from celery_app import app as celery_app
+from config.settings import UPLOAD_FOLDER, ALLOWED_ORIGINS
 
 app = FastAPI()
 
-@app.get("/", include_in_schema=False)
-def root():
-    return RedirectResponse(url="/static/index.html")
+# CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 @app.post("/transcribe")
-async def submit_transcription(file: UploadFile = File(...)):
-    ext = file.filename.split(".")[-1].lower()
-    if ext not in ["wav", "mp3", "m4a", "flac"]:
-        raise HTTPException(status_code=400, detail="Unsupported file format")
-    uid = str(uuid.uuid4())
-    dest = os.path.join(settings.UPLOAD_FOLDER, f"{uid}.{ext}")
-    os.makedirs(os.path.dirname(dest), exist_ok=True)
-    with open(dest, "wb") as f:
-        f.write(await file.read())
+async def start_transcription(file: UploadFile):
+    # генерируем UUID и сохраняем файл во временную папку
+    uid = str(uuid4())
+    dest_dir = os.path.abspath(UPLOAD_FOLDER)
+    os.makedirs(dest_dir, exist_ok=True)
+    dest = os.path.join(dest_dir, f"{uid}.wav")
 
-    # Chain tasks: diarize_full -> transcribe_segments
-    chain = diarize_full.s(dest) | transcribe_segments.s(dest)
-    result = chain.apply_async()
-    return {"task_id": result.id}
+    try:
+        with open(dest, "wb") as out:
+            shutil.copyfileobj(file.file, out)
+    except Exception as e:
+        raise HTTPException(500, f"Failed to save upload: {e}")
 
-@app.get("/result/{task_id}")
-def get_result(task_id: str):
-    res = AsyncResult(task_id)
-    if not res.ready():
-        return JSONResponse({"status": "PENDING"}, status_code=202)
-    if res.failed():
-        return JSONResponse(
-            {"status": "FAILURE", "error": str(res.result)},
-            status_code=500
-        )
-    return {"status": "SUCCESS", "data": res.result}
+    # сразу ставим задачу диаризации
+    celery_app.send_task("tasks.diarize_full", args=(dest,), kwargs={})
+    return {"job_id": uid}
+
+@app.get("/result/{job_id}")
+async def get_result(job_id: str):
+    # результат хранится в бэкенде Celery
+    result = celery_app.backend.get(job_id)
+    if result is None:
+        return {"status": "PENDING"}
+    # отдаём список сегментов
+    return {"status": "SUCCESS", "segments": result}
