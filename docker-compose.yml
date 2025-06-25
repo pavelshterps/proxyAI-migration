@@ -1,39 +1,60 @@
 version: "3.8"
+
 services:
-  api:
-    build:
-      context: .
-      target: cpu
-    ports:
-      - "${API_PORT}:8000"
-
-  cpu-worker:
-    build:
-      context: .
-      target: cpu
-    command: celery -A celery_app.celery_app worker --queue=preprocess_cpu --concurrency=${CELERY_CONCURRENCY}
-
-  gpu-worker:
-    build:
-      context: .
-      target: gpu
-    runtime: nvidia
-    command: celery -A celery_app.celery_app worker --queue=preprocess_gpu --concurrency=1
-
   redis:
     image: redis:7-alpine
 
   tusd:
-    image: tus/tusd:latest
+    image: tusproject/tusd:2.2.3
     ports:
       - "1080:1080"
 
-  flower:
-    image: mher/flower:latest
-    command: flower --broker=${CELERY_BROKER_URL}
+  api:
+    build:
+      context: .
+      target: base
+    command: >
+      uvicorn main:api
+      --host ${FASTAPI_HOST}
+      --port ${FASTAPI_PORT}
+      --workers ${API_WORKERS}
     ports:
-      - "5555:5555"
+      - "${FASTAPI_PORT}:${FASTAPI_PORT}"
+    volumes:
+      - upload-data:${UPLOAD_FOLDER}
+    depends_on:
+      - redis
+      - tusd
+
+  cpu-worker:
+    build:
+      context: .
+      target: base
+    command: celery -A celery_app.celery_app worker
+      --hostname=cpu_worker@%h
+      --concurrency=${CPU_CONCURRENCY}
+      --queues=preprocess_cpu
+    volumes:
+      - upload-data:${UPLOAD_FOLDER}
+      - hf_cache:/hf_cache
+    depends_on:
+      - redis
+
+  gpu-worker:
+    build:
+      context: .
+      target: base
+    runtime: nvidia
+    command: celery -A celery_app.celery_app worker
+      --hostname=gpu_worker@%h
+      --concurrency=${GPU_CONCURRENCY}
+      --queues=preprocess_gpu
+    volumes:
+      - upload-data:${UPLOAD_FOLDER}
+      - hf_cache:/hf_cache
+    depends_on:
+      - redis
 
 volumes:
+  upload-data:
   hf_cache:
-    driver: local
