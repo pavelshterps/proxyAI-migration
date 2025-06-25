@@ -45,14 +45,17 @@ services:
       - upload-data:/tmp/uploads
     depends_on:
       - redis
+    # Ensure Docker daemon default-runtime = "nvidia" for GPU support
     command: celery -A celery_app worker --loglevel=info --concurrency=1 -Q preprocess_gpu
 
   flower:
-    image: mher/flower:latest
+    image: mher/flower:0.9.7
     restart: always
+    env_file: .env
+    environment:
+      - BROKER_URL=${CELERY_BROKER_URL}
     ports:
       - "5555:5555"
-    command: ["flower", "--broker=redis://redis:6379/0"]
 
 volumes:
   upload-data:
