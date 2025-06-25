@@ -2,6 +2,7 @@
 
 from config.settings import settings
 from celery import Celery
+import tasks
 
 # Инициализируем Celery, указывая явно, что нужно импортировать наш модуль tasks
 celery_app = Celery(
