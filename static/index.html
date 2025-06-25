@@ -1,76 +1,19 @@
-<!DOCTYPE html>
-<html lang="en">
+<!doctype html>
+<html lang="ru">
 <head>
-  <meta charset="UTF-8" />
-  <title>ProxyAI Transcription</title>
-  <style>
-    body { font-family: sans-serif; margin: 2rem; }
-    #status { margin-top: 1rem; font-weight: bold; }
-    #output { white-space: pre-wrap; margin-top: 1rem; background: #f5f5f5; padding: 1rem; border-radius: 4px; }
-  </style>
+  <meta charset="utf-8">
+  <title>ProxyAI</title>
 </head>
 <body>
-  <h1>Загрузите аудио для транскрипции</h1>
-  <form id="upload-form">
-    <input type="file" id="audioFile" accept="audio/*" required />
-    <button type="submit">Загрузить и транскрибировать</button>
+  <h1>Загрузите WAV для транскрипции</h1>
+  <form
+    action="/transcribe"
+    method="post"
+    enctype="multipart/form-data"
+  >
+    <input type="file" name="file" accept=".wav" required>
+    <button type="submit">Отправить</button>
   </form>
-  <div id="status"></div>
-  <pre id="output"></pre>
-
-  <script>
-    const form = document.getElementById('upload-form');
-    const statusDiv = document.getElementById('status');
-    const output = document.getElementById('output');
-
-    form.addEventListener('submit', async (e) => {
-      e.preventDefault();
-      const fileInput = document.getElementById('audioFile');
-      if (!fileInput.files.length) {
-        alert('Пожалуйста, выберите аудиофайл.');
-        return;
-      }
-
-      statusDiv.textContent = 'Загрузка и создание задачи транскрипции…';
-      output.textContent = '';
-
-      const formData = new FormData();
-      formData.append('file', fileInput.files[0]);
-
-      const resp = await fetch('/transcribe', {
-        method: 'POST',
-        body: formData
-      });
-
-      if (!resp.ok) {
-        statusDiv.textContent = `Ошибка при отправке: ${resp.status} ${resp.statusText}`;
-        return;
-      }
-
-      const { task_id } = await resp.json();
-      statusDiv.textContent = `Задача запущена (ID: ${task_id}). Ожидание результата…`;
-
-      // Poll for result
-      async function poll() {
-        const r = await fetch(`/result/${task_id}`);
-        if (r.status === 202) {
-          statusDiv.textContent = 'Статус: в процессе…';
-          setTimeout(poll, 2000);
-        } else if (r.ok) {
-          const data = await r.json();
-          if (data.status === 'SUCCESS') {
-            statusDiv.textContent = 'Готово!';
-            output.textContent = data.text;
-          } else {
-            statusDiv.textContent = `Ошибка: ${data.error || 'неизвестная'}`;
-          }
-        } else {
-          statusDiv.textContent = `Ошибка при получении результата: ${r.status} ${r.statusText}`;
-        }
-      }
-
-      poll();
-    });
-  </script>
+  <p>После загрузки вы получите job_id. Его можно проверить через /result/{job_id}.</p>
 </body>
 </html>

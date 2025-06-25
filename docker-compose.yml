@@ -1,82 +1,60 @@
-version: '3.8'
-
+version: "3.8"
 services:
-  # TUSd сервер для приёма больших файлов по tus протоколу
-  tusd:
-    image: tusproject/tusd:v1.12.0
-    ports:
-      - "1080:1080"
-    command: >
-      tusd
-      -host=0.0.0.0
-      -port=1080
-      -dir=/data
-    volumes:
-      - upload-data:/data
-
-  # Redis как брокер и backend для Celery
-  redis:
-    image: redis:7.0
-    ports:
-      - "6379:6379"
-
-  # FastAPI + Uvicorn
   api:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    restart: always
+    build: .
     env_file: .env
     ports:
-      - "8000:8000"
+      - "${FASTAPI_PORT}:${FASTAPI_PORT}"
     depends_on:
       - redis
       - tusd
 
-  # Celery CPU-воркер, выполняет диаризацию
   cpu-worker:
     build:
       context: .
       dockerfile: Dockerfile
-    restart: always
     env_file: .env
-    depends_on:
-      - redis
     command: >
-      celery -A celery_app.celery_app worker
+      celery -A celery_app worker
       --loglevel=info
-      --concurrency=${CPU_CONCURRENCY:-4}
+      --concurrency=${CELERY_CONCURRENCY}
       --hostname=cpu-worker
       --queues=preprocess_cpu
+    depends_on:
+      - redis
 
-  # Celery GPU-воркер, выполняет chunked-Whisper
   gpu-worker:
     build:
       context: .
       dockerfile: Dockerfile.gpu
-    restart: always
     env_file: .env
-    runtime: nvidia   # старый синтаксис для Docker 19+; если не поддерживается, можно попробовать `deploy.resources.reservations.devices`
-    depends_on:
-      - redis
+    runtime: nvidia
+    deploy:
+      resources:
+        limits:
+          memory: 4G
     command: >
-      celery -A celery_app.celery_app worker
+      celery -A celery_app worker
       --loglevel=info
-      --concurrency=${GPU_CONCURRENCY:-1}
+      --concurrency=1
       --hostname=gpu-worker
       --queues=preprocess_gpu
+    depends_on:
+      - redis
 
-  # Flower для мониторинга Celery
-  flower:
-    image: mher/flower:1.2.0
-    restart: always
-    env_file: .env
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - redis-data:/data
+
+  tusd:
+    image: tusd/tusd:2.1.0
     ports:
-      - "5555:5555"
-    command: >
-      celery --broker=${CELERY_BROKER_URL} flower
-      --port=5555
+      - "1080:1080"
+    command: ["tusd","-port","1080","-dir","/files"]
+    volumes:
+      - upload-data:/files
 
 volumes:
+  redis-data:
   upload-data:
-  hf_cache:

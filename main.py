@@ -1,41 +1,42 @@
-import os
-import shutil
-from fastapi import FastAPI, UploadFile, HTTPException
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, UploadFile, File
 from fastapi.staticfiles import StaticFiles
-from celery_app import celery_app
-from config.settings import settings
+from uuid import uuid4
+import shutil, os
+from celery_app import app as celery_app
 
 app = FastAPI()
 
-# статика (index.html + JS/CSS) должна лежать в ./static
-app.mount("/static", StaticFiles(directory="static"), name="static")
-
-@app.get("/")
-def index():
-    path = os.path.join("static", "index.html")
-    if os.path.isfile(path):
-        return FileResponse(path, media_type="text/html")
-    raise HTTPException(status_code=404, detail="Not Found")
-
-@app.get("/health")
-def health():
-    return {"status": "ok"}
+# монтируем папку со статикой, отдаём index.html по GET /
+app.mount(
+    "/",
+    StaticFiles(directory="static", html=True),
+    name="static",
+)
 
 @app.post("/transcribe")
-async def start_transcription(file: UploadFile):
-    if file.content_type != "audio/wav":
-        raise HTTPException(400, "Only WAV files supported")
-    uid = str(__import__("uuid").uuid4())
-    dest = os.path.join(settings.UPLOAD_FOLDER, f"{uid}.wav")
-    os.makedirs(os.path.dirname(dest), exist_ok=True)
+async def start_transcription(
+    file: UploadFile = File(...),
+):
+    """
+    Принимаем multipart/form-data с полем 'file'.
+    """
+    uid = str(uuid4())
+    dest_dir = os.getenv("UPLOAD_FOLDER", "/tmp/uploads")
+    os.makedirs(dest_dir, exist_ok=True)
+    dest = os.path.join(dest_dir, f"{uid}.wav")
     with open(dest, "wb") as out:
         shutil.copyfileobj(file.file, out)
-    celery_app.send_task("tasks.diarize_full", args=(dest,))
+
+    # отправляем задачу в очередь diarization -> gpu-пайплайн
+    celery_app.send_task("tasks.diarize_full", args=(dest,), queue="preprocess_cpu")
     return {"job_id": uid}
 
 @app.get("/result/{job_id}")
-def get_result(job_id: str):
+async def get_result(job_id: str):
+    """
+    Возвращаем либо PENDING, либо результат в формате:
+    {"status":"SUCCESS","segments":[...]}
+    """
     result = celery_app.backend.get(job_id)
     if result is None:
         return {"status": "PENDING"}
