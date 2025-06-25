@@ -1,5 +1,6 @@
 fastapi
 uvicorn[standard]
+python-multipart
 celery[redis]
 faster-whisper>=1.1.1
 pyannote.audio>=3.3.2
