@@ -1,25 +1,24 @@
-version: "3.8"
+version: "3.9"
 services:
   api:
     build: .
+    command: uvicorn main:app --host 0.0.0.0 --port ${FASTAPI_PORT:-8000} --workers ${API_WORKERS:-1}
     env_file: .env
     ports:
-      - "${FASTAPI_PORT}:${FASTAPI_PORT}"
+      - "${FASTAPI_PORT:-8000}:${FASTAPI_PORT:-8000}"
     depends_on:
       - redis
-      - tusd
+    # не монтируем static/, он уже скопирован в образ
 
   cpu-worker:
     build:
       context: .
-      dockerfile: Dockerfile
-    env_file: .env
+      target: cpu-worker
     command: >
       celery -A celery_app worker
-      --loglevel=info
-      --concurrency=${CELERY_CONCURRENCY}
-      --hostname=cpu-worker
+      --concurrency=${CELERY_CONCURRENCY:-1}
       --queues=preprocess_cpu
+    env_file: .env
     depends_on:
       - redis
 
@@ -27,34 +26,30 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.gpu
-    env_file: .env
-    runtime: nvidia
-    deploy:
-      resources:
-        limits:
-          memory: 4G
     command: >
       celery -A celery_app worker
-      --loglevel=info
       --concurrency=1
-      --hostname=gpu-worker
       --queues=preprocess_gpu
+    env_file: .env
+    # для docker-compose v1.29+:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    volumes:
+      - hf_cache:/hf_cache
     depends_on:
       - redis
 
   redis:
-    image: redis:7-alpine
-    volumes:
-      - redis-data:/data
+    image: redis:7.0-alpine
 
   tusd:
-    image: tusd/tusd:2.1.0
-    ports:
-      - "1080:1080"
-    command: ["tusd","-port","1080","-dir","/files"]
-    volumes:
-      - upload-data:/files
+    image: tusproject/tusd:v1.12.0
+    # если нужна более новая версия, проверьте тег на Docker Hub
 
 volumes:
-  redis-data:
-  upload-data:
+  hf_cache:
