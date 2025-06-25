@@ -43,7 +43,15 @@ services:
       - hf_cache:/hf_cache
     depends_on:
       - redis
-
+  flower:
+    image: mher/flower:latest
+    command: >
+      celery -A celery_app.celery_app flower
+      --port=5555
+      --broker=${CELERY_BROKER_URL}
+    ports:
+      - "5555:5555"
+      -
   redis:
     image: redis:7.0-alpine
 
