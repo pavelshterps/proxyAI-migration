@@ -1,6 +1,8 @@
 # Dockerfile.gpu
 FROM nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04
 
+ENV UPLOAD_FOLDER=/tmp/uploads
+
 ENV PYTHONUNBUFFERED=1 \
     HF_HOME=/hf_cache \
     CELERY_BROKER_URL=redis://redis:6379/0 \

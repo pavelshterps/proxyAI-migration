@@ -1,3 +1,4 @@
+# celery_app.py
 from celery import Celery
 from config.settings import (
     CELERY_BROKER_URL,
@@ -8,7 +9,8 @@ from config.settings import (
 app = Celery(
     "proxyai",
     broker=CELERY_BROKER_URL,
-    backend=CELERY_RESULT_BACKEND
+    backend=CELERY_RESULT_BACKEND,
+    include=["tasks"],         # <— register your tasks module
 )
 
 app.conf.update(

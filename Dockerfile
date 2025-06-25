@@ -1,6 +1,8 @@
 # Dockerfile
 FROM python:3.10-slim
 
+ENV UPLOAD_FOLDER=/tmp/uploads
+
 # cache & build-time model dir
 ENV PYTHONUNBUFFERED=1 \
     HF_HOME=/hf_cache \
