@@ -1,9 +1,9 @@
 fastapi
 uvicorn[standard]
-celery[redis]
-faster-whisper>=1.1.1
-pyannote.audio
-huggingface-hub
-ffmpeg-python
+celery
+redis
 pydantic
-python-multipart
+faster-whisper>=1.1.1
+ctranslate2[cuda]
+pyannote.audio>=3.3.2
+speechbrain
