@@ -1,76 +1,71 @@
 version: "3.8"
 
+volumes:
+  hf_cache:
+  upload-data:
+
 services:
   redis:
     image: redis:7-alpine
-    restart: always
 
   api:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    restart: always
+    build: .
     env_file: .env
-    user: "1000:1000"
     volumes:
       - upload-data:/tmp/uploads
-      - ./static:/app/static
     ports:
       - "8000:8000"
     depends_on:
       - redis
+    command:
+      - uvicorn
+      - main:app
+      - --host
+      - "0.0.0.0"
+      - --port
+      - "8000"
+      - --workers
+      - "${API_WORKERS}"
 
   cpu-worker:
     build:
       context: .
       dockerfile: Dockerfile
-    restart: always
     env_file: .env
-    user: "1000:1000"
-    volumes:
-      - upload-data:/tmp/uploads
-    depends_on:
-      - redis
-    command: >
-      celery -A celery_app.celery_app worker
-      --loglevel=info
-      --concurrency=${CELERY_CONCURRENCY}
-      --queues=preprocess_cpu
-
-  gpu-worker:
-    build:
-      context: .
-      dockerfile: Dockerfile.gpu
-    restart: always
-    env_file: .env
-    user: "1000:1000"
     volumes:
       - upload-data:/tmp/uploads
       - hf_cache:/hf_cache
     depends_on:
       - redis
-    runtime: nvidia
-    deploy:
-      resources:
-        limits:
-          memory: 4g
-    command: >
-      celery -A celery_app.celery_app worker
-      --loglevel=info
-      --concurrency=${CELERY_CONCURRENCY}
-      --queues=preprocess_gpu
+    command:
+      - celery
+      - -A
+      - celery_app.app
+      - worker
+      - --concurrency=${CELERY_CONCURRENCY}
+      - --hostname=cpu-worker
+      - --queues=preprocess_cpu,default
 
-  flower:
-    image: mher/flower:0.9.7
-    restart: always
-    env_file: .env
+  gpu-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.gpu
+    runtime: nvidia
     environment:
-      - BROKER_URL=${CELERY_BROKER_URL}
-    ports:
-      - "5555:5555"
+      - NVIDIA_VISIBLE_DEVICES=all
+    env_file: .env
+    volumes:
+      - upload-data:/tmp/uploads
+      - hf_cache:/hf_cache
     depends_on:
       - redis
+    command:
+      - celery
+      - -A
+      - celery_app.app
+      - worker
+      - --concurrency=1
+      - --hostname=gpu-worker
+      - --queues=preprocess_gpu,default
 
-volumes:
-  upload-data:
-  hf_cache:
+# no extra services needed here
