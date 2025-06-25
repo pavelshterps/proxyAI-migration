@@ -1,117 +1,82 @@
-version: "3.8"
+version: '3.8'
 
 services:
-  # Redis для брокера и backend-а Celery
-  redis:
-    image: redis:7.0-alpine
-    restart: unless-stopped
-    volumes:
-      - redis-data:/data
-
-  # tusd (TUS upload server)
+  # TUSd сервер для приёма больших файлов по tus протоколу
   tusd:
-    image: tusproject/tusd:v1.1.1
-    command:
-      - tusd
-      - -host=0.0.0.0
-      - -port=1080
-      - -upload-dir=/data
-      - -cors=*
+    image: tusproject/tusd:v1.12.0
     ports:
       - "1080:1080"
-    restart: unless-stopped
+    command: >
+      tusd
+      -host=0.0.0.0
+      -port=1080
+      -dir=/data
     volumes:
       - upload-data:/data
 
-  # Flower UI для мониторинга Celery
-  flower:
-    image: mher/flower:latest
-    command:
-      - flower
-      - --port=5555
-      - --broker=redis://redis:6379/0
+  # Redis как брокер и backend для Celery
+  redis:
+    image: redis:7.0
     ports:
-      - "5555:5555"
-    restart: unless-stopped
-    depends_on:
-      - redis
+      - "6379:6379"
 
   # FastAPI + Uvicorn
   api:
     build:
       context: .
       dockerfile: Dockerfile
-    environment:
-      - FASTAPI_HOST=0.0.0.0
-      - FASTAPI_PORT=8000
-      - API_WORKERS=1
-      - CELERY_BROKER_URL=redis://redis:6379/0
-      - CELERY_RESULT_BACKEND=redis://redis:6379/1
-      # … остальные переменные из .env …
-    volumes:
-      - upload-data:/app/uploads
-      - hf_cache:/hf_cache
+    restart: always
+    env_file: .env
     ports:
       - "8000:8000"
     depends_on:
       - redis
       - tusd
 
-  # Celery worker для CPU (диаризация)
+  # Celery CPU-воркер, выполняет диаризацию
   cpu-worker:
     build:
       context: .
       dockerfile: Dockerfile
-    command:
-      - celery
-      - -A
-      - celery_app.celery_app
-      - worker
-      - --loglevel=info
-      - --concurrency=1
-      - --hostname=cpu-worker
-      - --queues=preprocess_cpu
-    environment:
-      - CELERY_BROKER_URL=redis://redis:6379/0
-      - CELERY_RESULT_BACKEND=redis://redis:6379/1
-      # … остальные из .env …
-    volumes:
-      - upload-data:/app/uploads
-      - hf_cache:/hf_cache
+    restart: always
+    env_file: .env
     depends_on:
       - redis
-      - tusd
+    command: >
+      celery -A celery_app.celery_app worker
+      --loglevel=info
+      --concurrency=${CPU_CONCURRENCY:-4}
+      --hostname=cpu-worker
+      --queues=preprocess_cpu
 
-  # Celery worker для GPU (chunked-Whisper)
+  # Celery GPU-воркер, выполняет chunked-Whisper
   gpu-worker:
     build:
       context: .
       dockerfile: Dockerfile.gpu
-    command:
-      - celery
-      - -A
-      - celery_app.celery_app
-      - worker
-      - --loglevel=info
-      - --concurrency=1
-      - --hostname=gpu-worker
-      - --queues=preprocess_gpu
-    deploy:
-      resources:
-        limits:
-          memory: 4g
-    environment:
-      - CELERY_BROKER_URL=redis://redis:6379/0
-      - CELERY_RESULT_BACKEND=redis://redis:6379/1
-      # … остальные из .env …
-    volumes:
-      - upload-data:/app/uploads
-      - hf_cache:/hf_cache
+    restart: always
+    env_file: .env
+    runtime: nvidia   # старый синтаксис для Docker 19+; если не поддерживается, можно попробовать `deploy.resources.reservations.devices`
     depends_on:
       - redis
-      - tusd
+    command: >
+      celery -A celery_app.celery_app worker
+      --loglevel=info
+      --concurrency=${GPU_CONCURRENCY:-1}
+      --hostname=gpu-worker
+      --queues=preprocess_gpu
+
+  # Flower для мониторинга Celery
+  flower:
+    image: mher/flower:1.2.0
+    restart: always
+    env_file: .env
+    ports:
+      - "5555:5555"
+    command: >
+      celery --broker=${CELERY_BROKER_URL} flower
+      --port=5555
 
 volumes:
   upload-data:
-  redis-data:
   hf_cache:
