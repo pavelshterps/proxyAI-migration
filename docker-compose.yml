@@ -46,14 +46,19 @@ services:
     user: "1000:1000"
     volumes:
       - upload-data:/tmp/uploads
+      - hf_cache:/hf_cache
     depends_on:
       - redis
-    # для локального docker-compose: даём runtime и лимит памяти
     runtime: nvidia
     deploy:
       resources:
         limits:
           memory: 4g
+    command: >
+      celery -A celery_app.celery_app worker
+      --loglevel=info
+      --concurrency=${CELERY_CONCURRENCY}
+      --queues=preprocess_gpu
 
   flower:
     image: mher/flower:0.9.7
@@ -68,3 +73,4 @@ services:
 
 volumes:
   upload-data:
+  hf_cache:
