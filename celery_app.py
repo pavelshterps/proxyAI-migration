@@ -3,24 +3,21 @@
 from config.settings import settings
 from celery import Celery
 
-# Инициализируем Celery без include/imports
+# Instantiate the app as “app” (not celery_app), include our tasks module
 app = Celery(
-    __name__,
+    "proxyai",
     broker=settings.CELERY_BROKER_URL,
     backend=settings.CELERY_RESULT_BACKEND,
+    include=["tasks"],
 )
 
-# Автоматически находим задачи в модуле tasks
-app.autodiscover_tasks(["tasks"])
-# Настраиваем маршрутизацию по очередям
+# Route the two entry-point tasks onto separate queues
 app.conf.task_routes = {
-    # полный файл для диаризации идёт в очередь preprocess_cpu
     "tasks.diarize_full": {"queue": "preprocess_cpu"},
-    # чанки для транскрипции — в очередь preprocess_gpu
     "tasks.transcribe_segments": {"queue": "preprocess_gpu"},
 }
 
-# Опционально можно задать дефолтную очередь
+# Default to the CPU queue if nothing else is specified
 app.conf.task_default_queue = "preprocess_cpu"
 app.conf.task_default_exchange = "preprocess_cpu"
 app.conf.task_default_routing_key = "preprocess_cpu"
