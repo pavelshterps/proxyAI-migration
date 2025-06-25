@@ -13,7 +13,7 @@ celery_app = Celery(
 
 # Автоматически находим задачи в модуле tasks
 celery_app.autodiscover_tasks(["tasks"])  # <- и вот это
-
+celery_app.conf.imports = ["tasks"]
 # Настраиваем маршрутизацию по очередям
 celery_app.conf.task_routes = {
     # полный файл для диаризации идёт в очередь preprocess_cpu
