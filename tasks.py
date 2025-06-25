@@ -1,70 +1,80 @@
 import os
-from celery_app import celery_app
+import tempfile
+from celery_app import app
 from config.settings import (
     DEVICE,
-    WHISPER_COMPUTE_TYPE,
     WHISPER_MODEL,
+    WHISPER_COMPUTE_TYPE,
     ALIGN_BEAM_SIZE,
     PYANNOTE_PROTOCOL,
+    HUGGINGFACE_TOKEN
 )
 from faster_whisper import WhisperModel
 from pyannote.audio import Pipeline
 
-# однократные загрузки моделей
 _diarizer = None
-_whisper_model = None
+_transcriber = None
 
 def get_diarizer():
     global _diarizer
     if _diarizer is None:
-        token = os.getenv("HUGGINGFACE_TOKEN")
-        _diarizer = Pipeline.from_pretrained(PYANNOTE_PROTOCOL, use_auth_token=token)
+        _diarizer = Pipeline.from_pretrained(
+            PYANNOTE_PROTOCOL,
+            use_auth_token=HUGGINGFACE_TOKEN,
+            cache_dir=os.getenv("HF_HOME")
+        )
     return _diarizer
 
-def get_whisper_model():
-    global _whisper_model
-    if _whisper_model is None:
-        cache_dir = os.getenv("HF_HOME", "/tmp/hf_cache")
-        _whisper_model = WhisperModel(
-            WHISPER_MODEL,
+def get_transcriber():
+    global _transcriber
+    if _transcriber is None:
+        _transcriber = WhisperModel(
+            model_size_or_path=WHISPER_MODEL,
             device=DEVICE,
+            device_index=0,
             compute_type=WHISPER_COMPUTE_TYPE,
-            cache_dir=cache_dir
+            inter_threads=1,
+            intra_threads=1,
+            cache_dir=os.getenv("HF_HOME")
         )
-    return _whisper_model
+    return _transcriber
 
-@celery_app.task
-def diarize_full(filepath):
+@app.task(name="tasks.diarize_full")
+def diarize_full(path: str):
     pipeline = get_diarizer()
-    output = pipeline(filepath)
+    output = pipeline(path)
     segments = []
-    for turn, _, speaker in output.itertracks(yield_label=True):
+    for turn in output.get_timeline().support():
         segments.append({
             "start": turn.start,
             "end": turn.end,
-            "speaker": speaker
+            "speaker": turn.label
         })
+    # enqueue transcription stage
+    app.send_task(
+        "tasks.transcribe_segments",
+        args=[path, segments],
+        queue="preprocess_gpu",
+        task_id=diarize_full.request.id
+    )
     return segments
 
-@celery_app.task
-def transcribe_segments(filepath):
-    model = get_whisper_model()
-    text_segments, _ = model.transcribe(filepath, beam_size=ALIGN_BEAM_SIZE)
-    return {"text": " ".join([seg.text for seg in text_segments])}
-
-@celery_app.task
-def transcribe_full(filepath):
-    # Сначала диаризация
-    segments = diarize_full(filepath)
-    model = get_whisper_model()
-    full_text = []
+@app.task(name="tasks.transcribe_segments")
+def transcribe_segments(path: str, segments: list):
+    transcriber = get_transcriber()
+    results = []
     for seg in segments:
         start, end = seg["start"], seg["end"]
-        text_segments, _ = model.transcribe(
-            filepath,
-            beam_size=ALIGN_BEAM_SIZE,
-            segment_timestamps=[(start, end)]
+        # cut chunk
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            tmp_path = tmp.name
+        os.system(f"ffmpeg -y -i {path} -ss {start} -to {end} {tmp_path}")
+        # transcribe chunk
+        txt_segs, _ = transcriber.transcribe(
+            tmp_path,
+            beam_size=ALIGN_BEAM_SIZE
         )
-        # добавляем первый (и единственный) фрагмент
-        full_text.append(text_segments[0].text)
-    return {"text": " ".join(full_text), "segments": segments}
+        text = " ".join([s.text for s in txt_segs])
+        results.append({**seg, "text": text})
+        os.remove(tmp_path)
+    return results

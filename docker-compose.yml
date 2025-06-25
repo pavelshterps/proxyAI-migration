@@ -16,6 +16,7 @@ services:
     user: "1000:1000"
     volumes:
       - upload-data:/tmp/uploads
+      - ./static:/app/static
     ports:
       - "8000:8000"
     depends_on:
@@ -32,7 +33,12 @@ services:
       - upload-data:/tmp/uploads
     depends_on:
       - redis
-    command: celery -A celery_app worker --loglevel=info --concurrency=${CELERY_CONCURRENCY} -Q preprocess_cpu
+    command: >
+      celery -A celery_app.app worker
+      --loglevel=info
+      --concurrency=${CELERY_CONCURRENCY}
+      -Q preprocess_cpu
+      --hostname=cpu@%h
 
   gpu-worker:
     build:
@@ -45,8 +51,17 @@ services:
       - upload-data:/tmp/uploads
     depends_on:
       - redis
-    # Ensure Docker daemon default-runtime = "nvidia" for GPU support
-    command: celery -A celery_app worker --loglevel=info --concurrency=1 -Q preprocess_gpu
+    deploy:
+      resources:
+        limits:
+          memory: 4g
+    runtime: nvidia
+    command: >
+      celery -A celery_app.app worker
+      --loglevel=info
+      --concurrency=1
+      -Q preprocess_gpu
+      --hostname=gpu@%h
 
   flower:
     image: mher/flower:0.9.7
@@ -56,6 +71,8 @@ services:
       - BROKER_URL=${CELERY_BROKER_URL}
     ports:
       - "5555:5555"
+    depends_on:
+      - redis
 
 volumes:
   upload-data:
