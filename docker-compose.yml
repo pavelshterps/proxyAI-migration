@@ -12,15 +12,7 @@ services:
     volumes:
       - upload-data:/tmp/uploads
       - hf_cache:/hf_cache
-    command:
-      - uvicorn
-      - main:app
-      - --host
-      - "0.0.0.0"
-      - --port
-      - "8000"
-      - --workers
-      - "1"                      # жёстко, чтобы избежать проблем с "${API_WORKERS}"
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --workers 1
 
   cpu-worker:
     build:
@@ -32,21 +24,15 @@ services:
       - upload-data:/tmp/uploads
       - hf_cache:/hf_cache
     environment:
-      HF_HOME:       /hf_cache
+      HF_HOME: /hf_cache
       TRANSFORMERS_CACHE: /hf_cache
       HF_DATASETS_CACHE: /hf_cache
-    command:
-      - celery
-      - -A
-      - celery_app.celery_app
-      - worker
-      - --loglevel=info
-      - --concurrency
-      - "4"                     # под 4-ядерный CPU
-      - --hostname
-      - cpu-worker
-      - --queues
-      - preprocess_cpu
+    command: >
+      celery -A celery_app.celery_app worker
+        --loglevel=info
+        --concurrency 4
+        --hostname cpu-worker
+        --queues preprocess_cpu
 
   gpu-worker:
     build:
@@ -58,22 +44,20 @@ services:
     deploy:
       resources:
         limits:
-          memory: 4g           # ограничение 4 GB
+          memory: 4g
     volumes:
       - upload-data:/tmp/uploads
       - hf_cache:/hf_cache
-    command:
-      - celery
-      - -A
-      - celery_app.celery_app
-      - worker
-      - --loglevel=info
-      - --concurrency
-      - "1"                     # GPU concurrency = 1 (L4-4Q 4 GB)
-      - --hostname
-      - gpu-worker
-      - --queues
-      - preprocess_gpu
+    environment:
+      HF_HOME: /hf_cache
+      TRANSFORMERS_CACHE: /hf_cache
+      HF_DATASETS_CACHE: /hf_cache
+    command: >
+      celery -A celery_app.celery_app worker
+        --loglevel=info
+        --concurrency 1
+        --hostname gpu-worker
+        --queues preprocess_gpu
 
   flower:
     image: mher/flower:latest

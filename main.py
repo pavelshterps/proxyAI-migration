@@ -2,31 +2,35 @@ import os
 import shutil
 from uuid import uuid4
 from fastapi import FastAPI, UploadFile, HTTPException
-from fastapi.staticfiles import StaticFiles
-from celery_app import celery_app
+from celery import chain
+
 from config.settings import settings
+from celery_app import celery_app
+from tasks import diarize_full, transcribe_full
 
 app = FastAPI()
 
-# если нужен фронтенд в папке `static/`
-if os.path.isdir("static"):
-    app.mount("/", StaticFiles(directory="static", html=True), name="static")
-
 @app.post("/transcribe")
 async def start_transcription(file: UploadFile):
-    if not file.content_type.startswith("audio/"):
-        raise HTTPException(status_code=400, detail="Invalid file type")
+    if not file.filename.lower().endswith(".wav"):
+        raise HTTPException(400, "Only WAV files accepted")
     uid = str(uuid4())
-    os.makedirs(settings.UPLOAD_FOLDER, exist_ok=True)
     dest = os.path.join(settings.UPLOAD_FOLDER, f"{uid}.wav")
+    os.makedirs(settings.UPLOAD_FOLDER, exist_ok=True)
     with open(dest, "wb") as out:
         shutil.copyfileobj(file.file, out)
-    celery_app.send_task("tasks.diarize_full", args=(dest,))
+    # цепочка: сначала диаризация, потом транскрипция
+    chain(
+        diarize_full.s(dest),
+        transcribe_full.s()
+    ).apply_async(task_id=uid)
     return {"job_id": uid}
 
 @app.get("/result/{job_id}")
 async def get_result(job_id: str):
-    data = celery_app.backend.get(job_id)
-    if data is None:
+    res = celery_app.AsyncResult(job_id)
+    if res.state in ["PENDING", "STARTED", "RETRY"]:
         return {"status": "PENDING"}
-    return {"status": "SUCCESS", "segments": data}
+    if res.successful():
+        return {"status": "SUCCESS", **res.result}
+    return {"status": res.state, "error": str(res.result)}
