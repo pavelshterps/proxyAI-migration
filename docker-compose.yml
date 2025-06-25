@@ -9,42 +9,44 @@ services:
     image: redis:7-alpine
 
   api:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
     env_file: .env
+    environment:
+      - HF_CACHE_DIR=/hf_cache
     volumes:
       - upload-data:/tmp/uploads
+      - hf_cache:/hf_cache
     ports:
       - "8000:8000"
     depends_on:
       - redis
-    command:
-      - uvicorn
-      - main:app
-      - --host
-      - "0.0.0.0"
-      - --port
-      - "8000"
-      - --workers
-      - "${API_WORKERS}"
+    # здесь переменные подставляются корректно
+    command: >
+      uvicorn main:app
+      --host 0.0.0.0
+      --port 8000
+      --workers ${API_WORKERS}
 
   cpu-worker:
     build:
       context: .
       dockerfile: Dockerfile
     env_file: .env
+    environment:
+      - HF_CACHE_DIR=/hf_cache
     volumes:
       - upload-data:/tmp/uploads
       - hf_cache:/hf_cache
     depends_on:
       - redis
-    command:
-      - celery
-      - -A
-      - celery_app.app
-      - worker
-      - --concurrency=${CELERY_CONCURRENCY}
-      - --hostname=cpu-worker
-      - --queues=preprocess_cpu,default
+    command: >
+      celery -A celery_app.celery_app worker
+      --loglevel=info
+      --concurrency ${CELERY_CONCURRENCY}
+      --hostname cpu-worker
+      --queues preprocess_cpu
 
   gpu-worker:
     build:
@@ -53,19 +55,27 @@ services:
     runtime: nvidia
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
+      - HF_CACHE_DIR=/hf_cache
     env_file: .env
     volumes:
       - upload-data:/tmp/uploads
       - hf_cache:/hf_cache
     depends_on:
       - redis
-    command:
-      - celery
-      - -A
-      - celery_app.app
-      - worker
-      - --concurrency=1
-      - --hostname=gpu-worker
-      - --queues=preprocess_gpu,default
+    command: >
+      celery -A celery_app.celery_app worker
+      --loglevel=info
+      --concurrency 1
+      --hostname gpu-worker
+      --queues preprocess_gpu
 
-# no extra services needed here
+  flower:
+    image: mher/flower:0.9.7
+    env_file: .env
+    environment:
+      - BROKER_URL=${CELERY_BROKER_URL}
+      - HF_CACHE_DIR=/hf_cache
+    ports:
+      - "5555:5555"
+    depends_on:
+      - redis

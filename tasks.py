@@ -1,27 +1,23 @@
 import os
-from celery import Celery
-from config.settings import PYANNOTE_PROTOCOL, HUGGINGFACE_TOKEN, UPLOAD_FOLDER
+from celery_app import celery_app
+from config.settings import settings
+
 from faster_whisper import WhisperModel
-from config.settings import DEVICE, WHISPER_MODEL, WHISPER_COMPUTE_TYPE, ALIGN_MODEL_NAME, ALIGN_BEAM_SIZE
-from config.settings import TUS_ENDPOINT, MAX_FILE_SIZE_MB, SNIPPET_FORMAT
+from pyannote.audio import Pipeline
 
-# Celery app is defined in celery_app.py (imported here just for context)
-from celery_app import app
-
-# Keep Whisper model global so we don't reload it on every segment
 _whisper_model = None
 _diarizer = None
 
 def get_diarizer():
     global _diarizer
     if _diarizer is None:
-        # Mount a volume at /hf_cache in docker-compose
-        cache_dir = os.getenv("HF_CACHE_DIR", "/hf_cache/pyannote")
+        # читаем переменную из окружения, примонтированную из docker-compose
+        cache_dir = os.getenv("HF_CACHE_DIR", "/hf_cache")
         os.makedirs(cache_dir, exist_ok=True)
         _diarizer = Pipeline.from_pretrained(
-            PYANNOTE_PROTOCOL,
+            settings.PYANNOTE_PROTOCOL,
             cache_dir=cache_dir,
-            use_auth_token=HUGGINGFACE_TOKEN
+            use_auth_token=settings.HUGGINGFACE_TOKEN
         )
     return _diarizer
 
@@ -29,25 +25,57 @@ def get_whisper_model():
     global _whisper_model
     if _whisper_model is None:
         _whisper_model = WhisperModel(
-            WHISPER_MODEL,
-            device=DEVICE,
+            settings.WHISPER_MODEL,
+            device=settings.DEVICE,
             device_index=0,
-            compute_type=WHISPER_COMPUTE_TYPE,
+            compute_type=settings.WHISPER_COMPUTE_TYPE,
             inter_threads=1,
             intra_threads=1
         )
     return _whisper_model
 
-@app.task(name="tasks.transcribe_full")
-def transcribe_full(filepath):
-    # 1) Diarize
-    diarizer = get_diarizer()
-    diarization = diarizer(filepath)
+@celery_app.task(
+    name="tasks.diarize_full",
+    bind=True,
+    autoretry_for=(Exception,),
+    retry_kwargs={"max_retries": 3},
+)
+def diarize_full(self, filepath):
+    job_id = self.request.id
+    diar = get_diarizer()
+    diarization = diar(filepath)
 
-    # Write snippet‐by-speaker, etc. (omitted)
-    # 2) Chunked Whisper
-    whisper = get_whisper_model()
-    segments, _ = whisper.transcribe(filepath, beam_size=ALIGN_BEAM_SIZE)
+    segments = []
+    for turn, _, speaker in diarization.itertracks(yield_label=True):
+        start, end = turn.start, turn.end
+        seg_path = os.path.join(
+            settings.UPLOAD_FOLDER,
+            f"{job_id}_{start:.2f}_{end:.2f}.wav"
+        )
+        # ffmpeg или pydub, по вкусу
+        os.system(f"ffmpeg -y -i {filepath} -ss {start} -to {end} -c copy {seg_path}")
+        segments.append((seg_path, speaker))
 
-    # Return segments (or align them)
-    return list(segments)
+    # отправляем сегментные задачи
+    results = []
+    for seg_path, speaker in segments:
+        results.append(transcribe_segment.delay(seg_path, speaker))
+
+    # ждём их завершения
+    output = [r.get(timeout=3600) for r in results]
+    return output
+
+@celery_app.task(name="tasks.transcribe_segment")
+def transcribe_segment(filepath, speaker):
+    model = get_whisper_model()
+    segments, _ = model.transcribe(
+        filepath,
+        beam_size=settings.ALIGN_BEAM_SIZE
+    )
+    return {
+        "speaker": speaker,
+        "segments": [
+            {"start": s.start, "end": s.end, "text": s.text}
+            for s in segments
+        ]
+    }
