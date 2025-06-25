@@ -1,4 +1,5 @@
 version: '3.8'
+
 services:
   api:
     build:
@@ -19,7 +20,7 @@ services:
       - --port
       - "8000"
       - --workers
-      - "${API_WORKERS}"
+      - "1"                                # <- hard-code to avoid ${API_WORKERS} interpolation gotchas
 
   cpu-worker:
     build:
@@ -30,14 +31,18 @@ services:
     volumes:
       - upload-data:/tmp/uploads
       - hf_cache:/hf_cache
+    environment:
+      HF_HOME: /hf_cache                 # <- force HF cache dir
+      TRANSFORMERS_CACHE: /hf_cache
+      HF_DATASETS_CACHE: /hf_cache
     command:
       - celery
       - -A
-      - celery_app:celery_app
+      - celery_app.celery_app
       - worker
       - --loglevel=info
       - --concurrency
-      - "${CELERY_CONCURRENCY}"
+      - "4"                               # or however many CPUs you want to dedicate
       - --hostname
       - cpu-worker
       - --queues
@@ -57,14 +62,18 @@ services:
     volumes:
       - upload-data:/tmp/uploads
       - hf_cache:/hf_cache
+    environment:
+      HF_HOME: /hf_cache
+      TRANSFORMERS_CACHE: /hf_cache
+      HF_DATASETS_CACHE: /hf_cache
     command:
       - celery
       - -A
-      - celery_app:celery_app
+      - celery_app.celery_app
       - worker
       - --loglevel=info
       - --concurrency
-      - "1"
+      - "1"                               # GPU concurrency = 1 to stay inside 4 GB
       - --hostname
       - gpu-worker
       - --queues
