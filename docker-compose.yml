@@ -1,10 +1,10 @@
 version: '3.8'
 services:
   api:
-    image: proxyai-api
     build:
       context: .
       dockerfile: Dockerfile
+    image: proxyai-api
     env_file: .env
     ports:
       - "8000:8000"
@@ -22,10 +22,10 @@ services:
       - "${API_WORKERS}"
 
   cpu-worker:
-    image: proxyai-cpu-worker
     build:
       context: .
       dockerfile: Dockerfile
+    image: proxyai-cpu-worker
     env_file: .env
     volumes:
       - upload-data:/tmp/uploads
@@ -44,10 +44,10 @@ services:
       - preprocess_cpu
 
   gpu-worker:
-    image: proxyai-gpu-worker
     build:
       context: .
       dockerfile: Dockerfile.gpu
+    image: proxyai-gpu-worker
     env_file: .env
     runtime: nvidia
     deploy:
