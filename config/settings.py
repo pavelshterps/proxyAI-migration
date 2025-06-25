@@ -1,31 +1,25 @@
-# was: from pydantic import BaseSettings
 from pydantic_settings import BaseSettings
 from typing import List
 
 class Settings(BaseSettings):
-    # FastAPI
-    FASTAPI_HOST: str
-    FASTAPI_PORT: int
-    API_WORKERS: int
+    FASTAPI_HOST: str = "0.0.0.0"
+    FASTAPI_PORT: int = 8000
+    API_WORKERS: int = 1
 
-    # CORS
-    ALLOWED_ORIGINS: List[str]
+    ALLOWED_ORIGINS: List[str] = ["*"]
 
-    # Celery & Redis
     CELERY_BROKER_URL: str
     CELERY_RESULT_BACKEND: str
-    CELERY_CONCURRENCY: int
-    CELERY_TIMEZONE: str
+    CELERY_CONCURRENCY: int = 1
+    CELERY_TIMEZONE: str = "UTC"
 
-    # Files
     UPLOAD_FOLDER: str
     FILE_RETENTION_DAYS: int
     MAX_FILE_SIZE: int
     TUS_ENDPOINT: str
-    SNIPPET_FORMAT: str
+    SNIPPET_FORMAT: str = "wav"
 
-    # Models
-    DEVICE: str
+    DEVICE: str = "cuda"
     WHISPER_COMPUTE_TYPE: str
     WHISPER_MODEL: str
     ALIGN_MODEL_NAME: str
@@ -33,12 +27,6 @@ class Settings(BaseSettings):
     PYANNOTE_PROTOCOL: str
     HUGGINGFACE_TOKEN: str
 
-    # Postgres
-    POSTGRES_DB: str
-    POSTGRES_USER: str
-    POSTGRES_PASSWORD: str
-
-    # URLs
     DATABASE_URL: str
     REDIS_URL: str
 

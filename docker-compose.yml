@@ -33,7 +33,7 @@ services:
     command:
       - celery
       - -A
-      - celery_app.celery_app
+      - celery_app:celery_app
       - worker
       - --loglevel=info
       - --concurrency
@@ -60,7 +60,7 @@ services:
     command:
       - celery
       - -A
-      - celery_app.celery_app
+      - celery_app:celery_app
       - worker
       - --loglevel=info
       - --concurrency
