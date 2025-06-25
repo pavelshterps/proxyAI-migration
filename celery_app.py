@@ -1,14 +1,31 @@
-import os
 from celery import Celery
-from config.settings import settings
-
-# заставляем HF-hub кешировать в нашем volume
-os.environ.setdefault("HF_HOME", "/hf_cache")
-os.environ.setdefault("TRANSFORMERS_CACHE", "/hf_cache")
-
-celery_app = Celery(
-    "proxyai",
-    broker=settings.CELERY_BROKER_URL,
-    backend=settings.CELERY_RESULT_BACKEND,
+from config.settings import (
+    CELERY_BROKER_URL,
+    CELERY_RESULT_BACKEND,
+    CELERY_TIMEZONE,
+    CELERY_CONCURRENCY,
 )
-celery_app.conf.timezone = settings.CELERY_TIMEZONE
+
+# Создаем Celery-приложение с именем "proxyai"
+app = Celery(
+    "proxyai",
+    broker=CELERY_BROKER_URL,
+    backend=CELERY_RESULT_BACKEND,
+)
+
+# Настройки Celery
+app.conf.update(
+    timezone=CELERY_TIMEZONE,
+    enable_utc=True,
+    task_serializer="json",
+    accept_content=["json"],
+    result_serializer="json",
+    worker_concurrency=int(CELERY_CONCURRENCY),
+)
+
+# Маршрутизация задач по очередям
+app.conf.task_routes = {
+    "tasks.diarize_full": {"queue": "preprocess_cpu"},
+    "tasks.transcribe_segments": {"queue": "preprocess_gpu"},
+    "tasks.transcribe_full": {"queue": "preprocess_cpu"},
+}
