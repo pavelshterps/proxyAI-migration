@@ -32,7 +32,17 @@ async def start_transcription(file: UploadFile):
     os.makedirs(upload_folder, exist_ok=True)
     with open(dest, "wb") as out:
         shutil.copyfileobj(file.file, out)
+
+    # Запускаем диаризацию на CPU
     celery_app.send_task("tasks.diarize_full", args=(dest,), task_id=uid)
+
+    # Сразу планируем транскрипцию на GPU
+    celery_app.send_task(
+        "tasks.transcribe_segments",
+        args=(dest,),
+        queue="preprocess_gpu"
+    )
+
     return {"job_id": uid}
 
 @app.get("/result/{job_id}")
