@@ -24,7 +24,8 @@ class Settings(BaseSettings):
     WHISPER_MODEL: str
     WHISPER_DEVICE: str
     WHISPER_COMPUTE_TYPE: str
-
+    ALIGN_MODEL_NAME: str
+    ALIGN_BEAM_SIZE: int
     # Pyannote diarization model
     PYANNOTE_MODEL: str
 
@@ -36,6 +37,8 @@ class Settings(BaseSettings):
     # Diarization chunk length (seconds)
     DIARIZE_CHUNK_LENGTH: int
     MAX_FILE_SIZE: int
+    HUGGINGFACE_TOKEN: str
+    HF_TOKEN: str
     # Other settings if present…
     # …
 
