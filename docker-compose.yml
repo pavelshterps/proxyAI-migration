@@ -8,6 +8,11 @@ services:
     container_name: proxyai-api
     env_file:
       - .env
+    environment:
+      UPLOAD_FOLDER: /tmp/uploads
+    volumes:
+      - upload-data:/tmp/uploads
+      - hf_cache:/hf_cache
     depends_on:
       - redis
       - tusd
@@ -24,6 +29,11 @@ services:
     container_name: proxyai-cpu-worker
     env_file:
       - .env
+    environment:
+      UPLOAD_FOLDER: /tmp/uploads
+    volumes:
+      - upload-data:/tmp/uploads
+      - hf_cache:/hf_cache
     depends_on:
       - redis
     command: >
@@ -40,6 +50,11 @@ services:
     container_name: proxyai-gpu-worker
     env_file:
       - .env
+    environment:
+      UPLOAD_FOLDER: /tmp/uploads
+    volumes:
+      - upload-data:/tmp/uploads
+      - hf_cache:/hf_cache
     depends_on:
       - redis
     runtime: nvidia
