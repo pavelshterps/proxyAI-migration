@@ -19,7 +19,6 @@ _diarizer: Pipeline | None = None
 def get_whisper_model() -> WhisperModel:
     global _whisper_model
     if _whisper_model is None:
-        # Only use required parameters, and force conversion on load
         params = {
             "model_size_or_path": settings.WHISPER_MODEL_NAME,
             "device": settings.WHISPER_DEVICE,
@@ -92,7 +91,6 @@ def transcribe_segments(self: Task, wav_path: str) -> list[dict]:
         beam_size=settings.WHISPER_BEAM_SIZE,
         best_of=settings.WHISPER_BEST_OF,
         task=settings.WHISPER_TASK,
-        bahasa=None,
     )
     out = []
     for start, end, text in segments:
