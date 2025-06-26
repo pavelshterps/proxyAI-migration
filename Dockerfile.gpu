@@ -16,16 +16,7 @@ COPY requirements.txt .
 RUN pip3 install --no-cache-dir --upgrade pip \
   && pip3 install --no-cache-dir -r requirements.txt
 
-# Pre-download Whisper model to cache so first task isn't blocked by download
-RUN python3 - << 'EOF'
-from faster_whisper import WhisperModel
-# adjust model path & compute_type if you use different settings
-WhisperModel(
-    model_size_or_path="openai/whisper-large-v2",
-    device="cpu",
-    compute_type="float16",
-)
-EOF
+
 
 # ---- Application code ----
 # Copy configuration, code, and static frontend
