@@ -1,3 +1,5 @@
+# tasks.py
+
 import os
 import logging
 from faster_whisper import WhisperModel
@@ -17,7 +19,6 @@ _diarizer: Pipeline | None = None
 def get_whisper_model() -> WhisperModel:
     global _whisper_model
     if _whisper_model is None:
-        # Only use required parameters
         params = {
             "model_size_or_path": settings.WHISPER_MODEL_NAME,
             "device": settings.WHISPER_DEVICE,
@@ -64,8 +65,7 @@ def diarize_full(self: Task, wav_path: str) -> list[dict]:
 
     # Schedule transcription on GPU
     logger.info(f"Scheduling transcribe_segments for {wav_path}")
-    celery_app.send_task(
-        "tasks.transcribe_segments",
+    transcribe_segments.apply_async(
         args=(wav_path,),
         queue="preprocess_gpu"
     )
