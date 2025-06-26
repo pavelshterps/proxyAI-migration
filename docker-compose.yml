@@ -55,6 +55,7 @@ services:
     volumes:
       - upload-data:/tmp/uploads
       - hf_cache:/hf_cache
+      - ctranslate2-cache:/root/.cache/ctranslate2
     depends_on:
       - redis
     runtime: nvidia

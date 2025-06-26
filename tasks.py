@@ -19,14 +19,15 @@ _diarizer: Pipeline | None = None
 def get_whisper_model() -> WhisperModel:
     global _whisper_model
     if _whisper_model is None:
+        # Only use required parameters, and force conversion on load
         params = {
             "model_size_or_path": settings.WHISPER_MODEL_NAME,
             "device": settings.WHISPER_DEVICE,
             "compute_type": settings.WHISPER_COMPUTE_TYPE,
             "device_index": settings.WHISPER_DEVICE_INDEX,
         }
-        logger.info(f"Loading WhisperModel with params: {params}")
-        _whisper_model = WhisperModel(**params)
+        logger.info(f"Loading WhisperModel with params: {params}, compile=True")
+        _whisper_model = WhisperModel(**params, compile=True)
         logger.info("WhisperModel loaded")
     return _whisper_model
 
@@ -52,10 +53,6 @@ def get_diarizer() -> Pipeline:
 )
 def diarize_full(self: Task, wav_path: str) -> list[dict]:
     logger.info(f"Starting diarize_full on {wav_path}")
-    """
-    Perform speaker diarization on the entire file.
-    Returns a list of segments: [{"start": float, "end": float, "speaker": str}, ...]
-    """
     diarizer = get_diarizer()
     timeline = diarizer(wav_path)
     segments = [
@@ -63,14 +60,12 @@ def diarize_full(self: Task, wav_path: str) -> list[dict]:
         for turn, _, speaker in timeline.itertracks(yield_label=True)
     ]
 
-    # Schedule transcription on GPU
     logger.info(f"Scheduling transcribe_segments for {wav_path}")
     transcribe_segments.apply_async(
         args=(wav_path,),
         queue="preprocess_gpu"
     )
 
-    # Optionally delete file after processing
     if settings.CLEAN_UP_UPLOADS:
         try:
             os.remove(wav_path)
@@ -87,10 +82,6 @@ def diarize_full(self: Task, wav_path: str) -> list[dict]:
 )
 def transcribe_segments(self: Task, wav_path: str) -> list[dict]:
     logger.info(f"Starting transcribe_segments on {wav_path}")
-    """
-    Transcribe the given audio file with Whisper into segments.
-    Returns a list of {"start": float, "end": float, "text": str}.
-    """
     model = get_whisper_model()
     segments, _info = model.transcribe(
         wav_path,
