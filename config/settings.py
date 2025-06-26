@@ -32,6 +32,7 @@ class Settings(BaseSettings):
     CPU_CONCURRENCY: int
     GPU_CONCURRENCY: int
 
+    PYANNOTE_PROTOCOL: str
     # Diarization chunk length (seconds)
     DIARIZE_CHUNK_LENGTH: int
 
