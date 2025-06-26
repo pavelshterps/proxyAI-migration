@@ -1,12 +1,12 @@
 # tasks.py
 
 import os
+import logging
 from faster_whisper import WhisperModel
 from pyannote.audio import Pipeline
 from celery import Task
 from celery_app import celery_app
 from config.settings import settings
-import logging
 
 logger = logging.getLogger(__name__)
 
@@ -52,25 +52,31 @@ def get_diarizer() -> Pipeline:
 def diarize_full(self: Task, wav_path: str) -> list[dict]:
     logger.info(f"Starting diarize_full on {wav_path}")
     """
-    Perform speaker diarization on the entire file, chunked by DIARIZE_CHUNK_LENGTH seconds.
+    Perform speaker diarization on the entire file.
     Returns a list of segments: [{"start": float, "end": float, "speaker": str}, ...]
     """
     diarizer = get_diarizer()
-    # Run diarization (the pipeline internally handles chunking if needed)
     timeline = diarizer(wav_path)
-    segments = []
-    for turn, _, speaker in timeline.itertracks(yield_label=True):
-        segments.append({
-            "start": float(turn.start),
-            "end": float(turn.end),
-            "speaker": speaker,
-        })
-    # Optionally delete file after processing:
+    segments = [
+        {"start": float(turn.start), "end": float(turn.end), "speaker": speaker}
+        for turn, _, speaker in timeline.itertracks(yield_label=True)
+    ]
+
+    # Отправляем транскрипцию на GPU
+    logger.info(f"Scheduling transcribe_segments for {wav_path}")
+    celery_app.send_task(
+        "tasks.transcribe_segments",
+        args=(wav_path,),
+        queue="preprocess_gpu"
+    )
+
+    # Удаляем файл, если включено
     if settings.CLEAN_UP_UPLOADS:
         try:
             os.remove(wav_path)
         except Exception:
             pass
+
     return segments
 
 @celery_app.task(
@@ -86,28 +92,26 @@ def transcribe_segments(self: Task, wav_path: str) -> list[dict]:
     Returns a list of {"start": float, "end": float, "text": str}.
     """
     model = get_whisper_model()
-    # decode into successive segments
     segments, _info = model.transcribe(
         wav_path,
         beam_size=settings.WHISPER_BEAM_SIZE,
         best_of=settings.WHISPER_BEST_OF,
         return_timestamps=True,
-        task=settings.WHISPER_TASK,  # e.g. "transcribe" or "translate"
+        task=settings.WHISPER_TASK,
         bahasa=None,
     )
-    # segments is an iterable of (start, end, text)
     out = []
-    for segment in segments:
-        start, end, text = segment
+    for start, end, text in segments:
         out.append({
             "start": float(start),
             "end": float(end),
             "text": text.strip(),
         })
-    # Clean up if desired
+
     if settings.CLEAN_UP_UPLOADS:
         try:
             os.remove(wav_path)
         except Exception:
             pass
+
     return out
