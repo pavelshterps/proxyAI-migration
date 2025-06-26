@@ -1,35 +1,32 @@
-import os
-import uuid
+from fastapi import FastAPI, UploadFile
+from fastapi.staticfiles import StaticFiles
+from uuid import uuid4
 import shutil
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from config.settings import settings
+import os
 from celery_app import celery_app
 
+# Create FastAPI app
 app = FastAPI()
 
+# Serve frontend static files (index.html, JS, CSS, etc.)
+app.mount("/", StaticFiles(directory="static", html=True), name="static")
+
 @app.post("/transcribe")
-async def start_transcription(file: UploadFile = File(...)):
-    if not file.content_type.startswith("audio"):
-        raise HTTPException(status_code=400, detail="Invalid file type")
-    uid = str(uuid.uuid4())
-    upload_dir = settings.UPLOAD_FOLDER
-    os.makedirs(upload_dir, exist_ok=True)
-    dest = os.path.join(upload_dir, f"{uid}.wav")
-    with open(dest, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-    celery_app.send_task(
-        "tasks.diarize_full",
-        args=[dest],
-        queue="preprocess_cpu",
-        task_id=uid,
-    )
+async def start_transcription(file: UploadFile):
+    uid = str(uuid4())
+    dest_dir = os.getenv("UPLOAD_FOLDER", "/tmp/uploads")
+    os.makedirs(dest_dir, exist_ok=True)
+    dest_path = os.path.join(dest_dir, f"{uid}.wav")
+    with open(dest_path, "wb") as out_file:
+        shutil.copyfileobj(file.file, out_file)
+    # Enqueue the diarization + transcription task
+    celery_app.send_task("tasks.diarize_full", args=(dest_path,), task_id=uid)
     return {"job_id": uid}
 
 @app.get("/result/{job_id}")
-def get_result(job_id: str):
-    async_result = celery_app.AsyncResult(job_id, backend=settings.CELERY_RESULT_BACKEND)
-    if async_result.state == "PENDING":
+async def get_result(job_id: str):
+    # Fetch result by task_id
+    result = celery_app.AsyncResult(job_id).result
+    if result is None:
         return {"status": "PENDING"}
-    if async_result.state == "SUCCESS":
-        return {"status": "SUCCESS", "segments": async_result.result}
-    return {"status": async_result.state, "detail": str(async_result.info)}
+    return {"status": "SUCCESS", "segments": result}
