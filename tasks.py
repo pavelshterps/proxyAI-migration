@@ -1,5 +1,3 @@
-# tasks.py
-
 import os
 import logging
 from faster_whisper import WhisperModel
@@ -64,7 +62,7 @@ def diarize_full(self: Task, wav_path: str) -> list[dict]:
         for turn, _, speaker in timeline.itertracks(yield_label=True)
     ]
 
-    # Отправляем транскрипцию на GPU
+    # Schedule transcription on GPU
     logger.info(f"Scheduling transcribe_segments for {wav_path}")
     celery_app.send_task(
         "tasks.transcribe_segments",
@@ -72,7 +70,7 @@ def diarize_full(self: Task, wav_path: str) -> list[dict]:
         queue="preprocess_gpu"
     )
 
-    # Удаляем файл, если включено
+    # Optionally delete file after processing
     if settings.CLEAN_UP_UPLOADS:
         try:
             os.remove(wav_path)
@@ -99,7 +97,7 @@ def transcribe_segments(self: Task, wav_path: str) -> list[dict]:
         beam_size=settings.WHISPER_BEAM_SIZE,
         best_of=settings.WHISPER_BEST_OF,
         return_timestamps=True,
-        task=settings.WHISPER_TASK,  # e.g. "transcribe" or "translate"
+        task=settings.WHISPER_TASK,
         bahasa=None,
     )
     out = []
