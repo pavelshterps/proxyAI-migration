@@ -1,89 +1,90 @@
-version: "3.8"
-
+version: "3.9"
 services:
-  # -------- TUSD (resumable upload server) ----------
+  # file upload endpoint
   tusd:
     image: tusproject/tusd:latest
+    container_name: proxyai-tusd
     ports:
       - "1080:1080"
-    command: ["tusd", "--upload-dir", "/files"]
+    command:
+      - "-host=0.0.0.0"
+      - "-port=1080"
+      - "-upload-dir=/uploads"
     volumes:
-      - upload-data:/files
+      - upload-data:/uploads
 
-  # -------- Redis (broker + backend) ----------
+  # fast, in-memory broker & result store
   redis:
     image: redis:7-alpine
+    container_name: proxyai-redis
+    ports:
+      - "6379:6379"
 
-  # -------- FastAPI / frontend & backend ----------
+  # HTTP API
   api:
     build:
       context: .
       dockerfile: Dockerfile
-    env_file:
-      - .env
+    container_name: proxyai-api
+    restart: unless-stopped
+    env_file: .env
     ports:
-      - "${FASTAPI_PORT}:${FASTAPI_PORT}"
+      - "${FASTAPI_HOST}:${FASTAPI_PORT}:${FASTAPI_PORT}"
     volumes:
-      - upload-data:${UPLOAD_FOLDER}
-    depends_on:
-      - redis
-      - tusd
+      - upload-data:/tmp/uploads
 
-  # -------- CPU worker (diarization) ----------
+  # CPU-only worker for pyannote diarization
   cpu-worker:
     build:
       context: .
       dockerfile: Dockerfile
-    env_file:
-      - .env
+    container_name: proxyai-cpu-worker
+    restart: unless-stopped
+    env_file: .env
     command: >
-      celery -A celery_app.celery_app worker
-      --loglevel=INFO
+      celery -A celery_app worker
+      --loglevel=info
       --concurrency=${CELERY_CONCURRENCY}
-      --queues preprocess_cpu
-      --hostname=cpu-worker@%h
+      -Q preprocess_cpu
     volumes:
-      - upload-data:${UPLOAD_FOLDER}
-      - hf_cache:/root/.cache/huggingface/hub
-    depends_on:
-      - redis
-      - api
+      - upload-data:/tmp/uploads
+      - hf_cache:/hf_cache
 
-  # -------- GPU worker (chunked Whisper) ----------
+  # GPU-accelerated worker for chunked Whisper transcription
   gpu-worker:
     build:
       context: .
       dockerfile: Dockerfile.gpu
-    env_file:
-      - .env
-    command: >
-      celery -A celery_app.celery_app worker
-      --loglevel=INFO
-      --concurrency=${GPU_CONCURRENCY}
-      --queues preprocess_gpu
-      --hostname=gpu-worker@%h
-    volumes:
-      - upload-data:${UPLOAD_FOLDER}
-      - hf_cache:/root/.cache/huggingface/hub
-    depends_on:
-      - redis
-      - api
+    container_name: proxyai-gpu-worker
+    restart: unless-stopped
+    env_file: .env
     deploy:
       resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
+        limits:
+          memory: 4g
+    # depending on your Docker Compose version you can use either `gpus: all` (v2.4+) or:
+    #   runtime: nvidia
+    gpus: all
+    command: >
+      celery -A celery_app worker
+      --loglevel=info
+      --concurrency=${GPU_CONCURRENCY}
+      -Q preprocess_gpu
+      --without-gossip --without-mingle --without-heartbeat
+    volumes:
+      - upload-data:/tmp/uploads
+      - hf_cache:/hf_cache
 
-  # -------- Flower (monitoring) ----------
+  # Flower monitoring UI
   flower:
-    image: mher/flower:latest
-    command: ["flower", "--port=5555", "--broker=${CELERY_BROKER_URL}"]
+    image: mher/flower:1.0.0
+    container_name: proxyai-flower
+    restart: unless-stopped
+    env_file: .env
+    command: >
+      flower -A celery_app --port=5555
     ports:
       - "5555:5555"
-    env_file:
-      - .env
     depends_on:
       - redis
 
