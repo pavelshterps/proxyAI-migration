@@ -22,11 +22,14 @@ services:
       dockerfile: Dockerfile
     ports:
       - "${FASTAPI_PORT:-8000}:8000"
+    env_file:
+      - .env
     environment:
-        env_file: .env
       - UPLOAD_FOLDER=/tmp/uploads
       - CELERY_BROKER_URL=redis://redis:6379
       - CELERY_RESULT_BACKEND=redis://redis:6379
+    volumes:
+      - upload-data:/tmp/uploads
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost:8000/docs || exit 1"]
       interval: 5s
@@ -34,11 +37,14 @@ services:
       retries: 5
 
   cpu-worker:
-    environment:
-      env_file: .env
     build:
       context: .
       dockerfile: Dockerfile
+    env_file:
+      - .env
+    volumes:
+      - hf_cache:/hf_cache
+      - upload-data:/tmp/uploads
     command: celery \
       -A celery_app.celery_app worker \
       --loglevel=info \
@@ -46,15 +52,16 @@ services:
       -Q preprocess_cpu
     depends_on:
       - redis
-    volumes:
-      - hf_cache:/hf_cache
 
   gpu-worker:
-    environment:
-      env_file: .env
     build:
       context: .
       dockerfile: Dockerfile.gpu
+    env_file:
+      - .env
+    volumes:
+      - hf_cache:/hf_cache
+      - upload-data:/tmp/uploads
     command: celery \
       -A celery_app.celery_app worker \
       --loglevel=info \
@@ -62,8 +69,6 @@ services:
       -Q preprocess_gpu
     depends_on:
       - redis
-    volumes:
-      - hf_cache:/hf_cache
 
   flower:
     image: mher/flower:latest
