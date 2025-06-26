@@ -50,26 +50,31 @@ services:
 
   redis:
     image: redis:7-alpine
+    container_name: proxyai-redis
+    restart: unless-stopped
     ports:
       - "6379:6379"
+    volumes:
+      - redis-data:/data
 
   tusd:
-    image: tusproject/tusd:v1.1.1
+    image: tusproject/tusd:latest
+    container_name: proxyai-tusd
+    restart: unless-stopped
     ports:
       - "1080:1080"
     command:
       - tusd
-      - -host
-      - "0.0.0.0"
-      - -port
-      - "1080"
-      - -dir
-      - /data
+      - --host=0.0.0.0
+      - --port=1080
+      - --dir=/data
     volumes:
       - upload-data:/data
 
   flower:
-    image: mher/flower
+    image: mher/flower:latest
+    container_name: proxyai-flower
+    restart: unless-stopped
     ports:
       - "5555:5555"
     env_file:
@@ -82,4 +87,5 @@ services:
 
 volumes:
   upload-data:
+  redis-data:
   hf_cache:
