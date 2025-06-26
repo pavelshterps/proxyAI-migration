@@ -1,16 +1,19 @@
 version: "3.8"
 
 services:
+  # файловый сервер tusd
   tusd:
-    image: tusproject/tusd:latest
+    image: tusproject/tusd:0.14.1
+    command: ["tusd", "--upload-dir", "/files"]
     ports:
       - "1080:1080"
-    command: ["tusd", "--upload-dir", "/files"]
     volumes:
       - upload-data:/files
 
   redis:
     image: redis:7-alpine
+    volumes:
+      - redis-data:/data
 
   api:
     build:
@@ -18,12 +21,14 @@ services:
       dockerfile: Dockerfile
     env_file: .env
     ports:
-      - "${FASTAPI_PORT}:8000"
-    volumes:
-      - ./static:/app/static:ro
+      - "${FASTAPI_PORT:-8000}:8000"
+    depends_on:
+      - tusd
+      - redis
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost:8000/docs || exit 1"]
       interval: 5s
+      timeout: 3s
       retries: 5
 
   cpu-worker:
@@ -32,9 +37,9 @@ services:
       dockerfile: Dockerfile
     env_file: .env
     command: >
-      celery -A celery_app worker
+      celery -A celery_app.celery_app worker
       --loglevel=info
-      --concurrency=${CELERY_CONCURRENCY}
+      --concurrency=${CELERY_CONCURRENCY:-4}
       -Q preprocess_cpu
     depends_on:
       - redis
@@ -46,12 +51,16 @@ services:
       context: .
       dockerfile: Dockerfile.gpu
     env_file: .env
-    runtime: nvidia
+    deploy:
+      resources:
+        limits:
+          memory: 4g
     command: >
-      celery -A celery_app worker
+      celery -A celery_app.celery_app worker
       --loglevel=info
       --concurrency=${WORKER_GPU_CONCURRENCY:-1}
       -Q preprocess_gpu
+    runtime: nvidia
     depends_on:
       - redis
     volumes:
@@ -59,22 +68,29 @@ services:
 
   flower:
     image: mher/flower:1.0.0
+    command: >
+      flower --broker=${CELERY_BROKER_URL}
+      --port=5555
     ports:
       - "5555:5555"
-    command: ["flower", "--port=5555", "--broker=${CELERY_BROKER_URL}"]
+    depends_on:
+      - redis
 
   integration-test:
     image: python:3.10-slim
-    depends_on:
-      api:
-        condition: service_healthy
     working_dir: /app
     volumes:
       - .:/app:cached
     env_file: .env
-    entrypoint: ["pytest", "-q", "tests/test_integration.py"]
+    environment:
+      API_URL: "http://api:8000"
+    depends_on:
+      api:
+        condition: service_healthy
+    entrypoint: ["pytest", "-q", "--disable-warnings", "--maxfail=1", "tests/test_integration.py"]
     restart: "no"
 
 volumes:
   upload-data:
+  redis-data:
   hf_cache:

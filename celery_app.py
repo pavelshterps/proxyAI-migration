@@ -2,7 +2,7 @@ from celery import Celery
 from config.settings import settings
 
 celery_app = Celery(
-    "proxyAI",
+    "proxyai",
     broker=settings.CELERY_BROKER_URL,
     backend=settings.CELERY_RESULT_BACKEND,
 )
@@ -13,6 +13,7 @@ celery_app.conf.update(
         "tasks.transcribe_segments": {"queue": "preprocess_gpu"},
     },
     task_serializer="json",
-    accept_content=["json"],
     result_serializer="json",
+    accept_content=["json"],
+    timezone=settings.CELERY_TIMEZONE,
 )

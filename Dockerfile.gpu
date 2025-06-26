@@ -1,10 +1,13 @@
+# === gpu base ===
 FROM nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04 AS gpu-base
-WORKDIR /app
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-      python3 python3-pip ffmpeg && \
+    apt-get install -y --no-install-recommends python3 python3-pip ffmpeg && \
+    ln -s /usr/bin/python3 /usr/local/bin/python && \
+    ln -s /usr/bin/pip3 /usr/local/bin/pip && \
     rm -rf /var/lib/apt/lists/*
-COPY requirements.txt .
-RUN pip3 install --no-cache-dir -r requirements.txt
-COPY . .
-ENV PYTHONPATH=/app
+
+WORKDIR /app
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . /app

@@ -1,23 +1,22 @@
-from fastapi import FastAPI, UploadFile, HTTPException
-from fastapi.staticfiles import StaticFiles
+import os, shutil
 from uuid import uuid4
-import shutil, os
+from fastapi import FastAPI, UploadFile, HTTPException
 from celery_app import celery_app
 from config.settings import settings
 
 app = FastAPI()
-app.mount("/", StaticFiles(directory="static", html=True), name="static")
 
 @app.post("/transcribe")
 async def start_transcription(file: UploadFile):
-    if file.content_type != "audio/wav":
-        raise HTTPException(400, "Only WAV files supported")
+    if not file.filename.lower().endswith(".wav"):
+        raise HTTPException(400, "Only .wav supported")
     uid = str(uuid4())
     dest = os.path.join(settings.UPLOAD_FOLDER, f"{uid}.wav")
-    os.makedirs(settings.UPLOAD_FOLDER, exist_ok=True)
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
     with open(dest, "wb") as out:
         shutil.copyfileobj(file.file, out)
-    celery_app.send_task("tasks.diarize_full", args=(dest,))
+    # сначала диаризация, потом транскрипция сегментов
+    celery_app.send_task("tasks.diarize_full", args=(dest,), queue="preprocess_cpu", task_id=uid)
     return {"job_id": uid}
 
 @app.get("/result/{job_id}")
