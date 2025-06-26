@@ -1,4 +1,5 @@
 from celery_app import celery_app
+from celery import group
 from config.settings import settings
 
 _whisper_model = None
@@ -42,8 +43,8 @@ def diarize_full(path: str):
         for start, end in segments
     ]
     # group and run in GPU queue
-    group = celery_app.Group(*result_tasks).set(queue="preprocess_gpu")
-    return group().get()
+    task_group = group(result_tasks, app=celery_app).set(queue="preprocess_gpu")
+    return task_group().get()
 
 @celery_app.task(name="tasks.transcribe_segments")
 def transcribe_segments(path: str, start: float, end: float):
