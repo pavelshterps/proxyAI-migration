@@ -24,6 +24,8 @@ def get_model():
             device_index=0,
             inter_threads=1,
             intra_threads=1,
+            chunk_length_s=30,
+            chunk_overlap_s=0,
         )
     return _model
 

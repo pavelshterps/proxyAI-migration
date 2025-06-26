@@ -1,19 +1,15 @@
 version: "3.8"
-
 services:
-  # файловый сервер tusd
   tusd:
-    image: tusproject/tusd:0.14.1
-    command: ["tusd", "--upload-dir", "/files"]
+    image: tusproject/tusd:latest
     ports:
       - "1080:1080"
+    command: ["tusd", "--upload-dir", "/files"]
     volumes:
       - upload-data:/files
 
   redis:
     image: redis:7-alpine
-    volumes:
-      - redis-data:/data
 
   api:
     build:
@@ -21,15 +17,10 @@ services:
       dockerfile: Dockerfile
     env_file: .env
     ports:
-      - "${FASTAPI_PORT:-8000}:8000"
-    depends_on:
-      - tusd
-      - redis
+      - "${FASTAPI_PORT}:8000"
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost:8000/docs || exit 1"]
-      interval: 5s
-      timeout: 3s
-      retries: 5
+      interval: 5s; timeout: 3s; retries: 5
 
   cpu-worker:
     build:
@@ -38,11 +29,10 @@ services:
     env_file: .env
     command: >
       celery -A celery_app.celery_app worker
-      --loglevel=info
-      --concurrency=${CELERY_CONCURRENCY:-4}
-      -Q preprocess_cpu
-    depends_on:
-      - redis
+        --loglevel=info
+        --concurrency=${CELERY_CONCURRENCY}
+        -Q preprocess_cpu
+    depends_on: [redis]
     volumes:
       - hf_cache:/hf_cache
 
@@ -51,46 +41,45 @@ services:
       context: .
       dockerfile: Dockerfile.gpu
     env_file: .env
-    deploy:
-      resources:
-        limits:
-          memory: 4g
     command: >
       celery -A celery_app.celery_app worker
-      --loglevel=info
-      --concurrency=${WORKER_GPU_CONCURRENCY:-1}
-      -Q preprocess_gpu
-    runtime: nvidia
-    depends_on:
-      - redis
+        --loglevel=info
+        --concurrency=${GPU_CONCURRENCY:-1}
+        -Q preprocess_gpu
+    depends_on: [redis]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
     volumes:
       - hf_cache:/hf_cache
 
   flower:
     image: mher/flower:1.0.0
+    env_file: .env
     command: >
-      flower --broker=${CELERY_BROKER_URL}
-      --port=5555
+      flower -A celery_app.celery_app
+        --port=5555
+        --broker=${CELERY_BROKER_URL}
     ports:
       - "5555:5555"
-    depends_on:
-      - redis
+    depends_on: [redis]
 
   integration-test:
     image: python:3.10-slim
-    working_dir: /app
-    volumes:
-      - .:/app:cached
     env_file: .env
-    environment:
-      API_URL: "http://api:8000"
     depends_on:
       api:
         condition: service_healthy
+    working_dir: /app
+    volumes:
+      - .:/app:cached
     entrypoint: ["pytest", "-q", "--disable-warnings", "--maxfail=1", "tests/test_integration.py"]
     restart: "no"
 
 volumes:
   upload-data:
-  redis-data:
   hf_cache:
