@@ -72,7 +72,7 @@ services:
       - upload-data:/data
 
   flower:
-      image: mher/flower:1.0.0
+      image: mher/flower:latest
       container_name: proxyai-flower
       restart: unless-stopped
       env_file:
