@@ -1,99 +1,89 @@
-# tasks.py
-
 import os
-from typing import List, Dict
-
-from celery_app import celery_app
+from celery import Celery
+from config.settings import settings
 from faster_whisper import WhisperModel
 from pyannote.audio import Pipeline
+import torch
 
-from config.settings import settings
+# Celery app setup
+celery_app = Celery(
+    'proxyai',
+    broker=settings.CELERY_BROKER_URL,
+    backend=settings.CELERY_RESULT_BACKEND,
+)
 
-# Global, lazy-loaded models
-_whisper_model: WhisperModel = None
-_diarizer_pipeline: Pipeline = None
+# Task routing
+celery_app.conf.task_routes = {
+    "tasks.diarize_full": {"queue": "preprocess_cpu"},
+    "tasks.transcribe_segments": {"queue": "preprocess_gpu"},
+}
 
-def get_whisper_model() -> WhisperModel:
-    global _whisper_model
-    if _whisper_model is None:
-        _whisper_model = WhisperModel(
-            device=settings.WHISPER_DEVICE,
-            compute_type="float16",
-            device_index=0,
-            inter_threads=1,
-            intra_threads=1
-        )
-    return _whisper_model
+# Lazy-loaded diarizer pipeline
+_diarizer_pipeline = None
 
-def get_diarizer_pipeline() -> Pipeline:
+
+def get_diarizer_pipeline():
     global _diarizer_pipeline
     if _diarizer_pipeline is None:
-        # Load without device argument
+        # Download & cache the model on first build (at runtime)
         _diarizer_pipeline = Pipeline.from_pretrained(
             settings.PYANNOTE_MODEL,
-            use_auth_token=settings.HUGGINGFACE_TOKEN
+            use_auth_token=settings.HUGGINGFACE_TOKEN,
         )
-        # Move pipeline to the configured device
-        _diarizer_pipeline.to(settings.WHISPER_DEVICE)
+    # Move pipeline to the configured device
+    device = torch.device(settings.WHISPER_DEVICE)
+    _diarizer_pipeline.to(device)
     return _diarizer_pipeline
 
+
 @celery_app.task(name="tasks.diarize_full")
-def diarize_full(filepath: str) -> List[Dict]:
+def diarize_full(file_path: str):
     """
-    Run speaker diarization in chunks and then enqueue transcription.
-    Returns list of {'start', 'end', 'speaker'} dicts.
+    1. Run speaker diarization to split audio into per-speaker segments.
+    2. Hand off each segment to Whisper in GPU.
+    3. Combine and return the list of (start, end, speaker, text).
     """
     pipeline = get_diarizer_pipeline()
-    chunk_len = settings.DIARIZE_CHUNK_LENGTH  # e.g. 30 seconds
+    # inference happens on GPU (float16)
+    diarization = pipeline({"audio": file_path})
+    segments = []
+    for turn, _, speaker in diarization.itertracks(yield_label=True):
+        segments.append((turn.start, turn.end, speaker))
+    # hand off to transcription
+    transcribe_segments.delay(file_path, segments)
+    return segments
 
-    # run diarization over entire file in sliding chunks
-    all_segments = []
-    audio_duration = pipeline.get_timeline(filepath).extent.duration  # uses pyannote's helper
-    for offset in range(0, int(audio_duration), chunk_len):
-        segment = {"uri": filepath, "start": offset, "end": offset + chunk_len}
-        diarization = pipeline({"audio": filepath, **segment})
-        for turn, _, speaker in diarization.itertracks(yield_label=True):
-            all_segments.append({
-                "start": turn.start + offset,
-                "end": turn.end + offset,
-                "speaker": speaker
-            })
-
-    # Enqueue transcription of each segment
-    transcribe_segments.delay(filepath, all_segments, settings.TUSD_ENDPOINT)
-    return all_segments
 
 @celery_app.task(name="tasks.transcribe_segments")
-def transcribe_segments(
-    filepath: str,
-    segments: List[Dict],
-    tusd_endpoint: str
-) -> List[Dict]:
+def transcribe_segments(file_path: str, segments: list):
     """
-    Transcribe each diarized segment with Whisper.
-    Returns list of {'start','end','speaker','text'}.
+    Transcribe each segment with WhisperModel on GPU.
     """
-    model = get_whisper_model()
+    model = WhisperModel(
+        settings.WHISPER_MODEL,
+        device=settings.WHISPER_DEVICE,
+        compute_type=settings.WHISPER_COMPUTE_TYPE,
+        device_index=settings.WHISPER_DEVICE_INDEX,
+        inter_threads=1,
+        intra_threads=1,
+    )
     results = []
-
-    for seg in segments:
-        start, end = seg["start"], seg["end"]
-        # WhisperModel returns (transcription, logprobs)
-        transcription, _ = model.transcribe(
-            filepath,
-            start=start,
-            end=end,
-            beam_size=settings.ALIGN_BEAM_SIZE,
-            model=settings.ALIGN_MODEL_NAME,
-            snippet_format=settings.SNIPPET_FORMAT
+    for start, end, speaker in segments:
+        duration = end - start
+        segments_gen, info = model.transcribe(
+            file_path,
+            beam_size=settings.WHISPER_BEAM_SIZE,
+            segment_first=start,
+            segment_last=end,
+            vad_filter=False,
         )
-        results.append({
-            "start": start,
-            "end": end,
-            "speaker": seg["speaker"],
-            "text": transcription
-        })
-
-    # Optionally upload to TUSD or store results here...
-    # e.g. requests.post(f"{tusd_endpoint}/files/", json=results)
+        # take joined text
+        text = "".join([segment.text for segment in segments_gen])
+        results.append((start, end, speaker, text.strip()))
+    # store in backend under job id
+    celery_app.backend.store_result(
+        task_id=os.path.splitext(os.path.basename(file_path))[0],
+        result=results,
+        status='SUCCESS',
+    )
     return results
