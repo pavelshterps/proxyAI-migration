@@ -12,5 +12,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 ENV HF_HOME=/hf_cache
-
-# Этот образ используется и для api, и для воркеров
+ENV UPLOAD_FOLDER=/uploads

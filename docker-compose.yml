@@ -14,7 +14,7 @@ services:
       context: .
       target: base
     command: >
-      uvicorn main:api
+      uvicorn main:app
       --host ${FASTAPI_HOST}
       --port ${FASTAPI_PORT}
       --workers ${API_WORKERS}
@@ -30,8 +30,9 @@ services:
     build:
       context: .
       target: base
-    command: celery -A celery_app.celery_app worker
-      --hostname=cpu_worker@%h
+    command: >
+      celery -A celery_app.celery_app worker
+      --hostname=cpu@%h
       --concurrency=${CPU_CONCURRENCY}
       --queues=preprocess_cpu
     volumes:
@@ -45,8 +46,9 @@ services:
       context: .
       target: base
     runtime: nvidia
-    command: celery -A celery_app.celery_app worker
-      --hostname=gpu_worker@%h
+    command: >
+      celery -A celery_app.celery_app worker
+      --hostname=gpu@%h
       --concurrency=${GPU_CONCURRENCY}
       --queues=preprocess_gpu
     volumes:

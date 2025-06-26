@@ -7,16 +7,16 @@ celery_app = Celery(
     backend=settings.CELERY_RESULT_BACKEND,
 )
 
-# Разделение задач по очередям
+# Маршрутизация задач по очередям
 celery_app.conf.task_routes = {
     "tasks.diarize_full": {"queue": "preprocess_cpu"},
     "tasks.transcribe_segments": {"queue": "preprocess_gpu"},
 }
 
-# Ограничение консьюмеров (CPU-воркер и GPU-воркер берут настройки из .env)
+# Общие настройки воркера
 celery_app.conf.update(
-    worker_concurrency=settings.CELERY_CONCURRENCY,
-    worker_prefetch_multiplier=1,
+    worker_concurrency=1,  # общее prefetch для стабильности
     task_acks_late=True,
     task_reject_on_worker_lost=True,
+    timezone=settings.CELERY_TIMEZONE,
 )
