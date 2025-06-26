@@ -6,6 +6,9 @@ from pyannote.audio import Pipeline
 from celery import Task
 from celery_app import celery_app
 from config.settings import settings
+import logging
+
+logger = logging.getLogger(__name__)
 
 # -----------------------------------------------------------------------------
 # Lazy-loaded singletons to avoid re-loading large models per task invocation
@@ -47,6 +50,7 @@ def get_diarizer() -> Pipeline:
     ignore_result=False,
 )
 def diarize_full(self: Task, wav_path: str) -> list[dict]:
+    logger.info(f"Starting diarize_full on {wav_path}")
     """
     Perform speaker diarization on the entire file, chunked by DIARIZE_CHUNK_LENGTH seconds.
     Returns a list of segments: [{"start": float, "end": float, "speaker": str}, ...]
@@ -76,6 +80,7 @@ def diarize_full(self: Task, wav_path: str) -> list[dict]:
     ignore_result=False,
 )
 def transcribe_segments(self: Task, wav_path: str) -> list[dict]:
+    logger.info(f"Starting transcribe_segments on {wav_path}")
     """
     Transcribe the given audio file with Whisper into segments.
     Returns a list of {"start": float, "end": float, "text": str}.
