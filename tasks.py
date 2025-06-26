@@ -19,14 +19,22 @@ _diarizer: Pipeline | None = None
 def get_whisper_model() -> WhisperModel:
     global _whisper_model
     if _whisper_model is None:
-        _whisper_model = WhisperModel(
-            model_size_or_path=settings.WHISPER_MODEL_NAME,
-            device=settings.WHISPER_DEVICE,
-            compute_type=settings.WHISPER_COMPUTE_TYPE,
-            device_index=settings.WHISPER_DEVICE_INDEX,
-            inter_threads=settings.WHISPER_INTER_THREADS,
-            intra_threads=settings.WHISPER_INTRA_THREADS,
-        )
+        # Собираем обязательные параметры
+        params = {
+            "model_size_or_path": settings.WHISPER_MODEL_NAME,
+            "device": settings.WHISPER_DEVICE,
+            "compute_type": settings.WHISPER_COMPUTE_TYPE,
+            "device_index": settings.WHISPER_DEVICE_INDEX,
+        }
+        # Передаём настройки потоков только если они явно заданы
+        if settings.WHISPER_INTER_THREADS is not None:
+            params["inter_threads"] = settings.WHISPER_INTER_THREADS
+        if settings.WHISPER_INTRA_THREADS is not None:
+            params["intra_threads"] = settings.WHISPER_INTRA_THREADS
+
+        logger.info(f"Loading WhisperModel with params: {params}")
+        _whisper_model = WhisperModel(**params)
+        logger.info("WhisperModel loaded")
     return _whisper_model
 
 def get_diarizer() -> Pipeline:
@@ -97,7 +105,7 @@ def transcribe_segments(self: Task, wav_path: str) -> list[dict]:
         beam_size=settings.WHISPER_BEAM_SIZE,
         best_of=settings.WHISPER_BEST_OF,
         return_timestamps=True,
-        task=settings.WHISPER_TASK,
+        task=settings.WHISPER_TASK,  # e.g. "transcribe" or "translate"
         bahasa=None,
     )
     out = []
