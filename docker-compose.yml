@@ -72,18 +72,17 @@ services:
       - upload-data:/data
 
   flower:
-      image: mher/flower:latest
-      container_name: proxyai-flower
-      restart: unless-stopped
-      env_file:
-        - .env
-      ports:
-        - "5555:5555"
-      command: >
-        flower
-        --app=celery_app.celery_app
-        --broker=${CELERY_BROKER_URL}
-        --port=5555
+    image: mher/flower:latest
+    container_name: proxyai-flower
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "5555:5555"
+    command: >
+      --app=celery_app.celery_app
+      --broker=${CELERY_BROKER_URL}
+      --port=5555
 
 volumes:
   upload-data:
