@@ -22,10 +22,19 @@ class Settings(BaseSettings):
     UPLOAD_FOLDER: str
     # Whisper settings
     WHISPER_MODEL: str
+    WHISPER_MODEL_NAME: str
     WHISPER_DEVICE: str
     WHISPER_COMPUTE_TYPE: str
+    WHISPER_DEVICE_INDEX: int
+    WHISPER_INTRA_THREADS: int
+    WHISPER_INTER_THREADS: int
+    WHISPER_BEAM_SIZE: int
+    WHISPER_TASK: str
+    WHISPER_BEST_OF: int
     ALIGN_MODEL_NAME: str
     ALIGN_BEAM_SIZE: int
+    CLEAN_UP_UPLOADS: bool
+    HF_CACHE_DIR: str
     # Pyannote diarization model
     PYANNOTE_MODEL: str
 
