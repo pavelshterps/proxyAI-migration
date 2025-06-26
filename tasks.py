@@ -28,11 +28,13 @@ def get_whisper_model() -> WhisperModel:
 def get_diarizer_pipeline() -> Pipeline:
     global _diarizer_pipeline
     if _diarizer_pipeline is None:
+        # Load without device argument
         _diarizer_pipeline = Pipeline.from_pretrained(
             settings.PYANNOTE_MODEL,
-            use_auth_token=settings.HUGGINGFACE_TOKEN,
-            device=settings.WHISPER_DEVICE
+            use_auth_token=settings.HUGGINGFACE_TOKEN
         )
+        # Move pipeline to the configured device
+        _diarizer_pipeline.to(settings.WHISPER_DEVICE)
     return _diarizer_pipeline
 
 @celery_app.task(name="tasks.diarize_full")
