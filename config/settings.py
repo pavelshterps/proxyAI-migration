@@ -28,6 +28,10 @@ class Settings(BaseSettings):
     # Pyannote diarization model
     PYANNOTE_MODEL: str
 
+    # Concurrency
+    CPU_CONCURRENCY: int
+    GPU_CONCURRENCY: int
+
     # Diarization chunk length (seconds)
     DIARIZE_CHUNK_LENGTH: int
 
