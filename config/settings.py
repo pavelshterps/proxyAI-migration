@@ -1,68 +1,53 @@
-# config/settings.py
-
-from typing import List, Dict
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import Field
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(
-        env_file=".env",
-        env_file_encoding="utf-8",
-        extra="ignore",   # игнорируем все не описанные тут переменные
-    )
+    # Tell Pydantic where to pull env from
+    model_config = SettingsConfigDict(env_file=".env", case_sensitive=True)
 
     # FastAPI
-    FASTAPI_HOST: str = "0.0.0.0"
-    FASTAPI_PORT: int = 8000
-    ALLOWED_ORIGINS: List[str] = ["*"]
+    fastapi_host: str = Field("0.0.0.0", env="FASTAPI_HOST")
+    fastapi_port: int = Field(8000, env="FASTAPI_PORT")
+    api_workers: int = Field(1, env="API_WORKERS")
+    allowed_origins: list[str] = Field(["*"], env="ALLOWED_ORIGINS")
 
-    # Celery & Redis
-    CELERY_BROKER_URL: str
-    CELERY_RESULT_BACKEND: str
-    WORKER_CPU_CONCURRENCY: int = 4
-    WORKER_GPU_CONCURRENCY: int = 1
+    # Celery / Redis
+    celery_broker_url: str = Field(..., env="CELERY_BROKER_URL")
+    celery_result_backend: str = Field(..., env="CELERY_RESULT_BACKEND")
+    celery_concurrency: int = Field(1, env="CELERY_CONCURRENCY")
+    celery_timezone: str = Field("UTC", env="CELERY_TIMEZONE")
 
-    # Заливка файлов
-    UPLOAD_FOLDER: str
-    FILE_RETENTION_DAYS: int = 7
-    MAX_FILE_SIZE: int = 1073741824
-
-    # TUSd
-    TUS_ENDPOINT: str = "http://tusd:1080/files/"
-    SNIPPET_FORMAT: str = "wav"
+    # File uploads
+    upload_folder: str = Field(..., env="UPLOAD_FOLDER")
+    file_retention_days: int = Field(..., env="FILE_RETENTION_DAYS")
+    max_file_size: int = Field(..., env="MAX_FILE_SIZE")
+    tus_endpoint: str = Field(..., env="TUS_ENDPOINT")
+    snippet_format: str = Field("wav", env="SNIPPET_FORMAT")
 
     # Whisper
-    WHISPER_MODEL: str = "Systran/faster-whisper-large-v2"
-    WHISPER_COMPUTE_TYPE: str = "float16"
-    DEVICE: str = "cuda"
+    device: str = Field("cpu", env="DEVICE")
+    whisper_compute_type: str = Field("float16", env="WHISPER_COMPUTE_TYPE")
+    whisper_model: str = Field(..., env="WHISPER_MODEL")
+    align_model_name: str = Field(..., env="ALIGN_MODEL_NAME")
+    align_beam_size: int = Field(5, env="ALIGN_BEAM_SIZE")
 
     # Pyannote
-    PYANNOTE_MODEL: str = "pyannote/speaker-diarization"
+    pyannote_protocol: str = Field(..., env="PYANNOTE_PROTOCOL")
+    pyannote_model: str | None = Field(None, env="PYANNOTE_MODEL")
 
-    # Align (опционально, если используется)
-    ALIGN_MODEL_NAME: str = "whisper-large"
-    ALIGN_BEAM_SIZE: int = 5
-
-    # Huggingface
-    HUGGINGFACE_TOKEN: str
+    # HF tokens
+    huggingface_token: str = Field(..., env="HUGGINGFACE_TOKEN")
+    hf_token: str | None = Field(None, env="HF_TOKEN")
 
     # Postgres / SQLAlchemy
-    POSTGRES_DB: str
-    POSTGRES_USER: str
-    POSTGRES_PASSWORD: str
-    DATABASE_URL: str
+    postgres_db: str = Field(..., env="POSTGRES_DB")
+    postgres_user: str = Field(..., env="POSTGRES_USER")
+    postgres_password: str = Field(..., env="POSTGRES_PASSWORD")
+    database_url: str = Field(..., env="DATABASE_URL")
 
-    # Redis (если где-то используется REDIS_URL)
-    REDIS_URL: str = ""
-
-    # Роутинг задач
-    CELERY_TASK_ROUTES: Dict[str, Dict[str, str]] = {
-        "tasks.diarize_full": {"queue": "preprocess_cpu"},
-        "tasks.transcribe_segments": {"queue": "preprocess_gpu"},
-    }
-
-    class Config:
-        env_prefix = ""  # имя переменных точно как в .env
+    # Redis (if used in code)
+    redis_url: str = Field(..., env="REDIS_URL")
 
 
 settings = Settings()

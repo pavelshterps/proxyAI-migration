@@ -1,19 +1,20 @@
-# celery_app.py
 from celery import Celery
 from config.settings import settings
 
-celery_app = Celery(
+app = Celery(
     "proxyai",
-    broker=settings.CELERY_BROKER_URL,
-    backend=settings.CELERY_RESULT_BACKEND,
+    broker=settings.celery_broker_url,
+    backend=settings.celery_result_backend,
 )
 
-celery_app.conf.update(
-    task_routes={
-        "tasks.diarize_full": {"queue": "preprocess_cpu"},
-        "tasks.transcribe_segments": {"queue": "preprocess_gpu"},
-    },
-    worker_concurrency=settings.CPU_CONCURRENCY,
-    timezone="UTC",
-    enable_utc=True,
-)
+# Task routing: CPU‐bound vs GPU‐bound
+app.conf.task_routes = {
+    "tasks.diarize_full": {"queue": "preprocess_cpu"},
+    "tasks.transcribe_segments": {"queue": "preprocess_gpu"},
+}
+app.conf.task_default_queue = "default"
+app.conf.worker_prefetch_multiplier = 1  # prevent overscheduling
+app.conf.task_acks_late = True
+
+# Let Celery auto‐discover tasks.py
+app.autodiscover_tasks(["tasks"])

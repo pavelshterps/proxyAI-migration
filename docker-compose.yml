@@ -1,6 +1,18 @@
 version: "3.8"
 
 services:
+  tusd:
+    image: tus/tusd:alpine
+    ports:
+      - "1080:1080"
+    command:
+      - "/tusd"
+      - "server"
+      - "--behind-proxy"
+      - "--upload-dir"
+      - "/files"
+    volumes:
+      - upload-data:/files
   redis:
     image: redis:7-alpine
 
@@ -11,6 +23,7 @@ services:
     ports:
       - "${FASTAPI_PORT:-8000}:8000"
     environment:
+        env_file: .env
       - UPLOAD_FOLDER=/tmp/uploads
       - CELERY_BROKER_URL=redis://redis:6379
       - CELERY_RESULT_BACKEND=redis://redis:6379
@@ -21,6 +34,8 @@ services:
       retries: 5
 
   cpu-worker:
+    environment:
+      env_file: .env
     build:
       context: .
       dockerfile: Dockerfile
@@ -31,8 +46,12 @@ services:
       -Q preprocess_cpu
     depends_on:
       - redis
+    volumes:
+      - hf_cache:/hf_cache
 
   gpu-worker:
+    environment:
+      env_file: .env
     build:
       context: .
       dockerfile: Dockerfile.gpu
@@ -41,6 +60,21 @@ services:
       --loglevel=info \
       --concurrency=${WORKER_GPU_CONCURRENCY:-1} \
       -Q preprocess_gpu
+    depends_on:
+      - redis
+    volumes:
+      - hf_cache:/hf_cache
+
+  flower:
+    image: mher/flower:latest
+    command: >
+      celery -A celery_app.celery_app flower
+      --port=5555
+      --broker=${CELERY_BROKER_URL}
+    ports:
+      - "5555:5555"
+    environment:
+      env_file: .env
     depends_on:
       - redis
 
@@ -54,6 +88,7 @@ services:
     volumes:
       - .:/app:cached
     environment:
+      env_file: .env
       API_URL: "http://api:8000"
     entrypoint: ["pytest", "-q", "--disable-warnings", "--maxfail=1", "tests/test_integration.py"]
     # После завершения теста контейнер выкинет exit code 0 или 1, и сам остановится:
