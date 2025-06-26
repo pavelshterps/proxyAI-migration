@@ -3,8 +3,6 @@ uvicorn[standard]>=0.23.0
 celery[redis]>=5.3.0
 faster-whisper>=1.1.1
 pyannote.audio>=3.3.2
-pydantic-settings>=2.10.0
-python-dotenv
-python-multipart
-pytest>=7.0
-httpx>=0.24
+pydantic-settings>=2.10.1
+python-dotenv>=0.21.0
+python-multipart>=0.0.6

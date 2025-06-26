@@ -1,67 +1,51 @@
 import os
-from celery_app import app
-from config.settings import settings
-
 from faster_whisper import WhisperModel
 from pyannote.audio import Pipeline
+from celery_app import celery_app
+from config.settings import settings
 
-# ---- Lazy singletons ----
-_model: WhisperModel | None = None
+# ленивое создание моделей
 _diarizer: Pipeline | None = None
-
-def get_model() -> WhisperModel:
-    global _model
-    if _model is None:
-        _model = WhisperModel(
-            settings.whisper_model,
-            device=settings.device,
-            compute_type=settings.whisper_compute_type,
-            device_index=0,
-            intra_threads=1,
-            inter_threads=1
-        )
-    return _model
+_whisper: WhisperModel | None = None
 
 def get_diarizer() -> Pipeline:
     global _diarizer
     if _diarizer is None:
+        os.environ["HF_HOME"] = "/hf_cache"
         _diarizer = Pipeline.from_pretrained(
-            settings.pyannote_protocol,
-            use_auth_token=settings.hf_token or settings.huggingface_token
+            settings.PYANNOTE_PROTOCOL,
+            use_auth_token=settings.HUGGINGFACE_TOKEN,
         )
     return _diarizer
 
-# ---- GPU task: transcribe a single 30s chunk ----
-@app.task(name="tasks.transcribe_segments")
-def transcribe_segments(path: str) -> list[dict]:
-    model = get_model()
-    segments, info = model.transcribe(
-        path,
-        beam_size=settings.align_beam_size,
-        word_timestamps=True
-    )
-    # Flatten results into serializable dicts
-    return [
-        {"start": seg.start, "end": seg.end, "text": seg.text}
-        for seg in segments
-    ]
+def get_model() -> WhisperModel:
+    global _whisper
+    if _whisper is None:
+        _whisper = WhisperModel(
+            settings.WHISPER_MODEL,
+            device=settings.DEVICE,
+            compute_type=settings.WHISPER_COMPUTE_TYPE,
+            cache_dir="/hf_cache",
+            device_index=0,
+            inter_threads=1,
+            intra_threads=1,
+        )
+    return _whisper
 
-# ---- CPU task: diarize full file & fan-out to GPU ----
-@app.task(name="tasks.diarize_full")
-def diarize_full(path: str) -> list[dict]:
+@celery_app.task(name="tasks.diarize_full")
+def diarize_full(filepath: str) -> list[dict]:
     diarizer = get_diarizer()
-    diarization = diarizer({"audio": path})
-    results: list[dict] = []
+    # получаем сегменты с метками спикеров
+    return [{"start": turn.start, "end": turn.end, "speaker": turn.label}
+            for turn in diarizer(filepath)]
 
-    # For each speaker segment, slice out the audio snippet and send to GPU
-    for turn, _, speaker in diarization.itertracks(yield_label=True):
-        snippet = f"{path}_{turn.start:.2f}_{turn.end:.2f}.wav"
-        # Use ffmpeg/tusd or local trim to create snippet
-        # ... (left as your existing code)
-        # Now send snippet for transcription
-        segs = transcribe_segments.delay(snippet).get()
-        for s in segs:
-            s["speaker"] = speaker
-            results.append(s)
-
-    return results
+@celery_app.task(name="tasks.transcribe_segments")
+def transcribe_segments(segment: dict) -> dict:
+    model = get_model()
+    result = model.transcribe(
+        segment["file"],
+        beam_size=settings.ALIGN_BEAM_SIZE,
+        language="en",
+        without_timestamps=False,
+    )
+    return {"text": result[0].text, **segment}

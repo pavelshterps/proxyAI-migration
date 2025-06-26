@@ -2,15 +2,10 @@ version: "3.8"
 
 services:
   tusd:
-    image: tus/tusd:alpine
+    image: tusproject/tusd:latest    # но проверьте, что в Docker Hub эта метка существует
     ports:
       - "1080:1080"
-    command:
-      - "/tusd"
-      - "server"
-      - "--behind-proxy"
-      - "--upload-dir"
-      - "/files"
+    command: [ "tusd", "-upload-dir", "/files" ]
     volumes:
       - upload-data:/files
   redis:
@@ -20,83 +15,78 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+    env_file: .env
     ports:
-      - "${FASTAPI_PORT:-8000}:8000"
-    env_file:
-      - .env
-    environment:
-      - UPLOAD_FOLDER=/tmp/uploads
-      - CELERY_BROKER_URL=redis://redis:6379
-      - CELERY_RESULT_BACKEND=redis://redis:6379
+      - "${FASTAPI_PORT}:8000"
     volumes:
       - upload-data:/tmp/uploads
+      - ./static:/app/static       # если у вас есть фронтенд
     healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:8000/docs || exit 1"]
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/ || exit 1"]
       interval: 5s
-      timeout: 3s
       retries: 5
 
   cpu-worker:
     build:
       context: .
       dockerfile: Dockerfile
-    env_file:
-      - .env
-    volumes:
-      - hf_cache:/hf_cache
-      - upload-data:/tmp/uploads
-    command: celery \
-      -A celery_app.celery_app worker \
+    env_file: .env
+    command:
+      celery -A celery_app.celery_app worker \
       --loglevel=info \
-      --concurrency=${WORKER_CPU_CONCURRENCY:-4} \
+      --concurrency=${WORKER_CPU_CONCURRENCY} \
       -Q preprocess_cpu
     depends_on:
       - redis
+    volumes:
+      - upload-data:/tmp/uploads
+      - hf_cache:/hf_cache
 
   gpu-worker:
     build:
       context: .
       dockerfile: Dockerfile.gpu
-    env_file:
-      - .env
-    volumes:
-      - hf_cache:/hf_cache
-      - upload-data:/tmp/uploads
-    command: celery \
-      -A celery_app.celery_app worker \
+    runtime: nvidia
+    env_file: .env
+    command:
+      celery -A celery_app.celery_app worker \
       --loglevel=info \
-      --concurrency=${WORKER_GPU_CONCURRENCY:-1} \
+      --concurrency=${WORKER_GPU_CONCURRENCY} \
       -Q preprocess_gpu
     depends_on:
       - redis
+    volumes:
+      - upload-data:/tmp/uploads
+      - hf_cache:/hf_cache
 
   flower:
-    image: mher/flower:latest
+    image: mher/flower:1.0.0          # последняя доступная версия
+    env_file: .env
     command: >
-      celery -A celery_app.celery_app flower
-      --port=5555
-      --broker=${CELERY_BROKER_URL}
+      celery --broker=${CELERY_BROKER_URL}
+             flower
+             --port=5555
+             --url_prefix=flower
     ports:
       - "5555:5555"
-    environment:
-      env_file: .env
     depends_on:
       - redis
 
-  # === сюда добавляем наш тестовый сервис ===
   integration-test:
     image: python:3.10-slim
-    depends_on:
-      api:
-        condition: service_healthy
+    env_file: .env
     working_dir: /app
     volumes:
       - .:/app:cached
-    environment:
-      env_file: .env
-      API_URL: "http://api:8000"
-    entrypoint: ["pytest", "-q", "--disable-warnings", "--maxfail=1", "tests/test_integration.py"]
-    # После завершения теста контейнер выкинет exit code 0 или 1, и сам остановится:
+    depends_on:
+      api:
+        condition: service_healthy
+      cpu-worker:
+        condition: service_started
+      gpu-worker:
+        condition: service_started
+    entrypoint:
+      ["pytest", "-q", "--disable-warnings", "--maxfail=1", "tests/test_integration.py"]
     restart: "no"
 
 volumes:
