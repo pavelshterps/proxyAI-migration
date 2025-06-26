@@ -11,7 +11,6 @@ COPY requirements.txt .
 RUN pip3 install --no-cache-dir --upgrade pip \
   && pip3 install --no-cache-dir -r requirements.txt
 
-
 # ---- Application code ----
 # Copy configuration, code, and static frontend
 COPY config        ./config
@@ -20,5 +19,4 @@ COPY celery_app.py ./celery_app.py
 COPY tasks.py      ./tasks.py
 COPY static        ./static
 
-COPY . .
 ENV PYTHONUNBUFFERED=1
