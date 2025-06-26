@@ -1,22 +1,44 @@
 # config/settings.py
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from pydantic import Field
+from typing import List
+
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    # 1) Подключаем .env
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",             # игнорируем лишние переменные
+    )
 
-    UPLOAD_FOLDER: str = Field("/tmp/uploads", env="UPLOAD_FOLDER")
-    CELERY_BROKER_URL: str = Field("redis://redis:6379", env="CELERY_BROKER_URL")
-    CELERY_RESULT_BACKEND: str = Field("redis://redis:6379", env="CELERY_RESULT_BACKEND")
-    PYANNOTE_MODEL: str = Field("pyannote/speaker-diarization", env="PYANNOTE_MODEL")
-    WHISPER_MODEL: str = Field("openai/whisper-large-v2", env="WHISPER_MODEL")
+    # 2) Обязательные
+    UPLOAD_FOLDER: str
+    CELERY_BROKER_URL: str
+    CELERY_RESULT_BACKEND: str
 
-    # ресурсы воркеров
-    CPU_CONCURRENCY: int = Field(4, env="WORKER_CPU_CONCURRENCY")
-    GPU_CONCURRENCY: int = Field(1, env="WORKER_GPU_CONCURRENCY")
+    # 3) Диаризация
+    PYANNOTE_MODEL: str = "pyannote/speaker-diarization"
 
-    # остальные переменные (HTTP, порты и пр.) — только если вы ими реально пользуетесь в коде
-    FASTAPI_HOST: str = Field("0.0.0.0", env="FASTAPI_HOST")
-    FASTAPI_PORT: int = Field(8000, env="FASTAPI_PORT")
+    # 4) Транскрипция
+    WHISPER_MODEL: str = "openai/whisper-large-v2"
+    WHISPER_COMPUTE_TYPE: str = "float16"
 
+    # 5) FastAPI
+    FASTAPI_HOST: str = "0.0.0.0"
+    FASTAPI_PORT: int = 8000
+    ALLOWED_ORIGINS: List[str] = ["*"]
+
+    # 6) Celery
+    WORKER_CPU_CONCURRENCY: int = 4
+    WORKER_GPU_CONCURRENCY: int = 1
+    CELERY_TASK_ROUTES: dict = {
+        "tasks.diarize_full": {"queue": "preprocess_cpu"},
+        "tasks.transcribe_segments": {"queue": "preprocess_gpu"},
+    }
+
+    class Config:
+        env_prefix = ""  # без префиксов
+
+# Одна инстанция для всего приложения
 settings = Settings()
