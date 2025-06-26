@@ -1,18 +1,18 @@
+# tasks.py
 import os
-from celery_app import app
-from config.settings import settings
 from pyannote.audio import Pipeline
 from faster_whisper import WhisperModel
+from celery_app import celery_app
+from config.settings import settings
 
-# ленивые синглтоны
+# Синглтоны для моделей
 _diarizer = None
 _whisper = None
 
 def get_diarizer():
     global _diarizer
     if _diarizer is None:
-        os.makedirs(settings.HF_CACHE_DIR, exist_ok=True)
-        os.environ["HF_HOME"] = settings.HF_CACHE_DIR
+        os.environ["HF_HOME"] = settings.HF_CACHE
         _diarizer = Pipeline.from_pretrained(settings.PYANNOTE_MODEL)
     return _diarizer
 
@@ -20,50 +20,38 @@ def get_whisper():
     global _whisper
     if _whisper is None:
         _whisper = WhisperModel(
-            model=settings.WHISPER_MODEL,
-            device=settings.DEVICE_TYPE,
-            compute_type=settings.COMPUTE_TYPE,
+            settings.WHISPER_MODEL,
+            device="cuda",
+            compute_type=settings.WHISPER_COMPUTE_TYPE,
             device_index=0,
             inter_threads=1,
             intra_threads=1,
         )
     return _whisper
 
-@app.task(name="tasks.diarize_full")
-def diarize_full(filepath: str):
-    """
-    делим полный файл на speaker-сегменты и шлём каждый сегмент на транскрипцию
-    """
+@celery_app.task(name="tasks.diarize_full")
+def diarize_full(path: str):
     diarizer = get_diarizer()
-    diarization = diarizer(filepath)
-    segments = []
-    # собираем спикер-сегменты
-    for turn, _, speaker in diarization.itertracks(yield_label=True):
-        segments.append({"start": turn.start, "end": turn.end, "speaker": speaker})
+    # Возвращаем сегменты speakers
+    return [
+        {"start": turn.start, "end": turn.end, "speaker": turn.label}
+        for turn in diarizer(path).get_timeline()
+    ]
 
-    # вырезаем каждый сегмент через ffmpeg и отдаём в очередь GPU
-    for seg in segments:
-        s, e, sp = seg["start"], seg["end"], seg["speaker"]
-        out_path = f"{filepath}_{int(s*1000)}_{int(e*1000)}.wav"
-        os.system(f"ffmpeg -y -i {filepath} -ss {s} -to {e} {out_path}")
-        app.send_task("tasks.transcribe_segments", args=[out_path, sp])
-    return segments
-
-@app.task(name="tasks.transcribe_segments")
-def transcribe_segments(filepath: str, speaker: str):
-    """
-    транскрибация маленького чанка GPU-моделью
-    """
+@celery_app.task(name="tasks.transcribe_segments")
+def transcribe_segments(path: str):
     whisper = get_whisper()
-    segments, info = whisper.transcribe(filepath)
-    result = []
-    for seg in segments:
-        result.append({
-            "start": seg.start,
-            "end": seg.end,
-            "speaker": speaker,
-            "text": seg.text
-        })
-    # чистим временный файл
-    os.remove(filepath)
-    return result
+    # Разбиение на чанки
+    segments, _ = whisper.transcribe(
+        path,
+        beam_size=5,
+        word_timestamps=False,
+        language=None,
+        vad_filter=False,
+        max_initial_timestamp=0.0,
+        chunk_length_s=settings.CHUNK_LENGTH_S,
+    )
+    return [
+        {"start": seg.start, "end": seg.end, "text": seg.text}
+        for seg in segments
+    ]
