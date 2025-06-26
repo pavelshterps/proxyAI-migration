@@ -82,12 +82,15 @@ def diarize_full(self: Task, wav_path: str) -> list[dict]:
 )
 def transcribe_segments(self: Task, wav_path: str) -> list[dict]:
     logger.info(f"Starting transcribe_segments on {wav_path}")
+    """
+    Transcribe the given audio file with Whisper into segments.
+    Returns a list of {"start": float, "end": float, "text": str}.
+    """
     model = get_whisper_model()
     segments, _info = model.transcribe(
         wav_path,
         beam_size=settings.WHISPER_BEAM_SIZE,
         best_of=settings.WHISPER_BEST_OF,
-        return_timestamps=True,
         task=settings.WHISPER_TASK,
         bahasa=None,
     )
