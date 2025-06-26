@@ -1,31 +1,40 @@
-from pydantic_settings import BaseSettings
-from pydantic import Field
+# config/settings.py
+from pathlib import Path
+from typing import List
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=Path(__file__).parent.parent / ".env",
+        env_file_encoding="utf-8",
+    )
+
     # FastAPI
-    FASTAPI_HOST: str = "0.0.0.0"
-    FASTAPI_PORT: int = 8000
-    API_WORKERS: int = 1
+    FASTAPI_HOST: str
+    FASTAPI_PORT: int
+    API_WORKERS: int
 
     # CORS
-    ALLOWED_ORIGINS: list[str] = Field(default_factory=lambda: ["*"])
+    ALLOWED_ORIGINS: List[str]
 
     # Celery & Redis
     CELERY_BROKER_URL: str
     CELERY_RESULT_BACKEND: str
-    CELERY_CONCURRENCY: int = 1
-    CELERY_TIMEZONE: str = "UTC"
+    CELERY_CONCURRENCY: int
+    CELERY_TIMEZONE: str
 
-    # File uploads
-    UPLOAD_FOLDER: str
-    FILE_RETENTION_DAYS: int = 7
+    # Uploads
+    UPLOAD_FOLDER: Path
+    FILE_RETENTION_DAYS: int
     MAX_FILE_SIZE: int
-    TUS_ENDPOINT: str
-    SNIPPET_FORMAT: str = "wav"
 
-    # Models and keys
-    DEVICE: str = "cpu"
-    WHISPER_COMPUTE_TYPE: str = "float16"
+    # TUSD
+    TUS_ENDPOINT: str
+    SNIPPET_FORMAT: str
+
+    # Models
+    DEVICE: str
+    WHISPER_COMPUTE_TYPE: str
     WHISPER_MODEL: str
     ALIGN_MODEL_NAME: str
     ALIGN_BEAM_SIZE: int
@@ -38,14 +47,10 @@ class Settings(BaseSettings):
     POSTGRES_PASSWORD: str
     DATABASE_URL: str
 
-    # Redis fallback
+    # Redis (if you reference REDIS_URL)
     REDIS_URL: str
 
-    # GPU worker concurrency
-    GPU_CONCURRENCY: int = 1
-
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
+    # GPU worker
+    GPU_CONCURRENCY: int
 
 settings = Settings()
