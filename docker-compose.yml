@@ -1,5 +1,7 @@
 version: "3.8"
+
 services:
+  # -------- TUSD (resumable upload server) ----------
   tusd:
     image: tusproject/tusd:latest
     ports:
@@ -8,45 +10,64 @@ services:
     volumes:
       - upload-data:/files
 
+  # -------- Redis (broker + backend) ----------
   redis:
     image: redis:7-alpine
 
+  # -------- FastAPI / frontend & backend ----------
   api:
     build:
       context: .
       dockerfile: Dockerfile
-    env_file: .env
+    env_file:
+      - .env
     ports:
-      - "${FASTAPI_PORT}:8000"
-    healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:8000/docs || exit 1"]
-      interval: 5s; timeout: 3s; retries: 5
+      - "${FASTAPI_PORT}:${FASTAPI_PORT}"
+    volumes:
+      - upload-data:${UPLOAD_FOLDER}
+    depends_on:
+      - redis
+      - tusd
 
+  # -------- CPU worker (diarization) ----------
   cpu-worker:
     build:
       context: .
       dockerfile: Dockerfile
-    env_file: .env
+    env_file:
+      - .env
     command: >
       celery -A celery_app.celery_app worker
-        --loglevel=info
-        --concurrency=${CELERY_CONCURRENCY}
-        -Q preprocess_cpu
-    depends_on: [redis]
+      --loglevel=INFO
+      --concurrency=${CELERY_CONCURRENCY}
+      --queues preprocess_cpu
+      --hostname=cpu-worker@%h
     volumes:
-      - hf_cache:/hf_cache
+      - upload-data:${UPLOAD_FOLDER}
+      - hf_cache:/root/.cache/huggingface/hub
+    depends_on:
+      - redis
+      - api
 
+  # -------- GPU worker (chunked Whisper) ----------
   gpu-worker:
     build:
       context: .
       dockerfile: Dockerfile.gpu
-    env_file: .env
+    env_file:
+      - .env
     command: >
       celery -A celery_app.celery_app worker
-        --loglevel=info
-        --concurrency=${GPU_CONCURRENCY:-1}
-        -Q preprocess_gpu
-    depends_on: [redis]
+      --loglevel=INFO
+      --concurrency=${GPU_CONCURRENCY}
+      --queues preprocess_gpu
+      --hostname=gpu-worker@%h
+    volumes:
+      - upload-data:${UPLOAD_FOLDER}
+      - hf_cache:/root/.cache/huggingface/hub
+    depends_on:
+      - redis
+      - api
     deploy:
       resources:
         reservations:
@@ -54,31 +75,17 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [gpu]
-    volumes:
-      - hf_cache:/hf_cache
 
+  # -------- Flower (monitoring) ----------
   flower:
-    image: mher/flower:1.0.0
-    env_file: .env
-    command: >
-      flower -A celery_app.celery_app
-        --port=5555
-        --broker=${CELERY_BROKER_URL}
+    image: mher/flower:latest
+    command: ["flower", "--port=5555", "--broker=${CELERY_BROKER_URL}"]
     ports:
       - "5555:5555"
-    depends_on: [redis]
-
-  integration-test:
-    image: python:3.10-slim
-    env_file: .env
+    env_file:
+      - .env
     depends_on:
-      api:
-        condition: service_healthy
-    working_dir: /app
-    volumes:
-      - .:/app:cached
-    entrypoint: ["pytest", "-q", "--disable-warnings", "--maxfail=1", "tests/test_integration.py"]
-    restart: "no"
+      - redis
 
 volumes:
   upload-data:
