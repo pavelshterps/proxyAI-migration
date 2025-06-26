@@ -1,37 +1,38 @@
+# config/settings.py
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
-    # Pydantic-v2 style settings
     model_config = SettingsConfigDict(
         env_file=".env",
-        env_file_encoding="utf-8",
         extra="ignore",
     )
 
-    # Where uploads live inside the container
-    UPLOAD_FOLDER: str = "/data"
+    # Where uploaded WAVs live
+    UPLOAD_FOLDER: str
 
-    # Celery broker & backend
+    # TUS protocol file server (tusd) endpoint, e.g. http://tusd:1080/files/
+    TUSD_ENDPOINT: str
+
+    # Celery broker and backend URLs
     CELERY_BROKER_URL: str
     CELERY_RESULT_BACKEND: str
 
-    # TUS upload callback URL
-    TUSD_ENDPOINT: str
+    # Redis URL for fast lookup
+    REDIS_URL: str
 
-    # Whisper & Pyannote settings
-    WHISPER_MODEL: str = "openai/whisper-large-v2"
-    WHISPER_COMPUTE_TYPE: str = "float16"
-    WHISPER_BEAM_SIZE: int = 5
-    PYANNOTE_PROTOCOL: str = "pyannote/speaker-diarization"
-    HUGGINGFACE_TOKEN: str | None = None
+    # Whisper settings
+    WHISPER_MODEL: str
+    WHISPER_DEVICE: str
+    WHISPER_COMPUTE_TYPE: str
 
-    # Device and chunking
-    DEVICE: str = "cuda"
-    CHUNK_LENGTH_S: int = 30
+    # Pyannote diarization model
+    PYANNOTE_MODEL: str
 
-    # Concurrency controls
-    API_WORKERS: int = 1
-    CELERY_CONCURRENCY: int = 1
-    GPU_CONCURRENCY: int = 1
+    # Diarization chunk length (seconds)
+    DIARIZE_CHUNK_LENGTH: int
 
+    # Other settings if present…
+    # …
+
+# instantiate once
 settings = Settings()
