@@ -1,51 +1,53 @@
 import os
-from faster_whisper import WhisperModel
-from pyannote.audio import Pipeline
 from celery_app import celery_app
 from config.settings import settings
+from faster_whisper import WhisperModel
+from pyannote.audio import Pipeline
 
-# ленивое создание моделей
-_diarizer: Pipeline | None = None
-_whisper: WhisperModel | None = None
+# Lazy singletons
+_whisper_model = None
+_diarizer = None
 
-def get_diarizer() -> Pipeline:
-    global _diarizer
-    if _diarizer is None:
-        os.environ["HF_HOME"] = "/hf_cache"
-        _diarizer = Pipeline.from_pretrained(
-            settings.PYANNOTE_PROTOCOL,
-            use_auth_token=settings.HUGGINGFACE_TOKEN,
-        )
-    return _diarizer
-
-def get_model() -> WhisperModel:
-    global _whisper
-    if _whisper is None:
-        _whisper = WhisperModel(
+def get_whisper():
+    global _whisper_model
+    if _whisper_model is None:
+        _whisper_model = WhisperModel(
             settings.WHISPER_MODEL,
             device=settings.DEVICE,
             compute_type=settings.WHISPER_COMPUTE_TYPE,
-            cache_dir="/hf_cache",
             device_index=0,
-            inter_threads=1,
             intra_threads=1,
+            inter_threads=1,
         )
-    return _whisper
+    return _whisper_model
+
+def get_diarizer():
+    global _diarizer
+    if _diarizer is None:
+        _diarizer = Pipeline.from_pretrained(
+            settings.PYANNOTE_PROTOCOL,
+            use_auth_token=settings.HUGGINGFACE_TOKEN,
+            cache_dir="/hf_cache",
+        )
+    return _diarizer
 
 @celery_app.task(name="tasks.diarize_full")
-def diarize_full(filepath: str) -> list[dict]:
+def diarize_full(path: str):
     diarizer = get_diarizer()
-    # получаем сегменты с метками спикеров
-    return [{"start": turn.start, "end": turn.end, "speaker": turn.label}
-            for turn in diarizer(filepath)]
+    timeline = diarizer({"audio": path})
+    # split into speaker‐labelled WAV and dispatch each to transcribe_segments
+    segments = []
+    for turn, _, speaker in timeline.itertracks(yield_label=True):
+        out = f"{path}.{speaker}.{turn.start:.2f}-{turn.end:.2f}.wav"
+        os.system(f"ffmpeg -i {path} -ss {turn.start} -to {turn.end} -c copy {out}")
+        segments.append((out, speaker))
+    res = []
+    for out, speaker in segments:
+        res.extend(transcribe_segments.delay(out).get())
+    return res
 
 @celery_app.task(name="tasks.transcribe_segments")
-def transcribe_segments(segment: dict) -> dict:
-    model = get_model()
-    result = model.transcribe(
-        segment["file"],
-        beam_size=settings.ALIGN_BEAM_SIZE,
-        language="en",
-        without_timestamps=False,
-    )
-    return {"text": result[0].text, **segment}
+def transcribe_segments(path: str):
+    model = get_whisper()
+    segments, info = model.transcribe(path, beam_size=settings.ALIGN_BEAM_SIZE)
+    return [{"start": s.start, "end": s.end, "text": s.text} for s in segments]

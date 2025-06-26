@@ -1,22 +1,16 @@
-### stage: base
+# === base stage ===
 FROM python:3.10-slim AS base
-ENV DEBIAN_FRONTEND=noninteractive
-RUN apt-get update \
- && apt-get install -y --no-install-recommends \
-      build-essential \
-      ffmpeg \
-      curl \
- && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+      ffmpeg git && \
+    rm -rf /var/lib/apt/lists/*
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-
-### stage: api
-FROM base AS api
 COPY . .
+ENV PYTHONPATH=/app
+
+# === api stage (same code base) ===
+FROM base AS api
 EXPOSE 8000
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "${API_WORKERS}"]
-
-### stage: worker
-FROM base AS worker
-COPY . .

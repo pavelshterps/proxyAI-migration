@@ -1,39 +1,36 @@
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, SettingsConfigDict, Field
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(
-        env_file=".env",
-        extra="ignore",
-        env_file_encoding="utf-8",
-    )
+    model_config = SettingsConfigDict(extra="ignore")
 
-    # FastAPI
     FASTAPI_HOST: str
     FASTAPI_PORT: int
-    API_WORKERS: int
+    API_WORKERS: int = 1
 
-    ALLOWED_ORIGINS: list[str]
+    ALLOWED_ORIGINS: str
 
-    # Celery
     CELERY_BROKER_URL: str
     CELERY_RESULT_BACKEND: str
-    WORKER_CPU_CONCURRENCY: int
-    WORKER_GPU_CONCURRENCY: int
+    CELERY_CONCURRENCY: int
     CELERY_TIMEZONE: str
 
-    # Uploads
     UPLOAD_FOLDER: str
+    FILE_RETENTION_DAYS: int
+    MAX_FILE_SIZE: int
+    TUS_ENDPOINT: str
+    SNIPPET_FORMAT: str
 
-    # Models
     DEVICE: str
     WHISPER_COMPUTE_TYPE: str
     WHISPER_MODEL: str
     ALIGN_MODEL_NAME: str
     ALIGN_BEAM_SIZE: int
     PYANNOTE_PROTOCOL: str
-    HUGGINGFACE_TOKEN: str
+    HUGGINGFACE_TOKEN: str = Field(env="HF_TOKEN")
 
-    # Database
+    POSTGRES_DB: str
+    POSTGRES_USER: str
+    POSTGRES_PASSWORD: str
     DATABASE_URL: str
     REDIS_URL: str
 
