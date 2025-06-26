@@ -35,7 +35,7 @@ class Settings(BaseSettings):
     PYANNOTE_PROTOCOL: str
     # Diarization chunk length (seconds)
     DIARIZE_CHUNK_LENGTH: int
-
+    MAX_FILE_SIZE: int
     # Other settings if present…
     # …
 
