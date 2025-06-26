@@ -1,56 +1,37 @@
-# config/settings.py
-from pathlib import Path
-from typing import List
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
+    # Pydantic-v2 style settings
     model_config = SettingsConfigDict(
-        env_file=Path(__file__).parent.parent / ".env",
+        env_file=".env",
         env_file_encoding="utf-8",
+        extra="ignore",
     )
 
-    # FastAPI
-    FASTAPI_HOST: str
-    FASTAPI_PORT: int
-    API_WORKERS: int
+    # Where uploads live inside the container
+    UPLOAD_FOLDER: str = "/data"
 
-    # CORS
-    ALLOWED_ORIGINS: List[str]
-
-    # Celery & Redis
+    # Celery broker & backend
     CELERY_BROKER_URL: str
     CELERY_RESULT_BACKEND: str
-    CELERY_CONCURRENCY: int
-    CELERY_TIMEZONE: str
 
-    # Uploads
-    UPLOAD_FOLDER: Path
-    FILE_RETENTION_DAYS: int
-    MAX_FILE_SIZE: int
+    # TUS upload callback URL
+    TUSD_ENDPOINT: str
 
-    # TUSD
-    TUS_ENDPOINT: str
-    SNIPPET_FORMAT: str
+    # Whisper & Pyannote settings
+    WHISPER_MODEL: str = "openai/whisper-large-v2"
+    WHISPER_COMPUTE_TYPE: str = "float16"
+    WHISPER_BEAM_SIZE: int = 5
+    PYANNOTE_PROTOCOL: str = "pyannote/speaker-diarization"
+    HUGGINGFACE_TOKEN: str | None = None
 
-    # Models
-    DEVICE: str
-    WHISPER_COMPUTE_TYPE: str
-    WHISPER_MODEL: str
-    ALIGN_MODEL_NAME: str
-    ALIGN_BEAM_SIZE: int
-    PYANNOTE_PROTOCOL: str
-    HUGGINGFACE_TOKEN: str
+    # Device and chunking
+    DEVICE: str = "cuda"
+    CHUNK_LENGTH_S: int = 30
 
-    # Database
-    POSTGRES_DB: str
-    POSTGRES_USER: str
-    POSTGRES_PASSWORD: str
-    DATABASE_URL: str
-
-    # Redis (if you reference REDIS_URL)
-    REDIS_URL: str
-
-    # GPU worker
-    GPU_CONCURRENCY: int
+    # Concurrency controls
+    API_WORKERS: int = 1
+    CELERY_CONCURRENCY: int = 1
+    GPU_CONCURRENCY: int = 1
 
 settings = Settings()

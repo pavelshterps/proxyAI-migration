@@ -1,72 +1,64 @@
-# tasks.py
-import os
 from celery_app import celery_app
 from config.settings import settings
-from pathlib import Path
 
-# pyannote diarizer
-from pyannote.audio import Pipeline
-# faster-whisper
-from faster_whisper import WhisperModel
+_whisper_model = None
+_pyannote_pipeline = None
 
-CACHE_DIR = os.getenv("HF_CACHE", "/hf_cache")
-Path(CACHE_DIR).mkdir(parents=True, exist_ok=True)
-
-_diarizer = None
-def get_diarizer():
-    global _diarizer
-    if _diarizer is None:
-        _diarizer = Pipeline.from_pretrained(
-            settings.PYANNOTE_PROTOCOL,
-            use_auth_token=settings.HUGGINGFACE_TOKEN,
-            cache_dir=CACHE_DIR,
-        )
-    return _diarizer
-
-_whisper = None
-def get_whisper():
-    global _whisper
-    if _whisper is None:
-        _whisper = WhisperModel(
-            model=settings.WHISPER_MODEL,
+def get_whisper_model():
+    global _whisper_model
+    if _whisper_model is None:
+        from faster_whisper import WhisperModel
+        _whisper_model = WhisperModel(
+            settings.WHISPER_MODEL,
             device=settings.DEVICE,
-            device_index=0,
             compute_type=settings.WHISPER_COMPUTE_TYPE,
-            cache_dir=CACHE_DIR,
             inter_threads=1,
             intra_threads=1,
+            chunk_length_s=settings.CHUNK_LENGTH_S
         )
-    return _whisper
+    return _whisper_model
+
+def get_pyannote_pipeline():
+    global _pyannote_pipeline
+    if _pyannote_pipeline is None:
+        from pyannote.audio import Pipeline
+        _pyannote_pipeline = Pipeline.from_pretrained(
+            settings.PYANNOTE_PROTOCOL,
+            use_auth_token=settings.HUGGINGFACE_TOKEN
+        )
+    return _pyannote_pipeline
 
 @celery_app.task(name="tasks.diarize_full")
-def diarize_full(filepath: str):
-    diarizer = get_diarizer()
-    diarization = diarizer(filepath)
+def diarize_full(path: str):
+    pipeline = get_pyannote_pipeline()
+    diarization = pipeline(path)
     segments = [
-        {"start": turn.start, "end": turn.end, "speaker": spk}
-        for turn, _, spk in diarization.itertracks(yield_label=True)
+        (seg.start, seg.end)
+        for seg in diarization.get_timeline().support()
     ]
-    # fan-out each segment for transcription
-    for seg in segments:
-        celery_app.send_task(
-            "tasks.transcribe_segments",
-            args=(filepath, seg["start"], seg["end"]),
-        )
-    return segments
+    # dispatch transcription of each 30s segment
+    result_tasks = [
+        transcribe_segments.s(path, start, end)
+        for start, end in segments
+    ]
+    # group and run in GPU queue
+    group = celery_app.Group(*result_tasks).set(queue="preprocess_gpu")
+    return group().get()
 
 @celery_app.task(name="tasks.transcribe_segments")
-def transcribe_segments(filepath: str, start: float, end: float):
-    model = get_whisper()
+def transcribe_segments(path: str, start: float, end: float):
+    model = get_whisper_model()
     segments, _ = model.transcribe(
-        filepath,
-        batch_size=1,
-        beam_size=settings.ALIGN_BEAM_SIZE,
-        chunk_length_s=30,
-        chunk_overlap_s=5,
-        condition_on_previous_text=True,
-        word_timestamps=True,
+        path,
+        beam_size=settings.WHISPER_BEAM_SIZE,
+        temperature=None,
+        return_segments=True,
+        split_on_word=False,
+        word_timestamps=False,
     )
-    return [
-        {"start": seg.start, "end": seg.end, "text": seg.text}
+    text = " ".join(
+        seg.text
         for seg in segments
-    ]
+        if seg.start >= start and seg.end <= end
+    )
+    return {"start": start, "end": end, "text": text.strip()}

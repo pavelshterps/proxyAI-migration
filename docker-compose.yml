@@ -5,48 +5,54 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    ports:
-      - "8000:8000"
+    container_name: proxyai-api
     env_file:
       - .env
     depends_on:
       - redis
       - tusd
+    ports:
+      - "8000:8000"
+    # shell form so $API_WORKERS expands
+    command: >
+      sh -c "uvicorn main:app --host 0.0.0.0 --port 8000 --workers $API_WORKERS"
 
   cpu-worker:
     build:
       context: .
       dockerfile: Dockerfile
+    container_name: proxyai-cpu-worker
     env_file:
       - .env
+    depends_on:
+      - redis
     command: >
-      celery -A celery_app
-      worker --loglevel=info
+      celery -A celery_app worker
+      --loglevel=info
       --concurrency ${CELERY_CONCURRENCY}
       --hostname cpu-worker
       --queues preprocess_cpu
-    depends_on:
-      - redis
 
   gpu-worker:
     build:
       context: .
       dockerfile: Dockerfile.gpu
+    container_name: proxyai-gpu-worker
     env_file:
       - .env
+    depends_on:
+      - redis
+    runtime: nvidia
     deploy:
       resources:
         limits:
           memory: 4g
-    runtime: nvidia
     command: >
-      celery -A celery_app
-      worker --loglevel=info
+      celery -A celery_app worker
+      --loglevel=info
       --concurrency ${GPU_CONCURRENCY}
       --hostname gpu-worker
       --queues preprocess_gpu
-    depends_on:
-      - redis
 
   redis:
     image: redis:7-alpine
@@ -77,16 +83,17 @@ services:
     restart: unless-stopped
     env_file:
       - .env
-    entrypoint:
-      - "flower"
-    command:
-      - "--app=celery_app.celery_app"
-      - "--broker=${CELERY_BROKER_URL}"
-      - "--port=5555"
-    ports:
-      - "5555:5555"
     depends_on:
       - redis
+    # explicitly invoke celery's flower subcommand
+    entrypoint:
+      - celery
+      - flower
+    command:
+      - --broker=${CELERY_BROKER_URL}
+      - --port=5555
+    ports:
+      - "5555:5555"
 
 volumes:
   upload-data:
