@@ -1,23 +1,22 @@
 # config/settings.py
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import Field
 
 class Settings(BaseSettings):
-    UPLOAD_FOLDER: str                   = "/tmp/uploads"
-    CELERY_BROKER_URL: str               = "redis://redis:6379/0"
-    CELERY_RESULT_BACKEND: str           = "redis://redis:6379/1"
-    HF_CACHE: str                        = "/hf_cache"
-    PYANNOTE_MODEL: str                  = "pyannote/speaker-diarization"
-    WHISPER_MODEL: str                   = "Systran/faster-whisper-large-v3"
-    WHISPER_COMPUTE_TYPE: str            = "float16"
-    CHUNK_LENGTH_S: int                  = 30
-    WORKER_CPU_CONCURRENCY: int          = 4
-    WORKER_GPU_CONCURRENCY: int          = 1
-    CELERY_CONCURRENCY: int              = 4
-    CELERY_TIMEZONE: str                 = "UTC"
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
-    model_config = SettingsConfigDict(
-        env_file = ".env",
-        extra    = "ignore",
-    )
+    UPLOAD_FOLDER: str = Field("/tmp/uploads", env="UPLOAD_FOLDER")
+    CELERY_BROKER_URL: str = Field("redis://redis:6379", env="CELERY_BROKER_URL")
+    CELERY_RESULT_BACKEND: str = Field("redis://redis:6379", env="CELERY_RESULT_BACKEND")
+    PYANNOTE_MODEL: str = Field("pyannote/speaker-diarization", env="PYANNOTE_MODEL")
+    WHISPER_MODEL: str = Field("openai/whisper-large-v2", env="WHISPER_MODEL")
+
+    # ресурсы воркеров
+    CPU_CONCURRENCY: int = Field(4, env="WORKER_CPU_CONCURRENCY")
+    GPU_CONCURRENCY: int = Field(1, env="WORKER_GPU_CONCURRENCY")
+
+    # остальные переменные (HTTP, порты и пр.) — только если вы ими реально пользуетесь в коде
+    FASTAPI_HOST: str = Field("0.0.0.0", env="FASTAPI_HOST")
+    FASTAPI_PORT: int = Field(8000, env="FASTAPI_PORT")
 
 settings = Settings()
