@@ -19,7 +19,7 @@ class Settings(BaseSettings):
 
     # Redis URL for fast lookup
     REDIS_URL: str
-
+    UPLOAD_FOLDER: str
     # Whisper settings
     WHISPER_MODEL: str
     WHISPER_DEVICE: str
