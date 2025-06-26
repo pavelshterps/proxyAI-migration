@@ -115,3 +115,4 @@ volumes:
   upload-data:
   redis-data:
   hf_cache:
+  ctranslate2-cache:

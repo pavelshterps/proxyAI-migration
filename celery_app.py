@@ -23,14 +23,3 @@ celery_app.conf.task_routes = {
 # Concurrency settings
 celery_app.conf.worker_concurrency = int(settings.CPU_CONCURRENCY)
 celery_app.conf.worker_prefetch_multiplier = 1
-
-# Preload Whisper model on GPU workers to avoid long first-run delay
-try:
-    import torch
-    if torch.cuda.is_available():
-        logger.info("CUDA available, preloading WhisperModel...")
-        from tasks import get_whisper_model
-        get_whisper_model()
-        logger.info("WhisperModel preloaded")
-except Exception as e:
-    logger.warning(f"Failed to preload WhisperModel: {e}")

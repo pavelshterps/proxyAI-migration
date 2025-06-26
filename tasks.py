@@ -26,8 +26,8 @@ def get_whisper_model() -> WhisperModel:
             "compute_type": settings.WHISPER_COMPUTE_TYPE,
             "device_index": settings.WHISPER_DEVICE_INDEX,
         }
-        logger.info(f"Loading WhisperModel with params: {params}, compile=True")
-        _whisper_model = WhisperModel(**params, compile=True)
+        logger.info(f"Loading WhisperModel with params: {params}")
+        _whisper_model = WhisperModel(**params)
         logger.info("WhisperModel loaded")
     return _whisper_model
 

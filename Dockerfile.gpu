@@ -16,7 +16,16 @@ COPY requirements.txt .
 RUN pip3 install --no-cache-dir --upgrade pip \
   && pip3 install --no-cache-dir -r requirements.txt
 
-
+# Pre-compile Whisper model on CPU to generate CTranslate2 binary
+RUN python3 - << 'EOF'
+from faster_whisper import WhisperModel
+WhisperModel(
+    model_size_or_path="openai/whisper-large-v2",
+    device="cpu",
+    compute_type="float16",
+    compile=True
+)
+EOF
 
 # ---- Application code ----
 # Copy configuration, code, and static frontend
