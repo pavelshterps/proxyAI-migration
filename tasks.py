@@ -1,5 +1,13 @@
 import os
 import logging
+import huggingface_hub
+# Monkey-patch HF snapshot_download to allow local quantized model paths
+_original_snapshot_download = huggingface_hub.snapshot_download
+def _snapshot_download_override(repo_id, *args, **kwargs):
+    if os.path.exists(repo_id):
+        return repo_id
+    return _original_snapshot_download(repo_id, *args, **kwargs)
+huggingface_hub.snapshot_download = _snapshot_download_override
 from faster_whisper import WhisperModel
 import faster_whisper.utils as fw_utils
 import faster_whisper.transcribe as fw_transcribe
