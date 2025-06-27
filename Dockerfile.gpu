@@ -9,11 +9,15 @@ RUN apt-get update \
        python3.10 python3-pip ffmpeg \
   && rm -rf /var/lib/apt/lists/*
 
+RUN pip3 install --no-cache-dir transformers
+
 WORKDIR /app
 COPY requirements.txt .
 RUN pip3 install --no-cache-dir --upgrade pip \
     && pip3 install --no-cache-dir ctranslate2[cuda] \
     && pip3 install --no-cache-dir -r requirements.txt
+
+RUN sed -i '1i import transformers' /usr/local/lib/python3.10/dist-packages/ctranslate2/converters/transformers.py
 
 # Pre-quantize whisper-medium into CTranslate2 format
 RUN ct2-transformers-converter \
