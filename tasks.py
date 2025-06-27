@@ -12,6 +12,18 @@ from faster_whisper import WhisperModel
 import faster_whisper.utils as fw_utils
 import faster_whisper.transcribe as fw_transcribe
 
+import huggingface_hub
+from huggingface_hub import snapshot_download
+
+import huggingface_hub.utils._validators as hf_validators
+# Monkey-patch validate_repo_id to accept local filesystem paths
+_orig_validate_repo_id = hf_validators.validate_repo_id
+def _validate_repo_id_override(repo_id):
+    if os.path.exists(repo_id):
+        return
+    return _orig_validate_repo_id(repo_id)
+hf_validators.validate_repo_id = _validate_repo_id_override
+
 # Monkey-patch download_model to accept local quantized model directories
 _original_download_model = fw_utils.download_model
 def _download_model_override(repo_id, *args, **kwargs):
