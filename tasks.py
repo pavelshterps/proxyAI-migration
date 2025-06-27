@@ -2,6 +2,7 @@ import os
 import logging
 from faster_whisper import WhisperModel
 import faster_whisper.utils as fw_utils
+import faster_whisper.transcribe as fw_transcribe
 
 # Monkey-patch download_model to accept local quantized model directories
 _original_download_model = fw_utils.download_model
@@ -10,6 +11,7 @@ def _download_model_override(repo_id, *args, **kwargs):
         return repo_id
     return _original_download_model(repo_id, *args, **kwargs)
 fw_utils.download_model = _download_model_override
+fw_transcribe.download_model = _download_model_override
 
 from pyannote.audio import Pipeline
 from celery import Task
