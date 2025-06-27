@@ -1,4 +1,3 @@
-# tasks.py
 import os
 import logging
 from faster_whisper import WhisperModel
@@ -9,9 +8,6 @@ from config.settings import settings
 
 logger = logging.getLogger(__name__)
 
-# -------------------------------------------------------------------------
-# Lazy-loaded singletons to avoid re-loading large models per task invoke
-# -------------------------------------------------------------------------
 _whisper_model: WhisperModel | None = None
 _diarizer: Pipeline | None = None
 
@@ -19,14 +15,14 @@ def get_whisper_model() -> WhisperModel:
     global _whisper_model
     if _whisper_model is None:
         params = {
-            "model_size_or_path": settings.WHISPER_MODEL_NAME,
+            "model_size_or_path": "/hf_cache/quantized/whisper-medium-float16",
             "device": settings.WHISPER_DEVICE,
             "compute_type": settings.WHISPER_COMPUTE_TYPE,
             "device_index": settings.WHISPER_DEVICE_INDEX,
         }
         logger.info(f"Loading WhisperModel with params: {params}")
         _whisper_model = WhisperModel(**params)
-        logger.info("WhisperModel loaded")
+        logger.info("WhisperModel loaded (quantized CTranslate2 format)")
     return _whisper_model
 
 def get_diarizer() -> Pipeline:
@@ -38,10 +34,6 @@ def get_diarizer() -> Pipeline:
             cache_dir=settings.HF_CACHE_DIR,
         )
     return _diarizer
-
-# -------------------------------------------------------------------------
-# Celery tasks
-# -------------------------------------------------------------------------
 
 @celery_app.task(
     name="tasks.diarize_full",
@@ -59,18 +51,10 @@ def diarize_full(self: Task, wav_path: str) -> list[dict]:
     ]
 
     logger.info(f"Scheduling transcribe_segments for {wav_path}")
-    # транскрипция пройдёт во втором таске
     transcribe_segments.apply_async(
         args=(wav_path,),
         queue="preprocess_gpu"
     )
-
-    # Убираем очистку здесь — файл нужен для transcribe_segments!
-    # if settings.CLEAN_UP_UPLOADS:
-    #     try:
-    #         os.remove(wav_path)
-    #     except Exception:
-    #         pass
 
     return segments
 
@@ -98,7 +82,6 @@ def transcribe_segments(self: Task, wav_path: str) -> list[dict]:
             "text":  text.strip(),
         })
 
-    # Очистка — удаляем файл только ПОСЛЕ транскрипции
     if settings.CLEAN_UP_UPLOADS:
         try:
             os.remove(wav_path)

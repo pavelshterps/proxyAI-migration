@@ -15,8 +15,13 @@ RUN pip3 install --no-cache-dir --upgrade pip \
     && pip3 install --no-cache-dir ctranslate2[cuda] \
     && pip3 install --no-cache-dir -r requirements.txt
 
+# Pre-quantize whisper-medium into CTranslate2 format
+RUN ct2-transformers-converter \
+    --model openai/whisper-medium \
+    --quantization float16 \
+    --output_dir /hf_cache/quantized/whisper-medium-float16
+
 # ---- Application code ----
-# Copy configuration, code, and static frontend
 COPY config        ./config
 COPY main.py       ./main.py
 COPY celery_app.py ./celery_app.py
