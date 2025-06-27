@@ -1,5 +1,4 @@
 # tasks.py
-
 import os
 import logging
 from faster_whisper import WhisperModel
@@ -10,9 +9,9 @@ from config.settings import settings
 
 logger = logging.getLogger(__name__)
 
-# -----------------------------------------------------------------------------
-# Lazy-loaded singletons to avoid re-loading large models per task invocation
-# -----------------------------------------------------------------------------
+# -------------------------------------------------------------------------
+# Lazy-loaded singletons to avoid re-loading large models per task invoke
+# -------------------------------------------------------------------------
 _whisper_model: WhisperModel | None = None
 _diarizer: Pipeline | None = None
 
@@ -40,9 +39,9 @@ def get_diarizer() -> Pipeline:
         )
     return _diarizer
 
-# -----------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 # Celery tasks
-# -----------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 
 @celery_app.task(
     name="tasks.diarize_full",
@@ -60,16 +59,18 @@ def diarize_full(self: Task, wav_path: str) -> list[dict]:
     ]
 
     logger.info(f"Scheduling transcribe_segments for {wav_path}")
+    # транскрипция пройдёт во втором таске
     transcribe_segments.apply_async(
         args=(wav_path,),
         queue="preprocess_gpu"
     )
 
-    if settings.CLEAN_UP_UPLOADS:
-        try:
-            os.remove(wav_path)
-        except Exception:
-            pass
+    # Убираем очистку здесь — файл нужен для transcribe_segments!
+    # if settings.CLEAN_UP_UPLOADS:
+    #     try:
+    #         os.remove(wav_path)
+    #     except Exception:
+    #         pass
 
     return segments
 
@@ -81,10 +82,6 @@ def diarize_full(self: Task, wav_path: str) -> list[dict]:
 )
 def transcribe_segments(self: Task, wav_path: str) -> list[dict]:
     logger.info(f"Starting transcribe_segments on {wav_path}")
-    """
-    Transcribe the given audio file with Whisper into segments.
-    Returns a list of {"start": float, "end": float, "text": str}.
-    """
     model = get_whisper_model()
     segments, _info = model.transcribe(
         wav_path,
@@ -92,18 +89,20 @@ def transcribe_segments(self: Task, wav_path: str) -> list[dict]:
         best_of=settings.WHISPER_BEST_OF,
         task=settings.WHISPER_TASK,
     )
+
     out = []
     for start, end, text in segments:
         out.append({
             "start": float(start),
-            "end": float(end),
-            "text": text.strip(),
+            "end":   float(end),
+            "text":  text.strip(),
         })
 
+    # Очистка — удаляем файл только ПОСЛЕ транскрипции
     if settings.CLEAN_UP_UPLOADS:
         try:
             os.remove(wav_path)
         except Exception:
-            pass
+            logger.warning(f"Failed to remove {wav_path}", exc_info=True)
 
     return out
