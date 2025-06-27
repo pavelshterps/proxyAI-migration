@@ -18,7 +18,6 @@ services:
       - tusd
     ports:
       - "8000:8000"
-    # shell form so $API_WORKERS expands
     command: >
       sh -c "uvicorn main:app --host 0.0.0.0 --port 8000 --workers $API_WORKERS"
 
@@ -56,6 +55,8 @@ services:
       - upload-data:/tmp/uploads
       - hf_cache:/hf_cache
       - ctranslate2-cache:/root/.cache/ctranslate2
+      - /path/to/host_cache:/hf_cache
+      - /path/to/whisper-large-v2-repo:/hf_cache/models--openai--whisper-large-v2
     depends_on:
       - redis
     runtime: nvidia
@@ -101,7 +102,6 @@ services:
       - .env
     depends_on:
       - redis
-    # explicitly invoke celery's flower subcommand
     entrypoint:
       - celery
       - flower
