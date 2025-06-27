@@ -21,12 +21,6 @@ RUN pip3 install --no-cache-dir --upgrade pip \
 RUN TRANSFORMER_FILE=$(python3 -c "import ctranslate2, os; print(os.path.dirname(ctranslate2.__file__) + '/converters/transformers.py')") \
     && sed -i '1i import transformers' "$TRANSFORMER_FILE"
 
-# Pre-quantize whisper-medium into CTranslate2 format
-RUN ct2-transformers-converter \
-    --model openai/whisper-medium \
-    --quantization float16 \
-    --output_dir /hf_cache/quantized/whisper-medium-float16
-
 # ---- Application code ----
 COPY config        ./config
 COPY main.py       ./main.py
