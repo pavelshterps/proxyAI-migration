@@ -9,7 +9,7 @@ COPY requirements.txt ./
 RUN pip3 install --no-cache-dir transformers && pip3 install --no-cache-dir --upgrade pip && pip3 install --no-cache-dir ctranslate2[cuda] && pip3 install --no-cache-dir -r requirements.txt
 
 # 3. Патчим CTranslate2-конвертер, чтобы он импортировал transformers
-RUN TRANSFORMER_FILE=$(python3 -c "import ctranslate2, os; print(os.path.dirname(ctranslate2.file) + '/converters/transformers.py')") && sed -i '1i import transformers' "$TRANSFORMER_FILE"
+RUN TRANSFORMER_FILE=$(python3 -c "import ctranslate2, os; print(os.path.dirname(ctranslate2.__file__) + '/converters/transformers.py')") && sed -i '1i import transformers' "$TRANSFORMER_FILE"
 
 WORKDIR /app
 
