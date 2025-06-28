@@ -54,8 +54,8 @@ services:
     volumes:
       - upload-data:/tmp/uploads
       - hf_cache:/hf_cache
-      - /path/to/whisper-large-v2-repo:/hf_cache/models--openai--whisper-large-v2:ro
       - ctranslate2-cache:/root/.cache/ctranslate2
+      - /path/to/whisper-large-v2-repo:/hf_cache/models--openai--whisper-large-v2
     depends_on:
       - redis
     runtime: nvidia
