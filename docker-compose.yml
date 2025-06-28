@@ -12,7 +12,7 @@ services:
       UPLOAD_FOLDER: /tmp/uploads
     volumes:
       - upload-data:/tmp/uploads
-      - /path/to/hf_cache_host:/hf_cache:ro
+      - /path/to/hf_cache_host:/hf_cache:ro    # bind-mount your host cache read-only
     depends_on:
       - redis
       - tusd
@@ -32,7 +32,7 @@ services:
       UPLOAD_FOLDER: /tmp/uploads
     volumes:
       - upload-data:/tmp/uploads
-      - /path/to/hf_cache_host:/hf_cache:ro
+      - /path/to/hf_cache_host:/hf_cache:ro    # same cache, read-only
     depends_on:
       - redis
     command: >
@@ -53,7 +53,7 @@ services:
       UPLOAD_FOLDER: /tmp/uploads
     volumes:
       - upload-data:/tmp/uploads
-      - /path/to/hf_cache_host:/hf_cache:rw
+      - /path/to/hf_cache_host:/hf_cache:rw    # cache must be writable for quantization output
       - ctranslate2-cache:/root/.cache/ctranslate2
     depends_on:
       - redis
