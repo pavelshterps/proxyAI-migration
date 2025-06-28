@@ -1,5 +1,6 @@
 import os
 import logging
+
 import huggingface_hub
 # Monkey-patch HF snapshot_download to allow local quantized model paths
 _original_snapshot_download = huggingface_hub.snapshot_download
@@ -8,12 +9,10 @@ def _snapshot_download_override(repo_id, *args, **kwargs):
         return repo_id
     return _original_snapshot_download(repo_id, *args, **kwargs)
 huggingface_hub.snapshot_download = _snapshot_download_override
+
 from faster_whisper import WhisperModel
 import faster_whisper.utils as fw_utils
 import faster_whisper.transcribe as fw_transcribe
-
-import huggingface_hub
-from huggingface_hub import snapshot_download
 
 import huggingface_hub.utils._validators as hf_validators
 # Monkey-patch validate_repo_id to accept local filesystem paths
@@ -24,7 +23,7 @@ def _validate_repo_id_override(repo_id):
     return _orig_validate_repo_id(repo_id)
 hf_validators.validate_repo_id = _validate_repo_id_override
 
-# Monkey-patch download_model to accept local quantized model directories
+# Monkey-patch download_model to accept local quantized model dirs
 _original_download_model = fw_utils.download_model
 def _download_model_override(repo_id, *args, **kwargs):
     if os.path.exists(repo_id):
@@ -40,21 +39,25 @@ from config.settings import settings
 
 logger = logging.getLogger(__name__)
 
+# Hold model instances across tasks
 _whisper_model: WhisperModel | None = None
 _diarizer: Pipeline | None = None
 
 def get_whisper_model() -> WhisperModel:
     global _whisper_model
     if _whisper_model is None:
+        # ←── Updated path to your quantized faster-whisper-medium-int8 model on the host mount
+        model_dir = "/hf_cache/models--guillaumekln--faster-whisper-medium"
         params = {
-            "model_size_or_path": "/hf_cache/quantized/whisper-medium-float16",
+            "model_size_or_path": model_dir,
             "device": settings.WHISPER_DEVICE,
-            "compute_type": settings.WHISPER_COMPUTE_TYPE,
+            # use int8 compute_type for the quantized model
+            "compute_type": "int8",
             "device_index": settings.WHISPER_DEVICE_INDEX,
         }
-        logger.info(f"Loading WhisperModel with params: {params}")
+        logger.info(f"Loading WhisperModel once at startup: {params}")
         _whisper_model = WhisperModel(**params)
-        logger.info("WhisperModel loaded (quantized CTranslate2 format)")
+        logger.info("WhisperModel loaded (quantized int8)")
     return _whisper_model
 
 def get_diarizer() -> Pipeline:
@@ -78,16 +81,19 @@ def diarize_full(self: Task, wav_path: str) -> list[dict]:
     diarizer = get_diarizer()
     timeline = diarizer(wav_path)
     segments = [
-        {"start": float(turn.start), "end": float(turn.end), "speaker": speaker}
+        {
+            "start": float(turn.start),
+            "end": float(turn.end),
+            "speaker": speaker,
+        }
         for turn, _, speaker in timeline.itertracks(yield_label=True)
     ]
-
     logger.info(f"Scheduling transcribe_segments for {wav_path}")
+    # push transcription onto GPU queue
     transcribe_segments.apply_async(
         args=(wav_path,),
-        queue="preprocess_gpu"
+        queue="preprocess_gpu",
     )
-
     return segments
 
 @celery_app.task(
@@ -105,19 +111,16 @@ def transcribe_segments(self: Task, wav_path: str) -> list[dict]:
         best_of=settings.WHISPER_BEST_OF,
         task=settings.WHISPER_TASK,
     )
-
-    out = []
+    out: list[dict] = []
     for start, end, text in segments:
         out.append({
             "start": float(start),
-            "end":   float(end),
-            "text":  text.strip(),
+            "end": float(end),
+            "text": text.strip(),
         })
-
     if settings.CLEAN_UP_UPLOADS:
         try:
             os.remove(wav_path)
         except Exception:
             logger.warning(f"Failed to remove {wav_path}", exc_info=True)
-
     return out
