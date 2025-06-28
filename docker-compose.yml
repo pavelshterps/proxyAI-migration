@@ -54,7 +54,6 @@ services:
     volumes:
       - upload-data:/tmp/uploads
       - /path/to/hf_cache_host:/hf_cache:rw    # cache must be writable for quantization output
-      - ctranslate2-cache:/root/.cache/ctranslate2
     depends_on:
       - redis
     runtime: nvidia
@@ -112,4 +111,3 @@ services:
 volumes:
   upload-data:
   redis-data:
-  ctranslate2-cache:
