@@ -33,13 +33,13 @@ services:
       DIARIZER_CACHE_DIR: /tmp/diarizer_cache
     volumes:
       - upload-data:/tmp/uploads
-      - /path/to/hf_cache_host:/hf_cache:ro
+      - hf_cache:/hf_cache
     depends_on:
       - redis
     command: >
       celery -A celery_app worker
       --loglevel=info
-      --concurrency ${CELERY_CONCURRENCY}
+      --concurrency ${CPU_CONCURRENCY}
       --hostname cpu-worker
       --queues preprocess_cpu
 
@@ -55,6 +55,7 @@ services:
     volumes:
       - upload-data:/tmp/uploads
       - /path/to/hf_cache_host:/hf_cache:rw
+      - ctranslate2-cache:/root/.cache/ctranslate2
     depends_on:
       - redis
     runtime: nvidia
@@ -112,3 +113,5 @@ services:
 volumes:
   upload-data:
   redis-data:
+  ctranslate2-cache:
+  hf_cache:
