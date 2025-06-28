@@ -1,20 +1,15 @@
 FROM nvidia/cuda:12.1.0-cudnn8-runtime-ubuntu22.04
 
 # 1. Системные зависимости
-RUN apt-get update \
- && apt-get install -y --no-install-recommends \
-      python3.10 python3-pip ffmpeg \
- && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends python3.10 python3-pip ffmpeg && rm -rf /var/lib/apt/lists/*
 
 # 2. Устанавливаем Python-пакеты
-RUN pip3 install --no-cache-dir transformers \
- && pip3 install --no-cache-dir --upgrade pip \
- && pip3 install --no-cache-dir ctranslate2[cuda] \
- && pip3 install --no-cache-dir -r requirements.txt
+WORKDIR /app
+COPY requirements.txt ./
+RUN pip3 install --no-cache-dir transformers && pip3 install --no-cache-dir --upgrade pip && pip3 install --no-cache-dir ctranslate2[cuda] && pip3 install --no-cache-dir -r requirements.txt
 
 # 3. Патчим CTranslate2-конвертер, чтобы он импортировал transformers
-RUN TRANSFORMER_FILE=$(python3 -c "import ctranslate2, os; print(os.path.dirname(ctranslate2.__file__) + '/converters/transformers.py')") \
- && sed -i '1i import transformers' "$TRANSFORMER_FILE"
+RUN TRANSFORMER_FILE=$(python3 -c "import ctranslate2, os; print(os.path.dirname(ctranslate2.file) + '/converters/transformers.py')") && sed -i '1i import transformers' "$TRANSFORMER_FILE"
 
 WORKDIR /app
 
