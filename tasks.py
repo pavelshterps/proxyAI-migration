@@ -63,10 +63,12 @@ def get_whisper_model() -> WhisperModel:
 def get_diarizer() -> Pipeline:
     global _diarizer
     if _diarizer is None:
+        cache_dir = "/tmp/pyannote_cache"
+        os.makedirs(cache_dir, exist_ok=True)
         _diarizer = Pipeline.from_pretrained(
             settings.PYANNOTE_MODEL,
             use_auth_token=settings.HUGGINGFACE_TOKEN,
-            cache_dir=settings.HF_CACHE_DIR,
+            cache_dir=cache_dir,
         )
     return _diarizer
 

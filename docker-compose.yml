@@ -12,7 +12,7 @@ services:
       UPLOAD_FOLDER: /tmp/uploads
     volumes:
       - upload-data:/tmp/uploads
-      - /path/to/hf_cache_host:/hf_cache:ro    # bind-mount host cache read-only
+      - /path/to/hf_cache_host:/hf_cache:rw    # bind-mount host cache read-only
     depends_on:
       - redis
       - tusd
@@ -32,7 +32,7 @@ services:
       UPLOAD_FOLDER: /tmp/uploads
     volumes:
       - upload-data:/tmp/uploads
-      - /path/to/hf_cache_host:/hf_cache:ro
+      - /path/to/hf_cache_host:/hf_cache:rw
     depends_on:
       - redis
     command: >
