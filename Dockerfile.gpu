@@ -11,7 +11,7 @@ COPY requirements.txt .
 RUN pip3 install --no-cache-dir -r requirements.txt
 
 # Патч CTranslate2, чтобы не было ошибок импорта transformers
-RUN TRANSFORMER_FILE=$(python3 - <<<'import ctranslate2, os; print(os.path.dirname(ctranslate2.__file__) + "/converters/transformers.py")') \
+RUN TRANSFORMER_FILE=$(python3 -c "import ctranslate2, os; print(os.path.dirname(ctranslate2.__file__) + '/converters/transformers.py')") \
  && sed -i '1i import transformers' "$TRANSFORMER_FILE"
 
 COPY config ./config
