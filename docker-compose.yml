@@ -12,7 +12,7 @@ services:
       UPLOAD_FOLDER: /tmp/uploads
     volumes:
       - upload-data:/tmp/uploads
-      - /path/to/hf_cache_host:/hf_cache:rw    # bind-mount host cache read-only
+      - /path/to/hf_cache_host:/hf_cache:ro
     depends_on:
       - redis
       - tusd
@@ -30,9 +30,10 @@ services:
       - .env
     environment:
       UPLOAD_FOLDER: /tmp/uploads
+      DIARIZER_CACHE_DIR: /tmp/diarizer_cache
     volumes:
       - upload-data:/tmp/uploads
-      - /path/to/hf_cache_host:/hf_cache:rw
+      - /path/to/hf_cache_host:/hf_cache:ro
     depends_on:
       - redis
     command: >
@@ -53,7 +54,7 @@ services:
       UPLOAD_FOLDER: /tmp/uploads
     volumes:
       - upload-data:/tmp/uploads
-      - /path/to/hf_cache_host:/hf_cache:rw    # writable for quantized models
+      - /path/to/hf_cache_host:/hf_cache:rw
     depends_on:
       - redis
     runtime: nvidia

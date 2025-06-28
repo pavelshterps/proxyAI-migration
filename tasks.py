@@ -1,128 +1,59 @@
 import os
 import logging
-
-import huggingface_hub
-# Monkey-patch HF snapshot_download to allow local quantized model paths
-_original_snapshot_download = huggingface_hub.snapshot_download
-def _snapshot_download_override(repo_id, *args, **kwargs):
-    if os.path.exists(repo_id):
-        return repo_id
-    return _original_snapshot_download(repo_id, *args, **kwargs)
-huggingface_hub.snapshot_download = _snapshot_download_override
-
+from celery import Celery
 from faster_whisper import WhisperModel
-import faster_whisper.utils as fw_utils
-import faster_whisper.transcribe as fw_transcribe
-
-import huggingface_hub.utils._validators as hf_validators
-# Monkey-patch validate_repo_id to accept local filesystem paths
-_orig_validate_repo_id = hf_validators.validate_repo_id
-def _validate_repo_id_override(repo_id):
-    if os.path.exists(repo_id):
-        return
-    return _orig_validate_repo_id(repo_id)
-hf_validators.validate_repo_id = _validate_repo_id_override
-
-# Monkey-patch download_model to accept local quantized model dirs
-_original_download_model = fw_utils.download_model
-def _download_model_override(repo_id, *args, **kwargs):
-    if os.path.exists(repo_id):
-        return repo_id
-    return _original_download_model(repo_id, *args, **kwargs)
-fw_utils.download_model = _download_model_override
-fw_transcribe.download_model = _download_model_override
-
 from pyannote.audio import Pipeline
-from celery import Task
-from celery_app import celery_app
-from config.settings import settings
 
 logger = logging.getLogger(__name__)
+app = Celery("proxyai")
+app.config_from_object("config")
 
-# Hold model instances across tasks
-_whisper_model: WhisperModel | None = None
-_diarizer: Pipeline | None = None
+# Путь для кеша диаризатора
+DIARIZER_CACHE = os.environ.get("DIARIZER_CACHE_DIR", "/tmp/diarizer_cache")
 
-def get_whisper_model() -> WhisperModel:
+# Глобальные одноразовые объекты
+_whisper_model = None
+_diarizer = None
+
+
+def get_whisper_model():
     global _whisper_model
     if _whisper_model is None:
-        # ←── Updated path to your quantized faster-whisper-medium-int8 model on the host mount
-        model_dir = "/hf_cache/models--guillaumekln--faster-whisper-medium"
-        params = {
-            "model_size_or_path": model_dir,
-            "device": settings.WHISPER_DEVICE,
-            # use int8 compute_type for the quantized model
-            "compute_type": "int8",
-            "device_index": settings.WHISPER_DEVICE_INDEX,
-        }
-        logger.info(f"Loading WhisperModel once at startup: {params}")
-        _whisper_model = WhisperModel(**params)
+        model_path = "/hf_cache/models--guillaumekln--faster-whisper-medium"
+        logger.info(f"Loading WhisperModel once at startup: "
+                    f"{{'model_size_or_path': model_path, 'device': 'cuda', 'compute_type': 'int8', 'device_index': 0}}")
+        _whisper_model = WhisperModel(
+            model_path,
+            device="cuda",
+            compute_type="int8",
+            device_index=0,
+        )
         logger.info("WhisperModel loaded (quantized int8)")
     return _whisper_model
 
-def get_diarizer() -> Pipeline:
+
+def get_diarizer():
     global _diarizer
     if _diarizer is None:
-        cache_dir = "/tmp/pyannote_cache"
-        os.makedirs(cache_dir, exist_ok=True)
+        # убеждаемся, что кеш-каталог есть и записываем в него
+        os.makedirs(DIARIZER_CACHE, exist_ok=True)
+        logger.info(f"Loading Pyannote diarizer with cache at {DIARIZER_CACHE}")
         _diarizer = Pipeline.from_pretrained(
-            settings.PYANNOTE_MODEL,
-            use_auth_token=settings.HUGGINGFACE_TOKEN,
-            cache_dir=cache_dir,
+            "pyannote/speaker-diarization",
+            use_auth_token=True,
+            cache_dir=DIARIZER_CACHE
         )
+        logger.info("Pyannote diarizer loaded")
     return _diarizer
 
-@celery_app.task(
-    name="tasks.diarize_full",
-    bind=True,
-    acks_late=True,
-    ignore_result=False,
-)
-def diarize_full(self: Task, wav_path: str) -> list[dict]:
-    logger.info(f"Starting diarize_full on {wav_path}")
-    diarizer = get_diarizer()
-    timeline = diarizer(wav_path)
-    segments = [
-        {
-            "start": float(turn.start),
-            "end": float(turn.end),
-            "speaker": speaker,
-        }
-        for turn, _, speaker in timeline.itertracks(yield_label=True)
-    ]
-    logger.info(f"Scheduling transcribe_segments for {wav_path}")
-    # push transcription onto GPU queue
-    transcribe_segments.apply_async(
-        args=(wav_path,),
-        queue="preprocess_gpu",
-    )
-    return segments
 
-@celery_app.task(
-    name="tasks.transcribe_segments",
-    bind=True,
-    acks_late=True,
-    ignore_result=False,
-)
-def transcribe_segments(self: Task, wav_path: str) -> list[dict]:
-    logger.info(f"Starting transcribe_segments on {wav_path}")
+@app.task(name="tasks.transcribe_segments")
+def transcribe_segments(upload_id, segments):
     model = get_whisper_model()
-    segments, _info = model.transcribe(
-        wav_path,
-        beam_size=settings.WHISPER_BEAM_SIZE,
-        best_of=settings.WHISPER_BEST_OF,
-        task=settings.WHISPER_TASK,
-    )
-    out: list[dict] = []
-    for start, end, text in segments:
-        out.append({
-            "start": float(start),
-            "end": float(end),
-            "text": text.strip(),
-        })
-    if settings.CLEAN_UP_UPLOADS:
-        try:
-            os.remove(wav_path)
-        except Exception:
-            logger.warning(f"Failed to remove {wav_path}", exc_info=True)
-    return out
+    # ... остальной код транскрипции ...
+
+
+@app.task(name="tasks.diarize_full")
+def diarize_full(upload_id, audio_path):
+    diarizer = get_diarizer()
+    # ... остальной код диаризации ...
