@@ -12,7 +12,7 @@ services:
       UPLOAD_FOLDER: /tmp/uploads
     volumes:
       - upload-data:/tmp/uploads
-      - hf_cache:/hf_cache
+      - /path/to/hf_cache_host:/hf_cache:ro
     depends_on:
       - redis
       - tusd
@@ -32,7 +32,7 @@ services:
       UPLOAD_FOLDER: /tmp/uploads
     volumes:
       - upload-data:/tmp/uploads
-      - hf_cache:/hf_cache
+      - /path/to/hf_cache_host:/hf_cache:ro
     depends_on:
       - redis
     command: >
