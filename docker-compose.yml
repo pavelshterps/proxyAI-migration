@@ -7,14 +7,14 @@ services:
       dockerfile: Dockerfile
     container_name: proxyai-api
     env_file: .env
-    volumes:
-      - upload-data:/tmp/uploads
-      - results-data:/tmp/results
+    ports:
+      - "8000:8000"
     depends_on:
       - redis
       - tusd
-    ports:
-      - "8000:8000"
+    volumes:
+      - upload-data:/tmp/uploads
+      - results-data:/tmp/results
     command: >
       sh -c "uvicorn main:app --host 0.0.0.0 --port 8000 --workers ${API_WORKERS}"
 
@@ -24,12 +24,12 @@ services:
       dockerfile: Dockerfile
     container_name: proxyai-cpu-worker
     env_file: .env
+    depends_on:
+      - redis
     volumes:
       - upload-data:/tmp/uploads
       - results-data:/tmp/results
       - diarizer-cache:/tmp/diarizer_cache
-    depends_on:
-      - redis
     command: >
       celery -A celery_app worker
       --loglevel=info
@@ -43,15 +43,15 @@ services:
       dockerfile: Dockerfile.gpu
     container_name: proxyai-gpu-worker
     env_file: .env
+    depends_on:
+      - redis
+    runtime: nvidia
     volumes:
       - upload-data:/tmp/uploads
       - results-data:/tmp/results
       # Бинд-маунт локального HF-кэша, writeable для quantization output
       - /path/to/hf_cache_host:/hf_cache:rw
       - ctranslate2-cache:/root/.cache/ctranslate2
-    depends_on:
-      - redis
-    runtime: nvidia
     command: >
       celery -A celery_app worker
       --loglevel=info
@@ -62,15 +62,14 @@ services:
   redis:
     image: redis:7-alpine
     container_name: proxyai-redis
-    volumes:
-      - redis-data:/data
     ports:
       - "6379:6379"
+    volumes:
+      - redis-data:/data
 
   tusd:
     image: tusproject/tusd:latest
     container_name: proxyai-tusd
-    restart: unless-stopped
     ports:
       - "1080:1080"
     command:
