@@ -74,11 +74,6 @@ services:
       - redis-data:/data
     ports:
       - "6379:6379"
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
 
   tusd:
     image: tusproject/tusd:latest
@@ -86,11 +81,6 @@ services:
     restart: unless-stopped
     ports:
       - "1080:1080"
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:1080/files"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
     command:
       - tusd
       - --host=0.0.0.0

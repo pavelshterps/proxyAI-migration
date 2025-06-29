@@ -12,7 +12,7 @@ from config.settings import UPLOAD_FOLDER, RESULTS_FOLDER
 
 logger = logging.getLogger(__name__)
 
-# Singletons so we only load each model once per worker process
+# Singleton instances
 _whisper_model = None
 _diarizer = None
 
@@ -43,7 +43,7 @@ def get_diarizer():
     if _diarizer is None:
         cache_dir = os.getenv("DIARIZER_CACHE_DIR", "/tmp/diarizer_cache")
         os.makedirs(cache_dir, exist_ok=True)
-        logger.info(f"Loading diarizer into cache '{cache_dir}'")
+        logger.info(f"Loading pyannote Pipeline into cache '{cache_dir}'")
         _diarizer = Pipeline.from_pretrained(
             "pyannote/speaker-diarization",
             cache_dir=cache_dir
@@ -53,9 +53,6 @@ def get_diarizer():
 
 
 def split_audio_fixed_windows(audio_path: Path):
-    """
-    Split the audio into fixed-length windows (default 30s).
-    """
     window_s = int(os.getenv("SEGMENT_LENGTH_S", "30"))
     audio = AudioSegment.from_file(str(audio_path))
     length_ms = len(audio)
@@ -69,11 +66,6 @@ def split_audio_fixed_windows(audio_path: Path):
 
 @shared_task(name="tasks.transcribe_segments")
 def transcribe_segments(upload_id: str):
-    """
-    1) Splits audio into fixed-window segments
-    2) Transcribes each with Whisper
-    3) Dumps RESULTS_FOLDER/<upload_id>/transcript.json
-    """
     whisper = get_whisper_model()
     src = Path(UPLOAD_FOLDER) / f"{upload_id}.wav"
     dst_dir = Path(RESULTS_FOLDER) / upload_id
@@ -81,7 +73,7 @@ def transcribe_segments(upload_id: str):
 
     logger.info(f"Starting transcription for '{src}'")
     segments = split_audio_fixed_windows(src)
-    logger.info(f"  → {len(segments)} segments of up to {os.getenv('SEGMENT_LENGTH_S','30')}s")
+    logger.info(f"  -> {len(segments)} segments of up to {os.getenv('SEGMENT_LENGTH_S','30')}s")
 
     transcript = []
     for idx, (start, end) in enumerate(segments):
@@ -110,10 +102,6 @@ def transcribe_segments(upload_id: str):
 
 @shared_task(name="tasks.diarize_full")
 def diarize_full(upload_id: str):
-    """
-    1) Runs speaker diarization on the whole file
-    2) Dumps RESULTS_FOLDER/<upload_id>/diarization.json
-    """
     diarizer = get_diarizer()
     src = Path(UPLOAD_FOLDER) / f"{upload_id}.wav"
     dst_dir = Path(RESULTS_FOLDER) / upload_id
