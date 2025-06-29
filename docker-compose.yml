@@ -6,11 +6,13 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: proxyai-api
-    env_file:
-      - .env
+    env_file: .env
     volumes:
       - upload-data:/tmp/uploads
-      - /path/to/hf_cache_host:/hf_cache:ro
+      - results-data:/tmp/results
+    depends_on:
+      - redis
+      - tusd
     ports:
       - "8000:8000"
     command: >
@@ -21,11 +23,11 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: proxyai-cpu-worker
-    env_file:
-      - .env
+    env_file: .env
     volumes:
       - upload-data:/tmp/uploads
-      - /path/to/hf_cache_host:/hf_cache:ro
+      - results-data:/tmp/results
+      - diarizer-cache:/tmp/diarizer_cache
     depends_on:
       - redis
     command: >
@@ -40,19 +42,16 @@ services:
       context: .
       dockerfile: Dockerfile.gpu
     container_name: proxyai-gpu-worker
-    env_file:
-      - .env
+    env_file: .env
     volumes:
       - upload-data:/tmp/uploads
-      - /path/to/hf_cache_host:/hf_cache:rw   # RW, чтобы писать quantized
+      - results-data:/tmp/results
+      # Бинд-маунт локального HF-кэша, writeable для quantization output
+      - /path/to/hf_cache_host:/hf_cache:rw
       - ctranslate2-cache:/root/.cache/ctranslate2
     depends_on:
       - redis
     runtime: nvidia
-    deploy:
-      resources:
-        limits:
-          memory: 4g
     command: >
       celery -A celery_app worker
       --loglevel=info
@@ -63,11 +62,10 @@ services:
   redis:
     image: redis:7-alpine
     container_name: proxyai-redis
-    restart: unless-stopped
-    ports:
-      - "6379:6379"
     volumes:
       - redis-data:/data
+    ports:
+      - "6379:6379"
 
   tusd:
     image: tusproject/tusd:latest
@@ -83,22 +81,9 @@ services:
     volumes:
       - upload-data:/data
 
-  flower:
-    image: mher/flower:latest
-    container_name: proxyai-flower
-    restart: unless-stopped
-    depends_on:
-      - redis
-    entrypoint:
-      - celery
-      - flower
-    command:
-      - --broker=${CELERY_BROKER_URL}
-      - --port=5555
-    ports:
-      - "5555:5555"
-
 volumes:
   upload-data:
-  redis-data:
+  results-data:
+  diarizer-cache:
   ctranslate2-cache:
+  redis-data:

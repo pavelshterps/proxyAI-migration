@@ -1,16 +1,14 @@
 fastapi>=0.95.0
-uvicorn[standard]>=0.23.0
-celery[redis]>=5.3.0
-faster-whisper>=1.1.1
-pyannote.audio>=3.3.2
-pydantic~=2.11
-pydantic-settings>=2.0,<3.0
-python-dotenv>=0.21.0
+uvicorn[standard]>=0.22.0
+celery>=5.5.3
+redis>=4.5.0
+python-dotenv>=1.1.0
 python-multipart>=0.0.5
-torch>=2.0.0
-ffmpeg-python>=0.2.0
-pytest
-pytest-asyncio
-httpx
+
+faster-whisper>=1.4.0
+pyannote.audio>=2.2.1
+ctranslate2>=4.6.0
+transformers>=4.53.0
 webrtcvad>=2.0.10
 
+pydantic~=1.10

@@ -1,6 +1,7 @@
+# Взят образ с поддержкой CUDA и cuDNN 8
 FROM nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04
 
-# system deps
+# 1) Установка Python, pip и ffmpeg
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
       python3.10 python3-pip ffmpeg && \
@@ -8,15 +9,23 @@ RUN apt-get update && \
 
 WORKDIR /app
 
-# install Python deps
+# 2) Установка зависимостей
 COPY requirements.txt .
 RUN pip3 install --no-cache-dir -r requirements.txt
 
-# patch CTranslate2 converter to import transformers correctly
-RUN TRANSFORMER_FILE=$(python3 - <<<'import ctranslate2, os; print(os.path.dirname(ctranslate2.__file__) + "/converters/transformers.py")') && \
-    sed -i '1i import transformers' "$TRANSFORMER_FILE"
+# 3) Патч преобразователя CTranslate2 для импорта transformers
+RUN python3 - << 'EOF'
+import ctranslate2, os
+path = os.path.join(os.path.dirname(ctranslate2.__file__),
+                    "converters", "transformers.py")
+content = open(path, "r").read().splitlines()
+if content[0] != "import transformers":
+    open(path, "w").write("import transformers\n" + "\n".join(content))
+EOF
 
-# copy app
-COPY . .
-
-# entrypoint is provided by docker-compose command
+# 4) Копируем код
+COPY config ./config
+COPY main.py .
+COPY celery_app.py .
+COPY tasks.py .
+COPY static ./static

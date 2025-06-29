@@ -1,13 +1,11 @@
-from pydantic import BaseSettings, Field
+from pydantic import BaseSettings
 
 class Settings(BaseSettings):
     # FastAPI
     FASTAPI_HOST: str = "0.0.0.0"
     FASTAPI_PORT: int = 8000
     API_WORKERS: int = 1
-
-    # CORS
-    ALLOWED_ORIGINS: str = '["*"]'
+    ALLOWED_ORIGINS: list[str] = ["*"]
 
     # Celery & Redis
     CELERY_BROKER_URL: str
@@ -16,38 +14,40 @@ class Settings(BaseSettings):
     GPU_CONCURRENCY: int = 1
 
     # File storage
-    UPLOAD_FOLDER: str
-    RESULTS_FOLDER: str
-
-    # Retention
+    UPLOAD_FOLDER: str = "/tmp/uploads"
+    RESULTS_FOLDER: str = "/tmp/results"
     FILE_RETENTION_DAYS: int = 7
-    MAX_FILE_SIZE: int = 1073741824
+    MAX_FILE_SIZE: int = 1 * 1024 * 1024 * 1024  # 1 GiB
 
-    # tusd
+    # tusd (resumable upload)
     TUSD_ENDPOINT: str
     SNIPPET_FORMAT: str = "wav"
 
-    # caches
+    # pyannote cache
     DIARIZER_CACHE_DIR: str = "/tmp/diarizer_cache"
-    HF_CACHE_DIR: str
+    PYANNOTE_PROTOCOL: str
 
-    # HuggingFace
+    # Hugging Face
     HUGGINGFACE_TOKEN: str
+    HF_CACHE_DIR: str = "/hf_cache"
 
-    # Whisper
+    # Faster Whisper / Whisper
     WHISPER_MODEL_PATH: str
     WHISPER_DEVICE: str = "cuda"
     WHISPER_DEVICE_INDEX: int = 0
     WHISPER_COMPUTE_TYPE: str = "int8"
     WHISPER_BEAM_SIZE: int = 5
+    WHISPER_TASK: str = "transcribe"
 
-    # Pyannote
-    PYANNOTE_PROTOCOL: str
-
+    # Cleanup
     CLEAN_UP_UPLOADS: bool = True
+
+    # Database / Redis (если используются)
+    DATABASE_URL: str
+    REDIS_URL: str
 
     class Config:
         env_file = ".env"
-        env_file_encoding = "utf-8"
+        case_sensitive = True
 
 settings = Settings()
