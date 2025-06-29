@@ -1,74 +1,67 @@
 import os
+import json
 import logging
 from pathlib import Path
-import json
 
 from celery import shared_task
 from faster_whisper import WhisperModel
 from pyannote.audio import Pipeline
 
-from config.settings import UPLOAD_FOLDER, RESULTS_FOLDER
+from config.settings import settings
 
 logger = logging.getLogger(__name__)
 
-# Singletonы моделей
-_whisper_model = None
-_diarizer = None
+# === singletons ===
+_whisper: WhisperModel | None = None
+_diarizer: Pipeline | None = None
 
-
-def get_whisper_model():
-    global _whisper_model
-    if _whisper_model is None:
-        model_path = os.getenv(
-            "WHISPER_MODEL_PATH",
-            "/hf_cache/models--guillaumekln--faster-whisper-medium"
+def get_whisper() -> WhisperModel:
+    global _whisper
+    if _whisper is None:
+        cfg = settings
+        logger.info(f"Loading WhisperModel: path={cfg.WHISPER_MODEL_PATH} "
+                    f"device={cfg.WHISPER_DEVICE} compute={cfg.WHISPER_COMPUTE_TYPE}")
+        _whisper = WhisperModel(
+            cfg.WHISPER_MODEL_PATH,
+            device=cfg.WHISPER_DEVICE,
+            compute_type=cfg.WHISPER_COMPUTE_TYPE,
+            device_index=cfg.WHISPER_DEVICE_INDEX,
+            # можно задать pool-threads через intra/inter, если нужно
         )
-        device = os.getenv("WHISPER_DEVICE", "cuda")
-        compute_type = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
-        logger.info(
-            f"Loading WhisperModel once at startup: "
-            f"{{'model': '{model_path}', 'device': '{device}', 'compute_type': '{compute_type}'}}"
-        )
-        _whisper_model = WhisperModel(
-            model_path,
-            device=device,
-            compute_type=compute_type
-        )
-        logger.info("WhisperModel loaded (quantized int8)")
-    return _whisper_model
+        logger.info("WhisperModel loaded")
+    return _whisper
 
-
-def get_diarizer():
+def get_diarizer() -> Pipeline:
     global _diarizer
     if _diarizer is None:
-        cache_dir = os.getenv("DIARIZER_CACHE_DIR", "/tmp/diarizer_cache")
+        cache_dir = settings.DIARIZER_CACHE_DIR
         os.makedirs(cache_dir, exist_ok=True)
-        logger.info(f"Loading pyannote Pipeline into cache {cache_dir}…")
-        # Убрали deprecated progress_bar, передаём только cache_dir
+        logger.info(f"Loading diarizer into {cache_dir}")
         _diarizer = Pipeline.from_pretrained(
-            "pyannote/speaker-diarization",
+            settings.PYANNOTE_MODEL,
             cache_dir=cache_dir
         )
         logger.info("Diarizer loaded")
     return _diarizer
 
-
 @shared_task(name="tasks.transcribe_segments")
 def transcribe_segments(upload_id: str):
-    whisper = get_whisper_model()
-    audio_file = Path(UPLOAD_FOLDER) / f"{upload_id}.wav"
-    out_dir = Path(RESULTS_FOLDER) / upload_id
-    out_dir.mkdir(parents=True, exist_ok=True)
+    cfg = settings
+    model = get_whisper()
 
-    logger.info(f"[Transcribe] {upload_id} → {audio_file}")
-    # единый сегмент на всё — можно разбить по VAD
+    src = Path(cfg.UPLOAD_FOLDER) / f"{upload_id}.wav"
+    dst_dir = Path(cfg.RESULTS_FOLDER) / upload_id
+    dst_dir.mkdir(parents=True, exist_ok=True)
+
+    logger.info(f"[Transcribe] {src}")
+    # TODO: если понадобится сегментация по беззвучию — здесь её вставить
     segments = [(0.0, None)]
 
     transcript = []
-    for i, (start, end) in enumerate(segments):
-        logger.debug(f" segment {i}: {start}-{end}")
-        result = whisper.transcribe(
-            str(audio_file),
+    for idx, (start, end) in enumerate(segments):
+        logger.debug(f"Segment {idx}: {start}-{end}")
+        res = model.transcribe(
+            str(src),
             beam_size=5,
             language="ru",
             vad_filter=True,
@@ -76,30 +69,37 @@ def transcribe_segments(upload_id: str):
             offset=start,
             duration=None if end is None else (end - start),
         )
-        text = result["segments"][0]["text"]
-        transcript.append({"segment": i, "start": start, "end": end, "text": text})
+        text = res["segments"][0]["text"]
+        transcript.append({
+            "segment": idx, "start": start, "end": end, "text": text
+        })
 
-    with open(out_dir / "transcript.json", "w", encoding="utf-8") as f:
+    out = dst_dir / "transcript.json"
+    with open(out, "w", encoding="utf-8") as f:
         json.dump(transcript, f, ensure_ascii=False, indent=2)
 
-    logger.info(f"[Transcribe] DONE → {out_dir / 'transcript.json'}")
-
+    logger.info(f"Transcript saved: {out}")
 
 @shared_task(name="tasks.diarize_full")
 def diarize_full(upload_id: str):
+    cfg = settings
     diarizer = get_diarizer()
-    audio_file = Path(UPLOAD_FOLDER) / f"{upload_id}.wav"
-    out_dir = Path(RESULTS_FOLDER) / upload_id
-    out_dir.mkdir(parents=True, exist_ok=True)
 
-    logger.info(f"[Diarize ] {upload_id} → {audio_file}")
-    diarization = diarizer(str(audio_file))
+    src = Path(cfg.UPLOAD_FOLDER) / f"{upload_id}.wav"
+    dst_dir = Path(cfg.RESULTS_FOLDER) / upload_id
+    dst_dir.mkdir(parents=True, exist_ok=True)
 
-    segments = []
+    logger.info(f"[Diarize] {src}")
+    diarization = diarizer(str(src))
+
+    turns = []
     for turn, _, speaker in diarization.itertracks(yield_label=True):
-        segments.append({"start": turn.start, "end": turn.end, "speaker": speaker})
+        turns.append({
+            "start": turn.start, "end": turn.end, "speaker": speaker
+        })
 
-    with open(out_dir / "diarization.json", "w", encoding="utf-8") as f:
-        json.dump(segments, f, ensure_ascii=False, indent=2)
+    out = dst_dir / "diarization.json"
+    with open(out, "w", encoding="utf-8") as f:
+        json.dump(turns, f, ensure_ascii=False, indent=2)
 
-    logger.info(f"[Diarize ] DONE → {out_dir / 'diarization.json'}")
+    logger.info(f"Diarization saved: {out}")

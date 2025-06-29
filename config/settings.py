@@ -7,49 +7,32 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # Where uploaded WAVs live
-    UPLOAD_FOLDER: str
-    RESULTS_FOLDER: str
-    # TUS protocol file server (tusd) endpoint, e.g. http://tusd:1080/files/
+    # где лежат загруженные WAV-файлы и куда писать результаты
+    UPLOAD_FOLDER: str = "/tmp/uploads"
+    RESULTS_FOLDER: str = "/tmp/results"
+
+    # tusd
     TUSD_ENDPOINT: str
 
-    # Celery broker and backend URLs
+    # celery + redis
     CELERY_BROKER_URL: str
     CELERY_RESULT_BACKEND: str
-
-    # Redis URL for fast lookup
     REDIS_URL: str
-    UPLOAD_FOLDER: str
-    # Whisper settings
-    WHISPER_MODEL: str
-    WHISPER_MODEL_NAME: str
-    WHISPER_DEVICE: str
-    WHISPER_COMPUTE_TYPE: str
-    WHISPER_DEVICE_INDEX: int
-    WHISPER_INTRA_THREADS: int
-    WHISPER_INTER_THREADS: int
-    WHISPER_BEAM_SIZE: int
-    WHISPER_TASK: str
-    WHISPER_BEST_OF: int
-    ALIGN_MODEL_NAME: str
-    ALIGN_BEAM_SIZE: int
-    CLEAN_UP_UPLOADS: bool
-    HF_CACHE_DIR: str
-    # Pyannote diarization model
+
+    # кэш для Pyannote
+    DIARIZER_CACHE_DIR: str = "/tmp/diarizer_cache"
+
+    # whisper
+    WHISPER_MODEL_PATH: str
+    WHISPER_DEVICE: str = "cuda"
+    WHISPER_COMPUTE_TYPE: str = "int8"
+    WHISPER_DEVICE_INDEX: int = 0
+
+    # параллелизм
+    CPU_CONCURRENCY: int = 1
+    GPU_CONCURRENCY: int = 1
+
+    # модель для Pyannote
     PYANNOTE_MODEL: str
 
-    # Concurrency
-    CPU_CONCURRENCY: int
-    GPU_CONCURRENCY: int
-
-    PYANNOTE_PROTOCOL: str
-    # Diarization chunk length (seconds)
-    DIARIZE_CHUNK_LENGTH: int
-    MAX_FILE_SIZE: int
-    HUGGINGFACE_TOKEN: str
-    HF_TOKEN: str
-    # Other settings if present…
-    # …
-
-# instantiate once
 settings = Settings()
