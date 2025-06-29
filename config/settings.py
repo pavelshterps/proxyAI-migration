@@ -1,35 +1,56 @@
-from pydantic_settings import BaseSettings
+from pydantic import BaseSettings
 
 class Settings(BaseSettings):
-    # FastAPI / Uvicorn
-    API_WORKERS: int = 2
+    # API
+    FASTAPI_HOST: str = "0.0.0.0"
+    FASTAPI_PORT: int = 8000
+    API_WORKERS: int = 1
 
-    # Celery
+    # CORS
+    ALLOWED_ORIGINS: str = '["*"]'
+
+    # Celery / Redis
     CELERY_BROKER_URL: str
     CELERY_RESULT_BACKEND: str
     CPU_CONCURRENCY: int = 4
     GPU_CONCURRENCY: int = 1
+    TIMEZONE: str = "UTC"
 
-    # file paths
+    # File storage
     UPLOAD_FOLDER: str = "/tmp/uploads"
     RESULTS_FOLDER: str = "/tmp/results"
+    FILE_RETENTION_DAYS: int = 7
+    MAX_FILE_SIZE: int = 1_073_741_824
 
-    # whisper / diarization
-    WHISPER_MODEL_PATH: str = "/hf_cache/models--guillaumekln--faster-whisper-medium"
-    WHISPER_DEVICE: str = "cuda"
-    WHISPER_COMPUTE_TYPE: str = "int8"
-    DIARIZER_CACHE_DIR: str = "/tmp/diarizer_cache"
+    # tusd
+    TUSD_ENDPOINT: str
+
+    # Pyannote
+    DIARIZER_CACHE_DIR: str
+    PYANNOTE_PROTOCOL: str
+
+    # Hugging Face
+    HUGGINGFACE_TOKEN: str
+    HF_CACHE_DIR: str
+
+    # Whisper
+    WHISPER_MODEL_PATH: str
+    WHISPER_DEVICE: str
+    WHISPER_DEVICE_INDEX: int = 0
+    WHISPER_COMPUTE_TYPE: str
+    WHISPER_BEAM_SIZE: int
+    WHISPER_TASK: str
     SEGMENT_LENGTH_S: int = 30
 
-    # HuggingFace
-    HUGGINGFACE_TOKEN: str  # must be provided
+    # Cleanup
+    CLEAN_UP_UPLOADS: bool = True
 
-    # Timezone
-    TIMEZONE: str = "UTC"
+    # Database
+    DATABASE_URL: str
+    REDIS_URL: str
 
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"
-
 
 settings = Settings()
