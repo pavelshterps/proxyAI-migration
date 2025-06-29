@@ -1,60 +1,55 @@
-# config/settings.py
-
-from pydantic_settings import BaseSettings, SettingsConfigDict
 from pathlib import Path
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from typing import List
 
 class Settings(BaseSettings):
+    model: SettingsConfigDict = SettingsConfigDict(env_file=".env", extra="ignore")
+
     # FastAPI
-    FASTAPI_HOST: str = "0.0.0.0"
-    FASTAPI_PORT: int = 8000
-    API_WORKERS: int = 1
-    ALLOWED_ORIGINS: list[str] = ["*"]
+    fastapi_host: str = "0.0.0.0"
+    fastapi_port: int = 8000
+    api_workers: int = 1
+    allowed_origins: List[str] = ["*"]
 
     # Celery / Redis
-    CELERY_BROKER_URL: str
-    CELERY_RESULT_BACKEND: str
-    CPU_CONCURRENCY: int
-    GPU_CONCURRENCY: int
-    TIMEZONE: str = "UTC"
+    celery_broker_url: str
+    celery_result_backend: str
+    cpu_concurrency: int = 4
+    gpu_concurrency: int = 1
+    timezone: str = "UTC"
 
     # Storage
-    UPLOAD_FOLDER: Path
-    RESULTS_FOLDER: Path
-    FILE_RETENTION_DAYS: int = 7
-    MAX_FILE_SIZE: int = 1_073_741_824
+    upload_folder: Path
+    results_folder: Path
+    file_retention_days: int = 7
+    max_file_size: int = 1_073_741_824  # 1 GiB
 
     # tusd
-    TUSD_ENDPOINT: str
-    SNIPPET_FORMAT: str = "wav"
+    tusd_endpoint: str
+    snippet_format: str = "wav"
 
-    # Pyannote
-    DIARIZER_CACHE_DIR: Path
-    PYANNOTE_PROTOCOL: str = "pyannote/speaker-diarization"
+    # Diarizer
+    diarizer_cache_dir: Path
+    pyannote_protocol: str = "pyannote/speaker-diarization"
 
     # Hugging Face
-    HUGGINGFACE_TOKEN: str
-    HF_CACHE_DIR: Path
+    huggingface_token: str
+    hf_cache_dir: Path
 
-    # Whisper
-    WHISPER_MODEL_PATH: Path
-    WHISPER_DEVICE: str = "cuda"
-    WHISPER_DEVICE_INDEX: int = 0
-    WHISPER_COMPUTE_TYPE: str = "int8"
-    WHISPER_BEAM_SIZE: int = 5
-    WHISPER_TASK: str = "transcribe"
-    SEGMENT_LENGTH_S: int = 30
+    # Whisper / Faster-Whisper
+    whisper_model_path: str
+    whisper_device: str = "cuda"
+    whisper_device_index: int = 0
+    whisper_compute_type: str = "int8"
+    whisper_beam_size: int = 5
+    whisper_language: str = "ru"
+    segment_length_s: int = 30
 
     # Cleanup
-    CLEAN_UP_UPLOADS: bool = True
+    clean_up_uploads: bool = True
 
-    # DB (optional)
-    DATABASE_URL: str | None = None
-    REDIS_URL: str | None = None
-
-    model_config = SettingsConfigDict(
-        env_file = ".env",
-        case_sensitive = True,
-        extra = "ignore",
-    )
+    # Database (future)
+    database_url: str
+    redis_url: str
 
 settings = Settings()

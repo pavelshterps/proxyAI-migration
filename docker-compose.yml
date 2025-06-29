@@ -7,6 +7,10 @@ services:
       dockerfile: Dockerfile
     container_name: proxyai-api
     env_file: .env
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:${FASTAPI_PORT}/health"]
+      interval: 30s; timeout: 5s; retries: 3
     volumes:
       - upload-data:/tmp/uploads
       - results-data:/tmp/results
@@ -14,15 +18,9 @@ services:
       - "${FASTAPI_PORT}:${FASTAPI_PORT}"
     command: >
       uvicorn main:app
-        --host ${FASTAPI_HOST}
-        --port ${FASTAPI_PORT}
-        --workers ${API_WORKERS}
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:${FASTAPI_PORT}/health"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
+      --host ${FASTAPI_HOST}
+      --port ${FASTAPI_PORT}
+      --workers ${API_WORKERS}
 
   cpu-worker:
     build:
@@ -30,29 +28,22 @@ services:
       dockerfile: Dockerfile
     container_name: proxyai-cpu-worker
     env_file: .env
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "celery", "-A", "celery_app", "status"]
+      interval: 60s; timeout: 10s; retries: 3
+    depends_on:
+      - redis
     volumes:
       - upload-data:/tmp/uploads
       - results-data:/tmp/results
       - diarizer-cache:/tmp/diarizer_cache
-    depends_on:
-      - redis
     command: >
       celery -A celery_app worker
-        --loglevel=info
-        --concurrency ${CPU_CONCURRENCY}
-        --hostname cpu-worker
-        --queues preprocess_cpu
-    restart: unless-stopped
-    healthcheck:
-      test:
-        - CMD
-        - celery
-        - -A
-        - celery_app
-        - status
-      interval: 60s
-      timeout: 10s
-      retries: 3
+      --loglevel=info
+      --concurrency ${CPU_CONCURRENCY}
+      --hostname cpu-worker
+      --queues preprocess_cpu
 
   gpu-worker:
     build:
@@ -60,85 +51,72 @@ services:
       dockerfile: Dockerfile.gpu
     container_name: proxyai-gpu-worker
     env_file: .env
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "celery", "-A", "celery_app", "status"]
+      interval: 60s; timeout: 10s; retries: 3
+    depends_on:
+      - redis
+    runtime: nvidia
     volumes:
       - upload-data:/tmp/uploads
       - results-data:/tmp/results
       - /path/to/hf_cache_host:/hf_cache:rw
       - ctranslate2-cache:/root/.cache/ctranslate2
-    depends_on:
-      - redis
-    runtime: nvidia
     command: >
       celery -A celery_app worker
-        --loglevel=info
-        --concurrency ${GPU_CONCURRENCY}
-        --hostname gpu-worker
-        --queues preprocess_gpu
-    restart: unless-stopped
-    healthcheck:
-      test:
-        - CMD
-        - celery
-        - -A
-        - celery_app
-        - status
-      interval: 60s
-      timeout: 10s
-      retries: 3
+      --loglevel=info
+      --concurrency ${GPU_CONCURRENCY}
+      --hostname gpu-worker
+      --queues preprocess_gpu
 
   flower:
     image: mher/flower:latest
     container_name: proxyai-flower
     env_file: .env
+    restart: unless-stopped
     depends_on:
       - redis
     ports:
       - "5555:5555"
     command: >
       flower
-        --broker=${CELERY_BROKER_URL}
-        --port=5555
-        --url_prefix=flower
-        --persistent=True
-    restart: unless-stopped
+      --broker=${CELERY_BROKER_URL}
+      --port=5555
+      --url_prefix=flower
+      --persistent=True
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:5555/flower/"]
-      interval: 60s
-      timeout: 10s
-      retries: 3
+      interval: 60s; timeout: 10s; retries: 3
 
   redis:
     image: redis:7-alpine
     container_name: proxyai-redis
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s; timeout: 5s; retries: 3
     volumes:
       - redis-data:/data
     ports:
       - "6379:6379"
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
 
   tusd:
     image: tusproject/tusd:latest
     container_name: proxyai-tusd
-    volumes:
-      - upload-data:/data
-    ports:
-      - "1080:1080"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:1080/files/"]
+      interval: 30s; timeout: 5s; retries: 3
     command:
       - tusd
       - --host=0.0.0.0
       - --port=1080
       - --dir=/data
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:1080/files/"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
+    volumes:
+      - upload-data:/data
+    ports:
+      - "1080:1080"
 
 volumes:
   upload-data:
