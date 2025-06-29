@@ -11,14 +11,14 @@ services:
     volumes:
       - upload-data:/tmp/uploads
       - results:/tmp/results
-      - hf_cache:/hf_cache:ro
+      - /path/to/hf_cache_host:/hf_cache:ro     # <- сюда смонтирована ваша квантизированная модель
     depends_on:
       - redis
       - tusd
     ports:
       - "8000:8000"
     command: >
-      sh -c "uvicorn main:app --host 0.0.0.0 --port 8000 --workers $API_WORKERS"
+      uvicorn main:app --host 0.0.0.0 --port 8000 --workers ${API_WORKERS:-1}
 
   cpu-worker:
     build:
@@ -30,7 +30,7 @@ services:
     volumes:
       - upload-data:/tmp/uploads
       - results:/tmp/results
-      - hf_cache:/hf_cache:ro
+      - /path/to/hf_cache_host:/hf_cache:ro
       - diarizer-cache:/tmp/diarizer_cache
     depends_on:
       - redis
@@ -51,15 +51,11 @@ services:
     volumes:
       - upload-data:/tmp/uploads
       - results:/tmp/results
-      - hf_cache:/hf_cache:ro
+      - /path/to/hf_cache_host:/hf_cache:ro
       - ctranslate2-cache:/root/.cache/ctranslate2
     depends_on:
       - redis
     runtime: nvidia
-    deploy:
-      resources:
-        limits:
-          memory: 4g
     command: >
       celery -A celery_app worker
       --loglevel=info
@@ -73,6 +69,7 @@ services:
     restart: unless-stopped
     ports:
       - "6379:6379"
+    # никаких replicaof/read-only настроек!
     volumes:
       - redis-data:/data
 
@@ -111,6 +108,5 @@ volumes:
   upload-data:
   redis-data:
   diarizer-cache:
-  hf_cache:
   ctranslate2-cache:
   results:
