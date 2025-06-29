@@ -6,32 +6,28 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: proxyai-api
-    env_file:
-      - .env
+    env_file: .env
     volumes:
       - upload-data:/tmp/uploads
-      - results:/tmp/results
-      - /path/to/hf_cache_host:/hf_cache:ro     # <- сюда смонтирована ваша квантизированная модель
+      - /path/to/hf_cache_host:/hf_cache:ro
     depends_on:
       - redis
       - tusd
     ports:
       - "8000:8000"
     command: >
-      uvicorn main:app --host 0.0.0.0 --port 8000 --workers ${API_WORKERS:-1}
+      sh -c "uvicorn main:app --host 0.0.0.0 --port 8000 --workers $API_WORKERS"
 
   cpu-worker:
     build:
       context: .
       dockerfile: Dockerfile
     container_name: proxyai-cpu-worker
-    env_file:
-      - .env
+    env_file: .env
     volumes:
       - upload-data:/tmp/uploads
-      - results:/tmp/results
       - /path/to/hf_cache_host:/hf_cache:ro
-      - diarizer-cache:/tmp/diarizer_cache
+      - $DIARIZER_CACHE_DIR:/tmp/diarizer_cache
     depends_on:
       - redis
     command: >
@@ -46,16 +42,18 @@ services:
       context: .
       dockerfile: Dockerfile.gpu
     container_name: proxyai-gpu-worker
-    env_file:
-      - .env
+    env_file: .env
     volumes:
       - upload-data:/tmp/uploads
-      - results:/tmp/results
-      - /path/to/hf_cache_host:/hf_cache:rw
+      - /path/to/hf_cache_host:/hf_cache:rw   # read-only download, writable for quantization
       - ctranslate2-cache:/root/.cache/ctranslate2
     depends_on:
       - redis
     runtime: nvidia
+    deploy:
+      resources:
+        limits:
+          memory: 4g
     command: >
       celery -A celery_app worker
       --loglevel=info
@@ -69,7 +67,6 @@ services:
     restart: unless-stopped
     ports:
       - "6379:6379"
-    # никаких replicaof/read-only настроек!
     volumes:
       - redis-data:/data
 
@@ -91,8 +88,7 @@ services:
     image: mher/flower:latest
     container_name: proxyai-flower
     restart: unless-stopped
-    env_file:
-      - .env
+    env_file: .env
     depends_on:
       - redis
     entrypoint:
@@ -107,6 +103,4 @@ services:
 volumes:
   upload-data:
   redis-data:
-  diarizer-cache:
   ctranslate2-cache:
-  results:

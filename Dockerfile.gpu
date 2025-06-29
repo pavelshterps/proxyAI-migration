@@ -1,31 +1,28 @@
 FROM nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04
 
+# system deps
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      python3.10 python3-pip ffmpeg \
+    python3.10 python3-pip ffmpeg \
  && rm -rf /var/lib/apt/lists/*
 
-# базовые пакеты
+# Python deps
 RUN pip3 install --no-cache-dir \
       faster-whisper \
       pyannote.audio \
       celery[redis] \
       kombu \
       uvicorn \
-      fastapi \
-      requests
+      ctranslate2 \
+      transformers
 
-# ctranslate2 + transformers + патч конвертера
-RUN pip3 install --no-cache-dir transformers ctranslate2 \
- && python3 - <<'EOF'
-import ctranslate2, os
-path = os.path.join(os.path.dirname(ctranslate2.__file__), "converters", "transformers.py")
-text = open(path).read()
-open(path, "w").write("import transformers\n" + text)
-EOF
+# Patch CTranslate2 converter to import transformers for dynamic-model loading
+RUN TRANSFORMER_FILE=$(python3 -c "import ctranslate2, os; print(os.path.dirname(ctranslate2.__file__) + '/converters/transformers.py')") \
+ && sed -i '1i import transformers' "$TRANSFORMER_FILE"
 
 WORKDIR /app
 COPY requirements.txt .
 RUN pip3 install --no-cache-dir -r requirements.txt
 
-COPY . .
+COPY config ./config
+COPY main.py celery_app.py tasks.py static ./
