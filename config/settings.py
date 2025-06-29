@@ -1,26 +1,53 @@
-from pydantic import Field
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import BaseSettings, Field
 
 class Settings(BaseSettings):
-    # how many Uvicorn workers for the API
-    API_WORKERS: int = Field(1, env="API_WORKERS")
-    # concurrency settings for Celery
-    CELERY_CONCURRENCY: int = Field(1, env="CELERY_CONCURRENCY")
-    GPU_CONCURRENCY: int = Field(1, env="GPU_CONCURRENCY")
+    # FastAPI
+    FASTAPI_HOST: str = "0.0.0.0"
+    FASTAPI_PORT: int = 8000
+    API_WORKERS: int = 1
 
-    # Redis broker / backend URLs
-    CELERY_BROKER_URL: str = Field("redis://redis:6379//", env="CELERY_BROKER_URL")
-    CELERY_RESULT_BACKEND: str = Field("redis://redis:6379/", env="CELERY_RESULT_BACKEND")
+    # CORS
+    ALLOWED_ORIGINS: str = '["*"]'
 
-    # file paths
-    UPLOAD_FOLDER: str = Field("/tmp/uploads", env="UPLOAD_FOLDER")
-    RESULTS_FOLDER: str = Field("/tmp/results", env="RESULTS_FOLDER")
+    # Celery & Redis
+    CELERY_BROKER_URL: str
+    CELERY_RESULT_BACKEND: str
+    CPU_CONCURRENCY: int = 4
+    GPU_CONCURRENCY: int = 1
 
-    # load .env
-    model_config = SettingsConfigDict(
-        env_file=".env",
-        env_file_encoding="utf-8"
-    )
+    # File storage
+    UPLOAD_FOLDER: str
+    RESULTS_FOLDER: str
 
-# instantiate a single settings object
+    # Retention
+    FILE_RETENTION_DAYS: int = 7
+    MAX_FILE_SIZE: int = 1073741824
+
+    # tusd
+    TUSD_ENDPOINT: str
+    SNIPPET_FORMAT: str = "wav"
+
+    # caches
+    DIARIZER_CACHE_DIR: str = "/tmp/diarizer_cache"
+    HF_CACHE_DIR: str
+
+    # HuggingFace
+    HUGGINGFACE_TOKEN: str
+
+    # Whisper
+    WHISPER_MODEL_PATH: str
+    WHISPER_DEVICE: str = "cuda"
+    WHISPER_DEVICE_INDEX: int = 0
+    WHISPER_COMPUTE_TYPE: str = "int8"
+    WHISPER_BEAM_SIZE: int = 5
+
+    # Pyannote
+    PYANNOTE_PROTOCOL: str
+
+    CLEAN_UP_UPLOADS: bool = True
+
+    class Config:
+        env_file = ".env"
+        env_file_encoding = "utf-8"
+
 settings = Settings()

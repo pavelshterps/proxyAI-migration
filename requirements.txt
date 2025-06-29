@@ -12,4 +12,5 @@ ffmpeg-python>=0.2.0
 pytest
 pytest-asyncio
 httpx
+webrtcvad>=2.0.10
 

@@ -6,15 +6,13 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: proxyai-api
-    env_file: .env
+    env_file:
+      - .env
     volumes:
       - upload-data:/tmp/uploads
-      - results-data:/tmp/results
+      - /path/to/hf_cache_host:/hf_cache:ro
     ports:
       - "8000:8000"
-    depends_on:
-      - redis
-      - tusd
     command: >
       sh -c "uvicorn main:app --host 0.0.0.0 --port 8000 --workers ${API_WORKERS}"
 
@@ -23,11 +21,11 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: proxyai-cpu-worker
-    env_file: .env
+    env_file:
+      - .env
     volumes:
       - upload-data:/tmp/uploads
-      - results-data:/tmp/results
-      - hf_cache:/hf_cache:ro
+      - /path/to/hf_cache_host:/hf_cache:ro
     depends_on:
       - redis
     command: >
@@ -42,14 +40,11 @@ services:
       context: .
       dockerfile: Dockerfile.gpu
     container_name: proxyai-gpu-worker
-    environment:
-      - DIARIZER_CACHE_DIR=/tmp/diarizer_cache
-      - WHISPER_MODEL_PATH=/hf_cache/models--guillaumekln--faster-whisper-mediu
-    env_file: .env
+    env_file:
+      - .env
     volumes:
       - upload-data:/tmp/uploads
-      - results-data:/tmp/results
-      - hf_cache:/hf_cache:ro
+      - /path/to/hf_cache_host:/hf_cache:rw   # RW, чтобы писать quantized
       - ctranslate2-cache:/root/.cache/ctranslate2
     depends_on:
       - redis
@@ -73,8 +68,6 @@ services:
       - "6379:6379"
     volumes:
       - redis-data:/data
-      - /path/to/hf_cache_host:/hf_cache:ro
-      - /path/to/hf_cache_host/quantized:/hf_cache/quantized:rw
 
   tusd:
     image: tusproject/tusd:latest
@@ -94,7 +87,6 @@ services:
     image: mher/flower:latest
     container_name: proxyai-flower
     restart: unless-stopped
-    env_file: .env
     depends_on:
       - redis
     entrypoint:
@@ -109,6 +101,4 @@ services:
 volumes:
   upload-data:
   redis-data:
-  results-data:
-  hf_cache:
   ctranslate2-cache:
