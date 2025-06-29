@@ -6,10 +6,12 @@ from fastapi.responses import FileResponse
 from uuid import uuid4
 import shutil
 import os
+from routes import router
 
 from celery_app import celery_app
 
 app = FastAPI()
+app.include_router(router)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 @app.get("/", response_class=FileResponse)
@@ -40,3 +42,6 @@ async def get_result(job_id: str):
     if result is None:
         return {"status": "PENDING"}
     return {"status": "SUCCESS", "segments": result}
+@app.get("/health", tags=["health"])
+def health_check():
+    return {"status": "ok"}

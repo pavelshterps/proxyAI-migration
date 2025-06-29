@@ -42,6 +42,9 @@ services:
       context: .
       dockerfile: Dockerfile.gpu
     container_name: proxyai-gpu-worker
+    environment:
+      - DIARIZER_CACHE_DIR=/tmp/diarizer_cache
+      - WHISPER_MODEL_PATH=/hf_cache/models--guillaumekln--faster-whisper-mediu
     env_file: .env
     volumes:
       - upload-data:/tmp/uploads
@@ -70,6 +73,8 @@ services:
       - "6379:6379"
     volumes:
       - redis-data:/data
+      - /path/to/hf_cache_host:/hf_cache:ro
+      - /path/to/hf_cache_host/quantized:/hf_cache/quantized:rw
 
   tusd:
     image: tusproject/tusd:latest
