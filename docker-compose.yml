@@ -10,13 +10,13 @@ services:
     volumes:
       - upload-data:/tmp/uploads
       - results-data:/tmp/results
-    depends_on:
-      - redis
-      - tusd
     ports:
       - "${FASTAPI_PORT}:${FASTAPI_PORT}"
     command: >
-      uvicorn main:app --host ${FASTAPI_HOST} --port ${FASTAPI_PORT} --workers ${API_WORKERS}
+      uvicorn main:app
+        --host ${FASTAPI_HOST}
+        --port ${FASTAPI_PORT}
+        --workers ${API_WORKERS}
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:${FASTAPI_PORT}/health"]
@@ -37,10 +37,19 @@ services:
     depends_on:
       - redis
     command: >
-      celery -A celery_app worker --loglevel=info --concurrency ${CPU_CONCURRENCY} --hostname cpu-worker --queues preprocess_cpu
+      celery -A celery_app worker
+        --loglevel=info
+        --concurrency ${CPU_CONCURRENCY}
+        --hostname cpu-worker
+        --queues preprocess_cpu
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "celery", "-A", "celery_app", "status"]
+      test:
+        - CMD
+        - celery
+        - -A
+        - celery_app
+        - status
       interval: 60s
       timeout: 10s
       retries: 3
@@ -60,10 +69,40 @@ services:
       - redis
     runtime: nvidia
     command: >
-      celery -A celery_app worker --loglevel=info --concurrency ${GPU_CONCURRENCY} --hostname gpu-worker --queues preprocess_gpu
+      celery -A celery_app worker
+        --loglevel=info
+        --concurrency ${GPU_CONCURRENCY}
+        --hostname gpu-worker
+        --queues preprocess_gpu
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "celery", "-A", "celery_app", "status"]
+      test:
+        - CMD
+        - celery
+        - -A
+        - celery_app
+        - status
+      interval: 60s
+      timeout: 10s
+      retries: 3
+
+  flower:
+    image: mher/flower:latest
+    container_name: proxyai-flower
+    env_file: .env
+    depends_on:
+      - redis
+    ports:
+      - "5555:5555"
+    command: >
+      flower
+        --broker=${CELERY_BROKER_URL}
+        --port=5555
+        --url_prefix=flower
+        --persistent=True
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5555/flower/"]
       interval: 60s
       timeout: 10s
       retries: 3

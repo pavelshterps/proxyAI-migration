@@ -27,7 +27,7 @@ class Settings(BaseSettings):
     TUSD_ENDPOINT: str
     SNIPPET_FORMAT: str = "wav"
 
-    # Pyannote diarizer
+    # Pyannote
     DIARIZER_CACHE_DIR: Path
     PYANNOTE_PROTOCOL: str = "pyannote/speaker-diarization"
 
@@ -35,7 +35,7 @@ class Settings(BaseSettings):
     HUGGINGFACE_TOKEN: str
     HF_CACHE_DIR: Path
 
-    # Whisper / Faster-Whisper
+    # Whisper
     WHISPER_MODEL_PATH: Path
     WHISPER_DEVICE: str = "cuda"
     WHISPER_DEVICE_INDEX: int = 0
@@ -47,14 +47,14 @@ class Settings(BaseSettings):
     # Cleanup
     CLEAN_UP_UPLOADS: bool = True
 
-    # Database (if used later)
+    # DB (optional)
     DATABASE_URL: str | None = None
     REDIS_URL: str | None = None
 
     model_config = SettingsConfigDict(
         env_file = ".env",
         case_sensitive = True,
-        extra = "ignore",           # allow unspecified vars without error
+        extra = "ignore",
     )
 
 settings = Settings()
