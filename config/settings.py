@@ -9,7 +9,7 @@ class Settings(BaseSettings):
 
     # Where uploaded WAVs live
     UPLOAD_FOLDER: str
-
+    RESULTS_FOLDER: str
     # TUS protocol file server (tusd) endpoint, e.g. http://tusd:1080/files/
     TUSD_ENDPOINT: str
 

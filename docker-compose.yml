@@ -13,6 +13,7 @@ services:
     volumes:
       - upload-data:/tmp/uploads
       - /path/to/hf_cache_host:/hf_cache:ro
+      - ctranslate2-cache:/root/.cache/ctranslate2
     depends_on:
       - redis
       - tusd
