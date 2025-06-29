@@ -1,40 +1,52 @@
 # config/settings.py
-from pathlib import Path
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from typing import List
 
 class Settings(BaseSettings):
-    model_path: Path
-    hf_cache_dir: Path
-    whisper_device: str
-    whisper_compute_type: str
-    whisper_beam_size: int
+    # FastAPI
+    FASTAPI_HOST:       str = "0.0.0.0"
+    FASTAPI_PORT:       int = 8000
+    API_WORKERS:        int = 1
+    ALLOWED_ORIGINS:    List[str] = ["*"]
 
-    pyannote_protocol: str
-    diarizer_cache_dir: Path
+    # Celery / Redis
+    CELERY_BROKER_URL:      str
+    CELERY_RESULT_BACKEND:  str
+    CPU_CONCURRENCY:        int = 4
+    GPU_CONCURRENCY:        int = 1
+    TIMEZONE:               str = "UTC"
 
-    upload_folder: Path
-    results_folder: Path
-    segment_length_s: int
+    # Storage
+    UPLOAD_FOLDER:      str = "/tmp/uploads"
+    RESULTS_FOLDER:     str = "/tmp/results"
+    FILE_RETENTION_DAYS: int = 7
+    MAX_FILE_SIZE:      int = 1 << 30  # 1 GiB
 
-    celery_broker_url: str
-    celery_result_backend: str
-    cpu_concurrency: int
-    gpu_concurrency: int
-    timezone: str
+    # tusd
+    TUSD_ENDPOINT:      str
+    SNIPPET_FORMAT:     str = "wav"
 
-    # secrets (in prod, pull from Docker Secrets or Vault)
-    huggingface_token: str
+    # pyannote diarizer
+    DIARIZER_CACHE_DIR: str = "/tmp/diarizer_cache"
+    PYANNOTE_PROTOCOL:  str = "pyannote/speaker-diarization"
 
-    # optional feature flags
-    enable_metrics: bool = True
-    clean_up_uploads: bool = True
-    file_retention_days: int = 7
-    max_file_size: int = 1_073_741_824  # 1 GiB
+    # Hugging Face
+    HUGGINGFACE_TOKEN:  str
+    HF_CACHE_DIR:       str = "/hf_cache"
 
-    model_config = SettingsConfigDict(
-        env_file=".env",
-        env_file_encoding="utf-8",
-        extra="ignore",
-    )
+    # Whisper / faster-whisper
+    WHISPER_MODEL_PATH:    str = "/hf_cache/models--guillaumekln--faster-whisper-medium"
+    WHISPER_DEVICE:        str = "cuda"
+    WHISPER_DEVICE_INDEX:  int = 0
+    WHISPER_COMPUTE_TYPE:  str = "int8"
+    WHISPER_BEAM_SIZE:     int = 5
+    WHISPER_LANGUAGE:      str = "ru"
+    WHISPER_TASK:          str = "transcribe"
+    SEGMENT_LENGTH_S:      int = 30
+
+    # Cleanup
+    CLEAN_UP_UPLOADS:   bool = True
+
+    model_config = SettingsConfigDict(extra="allow")
 
 settings = Settings()
