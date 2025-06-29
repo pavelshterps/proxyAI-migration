@@ -1,68 +1,73 @@
 # config/settings.py
-from pathlib import Path
-from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from typing import List
+from pydantic import Field
+from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
-    # Разрешаем незадекларированные поля игнорировать,
-    # чтобы новые переменные из .env не падали валидатором
-    model_config = SettingsConfigDict(
-        env_file=".env",
-        extra="ignore",
-        case_sensitive=False,
+    # FastAPI
+    FASTAPI_HOST: str = Field("0.0.0.0", description="FastAPI listen host")
+    FASTAPI_PORT: int = Field(8000, description="FastAPI listen port")
+    ALLOWED_ORIGINS: List[str] = Field(
+        ["*"], description="CORS allowed origins"
     )
 
-    # FastAPI
-    FASTAPI_HOST: str = "0.0.0.0"
-    FASTAPI_PORT: int = 8000
-    API_WORKERS: int = 1
-    ALLOWED_ORIGINS: list[str] = ["*"]
-
     # Celery / Redis
-    CELERY_BROKER_URL: str
-    CELERY_RESULT_BACKEND: str
-    CPU_CONCURRENCY: int = 4
-    GPU_CONCURRENCY: int = 1
-    TIMEZONE: str = "UTC"
+    CELERY_BROKER_URL: str = Field(..., description="Redis broker URL for Celery")
+    CELERY_RESULT_BACKEND: str = Field(..., description="Redis backend URL for Celery results")
+    CPU_CONCURRENCY: int = Field(4, description="Number of threads for cpu-worker")
+    GPU_CONCURRENCY: int = Field(1, description="Number of processes for gpu-worker")
+    TIMEZONE: str = Field("UTC", description="Timezone for Celery")
 
-    # File storage
-    UPLOAD_FOLDER: Path = Path("/tmp/uploads")
-    RESULTS_FOLDER: Path = Path("/tmp/results")
-    FILE_RETENTION_DAYS: int = 7
-    MAX_FILE_SIZE: int = 1 * 1024**3  # 1 GiB
+    # Storage
+    UPLOAD_FOLDER: str = Field("/tmp/uploads", description="Host folder for incoming files")
+    RESULTS_FOLDER: str = Field("/tmp/results", description="Host folder for outputs")
+    FILE_RETENTION_DAYS: int = Field(7, description="Days to keep files")
+    MAX_FILE_SIZE: int = Field(1_073_741_824, description="Max upload size in bytes")
 
-    # tusd (resumable upload)
-    TUSD_ENDPOINT: str
-    SNIPPET_FORMAT: str = "wav"
+    # Tusd (resumable upload)
+    TUSD_ENDPOINT: str = Field(..., description="tusd files endpoint")
+    SNIPPET_FORMAT: str = Field("wav", description="Format for snippet downloads")
 
-    # Pyannote diarizer cache
-    DIARIZER_CACHE_DIR: Path = Path("/tmp/diarizer_cache")
-    PYANNOTE_PROTOCOL: str
+    # Pyannote diarizer
+    DIARIZER_CACHE_DIR: str = Field(
+        "/tmp/diarizer_cache", description="Local cache for pyannote pipelines"
+    )
+    PYANNOTE_PROTOCOL: str = Field(
+        "pyannote/speaker-diarization", description="Hugging Face proto for diarization"
+    )
 
     # Hugging Face
-    HUGGINGFACE_TOKEN: str
-    HF_CACHE_DIR: Path = Path("/hf_cache")
+    HUGGINGFACE_TOKEN: str = Field(..., description="HF access token (use secrets)")
+    HF_CACHE_DIR: str = Field(
+        "/hf_cache", description="Bind-mounted HF cache on host"
+    )
 
-    # Whisper model (faster-whisper)
-    WHISPER_MODEL_PATH: Path
-    WHISPER_DEVICE: str = "cuda"
-    WHISPER_DEVICE_INDEX: int = 0
-    WHISPER_COMPUTE_TYPE: str = "int8"
-    WHISPER_BEAM_SIZE: int = 5
-    WHISPER_TASK: str = "transcribe"
-    # ← добавляем сюда env-переменную, которую таски по-тему ожидают:
-    SEGMENT_LENGTH_S: int = 30
+    # Whisper / Faster-Whisper
+    WHISPER_MODEL_PATH: str = Field(
+        "/hf_cache/models--guillaumekln--faster-whisper-medium",
+        description="Local path to quantized Whisper model"
+    )
+    WHISPER_DEVICE: str = Field("cuda", description="Device for whisper")
+    WHISPER_DEVICE_INDEX: int = Field(0, description="CUDA device index")
+    WHISPER_COMPUTE_TYPE: str = Field("int8", description="Quantization type")
+    WHISPER_BEAM_SIZE: int = Field(5, description="Beam size for transcription")
+    WHISPER_TASK: str = Field("transcribe", description="faster-whisper task")
+    SEGMENT_LENGTH_S: int = Field(30, description="Fixed window length (sec)")
 
     # Cleanup
-    CLEAN_UP_UPLOADS: bool = True
+    CLEAN_UP_UPLOADS: bool = Field(True, description="Remove uploads after processing")
 
     # Database
-    DATABASE_URL: str
-    REDIS_URL: str
+    DATABASE_URL: str = Field(..., description="Postgres connection URL")
+    REDIS_URL: str = Field(..., description="Redis URL (if used outside Celery)")
 
-    # Настройки CTranslate2 (если нужны)
-    # CTR_TRANSLATE2_CACHE: Path = Path.home() / ".cache" / "ctranslate2"
+    class Config:
+        env_file = ".env"
+        case_sensitive = True
+        extra = "ignore"  # drop any unknown vars rather than erroring
 
 
-# Синглтон-конфиг, импортируем из кода как `settings`
+# Синглтон-настройки
 settings = Settings()
