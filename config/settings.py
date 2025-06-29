@@ -1,73 +1,62 @@
 # config/settings.py
-
-from typing import List
 from pydantic import Field
-from pydantic_settings import BaseSettings
-
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     # FastAPI
-    FASTAPI_HOST: str = Field("0.0.0.0", description="FastAPI listen host")
-    FASTAPI_PORT: int = Field(8000, description="FastAPI listen port")
-    ALLOWED_ORIGINS: List[str] = Field(
-        ["*"], description="CORS allowed origins"
+    fastapi_host: str = Field("0.0.0.0", env="FASTAPI_HOST")
+    fastapi_port: int = Field(8000,       env="FASTAPI_PORT")
+    api_workers:  int = Field(1,          env="API_WORKERS")
+    allowed_origins: list[str] = Field(
+        ["*"], env="ALLOWED_ORIGINS", description="CORS origins"
     )
 
     # Celery / Redis
-    CELERY_BROKER_URL: str = Field(..., description="Redis broker URL for Celery")
-    CELERY_RESULT_BACKEND: str = Field(..., description="Redis backend URL for Celery results")
-    CPU_CONCURRENCY: int = Field(4, description="Number of threads for cpu-worker")
-    GPU_CONCURRENCY: int = Field(1, description="Number of processes for gpu-worker")
-    TIMEZONE: str = Field("UTC", description="Timezone for Celery")
+    celery_broker_url:    str = Field(..., env="CELERY_BROKER_URL")
+    celery_result_backend: str = Field(..., env="CELERY_RESULT_BACKEND")
+    cpu_concurrency:       int = Field(4,  env="CPU_CONCURRENCY")
+    gpu_concurrency:       int = Field(1,  env="GPU_CONCURRENCY")
+    timezone:             str = Field("UTC", env="TIMEZONE")
 
     # Storage
-    UPLOAD_FOLDER: str = Field("/tmp/uploads", description="Host folder for incoming files")
-    RESULTS_FOLDER: str = Field("/tmp/results", description="Host folder for outputs")
-    FILE_RETENTION_DAYS: int = Field(7, description="Days to keep files")
-    MAX_FILE_SIZE: int = Field(1_073_741_824, description="Max upload size in bytes")
+    upload_folder:      str = Field("/tmp/uploads",   env="UPLOAD_FOLDER")
+    results_folder:     str = Field("/tmp/results",   env="RESULTS_FOLDER")
+    file_retention_days: int = Field(7,                env="FILE_RETENTION_DAYS")
+    max_file_size:       int = Field(1<<30,            env="MAX_FILE_SIZE")
 
-    # Tusd (resumable upload)
-    TUSD_ENDPOINT: str = Field(..., description="tusd files endpoint")
-    SNIPPET_FORMAT: str = Field("wav", description="Format for snippet downloads")
+    # tusd
+    tusd_endpoint: str = Field(..., env="TUSD_ENDPOINT")
+    snippet_format: str = Field("wav", env="SNIPPET_FORMAT")
 
     # Pyannote diarizer
-    DIARIZER_CACHE_DIR: str = Field(
-        "/tmp/diarizer_cache", description="Local cache for pyannote pipelines"
-    )
-    PYANNOTE_PROTOCOL: str = Field(
-        "pyannote/speaker-diarization", description="Hugging Face proto for diarization"
-    )
+    diarizer_cache_dir: str = Field("/tmp/diarizer_cache", env="DIARIZER_CACHE_DIR")
+    pyannote_protocol:  str = Field("pyannote/speaker-diarization", env="PYANNOTE_PROTOCOL")
 
     # Hugging Face
-    HUGGINGFACE_TOKEN: str = Field(..., description="HF access token (use secrets)")
-    HF_CACHE_DIR: str = Field(
-        "/hf_cache", description="Bind-mounted HF cache on host"
-    )
+    huggingface_token: str = Field(..., env="HUGGINGFACE_TOKEN")
+    hf_cache_dir:      str = Field("/hf_cache", env="HF_CACHE_DIR")
 
-    # Whisper / Faster-Whisper
-    WHISPER_MODEL_PATH: str = Field(
-        "/hf_cache/models--guillaumekln--faster-whisper-medium",
-        description="Local path to quantized Whisper model"
-    )
-    WHISPER_DEVICE: str = Field("cuda", description="Device for whisper")
-    WHISPER_DEVICE_INDEX: int = Field(0, description="CUDA device index")
-    WHISPER_COMPUTE_TYPE: str = Field("int8", description="Quantization type")
-    WHISPER_BEAM_SIZE: int = Field(5, description="Beam size for transcription")
-    WHISPER_TASK: str = Field("transcribe", description="faster-whisper task")
-    SEGMENT_LENGTH_S: int = Field(30, description="Fixed window length (sec)")
+    # Whisper / Faster‐Whisper
+    whisper_model_path:  str = Field(..., env="WHISPER_MODEL_PATH")
+    whisper_device:      str = Field("cuda",  env="WHISPER_DEVICE")
+    whisper_device_index: int = Field(0,      env="WHISPER_DEVICE_INDEX")
+    whisper_compute_type: str = Field("int8", env="WHISPER_COMPUTE_TYPE")
+    whisper_beam_size:    int = Field(5,     env="WHISPER_BEAM_SIZE")
+    whisper_task:         str = Field("transcribe", env="WHISPER_TASK")
+    segment_length_s:     int = Field(30,    env="SEGMENT_LENGTH_S")
 
     # Cleanup
-    CLEAN_UP_UPLOADS: bool = Field(True, description="Remove uploads after processing")
+    clean_up_uploads: bool = Field(True, env="CLEAN_UP_UPLOADS")
 
-    # Database
-    DATABASE_URL: str = Field(..., description="Postgres connection URL")
-    REDIS_URL: str = Field(..., description="Redis URL (if used outside Celery)")
+    # Database / Misc
+    database_url: str = Field(..., env="DATABASE_URL")
+    redis_url:    str = Field(..., env="REDIS_URL")
 
-    class Config:
-        env_file = ".env"
-        case_sensitive = True
-        extra = "ignore"  # drop any unknown vars rather than erroring
+    # Pydantic config
+    model_config = SettingsConfigDict(
+        env_file = ".env",
+        env_file_encoding = "utf-8",
+        extra = "ignore"   # drop any env vars you didn't declare
+    )
 
-
-# Синглтон-настройки
 settings = Settings()
