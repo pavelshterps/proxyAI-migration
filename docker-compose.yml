@@ -9,14 +9,14 @@ services:
     env_file: .env
     volumes:
       - upload-data:/tmp/uploads
-      - /path/to/hf_cache_host:/hf_cache:ro
+      - results-data:/tmp/results
+    ports:
+      - "8000:8000"
     depends_on:
       - redis
       - tusd
-    ports:
-      - "8000:8000"
     command: >
-      sh -c "uvicorn main:app --host 0.0.0.0 --port 8000 --workers $API_WORKERS"
+      sh -c "uvicorn main:app --host 0.0.0.0 --port 8000 --workers ${API_WORKERS}"
 
   cpu-worker:
     build:
@@ -26,8 +26,8 @@ services:
     env_file: .env
     volumes:
       - upload-data:/tmp/uploads
-      - /path/to/hf_cache_host:/hf_cache:ro
-      - $DIARIZER_CACHE_DIR:/tmp/diarizer_cache
+      - results-data:/tmp/results
+      - hf_cache:/hf_cache:ro
     depends_on:
       - redis
     command: >
@@ -45,7 +45,8 @@ services:
     env_file: .env
     volumes:
       - upload-data:/tmp/uploads
-      - /path/to/hf_cache_host:/hf_cache:rw   # read-only download, writable for quantization
+      - results-data:/tmp/results
+      - hf_cache:/hf_cache:ro
       - ctranslate2-cache:/root/.cache/ctranslate2
     depends_on:
       - redis
@@ -103,4 +104,6 @@ services:
 volumes:
   upload-data:
   redis-data:
+  results-data:
+  hf_cache:
   ctranslate2-cache:

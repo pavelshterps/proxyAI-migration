@@ -1,25 +1,18 @@
 # celery_app.py
-
-import logging
 from celery import Celery
 from config.settings import settings
 
-logger = logging.getLogger(__name__)
-
-# Create Celery app
+# создаём celery-приложение
 celery_app = Celery(
     "proxyai",
     broker=settings.CELERY_BROKER_URL,
     backend=settings.CELERY_RESULT_BACKEND,
-    include=["tasks"],
 )
 
-# Route tasks to queues
-celery_app.conf.task_routes = {
-    "tasks.diarize_full": {"queue": "preprocess_cpu"},
-    "tasks.transcribe_segments": {"queue": "preprocess_gpu"},
-}
-
-# Concurrency settings
-celery_app.conf.worker_concurrency = int(settings.CPU_CONCURRENCY)
-celery_app.conf.worker_prefetch_multiplier = 1
+# конфигурируем очередь (для CPU и GPU воркеров мы будем выбирать разные очереди через --queues)
+celery_app.conf.update(
+    task_serializer="json",
+    accept_content=["json"],
+    result_serializer="json",
+    timezone=settings.model_config.env_file,  # TZ берётся из .env (по-умолчанию UTC)
+)
