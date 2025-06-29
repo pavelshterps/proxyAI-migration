@@ -7,6 +7,7 @@ python-multipart>=0.0.5
 pydantic~=1.10
 transformers>=4.28.1
 faster-whisper==1.1.1
-torch>=2.1.0        # CPU- и GPU-совместимая
-pyannote.audio>=2.2.1
+torch>=2.1.0
+ctranslate2~=4.6
+pyannote.audio>=2.1  # если требуется новая версия
 pydub>=0.25.1

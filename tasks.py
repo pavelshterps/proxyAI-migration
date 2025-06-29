@@ -1,3 +1,4 @@
+# tasks.py
 import os
 import json
 import logging
@@ -45,18 +46,14 @@ def get_diarizer():
         os.makedirs(cache_dir, exist_ok=True)
         logger.info(f"Loading pyannote Pipeline into cache '{cache_dir}'")
         _diarizer = Pipeline.from_pretrained(
-            "pyannote/speaker-diarization",
-            cache_dir=cache_dir,
-            use_auth_token=os.getenv("HUGGINGFACE_TOKEN", None)
+            os.getenv("PYANNOTE_PROTOCOL", "pyannote/speaker-diarization"),
+            cache_dir=cache_dir
         )
         logger.info("Diarizer loaded")
     return _diarizer
 
 
 def split_audio_fixed_windows(audio_path: Path):
-    """
-    Split the audio into fixed-length windows (default 30s).
-    """
     window_s = int(os.getenv("SEGMENT_LENGTH_S", "30"))
     audio = AudioSegment.from_file(str(audio_path))
     length_ms = len(audio)
@@ -77,15 +74,15 @@ def transcribe_segments(upload_id: str):
 
     logger.info(f"Starting transcription for '{src}'")
     segments = split_audio_fixed_windows(src)
-    logger.info(f"  -> {len(segments)} segments up to {os.getenv('SEGMENT_LENGTH_S','30')}s")
+    logger.info(f"  -> {len(segments)} segments of up to {os.getenv('SEGMENT_LENGTH_S','30')}s")
 
     transcript = []
     for idx, (start, end) in enumerate(segments):
         logger.debug(f"  Transcribing segment {idx}: {start:.1f}s → {end:.1f}s")
         result = whisper.transcribe(
             str(src),
-            beam_size=5,
-            language="ru",
+            beam_size=int(os.getenv("WHISPER_BEAM_SIZE", "5")),
+            language=os.getenv("WHISPER_LANGUAGE", "ru"),
             vad_filter=True,
             word_timestamps=True,
             offset=start,
