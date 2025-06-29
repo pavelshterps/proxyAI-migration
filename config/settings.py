@@ -1,53 +1,57 @@
-from pydantic import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import Field
 
 class Settings(BaseSettings):
-    # FastAPI
-    FASTAPI_HOST: str = "0.0.0.0"
-    FASTAPI_PORT: int = 8000
-    API_WORKERS: int = 1
-    ALLOWED_ORIGINS: list[str] = ["*"]
+    # tell Pydantic-v2 where to read the .env
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+    )
 
-    # Celery & Redis
+    # FastAPI
+    FASTAPI_HOST: str = Field("0.0.0.0")
+    FASTAPI_PORT: int = Field(8000)
+    API_WORKERS: int = Field(1)
+    ALLOWED_ORIGINS: str = Field('["*"]')
+
+    # Celery / Redis
     CELERY_BROKER_URL: str
     CELERY_RESULT_BACKEND: str
-    CPU_CONCURRENCY: int = 4
-    GPU_CONCURRENCY: int = 1
+    CPU_CONCURRENCY: int = Field(4)
+    GPU_CONCURRENCY: int = Field(1)
+    CELERY_RESULT_EXPIRES: int = Field(3600)
 
-    # File storage
-    UPLOAD_FOLDER: str = "/tmp/uploads"
-    RESULTS_FOLDER: str = "/tmp/results"
-    FILE_RETENTION_DAYS: int = 7
-    MAX_FILE_SIZE: int = 1 * 1024 * 1024 * 1024  # 1 GiB
+    # storage
+    UPLOAD_FOLDER: str
+    RESULTS_FOLDER: str
+    FILE_RETENTION_DAYS: int = Field(7)
+    MAX_FILE_SIZE: int = Field(1_073_741_824)
 
-    # tusd (resumable upload)
+    # tusd
     TUSD_ENDPOINT: str
-    SNIPPET_FORMAT: str = "wav"
+    SNIPPET_FORMAT: str = Field("wav")
 
-    # pyannote cache
-    DIARIZER_CACHE_DIR: str = "/tmp/diarizer_cache"
+    # pyannote
+    DIARIZER_CACHE_DIR: str
     PYANNOTE_PROTOCOL: str
 
-    # Hugging Face
+    # Hugging Face auth
     HUGGINGFACE_TOKEN: str
-    HF_CACHE_DIR: str = "/hf_cache"
+    HF_CACHE_DIR: str
 
-    # Faster Whisper / Whisper
+    # Whisper / faster-whisper
     WHISPER_MODEL_PATH: str
-    WHISPER_DEVICE: str = "cuda"
-    WHISPER_DEVICE_INDEX: int = 0
-    WHISPER_COMPUTE_TYPE: str = "int8"
-    WHISPER_BEAM_SIZE: int = 5
-    WHISPER_TASK: str = "transcribe"
+    WHISPER_DEVICE: str = Field("cuda")
+    WHISPER_DEVICE_INDEX: int = Field(0)
+    WHISPER_COMPUTE_TYPE: str = Field("int8")
+    WHISPER_BEAM_SIZE: int = Field(5)
+    WHISPER_TASK: str = Field("transcribe")
 
-    # Cleanup
-    CLEAN_UP_UPLOADS: bool = True
+    # cleanup
+    CLEAN_UP_UPLOADS: bool = Field(True)
 
-    # Database / Redis (если используются)
+    # database / misc
     DATABASE_URL: str
     REDIS_URL: str
-
-    class Config:
-        env_file = ".env"
-        case_sensitive = True
 
 settings = Settings()
