@@ -12,7 +12,7 @@ from config.settings import UPLOAD_FOLDER, RESULTS_FOLDER
 
 logger = logging.getLogger(__name__)
 
-# Singleton instances
+# Singletons so we only load each model once per worker process
 _whisper_model = None
 _diarizer = None
 
@@ -46,13 +46,17 @@ def get_diarizer():
         logger.info(f"Loading pyannote Pipeline into cache '{cache_dir}'")
         _diarizer = Pipeline.from_pretrained(
             "pyannote/speaker-diarization",
-            cache_dir=cache_dir
+            cache_dir=cache_dir,
+            use_auth_token=os.getenv("HUGGINGFACE_TOKEN", None)
         )
         logger.info("Diarizer loaded")
     return _diarizer
 
 
 def split_audio_fixed_windows(audio_path: Path):
+    """
+    Split the audio into fixed-length windows (default 30s).
+    """
     window_s = int(os.getenv("SEGMENT_LENGTH_S", "30"))
     audio = AudioSegment.from_file(str(audio_path))
     length_ms = len(audio)
@@ -73,7 +77,7 @@ def transcribe_segments(upload_id: str):
 
     logger.info(f"Starting transcription for '{src}'")
     segments = split_audio_fixed_windows(src)
-    logger.info(f"  -> {len(segments)} segments of up to {os.getenv('SEGMENT_LENGTH_S','30')}s")
+    logger.info(f"  -> {len(segments)} segments up to {os.getenv('SEGMENT_LENGTH_S','30')}s")
 
     transcript = []
     for idx, (start, end) in enumerate(segments):
