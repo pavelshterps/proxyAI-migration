@@ -1,8 +1,12 @@
 FROM nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04
 
+# Allow insecure repos and unauthenticated installs
+RUN echo 'Acquire::AllowInsecureRepositories "true";' > /etc/apt/apt.conf.d/99insecure \
+ && echo 'APT::Get::AllowUnauthenticated "true";' >> /etc/apt/apt.conf.d/99insecure
+
 # system deps
-RUN apt-get update \
- && apt-get install -y --no-install-recommends \
+RUN apt-get update -o Acquire::AllowInsecureRepositories=true \
+ && apt-get install -y --allow-unauthenticated \
     python3.10 python3-pip ffmpeg \
  && rm -rf /var/lib/apt/lists/*
 
