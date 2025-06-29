@@ -49,7 +49,7 @@ services:
     volumes:
       - upload-data:/tmp/uploads
       - results-data:/tmp/results
-      # Bind-mount your host HF cache (read/write) so the quantized model can be written back
+      # Bind-mount your host’s HF cache (RW) so quantized files get persisted:
       - /path/to/hf_cache_host:/hf_cache:rw
       - ctranslate2-cache:/root/.cache/ctranslate2
     command: >

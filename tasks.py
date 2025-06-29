@@ -12,7 +12,7 @@ from config.settings import UPLOAD_FOLDER, RESULTS_FOLDER
 
 logger = logging.getLogger(__name__)
 
-# Singletons so we only load each model once per worker process
+# singleton holders
 _whisper_model = None
 _diarizer = None
 
@@ -26,9 +26,7 @@ def get_whisper_model():
         )
         device = os.getenv("WHISPER_DEVICE", "cuda")
         compute = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
-        logger.info(
-            f"Loading WhisperModel {{'path': '{model_path}', 'device': '{device}', 'compute': '{compute}'}}"
-        )
+        logger.info(f"Loading WhisperModel {{'path': '{model_path}', 'device': '{device}', 'compute': '{compute}'}}")
         _whisper_model = WhisperModel(
             model_path,
             device=device,
@@ -55,7 +53,6 @@ def get_diarizer():
 def split_audio_fixed_windows(audio_path: Path):
     """
     Split the audio into fixed-length windows (default 30s) for batching.
-    Returns a list of (start_sec, end_sec) tuples.
     """
     window_s = int(os.getenv("SEGMENT_LENGTH_S", "30"))
     audio = AudioSegment.from_file(str(audio_path))
@@ -68,12 +65,12 @@ def split_audio_fixed_windows(audio_path: Path):
     return segments
 
 
-@shared_task
+@shared_task(name="tasks.transcribe_segments")
 def transcribe_segments(upload_id: str):
     """
-    1) Splits audio into fixed‐window segments
+    1) Splits audio into fixed-window segments
     2) Transcribes each with Whisper
-    3) Dumps RESULTS_FOLDER/<upload_id>/transcript.json
+    3) Saves transcript JSON
     """
     whisper = get_whisper_model()
     src = Path(UPLOAD_FOLDER) / f"{upload_id}.wav"
@@ -82,7 +79,7 @@ def transcribe_segments(upload_id: str):
 
     logger.info(f"Starting transcription for '{src}'")
     segments = split_audio_fixed_windows(src)
-    logger.info(f"  -> {len(segments)} segments of up to {os.getenv('SEGMENT_LENGTH_S','30')}s")
+    logger.info(f"  → {len(segments)} segments of up to {os.getenv('SEGMENT_LENGTH_S','30')}s")
 
     transcript = []
     for idx, (start, end) in enumerate(segments):
@@ -96,7 +93,7 @@ def transcribe_segments(upload_id: str):
             offset=start,
             duration=(end - start),
         )
-        text = result["segments"][0]["text"]
+        text = result["segments"][0]["text"].strip()
         transcript.append({
             "segment": idx,
             "start": start,
@@ -109,11 +106,11 @@ def transcribe_segments(upload_id: str):
     logger.info(f"Transcription complete: saved to '{out_path}'")
 
 
-@shared_task
+@shared_task(name="tasks.diarize_full")
 def diarize_full(upload_id: str):
     """
     1) Runs speaker diarization on the whole file
-    2) Dumps RESULTS_FOLDER/<upload_id>/diarization.json
+    2) Saves diarization JSON
     """
     diarizer = get_diarizer()
     src = Path(UPLOAD_FOLDER) / f"{upload_id}.wav"

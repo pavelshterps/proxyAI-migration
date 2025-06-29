@@ -1,60 +1,35 @@
-# config/settings.py
-from pydantic import BaseSettings, Field, AnyHttpUrl
+from pydantic_settings import BaseSettings
 
 class Settings(BaseSettings):
-    # FastAPI
-    FASTAPI_HOST: str = "0.0.0.0"
-    FASTAPI_PORT: int = 8000
-    API_WORKERS: int = 1
-
-    # CORS
-    ALLOWED_ORIGINS: list[str] = Field(default=["*"], env="ALLOWED_ORIGINS")
+    # FastAPI / Uvicorn
+    API_WORKERS: int = 2
 
     # Celery
     CELERY_BROKER_URL: str
     CELERY_RESULT_BACKEND: str
-    CELERY_TIMEZONE: str = "UTC"
     CPU_CONCURRENCY: int = 4
     GPU_CONCURRENCY: int = 1
 
-    # Storage
+    # file paths
     UPLOAD_FOLDER: str = "/tmp/uploads"
     RESULTS_FOLDER: str = "/tmp/results"
-    FILE_RETENTION_DAYS: int = 7
-    MAX_FILE_SIZE: int = 1_073_741_824
 
-    # tusd
-    TUSD_ENDPOINT: AnyHttpUrl
-    SNIPPET_FORMAT: str = "wav"
-
-    # Pyannote diarizer
-    DIARIZER_CACHE_DIR: str = "/tmp/diarizer_cache"
-    PYANNOTE_PROTOCOL: str
-
-    # Hugging Face
-    HUGGINGFACE_TOKEN: str
-    HF_CACHE_DIR: str = "/hf_cache"
-
-    # Whisper (faster-whisper)
-    WHISPER_MODEL_PATH: str
+    # whisper / diarization
+    WHISPER_MODEL_PATH: str = "/hf_cache/models--guillaumekln--faster-whisper-medium"
     WHISPER_DEVICE: str = "cuda"
-    WHISPER_DEVICE_INDEX: int = 0
     WHISPER_COMPUTE_TYPE: str = "int8"
-    WHISPER_BEAM_SIZE: int = 5
-    WHISPER_TASK: str = "transcribe"
+    DIARIZER_CACHE_DIR: str = "/tmp/diarizer_cache"
     SEGMENT_LENGTH_S: int = 30
 
-    # Cleanup
-    CLEAN_UP_UPLOADS: bool = True
+    # HuggingFace
+    HUGGINGFACE_TOKEN: str  # must be provided
 
-    # Database
-    DATABASE_URL: str
-    REDIS_URL: str
+    # Timezone
+    TIMEZONE: str = "UTC"
 
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"
-        # lock to pydantic v1
-        frozen = True
+
 
 settings = Settings()
