@@ -1,46 +1,63 @@
-# config/settings.py
-from pydantic_settings import BaseSettings
-from pydantic import Field
+from pydantic import BaseSettings, Field
+
 
 class Settings(BaseSettings):
-    # API (FastAPI/Uvicorn)
-    API_WORKERS: int = Field(2, env="API_WORKERS")
+    # CORS
+    ALLOWED_ORIGINS: str = Field('["*"]', env="ALLOWED_ORIGINS")
 
-    # Celery
-    CELERY_CONCURRENCY: int = Field(2, env="CELERY_CONCURRENCY")
-    GPU_CONCURRENCY: int = Field(1, env="GPU_CONCURRENCY")
+    # Celery & Redis
     CELERY_BROKER_URL: str = Field(..., env="CELERY_BROKER_URL")
     CELERY_RESULT_BACKEND: str = Field(..., env="CELERY_RESULT_BACKEND")
 
-    # Storage paths
-    UPLOAD_FOLDER: str = Field("/tmp/uploads", env="UPLOAD_FOLDER")
-    RESULTS_FOLDER: str = Field("/tmp/results", env="RESULTS_FOLDER")
+    API_WORKERS: int = Field(1, env="API_WORKERS")
+    CPU_CONCURRENCY: int = Field(4, env="CPU_CONCURRENCY")
+    GPU_CONCURRENCY: int = Field(1, env="GPU_CONCURRENCY")
 
-    # Diarizer cache (должен быть доступен на запись)
-    DIARIZER_CACHE_DIR: str = Field("/tmp/diarizer_cache", env="DIARIZER_CACHE_DIR")
+    # File storage
+    UPLOAD_FOLDER: str = Field(..., env="UPLOAD_FOLDER")
+    RESULTS_FOLDER: str = Field(..., env="RESULTS_FOLDER")
 
-    # Faster-Whisper / Whisper модель
-    WHISPER_MODEL_PATH: str = Field(
-        "/hf_cache/models--guillaumekln--faster-whisper-medium",
-        env="WHISPER_MODEL_PATH"
-    )
+    # Diarizer cache
+    DIARIZER_CACHE_DIR: str = Field(..., env="DIARIZER_CACHE_DIR")
+
+    # tusd (resumable upload)
+    TUSD_ENDPOINT: str = Field(..., env="TUSD_ENDPOINT")
+    SNIPPET_FORMAT: str = Field("wav", env="SNIPPET_FORMAT")
+
+    # Hugging Face
+    HUGGINGFACE_TOKEN: str | None = Field(None, env="HUGGINGFACE_TOKEN")
+    HF_CACHE_DIR: str = Field(..., env="HF_CACHE_DIR")
+
+    # Faster Whisper / Whisper
+    WHISPER_MODEL_PATH: str = Field(..., env="WHISPER_MODEL_PATH")
     WHISPER_DEVICE: str = Field("cuda", env="WHISPER_DEVICE")
     WHISPER_DEVICE_INDEX: int = Field(0, env="WHISPER_DEVICE_INDEX")
     WHISPER_COMPUTE_TYPE: str = Field("int8", env="WHISPER_COMPUTE_TYPE")
-
-    # Optional: настройки beam search
     WHISPER_BEAM_SIZE: int = Field(5, env="WHISPER_BEAM_SIZE")
 
-    # Pyannote diarization model
+    # Pyannote speaker-diarization
     PYANNOTE_PROTOCOL: str = Field("pyannote/speaker-diarization", env="PYANNOTE_PROTOCOL")
 
-    # Hugging Face token (для приватных моделей)
-    HUGGINGFACE_TOKEN: str = Field(..., env="HUGGINGFACE_TOKEN")
+    # Cleanup
+    CLEAN_UP_UPLOADS: bool = Field(True, env="CLEAN_UP_UPLOADS")
+    FILE_RETENTION_DAYS: int = Field(7, env="FILE_RETENTION_DAYS")
+    MAX_FILE_SIZE: int = Field(1073741824, env="MAX_FILE_SIZE")
 
-    model_config = Settings.ConfigDict(
-        env_file=".env",
-        extra="ignore"
-    )
+    class Config:
+        env_file = ".env"
 
-# сразу создаём инстанс, чтобы celery_app и main.py могли его импортировать
+    #
+    # добавляем свойства-синонимы, если кто-то в коде
+    # всё ещё обращается к ним в snake_case
+    #
+    @property
+    def celery_broker_url(self) -> str:
+        return self.CELERY_BROKER_URL
+
+    @property
+    def celery_result_backend(self) -> str:
+        return self.CELERY_RESULT_BACKEND
+
+
+# Единый инстанс на всё приложение
 settings = Settings()
