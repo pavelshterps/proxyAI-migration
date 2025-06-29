@@ -1,23 +1,20 @@
+# базовый образ с CUDA 12.1 + cuDNN8
 FROM nvidia/cuda:12.1.0-cudnn8-runtime-ubuntu22.04
 
 RUN apt-get update \
- && apt-get install -y --no-install-recommends \
-    python3.10 python3-pip ffmpeg \
+ && apt-get install -y --no-install-recommends python3.10 python3-pip ffmpeg \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-COPY requirements.txt .
+COPY requirements.txt ./
 RUN pip3 install --no-cache-dir -r requirements.txt
 
-# Патч CTranslate2, чтобы не было ошибок импорта transformers
+# патчим ctranslate2, правильно берём __file__
 RUN TRANSFORMER_FILE=$(python3 -c "import ctranslate2, os; print(os.path.dirname(ctranslate2.__file__) + '/converters/transformers.py')") \
  && sed -i '1i import transformers' "$TRANSFORMER_FILE"
 
-COPY config ./config
-COPY celery_app.py ./
-COPY main.py ./
-COPY tasks.py ./
-COPY static ./static
+COPY . .
 
-ENV UPLOAD_FOLDER=/tmp/uploads
+# по умолчанию запускаем celery
+CMD ["sh", "-c", "celery -A celery_app worker --loglevel=info --concurrency=${GPU_CONCURRENCY} --hostname gpu-worker --queues preprocess_gpu"]

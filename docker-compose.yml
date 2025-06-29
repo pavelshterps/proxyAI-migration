@@ -12,15 +12,13 @@ services:
       UPLOAD_FOLDER: /tmp/uploads
     volumes:
       - upload-data:/tmp/uploads
-      - /path/to/hf_cache_host:/hf_cache:ro
-      - ctranslate2-cache:/root/.cache/ctranslate2
     depends_on:
       - redis
       - tusd
     ports:
       - "8000:8000"
     command: >
-      sh -c "uvicorn main:app --host 0.0.0.0 --port 8000 --workers $API_WORKERS"
+      uvicorn main:app --host 0.0.0.0 --port 8000 --workers ${API_WORKERS}
 
   cpu-worker:
     build:
@@ -34,15 +32,12 @@ services:
       DIARIZER_CACHE_DIR: /tmp/diarizer_cache
     volumes:
       - upload-data:/tmp/uploads
-      - hf_cache:/hf_cache
+      # хотим, чтобы CPU-воркер тоже читал локальный кэш моделей
+      - /path/to/hf_cache_host:/hf_cache:ro
     depends_on:
       - redis
     command: >
-      celery -A celery_app worker
-      --loglevel=info
-      --concurrency ${CPU_CONCURRENCY}
-      --hostname cpu-worker
-      --queues preprocess_cpu
+      celery -A celery_app worker --loglevel=info --concurrency=${CPU_CONCURRENCY} --hostname cpu-worker --queues preprocess_cpu
 
   gpu-worker:
     build:
@@ -55,6 +50,7 @@ services:
       UPLOAD_FOLDER: /tmp/uploads
     volumes:
       - upload-data:/tmp/uploads
+      # здесь ваша quantized-модель, rw чтобы ctranslate2 мог писать кеш
       - /path/to/hf_cache_host:/hf_cache:rw
       - ctranslate2-cache:/root/.cache/ctranslate2
     depends_on:
@@ -64,12 +60,6 @@ services:
       resources:
         limits:
           memory: 4g
-    command: >
-      celery -A celery_app worker
-      --loglevel=info
-      --concurrency ${GPU_CONCURRENCY}
-      --hostname gpu-worker
-      --queues preprocess_gpu
 
   redis:
     image: redis:7-alpine
@@ -87,10 +77,7 @@ services:
     ports:
       - "1080:1080"
     command:
-      - tusd
-      - --host=0.0.0.0
-      - --port=1080
-      - --dir=/data
+      - tusd --host=0.0.0.0 --port=1080 --dir=/data
     volumes:
       - upload-data:/data
 
@@ -115,4 +102,3 @@ volumes:
   upload-data:
   redis-data:
   ctranslate2-cache:
-  hf_cache:
