@@ -1,14 +1,21 @@
+# API / web
 fastapi>=0.95.0
 uvicorn[standard]>=0.22.0
+
+# task queue
 celery>=5.5.3
 redis>=4.5.0
+
+# uploads
 python-dotenv>=1.1.0
 python-multipart>=0.0.5
 
-faster-whisper>=1.4.0
-pyannote.audio>=2.2.1
-ctranslate2>=4.6.0
-transformers>=4.53.0
-webrtcvad>=2.0.10
+# core ML
+faster-whisper>=1.1.1,<1.2        # pin to latest available on PyPI
+ctranslate2[cuda]>=4.6.0
+transformers>=4.30.2
+pyannote.audio>=2.1.1
 
-pydantic~=1.10
+# optional / tooling
+huggingface-hub>=0.13.4
+safetensors>=0.3.1
