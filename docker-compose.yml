@@ -51,7 +51,7 @@ services:
     volumes:
       - upload-data:/tmp/uploads
       - results:/tmp/results
-      - /path/to/hf_cache_host:/hf_cache:ro
+      - /path/to/hf_cache_host:/hf_cache:rw
       - ctranslate2-cache:/root/.cache/ctranslate2
     depends_on:
       - redis
