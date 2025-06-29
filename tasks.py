@@ -2,6 +2,7 @@ import os
 import json
 import logging
 from pathlib import Path
+
 from celery import shared_task
 from faster_whisper import WhisperModel, WhisperError
 from pyannote.audio import Pipeline, PyannoteError
@@ -33,7 +34,7 @@ def get_whisper_model():
 def get_diarizer():
     global _diarizer
     if _diarizer is None:
-        cache_dir = settings.DIARIZER_CACHE_DIR
+        cache_dir = Path(settings.DIARIZER_CACHE_DIR)
         cache_dir.mkdir(parents=True, exist_ok=True)
         logger.info(f"Loading pyannote Pipeline into cache {cache_dir}")
         _diarizer = Pipeline.from_pretrained(
@@ -58,8 +59,8 @@ def split_audio_fixed_windows(audio_path: Path):
 def transcribe_segments(upload_id: str):
     whisper = get_whisper_model()
     src = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
-    dst_dir = Path(settings.RESULTS_FOLDER) / upload_id
-    dst_dir.mkdir(parents=True, exist_ok=True)
+    dst = Path(settings.RESULTS_FOLDER) / upload_id
+    dst.mkdir(parents=True, exist_ok=True)
 
     logger.info(f"Transcription started: {src}")
     segments = split_audio_fixed_windows(src)
@@ -78,20 +79,25 @@ def transcribe_segments(upload_id: str):
             )
             text = res["segments"][0]["text"]
         except WhisperError as e:
-            logger.exception(f"Whisper error in segment {idx}: {e}")
+            logger.exception(f"Whisper error in segment #{idx}: {e}")
             text = ""
-        transcript.append({"segment": idx, "start": start, "end": end, "text": text})
+        transcript.append({
+            "segment": idx,
+            "start": start,
+            "end": end,
+            "text": text
+        })
 
-    out_path = dst_dir / "transcript.json"
-    out_path.write_text(json.dumps(transcript, ensure_ascii=False, indent=2), encoding="utf-8")
-    logger.info(f"Transcription saved: {out_path}")
+    out = dst / "transcript.json"
+    out.write_text(json.dumps(transcript, ensure_ascii=False, indent=2), encoding="utf-8")
+    logger.info(f"Transcription saved: {out}")
 
 @shared_task(name="tasks.diarize_full")
 def diarize_full(upload_id: str):
     diarizer = get_diarizer()
     src = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
-    dst_dir = Path(settings.RESULTS_FOLDER) / upload_id
-    dst_dir.mkdir(parents=True, exist_ok=True)
+    dst = Path(settings.RESULTS_FOLDER) / upload_id
+    dst.mkdir(parents=True, exist_ok=True)
 
     logger.info(f"Diarization started: {src}")
     try:
@@ -101,9 +107,9 @@ def diarize_full(upload_id: str):
             for turn, _, spk in dia.itertracks(yield_label=True)
         ]
     except PyannoteError as e:
-        logger.exception(f"Diarizer error: {e}")
+        logger.exception(f"Diarization error: {e}")
         speakers = []
 
-    out_path = dst_dir / "diarization.json"
-    out_path.write_text(json.dumps(speakers, ensure_ascii=False, indent=2), encoding="utf-8")
-    logger.info(f"Diarization saved: {out_path}")
+    out = dst / "diarization.json"
+    out.write_text(json.dumps(speakers, ensure_ascii=False, indent=2), encoding="utf-8")
+    logger.info(f"Diarization saved: {out}")
