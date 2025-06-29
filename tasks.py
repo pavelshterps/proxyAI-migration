@@ -1,113 +1,136 @@
-# tasks.py
-import os, json, logging
+import os
+import json
+import logging
 from pathlib import Path
+
 from celery import shared_task
-from faster_whisper import WhisperModel, load_vad
+from faster_whisper import WhisperModel
 from pyannote.audio import Pipeline
-from config.settings import settings
+from pydub import AudioSegment
+
+from config.settings import UPLOAD_FOLDER, RESULTS_FOLDER
 
 logger = logging.getLogger(__name__)
+
+# Singletons so we only load each model once per worker process
 _whisper_model = None
 _diarizer = None
-_vad = None
+
 
 def get_whisper_model():
     global _whisper_model
     if _whisper_model is None:
-        logger.info(f"Loading WhisperModel at '{settings.WHISPER_MODEL_PATH}'")
-        _whisper_model = WhisperModel(
-            settings.WHISPER_MODEL_PATH,
-            device=settings.WHISPER_DEVICE,
-            device_index=settings.WHISPER_DEVICE_INDEX,
-            compute_type=settings.WHISPER_COMPUTE_TYPE,
+        model_path = os.getenv(
+            "WHISPER_MODEL_PATH",
+            "/hf_cache/models--guillaumekln--faster-whisper-medium"
         )
+        device = os.getenv("WHISPER_DEVICE", "cuda")
+        compute = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
+        logger.info(
+            f"Loading WhisperModel {{'path': '{model_path}', 'device': '{device}', 'compute': '{compute}'}}"
+        )
+        _whisper_model = WhisperModel(
+            model_path,
+            device=device,
+            compute_type=compute
+        )
+        logger.info("WhisperModel loaded")
     return _whisper_model
 
-def get_vad():
-    global _vad
-    if _vad is None:
-        _vad = load_vad()
-    return _vad
 
-def split_audio(src: Path):
-    # attempt real VAD
-    try:
-        vad = get_vad()
-        segments = vad(str(src), chunk_length_s=settings.SEGMENT_LENGTH_S)
-        if segments:
-            return segments
-    except Exception as e:
-        logger.warning(f"VAD failed: {e}; falling back to fixed windows")
-
-    # fallback fixed windows
-    length = WhisperModel.get_audio_duration(str(src))
-    seg = settings.SEGMENT_LENGTH_S
-    return [(i, min(i+seg, length)) for i in range(0, int(length), seg)]
-
-@shared_task(
-    bind=True,
-    name="tasks.transcribe_segments",
-    autoretry_for=(IOError, RuntimeError),
-    retry_backoff=True,
-    max_retries=2,
-)
-def transcribe_segments(self, upload_id: str):
-    whisper = get_whisper_model()
-    src = Path(settings.UPLOAD_FOLDER)/f"{upload_id}.wav"
-    out_dir = Path(settings.RESULTS_FOLDER)/upload_id
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    logger.info(f"[{upload_id}] Transcribing {src}")
-    segments = split_audio(src)
-    logger.info(f"[{upload_id}] {len(segments)} segments")
-
-    transcript = []
-    for i,(start,end) in enumerate(segments):
-        try:
-            res = whisper.transcribe(
-                str(src),
-                task=settings.WHISPER_TASK,
-                language="ru",
-                beam_size=settings.WHISPER_BEAM_SIZE,
-                offset=start, duration=(end-start),
-                vad_filter=False,
-            )
-            text = res["segments"][0]["text"]
-        except Exception as e:
-            logger.error(f"Segment {i} failed: {e}")
-            text = ""
-        transcript.append({"segment":i,"start":start,"end":end,"text":text})
-
-    with open(out_dir/"transcript.json","w",encoding="utf-8") as f:
-        json.dump(transcript, f, ensure_ascii=False, indent=2)
-    logger.info(f"[{upload_id}] Transcript saved")
-
-@shared_task(
-    bind=True,
-    name="tasks.diarize_full",
-    autoretry_for=(IOError, RuntimeError),
-    retry_backoff=True,
-    max_retries=2,
-)
-def diarize_full(self, upload_id: str):
+def get_diarizer():
     global _diarizer
     if _diarizer is None:
-        os.makedirs(settings.DIARIZER_CACHE_DIR, exist_ok=True)
+        cache_dir = os.getenv("DIARIZER_CACHE_DIR", "/tmp/diarizer_cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        logger.info(f"Loading pyannote Pipeline into cache '{cache_dir}'")
         _diarizer = Pipeline.from_pretrained(
-            settings.PYANNOTE_PROTOCOL, cache_dir=settings.DIARIZER_CACHE_DIR
+            "pyannote/speaker-diarization",
+            cache_dir=cache_dir
         )
+        logger.info("Diarizer loaded")
+    return _diarizer
 
-    src = Path(settings.UPLOAD_FOLDER)/f"{upload_id}.wav"
-    out_dir = Path(settings.RESULTS_FOLDER)/upload_id
-    out_dir.mkdir(parents=True, exist_ok=True)
 
-    logger.info(f"[{upload_id}] Diarizing {src}")
-    diarization = _diarizer(str(src))
-    speakers = [
-        {"start":t.start,"end":t.end,"speaker":sp}
-        for t,_,sp in diarization.itertracks(yield_label=True)
-    ]
+def split_audio_fixed_windows(audio_path: Path):
+    """
+    Split the audio into fixed-length windows (default 30s) for batching.
+    Returns a list of (start_sec, end_sec) tuples.
+    """
+    window_s = int(os.getenv("SEGMENT_LENGTH_S", "30"))
+    audio = AudioSegment.from_file(str(audio_path))
+    length_ms = len(audio)
+    window_ms = window_s * 1000
+    segments = []
+    for start_ms in range(0, length_ms, window_ms):
+        end_ms = min(start_ms + window_ms, length_ms)
+        segments.append((start_ms / 1000.0, end_ms / 1000.0))
+    return segments
 
-    with open(out_dir/"diarization.json","w",encoding="utf-8") as f:
-        json.dump(speakers, f, ensure_ascii=False, indent=2)
-    logger.info(f"[{upload_id}] Diarization saved")
+
+@shared_task
+def transcribe_segments(upload_id: str):
+    """
+    1) Splits audio into fixed‐window segments
+    2) Transcribes each with Whisper
+    3) Dumps RESULTS_FOLDER/<upload_id>/transcript.json
+    """
+    whisper = get_whisper_model()
+    src = Path(UPLOAD_FOLDER) / f"{upload_id}.wav"
+    dst_dir = Path(RESULTS_FOLDER) / upload_id
+    dst_dir.mkdir(parents=True, exist_ok=True)
+
+    logger.info(f"Starting transcription for '{src}'")
+    segments = split_audio_fixed_windows(src)
+    logger.info(f"  -> {len(segments)} segments of up to {os.getenv('SEGMENT_LENGTH_S','30')}s")
+
+    transcript = []
+    for idx, (start, end) in enumerate(segments):
+        logger.debug(f"  Transcribing segment {idx}: {start:.1f}s → {end:.1f}s")
+        result = whisper.transcribe(
+            str(src),
+            beam_size=5,
+            language="ru",
+            vad_filter=True,
+            word_timestamps=True,
+            offset=start,
+            duration=(end - start),
+        )
+        text = result["segments"][0]["text"]
+        transcript.append({
+            "segment": idx,
+            "start": start,
+            "end": end,
+            "text": text
+        })
+
+    out_path = dst_dir / "transcript.json"
+    out_path.write_text(json.dumps(transcript, ensure_ascii=False, indent=2), encoding="utf-8")
+    logger.info(f"Transcription complete: saved to '{out_path}'")
+
+
+@shared_task
+def diarize_full(upload_id: str):
+    """
+    1) Runs speaker diarization on the whole file
+    2) Dumps RESULTS_FOLDER/<upload_id>/diarization.json
+    """
+    diarizer = get_diarizer()
+    src = Path(UPLOAD_FOLDER) / f"{upload_id}.wav"
+    dst_dir = Path(RESULTS_FOLDER) / upload_id
+    dst_dir.mkdir(parents=True, exist_ok=True)
+
+    logger.info(f"Starting diarization for '{src}'")
+    diarization = diarizer(str(src))
+
+    speakers = []
+    for turn, _, speaker in diarization.itertracks(yield_label=True):
+        speakers.append({
+            "start": turn.start,
+            "end": turn.end,
+            "speaker": speaker
+        })
+
+    out_path = dst_dir / "diarization.json"
+    out_path.write_text(json.dumps(speakers, ensure_ascii=False, indent=2), encoding="utf-8")
+    logger.info(f"Diarization complete: saved to '{out_path}'")
