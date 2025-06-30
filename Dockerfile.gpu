@@ -1,35 +1,40 @@
-# Dockerfile.gpu — proxyAI v13.4.5.2 → v13.5
-FROM nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04
+# Dockerfile.gpu
+ARG BASE_IMAGE=nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04
+FROM ${BASE_IMAGE}
 
-# 1) Системные утилиты, ffmpeg, curl
+# Установка системных зависимостей
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      python3.10 python3-pip ffmpeg curl \
+      python3.10 python3-pip ffmpeg curl git-lfs \
+ && git lfs install \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# 2) Копируем зависимости и устанавливаем PyTorch+CUDA
+# Копируем файл зависимостей
 COPY requirements.txt .
+
+# Обновляем pip и ставим PyTorch из NVIDIA index
 RUN pip install --no-cache-dir --upgrade pip \
  && pip install --no-cache-dir \
-      torch torchvision --extra-index-url https://download.pytorch.org/whl/cu118 \
- && pip install --no-cache-dir -r requirements.txt
+      torch torchvision torchaudio \
+      --extra-index-url https://download.pytorch.org/whl/cu118
 
-# 3) Патчим ctranslate2-конвертер, чтобы он мог импортировать transformers
+# Устанавливаем остальное
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Патчим CTranslate2-конвертер, чтобы подтянул transformers
 RUN python3 - << 'EOF'
 import ctranslate2, os
-tf = os.path.join(os.path.dirname(ctranslate2.__file__), "converters/transformers.py")
-text = open(tf).read()
-open(tf, "w").write("import transformers\n" + text)
+path = os.path.dirname(ctranslate2.__file__) + "/converters/transformers.py"
+# вставляем импорт transformers в начало
+content = open(path).read()
+with open(path, "w") as f:
+    f.write("import transformers\n" + content)
 EOF
 
-# 4) Копируем всё приложение
+# Копируем код приложения
 COPY . .
 
-# 5) Запуск GPU-воркера
-CMD ["celery", "-A", "celery_app", "worker", \
-     "--loglevel=info", \
-     "--concurrency=${GPU_CONCURRENCY}", \
-     "--hostname=gpu-worker", \
-     "--queues=preprocess_gpu"]
+# По умолчанию запускаем worker
+CMD ["celery", "-A", "celery_app", "worker", "--loglevel=info", "--hostname=gpu-worker", "--queues=preprocess_gpu"]
