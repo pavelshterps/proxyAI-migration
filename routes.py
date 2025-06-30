@@ -1,53 +1,49 @@
 import json
 import datetime
 from pathlib import Path
-from fastapi import APIRouter, HTTPException, Depends
-from fastapi import UploadFile, File, Header, Response
+from fastapi import APIRouter, HTTPException, Depends, Response
+from fastapi import UploadFile, File, Header
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from config.settings import settings
 from database import get_db
-from crud import get_upload_for_user, create_upload_record
-from models import User
+from crud import (
+    get_upload_for_user,
+    create_upload_record
+)
+from main import get_current_user
 
 router = APIRouter()
-
-# reuse get_current_user from main.py
-from main import get_current_user
 
 @router.get("/results/{upload_id}")
 async def get_results(
     upload_id: str,
-    current_user: User = Depends(get_current_user),
+    current_user=Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    # ownership check
     rec = await get_upload_for_user(db, current_user.id, upload_id)
     if not rec:
-        raise HTTPException(404, "upload_id not found")
+        raise HTTPException(status_code=404, detail="upload_id not found")
 
     base = Path(settings.results_folder) / upload_id
     if not base.exists():
-        raise HTTPException(404, "Results not yet available")
+        raise HTTPException(status_code=404, detail="Results not yet available")
 
-    # raw JSON
+    # load raw JSON
     tpath = base / "transcript.json"
     dpath = base / "diarization.json"
     transcript_list = json.loads(tpath.read_text(encoding="utf-8")) if tpath.exists() else []
     diar_list = json.loads(dpath.read_text(encoding="utf-8")) if dpath.exists() else []
 
-    # apply labels if any
+    # load labels if exist
     labels_path = base / "labels.json"
-    labels = {}
-    if labels_path.exists():
-        labels = json.loads(labels_path.read_text(encoding="utf-8"))
+    labels = json.loads(labels_path.read_text(encoding="utf-8")) if labels_path.exists() else {}
 
     # remap speakers & add time stamps to transcript
     for seg in transcript_list:
         spk = seg.get("speaker")
         if spk in labels:
             seg["speaker"] = labels[spk]
-        # add a human-readable time string if start exists
         if "start" in seg:
             seconds = int(seg["start"])
             seg["time"] = str(datetime.timedelta(seconds=seconds))
@@ -62,23 +58,46 @@ async def get_results(
 async def set_labels(
     upload_id: str,
     mapping: dict[str, str],
-    current_user: User = Depends(get_current_user),
+    current_user=Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
     rec = await get_upload_for_user(db, current_user.id, upload_id)
     if not rec:
-        raise HTTPException(404, "upload_id not found")
+        raise HTTPException(status_code=404, detail="upload_id not found")
+
     base = Path(settings.results_folder) / upload_id
     if not base.exists():
-        raise HTTPException(404, "Results not yet available")
+        raise HTTPException(status_code=404, detail="Results not yet available")
 
-    # валидация ключей
+    # load original transcript to get valid speaker keys
     transcript = json.loads((base / "transcript.json").read_text(encoding="utf-8"))
     valid_keys = {seg["speaker"] for seg in transcript}
+
+    # validate mapping keys
     invalid = [k for k in mapping if k not in valid_keys]
     if invalid:
-        raise HTTPException(400, f"Invalid speaker keys: {invalid}")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid speaker keys: {invalid}"
+        )
 
-    # сохраняем
-    (base / "labels.json").write_text(json.dumps(mapping, ensure_ascii=False, indent=2), encoding="utf-8")
+    # validate mapping values (1–50 chars, no angle brackets)
+    for new_name in mapping.values():
+        if not isinstance(new_name, str) or not (1 <= len(new_name) <= 50):
+            raise HTTPException(
+                status_code=400,
+                detail="Label names must be 1–50 characters long"
+            )
+        if "<" in new_name or ">" in new_name:
+            raise HTTPException(
+                status_code=400,
+                detail="Label names must not contain '<' or '>'"
+            )
+
+    # save mapping
+    labels_path = base / "labels.json"
+    labels_path.write_text(
+        json.dumps(mapping, ensure_ascii=False, indent=2),
+        encoding="utf-8"
+    )
     return {"status": "labels saved", "labels": mapping}
