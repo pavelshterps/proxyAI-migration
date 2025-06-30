@@ -12,3 +12,6 @@ pydub>=0.25.1
 pyannote.audio>=2.1.1
 webrtcvad>=2.0.10           # VAD segmentation
 structlog>=23.3.0           # structured logging
+# database & auth
+SQLAlchemy>=2.0.0
+aiosqlite

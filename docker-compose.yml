@@ -10,6 +10,7 @@ services:
       - results-data:/data/results
       - diarizer-cache:/data/diarizer_cache
       - hf-cache:/hf_cache
+      - ./app.db:/app/app.db
     ports:
       - "8000:8000"
     depends_on:
@@ -76,7 +77,7 @@ services:
     volumes:
       - redis-data:/data
     ports:
-      - "6379:6379"
+      - "6380:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 30s
