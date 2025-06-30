@@ -11,3 +11,4 @@ faster-whisper==1.1.1
 ctranslate2>=4.6.0
 pyannote.audio>=2.1.1
 pydub>=0.25.1
+structlog>=22.1.0
