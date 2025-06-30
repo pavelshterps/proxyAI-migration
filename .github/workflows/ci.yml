@@ -1,46 +1,30 @@
-name: Smoke Test
+name: CI
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
   pull_request:
-    branches: [ main ]
+    branches: [main]
 
 jobs:
-  smoke-test:
+  test:
     runs-on: ubuntu-latest
-
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v3
-
-      - name: Copy example env
-        run: cp .env.example .env
-
-      - name: Set up Docker Compose
-        uses: docker/setup-buildx-action@v2
-
-      - name: Build all images
-        run: docker compose build --no-cache
-
-      - name: Start all services
-        run: docker compose up -d --remove-orphans
-
-      - name: Wait for API to be healthy
+      - uses: actions/checkout@v3
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+      - name: Install dependencies
         run: |
-          for i in {1..30}; do
-            curl -sf http://localhost:8000/health && exit 0
-            sleep 2
-          done
-          echo "API did not become healthy in time" && exit 1
-
-      - name: Run smoke-test transcription
-        run: |
-          # здесь ваша команда для smoke-теста
-          curl -X POST http://localhost:8000/transcribe \
-            -F file="@tests/fixtures/sample.wav" \
-            | grep "transcription"
-
-      - name: Tear down services
-        if: always()
-        run: docker compose down -v
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest safety
+      - name: Run tests
+        run: pytest --maxfail=1 --disable-warnings -q
+      - name: Security check
+        run: safety check
