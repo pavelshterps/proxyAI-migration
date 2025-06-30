@@ -1,40 +1,27 @@
 # Dockerfile.gpu
-ARG BASE_IMAGE=nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04
-FROM ${BASE_IMAGE}
+ARG CUDA_IMAGE="nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04"
+FROM ${CUDA_IMAGE}
 
-# Установка системных зависимостей
+# Install python, pip, FFmpeg plus build chain for C extensions
 RUN apt-get update \
- && apt-get install -y --no-install-recommends \
-      python3.10 python3-pip ffmpeg curl git-lfs \
- && git lfs install \
- && rm -rf /var/lib/apt/lists/*
+    && apt-get install -y --no-install-recommends \
+       python3.10 python3-pip \
+       ffmpeg \
+       build-essential \            # gcc, make, etc.  [oai_citation:2‡forum-nas.fr](https://www.forum-nas.fr/threads/bazarr-1-1-4-0-companion-application-to-sonarr-and-radarr-it-manages-and-downloads-subtitles.10638/page-4?utm_source=chatgpt.com)
+       python3-dev \                # Python C headers
+       libsndfile1 \
+       libopus-dev \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-
-# Копируем файл зависимостей
 COPY requirements.txt .
 
-# Обновляем pip и ставим PyTorch из NVIDIA index
+# Upgrade pip and install Python dependencies
 RUN pip install --no-cache-dir --upgrade pip \
- && pip install --no-cache-dir \
-      torch torchvision torchaudio \
-      --extra-index-url https://download.pytorch.org/whl/cu118
+ && pip install --no-cache-dir -r requirements.txt
 
-# Устанавливаем остальное
-RUN pip install --no-cache-dir -r requirements.txt
-
-# Патчим CTranslate2-конвертер, чтобы подтянул transformers
-RUN python3 - << 'EOF'
-import ctranslate2, os
-path = os.path.dirname(ctranslate2.__file__) + "/converters/transformers.py"
-# вставляем импорт transformers в начало
-content = open(path).read()
-with open(path, "w") as f:
-    f.write("import transformers\n" + content)
-EOF
-
-# Копируем код приложения
+# Copy the rest of your application
 COPY . .
 
-# По умолчанию запускаем worker
-CMD ["celery", "-A", "celery_app", "worker", "--loglevel=info", "--hostname=gpu-worker", "--queues=preprocess_gpu"]
+# Ensure only one GPU‐bound worker process
+CMD ["celery", "-A", "celery_app", "worker", "--loglevel=info", "--concurrency=1", "--hostname=gpu-worker", "--queues=preprocess_gpu"]
