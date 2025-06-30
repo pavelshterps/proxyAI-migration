@@ -95,20 +95,20 @@ services:
       - "--port=5555"
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:5555"]
+      test: [ "CMD", "curl", "-f", "http://localhost:5555" ]
       interval: 30s
       retries: 3
 
   dcgm-exporter:
-    image: nvidia/dcgm-exporter:2.1.13-2.1.13-ubi8
-    runtime: nvidia
-    environment:
-      - DCGM_EXPORTER_EXPORT_PER_PROCESS_METRICS=true
-    ports:
-      - "9400:9400"
-    depends_on:
-      - gpu-worker
-    restart: unless-stopped
+      image: nvidia/dcgm-exporter:2.5.6-2.5.6-ubuntu20.04
+      runtime: nvidia
+      environment:
+        - DCGM_EXPORTER_EXPORT_PER_PROCESS_METRICS=true
+      ports:
+        - "9400:9400"
+      depends_on:
+        - gpu-worker
+      restart: unless-stopped
 
 volumes:
   upload-data:

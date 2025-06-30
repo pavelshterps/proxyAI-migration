@@ -45,7 +45,8 @@ class Settings(BaseSettings):
 
     # Metrics exporter
     metrics_port: int = Field(8001, gt=0, env="METRICS_PORT")
-
+    # API authentication
+    api_key: str = Field(..., env="API_KEY")
     model_config = {
         "env_file": ".env",
         "env_file_encoding": "utf-8",
