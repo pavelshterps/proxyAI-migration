@@ -4,71 +4,55 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: proxyai-api
     env_file: .env
     volumes:
-      - upload-data:/tmp/uploads
-      - results-data:/tmp/results
-    depends_on:
-      - redis
-      - tusd
+      - upload-data:/data/uploads
+      - results-data:/data/results
+      - diarizer-cache:/data/diarizer_cache
     ports:
       - "8000:8000"
+    depends_on:
+      - redis
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
-      timeout: 5s
       retries: 3
     restart: unless-stopped
-    command: ["sh", "-c", "gunicorn main:app -k uvicorn.workers.UvicornWorker -w ${API_WORKERS} -b 0.0.0.0:8000"]
 
   cpu-worker:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: proxyai-cpu-worker
     env_file: .env
     volumes:
-      - upload-data:/tmp/uploads
-      - results-data:/tmp/results
-      - diarizer-cache:/tmp/diarizer_cache
+      - upload-data:/data/uploads
+      - results-data:/data/results
+      - diarizer-cache:/data/diarizer_cache
     depends_on:
       - redis
+    command: ["celery", "-A", "celery_app", "worker", "--loglevel=info", "--concurrency=${CPU_CONCURRENCY}", "--hostname=cpu-worker", "--queues=preprocess_cpu"]
     restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-    command: ["celery", "-A", "celery_app", "worker", "--loglevel=info", "--concurrency", "${CPU_CONCURRENCY}", "--hostname", "cpu-worker", "--queues", "preprocess_cpu"]
 
   gpu-worker:
     build:
       context: .
       dockerfile: Dockerfile.gpu
-    container_name: proxyai-gpu-worker
     env_file: .env
     volumes:
-      - upload-data:/tmp/uploads
-      - results-data:/tmp/results
-      - /path/to/hf_cache_host:/hf_cache:rw
+      - upload-data:/data/uploads
+      - results-data:/data/results
+      - diarizer-cache:/data/diarizer_cache
       - ctranslate2-cache:/root/.cache/ctranslate2
+    runtime: nvidia
     depends_on:
       - redis
-    runtime: nvidia
+    command: ["celery", "-A", "celery_app", "worker", "--loglevel=info", "--concurrency=1", "--hostname=gpu-worker", "--queues=preprocess_gpu"]
     restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-    command: ["celery", "-A", "celery_app", "worker", "--loglevel=info", "--concurrency", "${GPU_CONCURRENCY}", "--hostname", "gpu-worker", "--queues", "preprocess_gpu"]
 
   beat:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: proxyai-beat
     env_file: .env
     depends_on:
       - redis
@@ -77,7 +61,6 @@ services:
 
   redis:
     image: redis:7-alpine
-    container_name: proxyai-redis
     volumes:
       - redis-data:/data
     ports:
@@ -85,46 +68,20 @@ services:
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 30s
-      timeout: 5s
       retries: 3
     restart: unless-stopped
-
-  tusd:
-    image: tusproject/tusd:latest
-    container_name: proxyai-tusd
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:1080/"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-    ports:
-      - "1080:1080"
-    command:
-      - tusd
-      - --host=0.0.0.0
-      - --port=1080
-      - --dir=/data
-    volumes:
-      - upload-data:/data
 
   flower:
     image: celery/flower:latest
-    container_name: proxyai-flower
     env_file: .env
     ports:
       - "5555:5555"
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:5555/"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-    restart: unless-stopped
     command:
       - flower
       - "--broker=${CELERY_BROKER_URL}"
       - "--basic_auth=${FLOWER_USER}:${FLOWER_PASS}"
       - "--port=5555"
+    restart: unless-stopped
 
 volumes:
   upload-data:

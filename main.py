@@ -1,31 +1,30 @@
 import time
-import structlog
 from pathlib import Path
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, Response
+import structlog
+from fastapi import FastAPI, UploadFile, File, HTTPException, Response, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
 
 from config.settings import settings
-from tasks import transcribe_segments, diarize_full
 from routes import router as api_router
 
-# Настройка structlog для вывода JSON
+# Настройка structlog
 structlog.configure(
     processors=[
+        structlog.processors.add_log_level,
         structlog.processors.TimeStamper(fmt="iso"),
         structlog.processors.JSONRenderer()
     ]
 )
 log = structlog.get_logger()
 
-# Гарантируем существование директорий
-Path(settings.upload_folder).mkdir(parents=True, exist_ok=True)
-Path(settings.results_folder).mkdir(parents=True, exist_ok=True)
-Path(settings.diarizer_cache_dir).mkdir(parents=True, exist_ok=True)
+# Создаём необходимые директории
+for folder in (settings.upload_folder, settings.results_folder, settings.diarizer_cache_dir):
+    Path(folder).mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="proxyAI")
+app = FastAPI(title="proxyAI", version="13.7.1")
 
 # CORS
 app.add_middleware(
@@ -36,49 +35,51 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# HTTP-метрики
-REQUESTS = Counter("proxyai_http_requests_total", "HTTP requests", ["method", "endpoint"])
-LATENCY = Histogram("proxyai_http_request_duration_seconds", "Request latency", ["endpoint"])
+# Prometheus metrics
+REQUEST_COUNT = Counter("http_requests_total", "Total HTTP requests", ["method", "path"])
+REQUEST_LATENCY = Histogram("http_request_duration_seconds", "HTTP request latency", ["path"])
 
 @app.middleware("http")
 async def metrics_middleware(request, call_next):
     start = time.time()
-    REQUESTS.labels(request.method, request.url.path).inc()
     response = await call_next(request)
-    LATENCY.labels(request.url.path).observe(time.time() - start)
+    elapsed = time.time() - start
+    REQUEST_COUNT.labels(request.method, request.url.path).inc()
+    REQUEST_LATENCY.labels(request.url.path).observe(elapsed)
     return response
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    return {"status": "ok", "version": app.version}
 
 @app.get("/metrics")
 async def metrics():
     data = generate_latest()
-    return Response(data, media_type=CONTENT_TYPE_LATEST)
+    return Response(content=data, media_type=CONTENT_TYPE_LATEST)
 
 @app.post("/upload/")
-async def upload(file: UploadFile = File(...)):
-    # Валидация типа
+async def upload(
+    file: UploadFile = File(...),
+    x_correlation_id: str | None = Header(None)
+):
     if file.content_type not in ("audio/wav", "audio/x-wav", "audio/mpeg"):
         raise HTTPException(status_code=415, detail="Unsupported file type")
     data = await file.read()
-    # Валидация размера
     if len(data) > settings.max_file_size:
         raise HTTPException(status_code=413, detail="File too large")
-    # Сохраняем
-    upload_id = file.filename
+    upload_id = file.filename  # или можно генерировать UUID
     dest = Path(settings.upload_folder) / upload_id
-    with open(dest, "wb") as f:
-        f.write(data)
-    # Запускаем фоновые задачи
+    dest.write_bytes(data)
+    log = log.bind(correlation_id=x_correlation_id, upload_id=upload_id, size=len(data))
+    log.info("upload accepted")
+    # Отправляем на обработку
+    from tasks import transcribe_segments, diarize_full
     transcribe_segments.delay(upload_id)
     diarize_full.delay(upload_id)
-    log.info("upload_accepted", upload_id=upload_id, size=len(data))
     return {"upload_id": upload_id}
 
-# Дополнительные маршруты (транскрипция по HTTP и выдача результатов)
-app.include_router(api_router)
+# Подключаем остальные маршруты
+app.include_router(api_router, prefix="", tags=["proxyAI"])
 
-# Статика (фронтенд)
-app.mount("/static", StaticFiles(directory="static", html=True), name="static")
+# Статика для фронтенда
+app.mount("/static", StaticFiles(directory="static"), name="static")

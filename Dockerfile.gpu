@@ -15,4 +15,4 @@ RUN pip install --upgrade pip \
 
 COPY . .
 
-CMD ["celery", "-A", "celery_app", "worker", "--loglevel=info", "--concurrency", "${GPU_CONCURRENCY}", "--hostname", "gpu-worker", "--queues", "preprocess_gpu"]
+CMD ["celery", "-A", "celery_app", "worker", "--loglevel=info", "--concurrency=1", "--hostname=gpu-worker", "--queues=preprocess_gpu"]
