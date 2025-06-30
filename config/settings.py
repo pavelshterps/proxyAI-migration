@@ -1,3 +1,4 @@
+import json
 from functools import lru_cache
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings
@@ -18,10 +19,9 @@ class Settings(BaseSettings):
     results_folder: str = Field("/data/results", env="RESULTS_FOLDER")
     diarizer_cache_dir: str = Field("/data/diarizer_cache", env="DIARIZER_CACHE_DIR")
 
-    # Models (quantized faster-whisper-medium by default)
+    # Models
     whisper_model_path: str = Field(
-        "/hf_cache/models--guillaumekln--faster-whisper-medium",
-        env="WHISPER_MODEL_PATH"
+        "/hf_cache/models--guillaumekln--faster-whisper-medium", env="WHISPER_MODEL_PATH"
     )
     whisper_device: str = Field("cuda", env="WHISPER_DEVICE")
     whisper_compute_type: str = Field("int8", env="WHISPER_COMPUTE_TYPE")
@@ -45,9 +45,10 @@ class Settings(BaseSettings):
     # Metrics exporter
     metrics_port: int = Field(8001, gt=0, env="METRICS_PORT")
 
+    # Admin
     admin_api_key: str = Field(..., env="ADMIN_API_KEY")
 
-    # Database (SQLite for dev; override to PostgreSQL in prod)
+    # Database
     database_url: str = Field("sqlite+aiosqlite:///./app.db", env="DATABASE_URL")
 
     model_config = {
@@ -59,8 +60,24 @@ class Settings(BaseSettings):
     @field_validator("allowed_origins", mode="before")
     @classmethod
     def split_origins(cls, v):
+        """
+        Accepts:
+          - blank / missing → default ["*"]
+          - JSON list (e.g. '["a","b"]')
+          - comma-separated string (e.g. "a,b,c")
+        """
+        if v is None or (isinstance(v, str) and not v.strip()):
+            return ["*"]
         if isinstance(v, str):
-            return [o.strip() for o in v.split(",")]
+            s = v.strip()
+            # JSON list?
+            if s.startswith("[") and s.endswith("]"):
+                try:
+                    return json.loads(s)
+                except json.JSONDecodeError:
+                    pass
+            # Fallback to comma split
+            return [o.strip() for o in s.split(",") if o.strip()]
         return v
 
 @lru_cache()

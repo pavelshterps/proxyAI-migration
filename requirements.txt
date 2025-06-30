@@ -16,3 +16,4 @@ structlog>=23.3.0           # structured logging
 # database & auth
 SQLAlchemy>=2.0.0
 aiosqlite
+prometheus-client>=0.14.1
