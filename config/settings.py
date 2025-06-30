@@ -1,4 +1,5 @@
 from typing import List
+from functools import lru_cache
 from pydantic import BaseSettings, Field, validator
 
 class Settings(BaseSettings):
@@ -32,16 +33,18 @@ class Settings(BaseSettings):
     max_file_size: int = Field(1_073_741_824, gt=0, env="MAX_FILE_SIZE")  # 1 GB
     file_retention_days: int = Field(7, gt=0, env="FILE_RETENTION_DAYS")
 
-    # Tus
+    # Tus endpoint
     tus_endpoint: str = Field(..., env="TUS_ENDPOINT")
 
-    # Frontend
+    # Frontend / CORS
     allowed_origins: List[str] = Field(["*"], env="ALLOWED_ORIGINS")
+
+    # Metrics exporter
+    metrics_port: int = Field(8001, gt=0, env="METRICS_PORT")
 
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"
-        case_sensitive = False
 
     @validator("allowed_origins", pre=True)
     def split_origins(cls, v):
@@ -49,4 +52,9 @@ class Settings(BaseSettings):
             return [o.strip() for o in v.split(",")]
         return v
 
-settings = Settings()
+@lru_cache()
+def get_settings() -> Settings:
+    return Settings()
+
+# единый экспорт
+settings = get_settings()

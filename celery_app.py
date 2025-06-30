@@ -1,5 +1,6 @@
 from celery import Celery
 from celery.schedules import crontab
+from celery.signals import worker_process_init
 
 from config.settings import settings
 
@@ -20,20 +21,25 @@ celery_app.conf.update(
     task_time_limit=600,
     task_soft_time_limit=550,
     task_acks_late=True,
-    task_reject_on_worker_lost=True
+    task_reject_on_worker_lost=True,
 )
 
-# Разделение очередей
 celery_app.conf.task_routes = {
     "tasks.diarize_full": {"queue": "preprocess_cpu"},
     "tasks.transcribe_segments": {"queue": "preprocess_gpu"},
-    "tasks.cleanup_old_files": {"queue": "maintenance"}
+    "tasks.cleanup_old_files": {"queue": "maintenance"},
 }
 
-# Периодическая очистка старых файлов
 celery_app.conf.beat_schedule = {
     "cleanup-old-files": {
         "task": "tasks.cleanup_old_files",
         "schedule": crontab(hour=0, minute=0),
-    }
+    },
 }
+
+@worker_process_init.connect
+def preload_models(**kwargs):
+    # предзагружаем Whisper и Diarizer
+    from tasks import get_whisper, get_diarizer
+    get_whisper()
+    get_diarizer()

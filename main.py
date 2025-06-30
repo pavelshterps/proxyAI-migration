@@ -10,7 +10,7 @@ from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_
 from config.settings import settings
 from routes import router as api_router
 
-# Настройка structlog
+# structlog JSON
 structlog.configure(
     processors=[
         structlog.processors.add_log_level,
@@ -20,11 +20,11 @@ structlog.configure(
 )
 log = structlog.get_logger()
 
-# Создаём необходимые директории
-for folder in (settings.upload_folder, settings.results_folder, settings.diarizer_cache_dir):
-    Path(folder).mkdir(parents=True, exist_ok=True)
+# Ensure dirs exist
+for d in (settings.upload_folder, settings.results_folder, settings.diarizer_cache_dir):
+    Path(d).mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="proxyAI", version="13.7.1")
+app = FastAPI(title="proxyAI", version="13.7.2")
 
 # CORS
 app.add_middleware(
@@ -35,17 +35,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Prometheus metrics
-REQUEST_COUNT = Counter("http_requests_total", "Total HTTP requests", ["method", "path"])
-REQUEST_LATENCY = Histogram("http_request_duration_seconds", "HTTP request latency", ["path"])
+# HTTP metrics
+HTTP_REQ_COUNT = Counter("http_requests_total", "Total HTTP requests", ["method", "path"])
+HTTP_REQ_LATENCY = Histogram("http_request_duration_seconds", "HTTP request latency", ["path"])
 
 @app.middleware("http")
 async def metrics_middleware(request, call_next):
-    start = time.time()
+    start_ts = time.time()
     response = await call_next(request)
-    elapsed = time.time() - start
-    REQUEST_COUNT.labels(request.method, request.url.path).inc()
-    REQUEST_LATENCY.labels(request.url.path).observe(elapsed)
+    HTTP_REQ_COUNT.labels(request.method, request.url.path).inc()
+    HTTP_REQ_LATENCY.labels(request.url.path).observe(time.time() - start_ts)
     return response
 
 @app.get("/health")
@@ -62,24 +61,29 @@ async def upload(
     file: UploadFile = File(...),
     x_correlation_id: str | None = Header(None)
 ):
+    # file type check
     if file.content_type not in ("audio/wav", "audio/x-wav", "audio/mpeg"):
         raise HTTPException(status_code=415, detail="Unsupported file type")
     data = await file.read()
+    # size check
     if len(data) > settings.max_file_size:
         raise HTTPException(status_code=413, detail="File too large")
-    upload_id = file.filename  # или можно генерировать UUID
+
+    upload_id = file.filename  # or use uuid4()
     dest = Path(settings.upload_folder) / upload_id
     dest.write_bytes(data)
-    log = log.bind(correlation_id=x_correlation_id, upload_id=upload_id, size=len(data))
-    log.info("upload accepted")
-    # Отправляем на обработку
+
+    log_ctx = log.bind(correlation_id=x_correlation_id, upload_id=upload_id, size=len(data))
+    log_ctx.info("upload accepted")
+
     from tasks import transcribe_segments, diarize_full
     transcribe_segments.delay(upload_id)
     diarize_full.delay(upload_id)
+
     return {"upload_id": upload_id}
 
-# Подключаем остальные маршруты
-app.include_router(api_router, prefix="", tags=["proxyAI"])
+# include other routes (/transcribe, /results)
+app.include_router(api_router, tags=["proxyAI"])
 
-# Статика для фронтенда
+# serve frontend
 app.mount("/static", StaticFiles(directory="static"), name="static")
