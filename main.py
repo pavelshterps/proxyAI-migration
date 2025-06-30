@@ -1,42 +1,60 @@
-# main.py
+import structlog
+from fastapi import FastAPI, HTTPException
+from starlette_exporter import PrometheusMiddleware, handle_metrics
+from prometheus_client import Counter, Histogram
 
-from fastapi import FastAPI, UploadFile, HTTPException
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
-from uuid import uuid4
-import shutil
-import os
+from config.settings import settings
+from tasks import transcribe_segments, diarize_full
 
-from celery_app import celery_app
+# Structlog
+structlog.configure(
+    processors=[
+        structlog.processors.TimeStamper(fmt="iso"),
+        structlog.processors.JSONRenderer(),
+    ],
+    logger_factory=structlog.stdlib.LoggerFactory(),
+)
+logger = structlog.get_logger()
+
+# Prometheus metrics
+REQUEST_COUNT = Counter("http_requests_total", "HTTP запросы", ["method", "endpoint", "status"])
+REQUEST_LATENCY = Histogram("http_request_latency_seconds", "Латентность HTTP запросов", ["endpoint"])
 
 app = FastAPI()
-app.mount("/static", StaticFiles(directory="static"), name="static")
+app.add_middleware(PrometheusMiddleware)
+app.add_route("/metrics", handle_metrics)
 
-@app.get("/", response_class=FileResponse)
-async def root():
-    index_path = os.path.join(os.path.dirname(__file__), "static", "index.html")
-    if not os.path.exists(index_path):
-        raise HTTPException(404, "Index not found")
-    return index_path
 
-@app.post("/transcribe")
-async def start_transcription(file: UploadFile):
-    if file.content_type not in ("audio/wav", "audio/x-wav"):
-        raise HTTPException(400, "Only WAV uploads are supported")
-    uid = str(uuid4())
-    upload_folder = os.getenv("UPLOAD_FOLDER", "/tmp/uploads")
-    os.makedirs(upload_folder, exist_ok=True)
-    dest = os.path.join(upload_folder, f"{uid}.wav")
-    with open(dest, "wb") as out_f:
-        shutil.copyfileobj(file.file, out_f)
+@app.middleware("http")
+async def metrics_middleware(request, call_next):
+    endpoint = request.url.path
+    method = request.method
+    with REQUEST_LATENCY.labels(endpoint=endpoint).time():
+        response = await call_next(request)
+    REQUEST_COUNT.labels(method=method, endpoint=endpoint, status=response.status_code).inc()
+    return response
 
-    # Start diarization task; uses upload_id internally
-    celery_app.send_task("tasks.diarize_full", args=(uid,), task_id=uid)
-    return {"job_id": uid}
 
-@app.get("/result/{job_id}")
-async def get_result(job_id: str):
-    res = celery_app.backend.get(job_id)
-    if res is None:
-        return {"status": "PENDING"}
-    return {"status": "SUCCESS", "segments": res}
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
+
+@app.post("/uploads/{upload_id}/transcribe")
+async def api_transcribe(upload_id: str):
+    try:
+        transcribe_segments.delay(upload_id)
+        return {"status": "queued", "task": "transcribe_segments", "upload_id": upload_id}
+    except Exception as e:
+        logger.error("Failed to queue transcription", error=str(e))
+        raise HTTPException(500, detail="Failed to queue transcription")
+
+
+@app.post("/uploads/{upload_id}/diarize")
+async def api_diarize(upload_id: str):
+    try:
+        diarize_full.delay(upload_id)
+        return {"status": "queued", "task": "diarize_full", "upload_id": upload_id}
+    except Exception as e:
+        logger.error("Failed to queue diarization", error=str(e))
+        raise HTTPException(500, detail="Failed to queue diarization")

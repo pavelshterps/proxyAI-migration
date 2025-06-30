@@ -1,7 +1,15 @@
-# proxyAI v13.6 – celery_app.py
-
+import structlog
 from celery import Celery
 from config.settings import settings
+
+# Structlog configuration
+structlog.configure(
+    processors=[
+        structlog.processors.TimeStamper(fmt="iso"),
+        structlog.processors.JSONRenderer()
+    ],
+    logger_factory=structlog.stdlib.LoggerFactory(),
+)
 
 celery_app = Celery(
     "proxyai",
@@ -10,7 +18,7 @@ celery_app = Celery(
     include=["tasks"],
 )
 
-# Route CPU vs GPU tasks
+# Разделяем очереди для CPU- и GPU-preprocess
 celery_app.conf.task_routes = {
     "tasks.diarize_full": {"queue": "preprocess_cpu"},
     "tasks.transcribe_segments": {"queue": "preprocess_gpu"},
@@ -26,6 +34,3 @@ celery_app.conf.update(
     task_time_limit=600,
     task_soft_time_limit=550,
 )
-
-if __name__ == "__main__":
-    celery_app.start()
