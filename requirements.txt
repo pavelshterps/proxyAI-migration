@@ -4,17 +4,15 @@ celery>=5.5.3
 redis>=4.5.0
 python-dotenv>=1.1.0
 python-multipart>=0.0.5
-# Enforce Pydantic v1.x
-pydantic>=1.10,<2.0
+pydantic<2.0,>=1.10
 transformers>=4.28.1
 faster-whisper==1.1.1
 ctranslate2>=4.6.0
-torch>=2.0.0
-torchvision>=0.15.0
-torchaudio>=2.0.1
+torch==2.0.1+cu118
+torchvision==0.15.2+cu118
+torchaudio==2.0.2+cu118
 structlog>=22.1.0
 pydub>=0.25.1
 pyannote.audio>=2.2.1
 prometheus-client>=0.16.0
-ctranslate2[cuda]>=4.6.0
 webrtcvad

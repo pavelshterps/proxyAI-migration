@@ -1,30 +1,27 @@
-ARG BASE_IMAGE=nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04
-FROM ${BASE_IMAGE}
+# Use NVIDIA CUDA runtime
+ARG CUDA_IMAGE=nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04
+FROM ${CUDA_IMAGE}
 
-# system deps + compiler
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
-        python3.10 python3-pip \
-        build-essential \
-        gcc \
-        python3-dev \
-        ffmpeg \
+# Install system deps (including build tools for native extensions)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      python3.10 python3-pip \
+      build-essential gcc python3-dev \
+      ffmpeg curl git-lfs \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Copy requirements and install PyTorch from NVIDIA index + others
+# Copy and install Python deps
 COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip \
-    \
-    && pip install --no-cache-dir \
-       --index-url https://download.pytorch.org/whl/cu118 \
-       torch==2.1.0+cu118 torchvision==0.15.2+cu118 torchaudio==2.0.2+cu118 \
-    \
-    && pip install --no-cache-dir -r requirements.txt
+ && pip install --no-cache-dir \
+      --index-url https://download.pytorch.org/whl/cu118 \
+      torch==2.0.1+cu118 torchvision==0.15.2+cu118 torchaudio==2.0.2+cu118 \
+ && pip install --no-cache-dir -r requirements.txt
 
-# copy app
+# Copy application code
 COPY . .
 
-# default
-CMD ["celery", "-A", "celery_app", "worker", "--loglevel=info", "--hostname=gpu-worker", "--queues=preprocess_gpu"]
+# Entrypoint
+ENV PYTHONUNBUFFERED=1
+CMD ["celery", "-A", "celery_app", "worker", "--loglevel=info", "--concurrency", "${GPU_CONCURRENCY}", "--hostname", "gpu-worker", "--queues", "preprocess_gpu"]

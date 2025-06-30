@@ -1,31 +1,29 @@
-# celery_app.py
-
 from celery import Celery
 from config.settings import settings
 
 celery_app = Celery(
     "proxyai",
-    broker=settings.celery_broker_url,
-    backend=settings.celery_result_backend,
-    include=["tasks"],  # ensure tasks.py is imported at startup
+    broker=settings.CELERY_BROKER_URL,
+    backend=settings.CELERY_RESULT_BACKEND,
+    include=["tasks"],
 )
 
-# route tasks onto separate queues
+# Route tasks to the right queues
 celery_app.conf.task_routes = {
     "tasks.diarize_full": {"queue": "preprocess_cpu"},
     "tasks.transcribe_segments": {"queue": "preprocess_gpu"},
 }
 
-# JSON everywhere, sensible timeouts, UTC handling
+# Use JSON serialization, set timeouts, etc.
 celery_app.conf.update(
     task_serializer="json",
     result_serializer="json",
     accept_content=["json"],
     enable_utc=True,
-    timezone=settings.timezone,
-    result_expires=3600,         # 1 hour
-    task_time_limit=600,         # 10 minutes hard
-    task_soft_time_limit=550,    # 9 minutes 10 sec soft
+    timezone=settings.TIMEZONE,
+    result_expires=3600,
+    task_time_limit=600,
+    task_soft_time_limit=550,
 )
 
 if __name__ == "__main__":
