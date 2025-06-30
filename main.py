@@ -5,6 +5,7 @@ import structlog
 from fastapi import FastAPI, UploadFile, File, HTTPException, Response, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
 
 from config.settings import settings
@@ -24,7 +25,14 @@ log = structlog.get_logger()
 for d in (settings.upload_folder, settings.results_folder, settings.diarizer_cache_dir):
     Path(d).mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="proxyAI", version="13.7.3")
+# bump version
+app = FastAPI(title="proxyAI", version="13.7.4")
+
+# Host validation (only localhost and your frontend domains)
+app.add_middleware(
+    TrustedHostMiddleware,
+    allowed_hosts=["127.0.0.1", "localhost"] + settings.allowed_origins  # add your production domains here
+)
 
 # CORS
 app.add_middleware(
@@ -71,8 +79,7 @@ async def upload(
     dest = Path(settings.upload_folder) / upload_id
     dest.write_bytes(data)
 
-    log_ctx = log.bind(correlation_id=x_correlation_id, upload_id=upload_id, size=len(data))
-    log_ctx.info("upload accepted")
+    log.bind(correlation_id=x_correlation_id, upload_id=upload_id, size=len(data)).info("upload accepted")
 
     from tasks import transcribe_segments, diarize_full
     transcribe_segments.delay(upload_id, correlation_id=x_correlation_id)

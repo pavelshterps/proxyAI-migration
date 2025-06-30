@@ -31,7 +31,12 @@ services:
     depends_on:
       - redis
     command:
-      ["celery", "-A", "celery_app", "worker", "--loglevel=info", "--concurrency=${CPU_CONCURRENCY}", "--hostname=cpu-worker", "--queues=preprocess_cpu"]
+      ["celery", "-A", "celery_app", "worker",
+       "--loglevel=info",
+       "--concurrency=${CPU_CONCURRENCY}",
+       "--hostname=cpu-worker",
+       "--queues=preprocess_cpu",
+       "--prefetch-multiplier=1"]
     restart: unless-stopped
 
   gpu-worker:
@@ -48,7 +53,12 @@ services:
     depends_on:
       - redis
     command:
-      ["celery", "-A", "celery_app", "worker", "--loglevel=info", "--concurrency=1", "--hostname=gpu-worker", "--queues=preprocess_gpu"]
+      ["celery", "-A", "celery_app", "worker",
+       "--loglevel=info",
+       "--concurrency=1",
+       "--hostname=gpu-worker",
+       "--queues=preprocess_gpu",
+       "--prefetch-multiplier=1"]
     restart: unless-stopped
 
   beat:
@@ -82,9 +92,13 @@ services:
     ports:
       - "6379:6379"
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      retries: 3
 
   flower:
-    image: celery/flower:latest
+    image: mher/flower:latest
     env_file: .env
     ports:
       - "5555:5555"
@@ -94,6 +108,10 @@ services:
       - "--basic_auth=${FLOWER_USER}:${FLOWER_PASS}"
       - "--port=5555"
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5555"]
+      interval: 30s
+      retries: 3
 
 volumes:
   upload-data:
