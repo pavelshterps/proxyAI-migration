@@ -9,6 +9,7 @@ services:
       - upload-data:/data/uploads
       - results-data:/data/results
       - diarizer-cache:/data/diarizer_cache
+      - hf-cache:/hf_cache
     ports:
       - "8000:8000"
     depends_on:
@@ -34,7 +35,6 @@ services:
       ["celery", "-A", "celery_app", "worker",
        "--loglevel=info",
        "--concurrency=${CPU_CONCURRENCY}",
-       "--hostname=cpu-worker",
        "--queues=preprocess_cpu",
        "--prefetch-multiplier=1"]
     restart: unless-stopped
@@ -50,14 +50,13 @@ services:
       - results-data:/data/results
       - diarizer-cache:/data/diarizer_cache
       - ctranslate2-cache:/root/.cache/ctranslate2
-      - /path/to/hf_cache_host:/hf_cache:rw
+      - hf-cache:/hf_cache
     depends_on:
       - redis
     command:
       ["celery", "-A", "celery_app", "worker",
        "--loglevel=info",
        "--concurrency=1",
-       "--hostname=gpu-worker",
        "--queues=preprocess_gpu",
        "--prefetch-multiplier=1"]
     restart: unless-stopped
@@ -69,22 +68,7 @@ services:
     env_file: .env
     depends_on:
       - redis
-    command:
-      ["celery", "-A", "celery_app", "beat", "--loglevel=info"]
-    restart: unless-stopped
-
-  metrics:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    env_file: .env
-    command: [ "python", "metrics.py" ]
-    # подставляем значение из METRICS_PORT или 8001 по-умолчанию
-    ports:
-      - "${METRICS_PORT:-8001}:${METRICS_PORT:-8001}"
-    depends_on:
-      - cpu-worker
-      - gpu-worker
+    command: ["celery", "-A", "celery_app", "beat", "--loglevel=info"]
     restart: unless-stopped
 
   redis:
@@ -93,14 +77,14 @@ services:
       - redis-data:/data
     ports:
       - "6379:6379"
-    restart: unless-stopped
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 30s
       retries: 3
+    restart: unless-stopped
 
   flower:
-    image: mher/flower:0.9.7
+    image: mher/flower:latest
     env_file: .env
     ports:
       - "5555:5555"
@@ -114,6 +98,7 @@ services:
       test: ["CMD", "curl", "-f", "http://localhost:5555"]
       interval: 30s
       retries: 3
+
   dcgm-exporter:
     image: nvidia/dcgm-exporter:2.1.13-2.1.13-ubi8
     runtime: nvidia
@@ -130,4 +115,5 @@ volumes:
   results-data:
   diarizer-cache:
   ctranslate2-cache:
+  hf-cache:
   redis-data:

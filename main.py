@@ -9,7 +9,6 @@ from fastapi.staticfiles import StaticFiles
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
 
-# ★ Новый rate‐limiter
 from slowapi import Limiter
 from slowapi.middleware import SlowAPIMiddleware
 from slowapi.util import get_remote_address
@@ -17,23 +16,24 @@ from slowapi.util import get_remote_address
 from config.settings import settings
 from routes import router as api_router
 
-# structlog
+# structlog JSON
 structlog.configure(
     processors=[
         structlog.processors.add_log_level,
         structlog.processors.TimeStamper(fmt="iso"),
-        structlog.processors.JSONRenderer()
+        structlog.processors.JSONRenderer(),
     ]
 )
 log = structlog.get_logger()
 
-# rate limiter: 20 запросов в минуту с одного IP
+# rate limiter: 20 req/min per IP
 limiter = Limiter(key_func=get_remote_address)
-app = FastAPI(title="proxyAI", version="13.7.6.1")
+
+app = FastAPI(title="proxyAI", version="13.7.6.2")
 app.state.limiter = limiter
 app.add_middleware(SlowAPIMiddleware)
 
-# Ensure dirs
+# Ensure directories exist
 for d in (settings.upload_folder, settings.results_folder, settings.diarizer_cache_dir):
     Path(d).mkdir(parents=True, exist_ok=True)
 
@@ -69,6 +69,11 @@ async def metrics_middleware(request, call_next):
 async def health():
     return {"status": "ok", "version": app.version}
 
+@app.get("/ready")
+async def ready():
+    # Kubernetes readiness probe
+    return {"status": "ready", "version": app.version}
+
 @app.get("/metrics")
 @limiter.limit("10/minute")
 async def metrics():
@@ -81,7 +86,6 @@ async def upload(
     file: UploadFile = File(...),
     x_correlation_id: str | None = Header(None)
 ):
-    # ▶️ Correlation-ID
     cid = x_correlation_id or str(uuid.uuid4())
 
     if file.content_type not in ("audio/wav", "audio/x-wav", "audio/mpeg"):
@@ -90,18 +94,16 @@ async def upload(
     if len(data) > settings.max_file_size:
         raise HTTPException(status_code=413, detail="File too large")
 
-    upload_id = file.filename  # or uuid4()
+    upload_id = file.filename
     dest = Path(settings.upload_folder) / upload_id
     dest.write_bytes(data)
 
     log.bind(correlation_id=cid, upload_id=upload_id, size=len(data)).info("upload accepted")
 
     from tasks import transcribe_segments, diarize_full
-    # передаём сквозной Correlation-ID
     transcribe_segments.delay(upload_id, correlation_id=cid)
     diarize_full.delay(upload_id, correlation_id=cid)
 
-    # возвращаем Correlation-ID в заголовке
     return Response(
         content={"upload_id": upload_id},
         headers={"X-Correlation-ID": cid}
