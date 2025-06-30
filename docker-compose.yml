@@ -1,6 +1,7 @@
 version: "3.8"
 
 services:
+  # HTTP API на FastAPI/Uvicorn
   api:
     build:
       context: .
@@ -10,20 +11,24 @@ services:
     volumes:
       - upload-data:/tmp/uploads
       - results-data:/tmp/results
+    ports:
+      - "8000:8000"
     depends_on:
       - redis
       - tusd
-    ports:
-      - "${API_PORT:-8000}:8000"
+    command: >
+      sh -c "uvicorn main:app
+             --host 0.0.0.0
+             --port ${FASTAPI_PORT:-8000}
+             --workers ${API_WORKERS:-1}"
+    restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:${API_PORT:-8000}/healthz"]
-      interval: 15s
+      test: ["CMD", "curl", "-f", "http://localhost:${FASTAPI_PORT:-8000}/health"]
+      interval: 30s
       timeout: 5s
       retries: 3
-    restart: unless-stopped
-    command: >
-      uvicorn main:app --host 0.0.0.0 --port ${API_PORT:-8000} --workers ${API_WORKERS}
 
+  # Celery-воркер для CPU-задач (диаризация и пр.)
   cpu-worker:
     build:
       context: .
@@ -36,14 +41,20 @@ services:
       - diarizer-cache:/tmp/diarizer_cache
     depends_on:
       - redis
-    restart: unless-stopped
     command: >
       celery -A celery_app worker
-        --loglevel=info
-        --concurrency ${CPU_CONCURRENCY}
-        --hostname cpu-worker
-        --queues preprocess_cpu
+      --loglevel=info
+      --concurrency ${CPU_CONCURRENCY:-4}
+      --hostname cpu-worker
+      --queues preprocess_cpu
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "pgrep", "-f", "celery"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
 
+  # Celery-воркер для GPU-задач (транскрипция)
   gpu-worker:
     build:
       context: .
@@ -58,27 +69,20 @@ services:
     depends_on:
       - redis
     runtime: nvidia
-    restart: unless-stopped
     command: >
       celery -A celery_app worker
-        --loglevel=info
-        --concurrency ${GPU_CONCURRENCY}
-        --hostname gpu-worker
-        --queues preprocess_gpu
-
-  flower:
-    image: mher/flower:latest
-    container_name: proxyai-flower
-    env_file: .env
-    ports:
-      - "${FLOWER_PORT:-5555}:5555"
-    depends_on:
-      - redis
+      --loglevel=info
+      --concurrency ${GPU_CONCURRENCY:-1}
+      --hostname gpu-worker
+      --queues preprocess_gpu
     restart: unless-stopped
-    command: >
-      celery -A celery_app flower
-        --basic_auth=${FLOWER_USER}:${FLOWER_PASS}
+    healthcheck:
+      test: ["CMD", "pgrep", "-f", "celery"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
 
+  # Redis для брокера и backend’а Celery
   redis:
     image: redis:7-alpine
     container_name: proxyai-redis
@@ -86,13 +90,14 @@ services:
       - redis-data:/data
     ports:
       - "6379:6379"
+    restart: unless-stopped
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
+      interval: 30s
       timeout: 5s
-      retries: 5
-    restart: unless-stopped
+      retries: 3
 
+  # Tusd для resumable upload
   tusd:
     image: tusproject/tusd:latest
     container_name: proxyai-tusd
@@ -104,13 +109,32 @@ services:
       - --host=0.0.0.0
       - --port=1080
       - --dir=/data
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:1080/files"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
     volumes:
       - upload-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:1080/files/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # Flower для мониторинга Celery
+  flower:
+    image: mher/flower:1.0.0
+    container_name: proxyai-flower
+    env_file: .env     # ожидание переменных FLOWER_USER/FLOWER_PASS
+    ports:
+      - "5555:5555"
+    command: >
+      flower
+      --broker=${CELERY_BROKER_URL}
+      --basic_auth=${FLOWER_USER}:${FLOWER_PASS}
+      --port=5555
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5555"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
 
 volumes:
   upload-data:
