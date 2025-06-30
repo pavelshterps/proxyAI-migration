@@ -10,7 +10,7 @@ from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_
 from config.settings import settings
 from routes import router as api_router
 
-# structlog JSON
+# structlog
 structlog.configure(
     processors=[
         structlog.processors.add_log_level,
@@ -20,11 +20,11 @@ structlog.configure(
 )
 log = structlog.get_logger()
 
-# Ensure dirs exist
+# Ensure directories exist
 for d in (settings.upload_folder, settings.results_folder, settings.diarizer_cache_dir):
     Path(d).mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="proxyAI", version="13.7.2")
+app = FastAPI(title="proxyAI", version="13.7.3")
 
 # CORS
 app.add_middleware(
@@ -61,15 +61,13 @@ async def upload(
     file: UploadFile = File(...),
     x_correlation_id: str | None = Header(None)
 ):
-    # file type check
     if file.content_type not in ("audio/wav", "audio/x-wav", "audio/mpeg"):
         raise HTTPException(status_code=415, detail="Unsupported file type")
     data = await file.read()
-    # size check
     if len(data) > settings.max_file_size:
         raise HTTPException(status_code=413, detail="File too large")
 
-    upload_id = file.filename  # or use uuid4()
+    upload_id = file.filename  # or uuid4()
     dest = Path(settings.upload_folder) / upload_id
     dest.write_bytes(data)
 
@@ -77,13 +75,10 @@ async def upload(
     log_ctx.info("upload accepted")
 
     from tasks import transcribe_segments, diarize_full
-    transcribe_segments.delay(upload_id)
-    diarize_full.delay(upload_id)
+    transcribe_segments.delay(upload_id, correlation_id=x_correlation_id)
+    diarize_full.delay(upload_id, correlation_id=x_correlation_id)
 
     return {"upload_id": upload_id}
 
-# include other routes (/transcribe, /results)
 app.include_router(api_router, tags=["proxyAI"])
-
-# serve frontend
 app.mount("/static", StaticFiles(directory="static"), name="static")

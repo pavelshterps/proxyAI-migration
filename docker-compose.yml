@@ -13,11 +13,11 @@ services:
       - "8000:8000"
     depends_on:
       - redis
+    restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
       retries: 3
-    restart: unless-stopped
 
   cpu-worker:
     build:
@@ -39,12 +39,12 @@ services:
       context: .
       dockerfile: Dockerfile.gpu
     env_file: .env
+    runtime: nvidia
     volumes:
       - upload-data:/data/uploads
       - results-data:/data/results
       - diarizer-cache:/data/diarizer_cache
       - ctranslate2-cache:/root/.cache/ctranslate2
-    runtime: nvidia
     depends_on:
       - redis
     command:
@@ -70,10 +70,6 @@ services:
     command: ["python", "metrics.py"]
     ports:
       - "${METRICS_PORT}:${METRICS_PORT}"
-    volumes:
-      - upload-data:/data/uploads
-      - results-data:/data/results
-      - diarizer-cache:/data/diarizer_cache
     depends_on:
       - cpu-worker
       - gpu-worker
@@ -85,10 +81,6 @@ services:
       - redis-data:/data
     ports:
       - "6379:6379"
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 30s
-      retries: 3
     restart: unless-stopped
 
   flower:

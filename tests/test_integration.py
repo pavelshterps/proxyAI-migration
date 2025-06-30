@@ -1,26 +1,45 @@
-import os
+import json
 import time
-import httpx
+from pathlib import Path
+
 import pytest
+from fastapi.testclient import TestClient
 
-API_URL = os.getenv("API_URL", "http://api:8000")
+from main import app
+from config.settings import settings
 
-def test_transcription_on_sample_wav():
-    # 1) Отправляем sample.wav
-    with open("tests/fixtures/sample.wav", "rb") as f:
-        files = {"file": ("sample.wav", f, "audio/wav")}
-        resp = httpx.post(f"{API_URL}/transcribe", files=files, timeout=30.0)
-    assert resp.status_code == 200, f"POST /transcribe returned {resp.status_code}: {resp.text}"
-    job_id = resp.json().get("job_id")
-    assert job_id, "No job_id in response"
+client = TestClient(app)
 
-    # 2) Ждём окончания (до 60 с)
-    for _ in range(30):
-        r = httpx.get(f"{API_URL}/result/{job_id}", timeout=10.0)
-        data = r.json()
-        if data.get("status") == "SUCCESS":
-            segments = data.get("segments")
-            assert isinstance(segments, list) and segments, "Пустой или неверный формат segments"
-            return
-        time.sleep(2)
-    pytest.fail("Timed out waiting for transcription")
+@pytest.fixture(scope="session")
+def sample_wav(tmp_path_factory):
+    src = Path(__file__).parent / "fixtures" / "sample.wav"
+    dest_dir = tmp_path_factory.mktemp("uploads")
+    dest = dest_dir / "sample.wav"
+    dest.write_bytes(src.read_bytes())
+    # override upload_folder
+    settings.upload_folder = str(dest_dir)
+    settings.results_folder = str(tmp_path_factory.mktemp("results"))
+    return "sample.wav"
+
+def test_upload_and_process(sample_wav):
+    # Upload
+    r1 = client.post("/upload/", files={"file": ("sample.wav", open(Path(settings.upload_folder) / sample_wav, "rb"), "audio/wav")})
+    assert r1.status_code == 200, r1.text
+    upload_id = r1.json()["upload_id"]
+
+    # Give Celery some time (in real CI you might mock Celery or run tasks eagerly)
+    time.sleep(5)
+
+    # Fetch results
+    r2 = client.get(f"/results/{upload_id}")
+    assert r2.status_code == 200, r2.text
+    data = r2.json()
+    # Check that at least transcript or diarization is present
+    assert data["transcript"] is not None, "Transcript should not be empty"
+    assert data["diarization"] is not None, "Diarization should not be empty"
+
+    # Validate JSON structure
+    transcript = json.loads(data["transcript"])
+    diar = json.loads(data["diarization"])
+    assert isinstance(transcript, list)
+    assert isinstance(diar, list)

@@ -30,7 +30,7 @@ class Settings(BaseSettings):
     vad_level: int = Field(2, ge=0, le=3, env="VAD_LEVEL")
 
     # File limits & retention
-    max_file_size: int = Field(1_073_741_824, gt=0, env="MAX_FILE_SIZE")  # 1 GB
+    max_file_size: int = Field(1_073_741_824, gt=0, env="MAX_FILE_SIZE")
     file_retention_days: int = Field(7, gt=0, env="FILE_RETENTION_DAYS")
 
     # Tus endpoint
@@ -56,5 +56,4 @@ class Settings(BaseSettings):
 def get_settings() -> Settings:
     return Settings()
 
-# единый экспорт
 settings = get_settings()

@@ -39,7 +39,6 @@ celery_app.conf.beat_schedule = {
 
 @worker_process_init.connect
 def preload_models(**kwargs):
-    # предзагружаем Whisper и Diarizer
     from tasks import get_whisper, get_diarizer
     get_whisper()
     get_diarizer()
