@@ -14,15 +14,9 @@ services:
       - redis
       - tusd
     ports:
-      - "8000:8000"
-    healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-    restart: unless-stopped
+      - "${API_PORT:-8000}:8000"
     command: >
-      sh -c "uvicorn main:app --host 0.0.0.0 --port 8000 --workers ${API_WORKERS}"
+      sh -c "uvicorn main:app --host 0.0.0.0 --port 8000 --workers ${API_WORKERS:-1}"
 
   cpu-worker:
     build:
@@ -36,18 +30,17 @@ services:
       - diarizer-cache:/tmp/diarizer_cache
     depends_on:
       - redis
-    healthcheck:
-      test: ["CMD", "celery", "-A", "celery_app", "status"]
-      interval: 60s
-      timeout: 10s
-      retries: 3
-    restart: unless-stopped
     command: >
       celery -A celery_app worker
-      --loglevel=info
-      --concurrency ${CPU_CONCURRENCY}
+      --loglevel=${CELERY_LOGLEVEL:-info}
+      --concurrency ${CPU_CONCURRENCY:-1}
       --hostname cpu-worker
       --queues preprocess_cpu
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "-h", "redis", "ping"]
+      interval: 30s
+      retries: 3
 
   gpu-worker:
     build:
@@ -63,12 +56,38 @@ services:
     depends_on:
       - redis
     runtime: nvidia
-    healthcheck:
-      test: ["CMD", "nvidia-smi"]
-      interval: 60s
-      timeout: 10s
-      retries: 3
+    command: >
+      celery -A celery_app worker
+      --loglevel=${CELERY_LOGLEVEL:-info}
+      --concurrency ${GPU_CONCURRENCY:-1}
+      --hostname gpu-worker
+      --queues preprocess_gpu
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "-h", "redis", "ping"]
+      interval: 30s
+      retries: 3
+
+  flower:
+    image: mher/flower:latest
+    container_name: proxyai-flower
+    env_file: .env
+    depends_on:
+      - redis
+      - api
+    ports:
+      - "${FLOWER_PORT:-5555}:5555"
+    # запускаем через celery, а не напрямую "flower"
+    command: >
+      celery -A celery_app flower
+      --broker=${CELERY_BROKER_URL}
+      --basic_auth=${FLOWER_USER}:${FLOWER_PASS}
+      --port=5555
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:${FLOWER_PORT:-5555}/"]
+      interval: 30s
+      retries: 3
 
   redis:
     image: redis:7-alpine
@@ -76,11 +95,10 @@ services:
     volumes:
       - redis-data:/data
     ports:
-      - "6379:6379"
+      - "${REDIS_PORT:-6379}:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
-      interval: 30s
-      timeout: 5s
+      interval: 10s
       retries: 3
     restart: unless-stopped
 
@@ -89,7 +107,7 @@ services:
     container_name: proxyai-tusd
     restart: unless-stopped
     ports:
-      - "1080:1080"
+      - "${TUSD_PORT:-1080}:1080"
     command:
       - tusd
       - --host=0.0.0.0
@@ -98,31 +116,9 @@ services:
     volumes:
       - upload-data:/data
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:1080/files"]
+      test: ["CMD", "curl", "-f", "http://localhost:${TUSD_PORT:-1080}/"]
       interval: 30s
-      timeout: 5s
       retries: 3
-
-  flower:
-    image: mher/flower:latest
-    container_name: proxyai-flower
-    env_file: .env
-    ports:
-      - "5555:5555"
-    depends_on:
-      - redis
-    healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:5555 || exit 1"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-    restart: unless-stopped
-    command: >
-      flower
-      --broker=${CELERY_BROKER_URL}
-      --address=0.0.0.0
-      --port=5555
-      --basic_auth=${FLOWER_USER}:${FLOWER_PASS}
 
 volumes:
   upload-data:
