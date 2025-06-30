@@ -10,21 +10,21 @@ services:
     volumes:
       - upload-data:/tmp/uploads
       - results-data:/tmp/results
-    ports:
-      - "8000:${FASTAPI_PORT:-8000}"
     depends_on:
       - redis
       - tusd
+    ports:
+      - "8000:8000"
     command: >
       uvicorn main:app
       --host 0.0.0.0
-      --port ${FASTAPI_PORT:-8000}
+      --port 8000
       --workers ${API_WORKERS:-1}
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:${FASTAPI_PORT:-8000}/health"]
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
       interval: 30s
-      timeout: 5s
+      timeout: 10s
       retries: 3
 
   cpu-worker:
@@ -42,14 +42,14 @@ services:
     command: >
       celery -A celery_app worker
       --loglevel=info
-      --concurrency ${CPU_CONCURRENCY:-4}
+      --concurrency ${CPU_CONCURRENCY:-1}
       --hostname cpu-worker
       --queues preprocess_cpu
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "pgrep", "-f", "celery"]
+      test: ["CMD", "celery", "-A", "celery_app", "status"]
       interval: 30s
-      timeout: 5s
+      timeout: 10s
       retries: 3
 
   gpu-worker:
@@ -74,9 +74,9 @@ services:
       --queues preprocess_gpu
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "pgrep", "-f", "celery"]
+      test: ["CMD", "celery", "-A", "celery_app", "status"]
       interval: 30s
-      timeout: 5s
+      timeout: 10s
       retries: 3
 
   redis:
@@ -107,27 +107,31 @@ services:
     volumes:
       - upload-data:/data
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:1080/files/"]
+      test: ["CMD-SHELL", "curl -f http://localhost:1080/files || exit 1"]
       interval: 30s
-      timeout: 5s
+      timeout: 10s
       retries: 3
 
   flower:
-    image: mher/flower:1.0.0
+    image: mher/flower:latest
     container_name: proxyai-flower
     env_file: .env
+    environment:
+      - CELERY_BROKER_URL=${CELERY_BROKER_URL}
+      - FLOWER_USER=${FLOWER_USER}
+      - FLOWER_PASS=${FLOWER_PASS}
     ports:
       - "5555:5555"
     command: >
       flower
       --broker=${CELERY_BROKER_URL}
-      --basic_auth=${FLOWER_USER}:${FLOWER_PASS}
       --port=5555
+      ${FLOWER_USER:+--basic_auth=${FLOWER_USER}:${FLOWER_PASS}}
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:5555"]
+      test: ["CMD-SHELL", "curl -f http://localhost:5555 || exit 1"]
       interval: 30s
-      timeout: 5s
+      timeout: 10s
       retries: 3
 
 volumes:
