@@ -1,17 +1,22 @@
-# proxyAI v13.6 – requirements.txt
-
 fastapi>=0.95.0
 uvicorn[standard]>=0.22.0
 celery>=5.5.3
 redis>=4.5.0
 python-dotenv>=1.1.0
 python-multipart>=0.0.5
+
+# Use Pydantic v1.x for compatibility
 pydantic<2.0,>=1.10
+
 transformers>=4.28.1
 faster-whisper==1.1.1
 ctranslate2>=4.6.0
-pyannote.audio>=2.2.1
+onnxruntime<2,>=1.14
+
+# Audio & diarization
 pydub>=0.25.1
-structlog>=22.1.0
-prometheus-client>=0.16.0
-webrtcvad  # now builds OK thanks to build-essential in Dockerfiles
+webrtcvad>=2.0.10
+pyannote.audio>=3.3.2
+
+# VAD/segmentation helpers
+webrtcvad                           # will need gcc to build
