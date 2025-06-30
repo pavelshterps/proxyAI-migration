@@ -7,16 +7,16 @@ celery_app = Celery(
     "proxyai",
     broker=settings.celery_broker_url,
     backend=settings.celery_result_backend,
-    include=["tasks"],  # make sure tasks.py is imported at startup
+    include=["tasks"],
 )
 
-# Route tasks onto their own queues
+# Route tasks onto their queues
 celery_app.conf.task_routes = {
     "tasks.diarize_full": {"queue": "preprocess_cpu"},
     "tasks.transcribe_segments": {"queue": "preprocess_gpu"},
 }
 
-# Use JSON everywhere, enable UTC+timezone, plus sensible timeouts
+# JSON everywhere, sensible timeouts, UTC
 celery_app.conf.update(
     task_serializer="json",
     result_serializer="json",
@@ -25,7 +25,7 @@ celery_app.conf.update(
     timezone=settings.timezone,
     result_expires=3600,         # 1 hour
     task_time_limit=600,         # 10 minutes hard
-    task_soft_time_limit=550,    # 9 minutes 10 sec soft
+    task_soft_time_limit=550,    # 9m10s soft
 )
 
 if __name__ == "__main__":
