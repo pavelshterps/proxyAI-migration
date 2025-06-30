@@ -1,55 +1,42 @@
 # config/settings.py
 
 from pathlib import Path
-from typing import List
-from pydantic import BaseSettings
+from pydantic import BaseSettings, Field
+
 
 class Settings(BaseSettings):
-    # FastAPI
-    fastapi_host: str = "0.0.0.0"
-    fastapi_port: int = 8000
-    api_workers: int = 1
-    allowed_origins: List[str] = ["*"]
+    # Redis / Celery
+    celery_broker_url: str = Field(..., env="CELERY_BROKER_URL")
+    celery_result_backend: str = Field(..., env="CELERY_RESULT_BACKEND")
 
-    # Celery / Redis
-    celery_broker_url: str
-    celery_result_backend: str
-    cpu_concurrency: int = 4
-    gpu_concurrency: int = 1
-    timezone: str = "UTC"
+    # FastAPI / Uvicorn
+    api_host: str = Field("0.0.0.0", env="API_HOST")
+    api_port: int = Field(8000, env="API_PORT")
+    api_workers: int = Field(1, env="API_WORKERS")
 
-    # Storage
-    upload_folder: Path = Path("/tmp/uploads")
-    results_folder: Path = Path("/tmp/results")
+    # Worker concurrency
+    cpu_concurrency: int = Field(1, env="CPU_CONCURRENCY")
+    gpu_concurrency: int = Field(1, env="GPU_CONCURRENCY")
 
-    # tusd
-    tusd_endpoint: str
-    snippet_format: str = "wav"
+    # File paths (mounts from docker‐compose)
+    upload_folder: Path = Field(Path("/tmp/uploads"), env="UPLOAD_FOLDER")
+    results_folder: Path = Field(Path("/tmp/results"), env="RESULTS_FOLDER")
+    diarizer_cache_dir: Path = Field(Path("/tmp/diarizer_cache"), env="DIARIZER_CACHE_DIR")
+    hf_cache_dir: Path = Field(Path("/hf_cache"), env="HF_CACHE_DIR")
 
-    # Diarizer
-    diarizer_cache_dir: Path = Path("/tmp/diarizer_cache")
-    pyannote_protocol: str = "pyannote/speaker-diarization"
+    # Whisper settings
+    whisper_model_path: str = Field("models--guillaumekln--faster-whisper-medium", env="WHISPER_MODEL_PATH")
+    whisper_device: str = Field("cuda", env="WHISPER_DEVICE")
+    whisper_compute_type: str = Field("int8", env="WHISPER_COMPUTE_TYPE")
+    segment_length_s: int = Field(30, env="SEGMENT_LENGTH_S")
 
-    # Hugging Face
-    huggingface_token: str
-    hf_cache_dir: Path = Path("/hf_cache")
-
-    # Whisper / Faster-Whisper
-    whisper_model_path: Path
-    whisper_device: str = "cuda"
-    whisper_device_index: int = 0
-    whisper_compute_type: str = "int8"
-    whisper_beam_size: int = 5
-    whisper_language: str = "ru"
-    segment_length_s: int = 30
-
-    # Cleanup & misc
-    clean_up_uploads: bool = True
+    # Timezone
+    timezone: str = Field("UTC", env="TIMEZONE")
 
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"
-        extra = "forbid"
 
-# Instantiate for import
+
+# instantiate once for import
 settings = Settings()
