@@ -19,7 +19,7 @@ class Settings(BaseSettings):
     diarizer_cache_dir: str = Field("/data/diarizer_cache", env="DIARIZER_CACHE_DIR")
 
     # Models
-    whisper_model_path: str = Field(..., env="WHISPER_MODEL_PATH")
+    whisper_model_path: str = Field(str = Field("/hf_cache/models--guillaumekln--faster-whisper-medium", env="WHISPER_MODEL_PATH")
     whisper_device: str = Field("cuda", env="WHISPER_DEVICE")
     whisper_compute_type: str = Field("int8", env="WHISPER_COMPUTE_TYPE")
     pyannote_protocol: str = Field(..., env="PYANNOTE_PROTOCOL")

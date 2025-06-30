@@ -50,6 +50,7 @@ services:
       - results-data:/data/results
       - diarizer-cache:/data/diarizer_cache
       - ctranslate2-cache:/root/.cache/ctranslate2
+      - /path/to/hf_cache_host:/hf_cache:rw
     depends_on:
       - redis
     command:
@@ -77,9 +78,10 @@ services:
       context: .
       dockerfile: Dockerfile
     env_file: .env
-    command: ["python", "metrics.py"]
+    command: [ "python", "metrics.py" ]
+    # подставляем значение из METRICS_PORT или 8001 по-умолчанию
     ports:
-      - "${METRICS_PORT}:${METRICS_PORT}"
+      - "${METRICS_PORT:-8001}:${METRICS_PORT:-8001}"
     depends_on:
       - cpu-worker
       - gpu-worker
@@ -98,7 +100,7 @@ services:
       retries: 3
 
   flower:
-    image: mher/flower:latest
+    image: mher/flower:0.9.7
     env_file: .env
     ports:
       - "5555:5555"
