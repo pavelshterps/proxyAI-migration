@@ -1,8 +1,7 @@
 # syntax=docker/dockerfile:1
-
 FROM python:3.10-slim
 
-# Устанавливаем всё, что нужно для VAD, pyannote-pipeline, ffmpeg и сборки C-расширений
+# Устанавливаем все системные зависимости для ffmpeg, webrtcvad, julius и т.п.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       build-essential \
@@ -13,13 +12,13 @@ RUN apt-get update \
 
 WORKDIR /app
 
+# Сначала ставим зависимости
 COPY requirements.txt .
-
 RUN pip install --upgrade pip \
  && pip install --no-cache-dir -r requirements.txt
 
+# Копируем весь код
 COPY . .
 
-# По умолчанию запускаем API.
-# CPU-воркер будет переопределять команду в docker-compose.yml
+# Для API
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
