@@ -1,5 +1,4 @@
 # syntax=docker/dockerfile:1
-
 FROM python:3.10-slim
 
 RUN apt-get update \
@@ -9,11 +8,11 @@ RUN apt-get update \
 
 WORKDIR /app
 
-COPY requirements.txt .
+COPY requirements.txt ./
 RUN pip install --upgrade pip \
  && pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-# По умолчанию запускаем API
+# Default to API; overridden in CPU service:
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]

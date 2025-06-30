@@ -2,136 +2,86 @@ import os
 import json
 import logging
 from pathlib import Path
-from typing import List, Tuple
 
+import structlog
+import webrtcvad
+from pydub import AudioSegment
 from celery import shared_task
 from faster_whisper import WhisperModel
 from pyannote.audio import Pipeline
-from pydub import AudioSegment
-import webrtcvad
+from prometheus_client import Counter
 
 from config.settings import UPLOAD_FOLDER, RESULTS_FOLDER
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger()
+MODEL_LOAD_ERRORS = Counter("proxyai_model_load_errors_total", "Failures loading models")
+TRANSCRIBE_ERRORS = Counter("proxyai_transcribe_errors_total", "Failures during transcription")
 
+# singletons so we only load once per worker
 _whisper_model = None
 _diarizer = None
 
 
-def get_whisper_model() -> WhisperModel:
+def get_whisper_model():
     global _whisper_model
     if _whisper_model is None:
-        model_path = os.getenv(
-            "WHISPER_MODEL_PATH",
-            "/hf_cache/models--guillaumekln--faster-whisper-medium"
-        )
+        model_path = os.getenv("WHISPER_MODEL_PATH", "/hf_cache/models--guillaumekln--faster-whisper-medium")
         device = os.getenv("WHISPER_DEVICE", "cuda")
         compute = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
         try:
-            logger.info(
-                "Loading WhisperModel",
-                extra={"model_path": model_path, "device": device, "compute": compute},
-            )
-            _whisper_model = WhisperModel(
-                model_path,
-                device=device,
-                compute_type=compute
-            )
-            logger.info("WhisperModel loaded successfully")
+            logger.info("Loading WhisperModel", path=model_path, device=device, compute=compute)
+            _whisper_model = WhisperModel(model_path, device=device, compute_type=compute)
+            logger.info("WhisperModel loaded")
         except Exception as e:
-            logger.exception(f"Failed to load WhisperModel from {model_path}: {e}")
+            MODEL_LOAD_ERRORS.inc()
+            logger.error("Failed to load WhisperModel", path=model_path, error=str(e))
             raise
     return _whisper_model
 
 
-def get_diarizer() -> Pipeline:
+def get_diarizer():
     global _diarizer
     if _diarizer is None:
         cache_dir = os.getenv("DIARIZER_CACHE_DIR", "/tmp/diarizer_cache")
         os.makedirs(cache_dir, exist_ok=True)
         try:
-            logger.info("Loading pyannote Pipeline", extra={"cache_dir": cache_dir})
-            _diarizer = Pipeline.from_pretrained(
-                "pyannote/speaker-diarization",
-                cache_dir=cache_dir
-            )
-            logger.info("Diarizer loaded successfully")
+            logger.info("Loading pyannote Pipeline", cache_dir=cache_dir)
+            _diarizer = Pipeline.from_pretrained("pyannote/speaker-diarization", cache_dir=cache_dir)
+            logger.info("Diarizer loaded")
         except Exception as e:
-            logger.exception(f"Failed to load diarizer into {cache_dir}: {e}")
+            MODEL_LOAD_ERRORS.inc()
+            logger.error("Failed to load pyannote Pipeline", error=str(e))
             raise
     return _diarizer
 
 
-def frame_generator(frame_duration_ms: int,
-                    audio_bytes: bytes,
-                    sample_rate: int) -> List[bytes]:
-    """Yield successive frames of audio_bytes for VAD."""
-    n_bytes_per_frame = int(sample_rate * frame_duration_ms / 1000) * 2  # 16-bit mono
-    offset = 0
-    frames = []
-    while offset + n_bytes_per_frame < len(audio_bytes):
-        frames.append(audio_bytes[offset:offset + n_bytes_per_frame])
-        offset += n_bytes_per_frame
-    return frames
+def split_audio_vad(audio_path: Path, aggressiveness: int = 3):
+    """Use webrtcvad to split speech regions."""
+    audio = AudioSegment.from_file(str(audio_path)).set_channels(1).set_frame_rate(16000)
+    vad = webrtcvad.Vad(aggressiveness)
+    sample_rate = 16000
+    frame_duration_ms = 30
+    frame_bytes = int(sample_rate * frame_duration_ms / 1000) * 2
+    raw = audio.raw_data
+    frames = [raw[i : i + frame_bytes] for i in range(0, len(raw), frame_bytes)]
 
-
-def vad_collector(sample_rate: int,
-                  frame_duration_ms: int,
-                  padding_duration_ms: int,
-                  vad: webrtcvad.Vad,
-                  frames: List[bytes]) -> List[Tuple[float, float]]:
-    """
-    Returns time windows (in sec) where speech is detected.
-    """
-    num_padding_frames = padding_duration_ms // frame_duration_ms
-    speech_windows = []
-    ring_buffer = []
-    triggered = False
-    window_start = 0.0
-
+    segments = []
+    current_start = None
     for i, frame in enumerate(frames):
-        is_speech = vad.is_speech(frame, sample_rate)
-        if not triggered:
-            ring_buffer.append((i, is_speech))
-            if sum(1 for _, speech in ring_buffer if speech) > 0.9 * len(ring_buffer):
-                triggered = True
-                window_start = ring_buffer[0][0] * frame_duration_ms / 1000.0
-                ring_buffer.clear()
-        else:
-            ring_buffer.append((i, is_speech))
-            if sum(1 for _, speech in ring_buffer if not speech) > 0.9 * len(ring_buffer):
-                window_end = i * frame_duration_ms / 1000.0
-                speech_windows.append((window_start, window_end))
-                triggered = False
-                ring_buffer.clear()
-
-    # Catch last segment
-    if triggered:
-        speech_windows.append((window_start, len(frames) * frame_duration_ms / 1000.0))
-
-    return speech_windows
-
-
-def split_audio_vad(audio_path: Path) -> List[Tuple[float, float]]:
-    """
-    Perform VAD segmentation and return list of (start_s, end_s) for speech.
-    """
-    # Load, convert to mono 16kHz
-    audio = AudioSegment.from_file(str(audio_path))
-    audio = audio.set_frame_rate(16000).set_channels(1).set_sample_width(2)
-    pcm = audio.raw_data
-
-    vad_mode = int(os.getenv("VAD_MODE", "2"))
-    vad = webrtcvad.Vad(vad_mode)
-
-    frame_ms = int(os.getenv("VAD_FRAME_MS", "30"))
-    padding_ms = int(os.getenv("VAD_PADDING_MS", "300"))
-
-    frames = frame_generator(frame_ms, pcm, 16000)
-    speech_segments = vad_collector(16000, frame_ms, padding_ms, vad, frames)
-
-    logger.info(f"VAD found {len(speech_segments)} speech segment(s)")
-    return speech_segments
+        is_speech = False
+        try:
+            is_speech = vad.is_speech(frame, sample_rate)
+        except Exception:
+            pass
+        t = i * frame_duration_ms / 1000.0
+        if is_speech and current_start is None:
+            current_start = t
+        elif not is_speech and current_start is not None:
+            segments.append((current_start, t))
+            current_start = None
+    if current_start is not None:
+        segments.append((current_start, len(audio) / 1000.0))
+    return segments or [(0.0, None)]
 
 
 @shared_task(name="tasks.transcribe_segments")
@@ -141,40 +91,34 @@ def transcribe_segments(upload_id: str):
     dst_dir = Path(RESULTS_FOLDER) / upload_id
     dst_dir.mkdir(parents=True, exist_ok=True)
 
-    logger.info(f"Starting transcription for '{src}'")
+    logger.info("Starting transcription", src=str(src))
+    # 1) Try VAD‐based segments, else fixed windows
     segments = split_audio_vad(src)
-    if not segments:
-        # fallback to whole file
-        segments = [(0.0, None)]
-        logger.warning("No VAD segments detected; falling back to full-file transcription")
+    logger.info("Using segments count", count=len(segments))
 
     transcript = []
     for idx, (start, end) in enumerate(segments):
+        logger.debug("Transcribing segment", idx=idx, start=start, end=end)
         try:
-            logger.debug(f"Transcribing segment {idx}: {start:.2f}s → {end}")
             result = whisper.transcribe(
                 str(src),
                 beam_size=5,
                 language="ru",
-                vad_filter=False,            # we've already segmented
+                vad_filter=True,
                 word_timestamps=True,
                 offset=start,
-                duration=None if end is None else (end - start),
+                duration=(None if end is None else end - start),
             )
             text = result["segments"][0]["text"]
         except Exception as e:
-            logger.exception(f"Error transcribing segment {idx}; skipping: {e}")
+            TRANSCRIBE_ERRORS.inc()
+            logger.error("Segment transcription failed", idx=idx, error=str(e))
             text = ""
-        transcript.append({
-            "segment": idx,
-            "start": start,
-            "end": end,
-            "text": text
-        })
+        transcript.append({"segment": idx, "start": start, "end": end, "text": text})
 
     out_path = dst_dir / "transcript.json"
     out_path.write_text(json.dumps(transcript, ensure_ascii=False, indent=2), encoding="utf-8")
-    logger.info(f"Transcription complete: saved to '{out_path}'")
+    logger.info("Transcription complete", out_path=str(out_path))
 
 
 @shared_task(name="tasks.diarize_full")
@@ -184,24 +128,17 @@ def diarize_full(upload_id: str):
     dst_dir = Path(RESULTS_FOLDER) / upload_id
     dst_dir.mkdir(parents=True, exist_ok=True)
 
-    logger.info(f"Starting diarization for '{src}'")
+    logger.info("Starting diarization", src=str(src))
     try:
         diarization = diarizer(str(src))
     except Exception as e:
-        logger.exception(f"Diarization pipeline failed on '{src}': {e}")
-        diarization = []
+        logger.error("Diarization failed", error=str(e))
+        return
 
     speakers = []
-    if hasattr(diarization, "itertracks"):
-        for turn, _, speaker in diarization.itertracks(yield_label=True):
-            speakers.append({
-                "start": turn.start,
-                "end": turn.end,
-                "speaker": speaker
-            })
-    else:
-        logger.warning("No diarization output; saving empty speaker list")
+    for turn, _, spk in diarization.itertracks(yield_label=True):
+        speakers.append({"start": turn.start, "end": turn.end, "speaker": spk})
 
     out_path = dst_dir / "diarization.json"
     out_path.write_text(json.dumps(speakers, ensure_ascii=False, indent=2), encoding="utf-8")
-    logger.info(f"Diarization complete: saved to '{out_path}'")
+    logger.info("Diarization complete", out_path=str(out_path))
