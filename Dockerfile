@@ -1,21 +1,22 @@
-# syntax=docker/dockerfile:1
+# Dockerfile
+
 FROM python:3.10-slim
 
-# Устанавливаем только нужные пакеты, очищаем кеш apt
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
-         ffmpeg \
-         git-lfs \
-    && git lfs install \
-    && rm -rf /var/lib/apt/lists/*
-
-# Копируем и ставим зависимости
-COPY requirements.txt .
-RUN pip install --no-cache-dir --upgrade pip \
-    && pip install --no-cache-dir -r requirements.txt
-
-# Копируем весь код и настраиваем рабочую директорию
 WORKDIR /app
+
+# Установка системных зависимостей
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ffmpeg \
+ && rm -rf /var/lib/apt/lists/*
+
+# Скопировать и установить Python-зависимости
+COPY requirements.txt ./
+RUN pip install --no-cache-dir --upgrade pip \
+ && pip install --no-cache-dir -r requirements.txt
+
+# Копируем приложение
 COPY . .
 
-# По умолчанию команда подменяется в docker-compose.yml
+# Экспонируем порт и задаём команду запуска
+EXPOSE 8000
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]

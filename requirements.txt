@@ -14,3 +14,4 @@ torchaudio>=2.0.1
 structlog>=22.1.0
 pydub>=0.25.1
 pyannote.audio>=2.2.1
+prometheus-client>=0.16.0
