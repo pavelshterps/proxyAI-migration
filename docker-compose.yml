@@ -85,7 +85,7 @@ services:
     restart: unless-stopped
 
   flower:
-    image: mher/flower:latest
+    image: mher/flower:0.9.7
     env_file: .env
     ports:
       - "5555:5555"
