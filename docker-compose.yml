@@ -1,7 +1,6 @@
 version: "3.8"
 
 services:
-  # HTTP API на FastAPI/Uvicorn
   api:
     build:
       context: .
@@ -12,23 +11,22 @@ services:
       - upload-data:/tmp/uploads
       - results-data:/tmp/results
     ports:
-      - "8000:8000"
+      - "8000:${FASTAPI_PORT:-8000}"
     depends_on:
       - redis
       - tusd
     command: >
-      sh -c "uvicorn main:app
-             --host 0.0.0.0
-             --port ${FASTAPI_PORT:-8000}
-             --workers ${API_WORKERS:-1}"
+      uvicorn main:app
+      --host 0.0.0.0
+      --port ${FASTAPI_PORT:-8000}
+      --workers ${API_WORKERS:-1}
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:${FASTAPI_PORT:-8000}/health"]
+      test: ["CMD", "curl", "-sf", "http://localhost:${FASTAPI_PORT:-8000}/health"]
       interval: 30s
       timeout: 5s
       retries: 3
 
-  # Celery-воркер для CPU-задач (диаризация и пр.)
   cpu-worker:
     build:
       context: .
@@ -54,7 +52,6 @@ services:
       timeout: 5s
       retries: 3
 
-  # Celery-воркер для GPU-задач (транскрипция)
   gpu-worker:
     build:
       context: .
@@ -82,7 +79,6 @@ services:
       timeout: 5s
       retries: 3
 
-  # Redis для брокера и backend’а Celery
   redis:
     image: redis:7-alpine
     container_name: proxyai-redis
@@ -97,7 +93,6 @@ services:
       timeout: 5s
       retries: 3
 
-  # Tusd для resumable upload
   tusd:
     image: tusproject/tusd:latest
     container_name: proxyai-tusd
@@ -112,16 +107,15 @@ services:
     volumes:
       - upload-data:/data
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:1080/files/"]
+      test: ["CMD", "curl", "-sf", "http://localhost:1080/files/"]
       interval: 30s
       timeout: 5s
       retries: 3
 
-  # Flower для мониторинга Celery
   flower:
     image: mher/flower:1.0.0
     container_name: proxyai-flower
-    env_file: .env     # ожидание переменных FLOWER_USER/FLOWER_PASS
+    env_file: .env
     ports:
       - "5555:5555"
     command: >
@@ -131,7 +125,7 @@ services:
       --port=5555
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:5555"]
+      test: ["CMD", "curl", "-sf", "http://localhost:5555"]
       interval: 30s
       timeout: 5s
       retries: 3

@@ -1,29 +1,26 @@
-# Используем уже готовый образ PyTorch с CUDA и cuDNN
-FROM pytorch/pytorch:2.1.0-cuda11.8-cudnn8-runtime
+# NVIDIA-образ для CUDA/cuDNN
+FROM nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04
+
+# установить Python + сборочные утилиты
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+       python3.10 python3-pip build-essential \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Системные зависимости для ffmpeg, webrtcvad, pydub
-RUN apt-get update \
- && apt-get install -y --no-install-recommends \
-      ffmpeg \
-      build-essential \
-      python3-dev \
- && rm -rf /var/lib/apt/lists/*
-
-# Копируем только requirements и ставим нужное
+# зависимости приложения
 COPY requirements.txt .
 
-# Обновляем pip и устанавливаем все зависимости из requirements
-RUN pip install --no-cache-dir --upgrade pip \
- && pip install --no-cache-dir -r requirements.txt
+# поставить pip + PyTorch с CUDA (torchaudio для аудио-просчётов)
+RUN pip install --upgrade pip \
+    && pip install --no-cache-dir \
+         --index-url https://download.pytorch.org/whl/cu118 \
+         torch==2.1.0+cu118 \
+         torchaudio==2.0.2+cu118 \
+    && pip install --no-cache-dir -r requirements.txt
 
-# Копируем весь код приложения
+# сам код
 COPY . .
 
-# Указываем точку входа
-CMD ["celery", "-A", "celery_app", "worker",
-     "--loglevel=info",
-     "--concurrency", "${GPU_CONCURRENCY}",
-     "--hostname", "gpu-worker",
-     "--queues", "preprocess_gpu"]
+# NOTE: точка входа задаётся в docker-compose командой celery
