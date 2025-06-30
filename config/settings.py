@@ -1,8 +1,8 @@
 # config/settings.py
 
 from pathlib import Path
-from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing import List
+from pydantic import BaseSettings
 
 class Settings(BaseSettings):
     # FastAPI
@@ -43,14 +43,12 @@ class Settings(BaseSettings):
     whisper_language: str = "ru"
     segment_length_s: int = 30
 
-    # Cleanup
+    # Cleanup & misc
     clean_up_uploads: bool = True
-    model_task: str = "transcribe"
 
-    model_config = SettingsConfigDict(
-        env_file=".env",
-        env_file_encoding="utf-8",
-        extra_forbid=True,
-    )
+    class Config:
+        env_file = ".env"
+        env_file_encoding = "utf-8"
+        extra = "forbid"
 
 settings = Settings()
