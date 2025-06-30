@@ -1,7 +1,5 @@
-# NVIDIA-образ для CUDA/cuDNN
 FROM nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04
 
-# установить Python + сборочные утилиты
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
        python3.10 python3-pip build-essential \
@@ -9,18 +7,16 @@ RUN apt-get update \
 
 WORKDIR /app
 
-# зависимости приложения
 COPY requirements.txt .
 
-# поставить pip + PyTorch с CUDA (torchaudio для аудио-просчётов)
+# Сначала ставим «чистый» PyTorch+torchaudio под CU118,
+# без torchvision — чтобы не лезть в конфликты версий.
 RUN pip install --upgrade pip \
     && pip install --no-cache-dir \
          --index-url https://download.pytorch.org/whl/cu118 \
          torch==2.1.0+cu118 \
-         torchaudio==2.0.2+cu118 \
+         torchaudio==2.1.0+cu118 \
     && pip install --no-cache-dir -r requirements.txt
 
-# сам код
 COPY . .
-
-# NOTE: точка входа задаётся в docker-compose командой celery
+# Точка входа ― в docker-compose командой celery
