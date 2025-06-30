@@ -15,4 +15,4 @@ RUN pip install --upgrade pip \
 
 COPY . .
 
-CMD ["gunicorn", "main:app", "-k", "uvicorn.workers.UvicornWorker", "-w", "${API_WORKERS}", "-b", "0.0.0.0:8000"]
+CMD ["sh", "-c", "gunicorn main:app -k uvicorn.workers.UvicornWorker -w ${API_WORKERS:-1} -b 0.0.0.0:8000"]

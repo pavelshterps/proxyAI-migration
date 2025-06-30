@@ -1,6 +1,8 @@
 version: "3.8"
 services:
   api:
+    environment:
+      - API_WORKERS=2
     build:
       context: .
       dockerfile: Dockerfile

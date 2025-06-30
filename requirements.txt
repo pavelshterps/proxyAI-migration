@@ -4,7 +4,8 @@ celery>=5.5.3
 redis>=4.5.0
 python-dotenv>=1.1.0
 python-multipart>=0.0.5
-pydantic<2.0,>=1.10
+pydantic>=2.0,<3.0
+pydantic-settings>=2.0,<3.0
 transformers>=4.28.1
 faster-whisper==1.1.1
 ctranslate2>=4.6.0
