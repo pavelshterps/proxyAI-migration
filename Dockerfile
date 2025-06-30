@@ -1,24 +1,25 @@
-# Dockerfile (api + cpu-worker)
-FROM python:3.10-slim@sha256:<digest>
+# syntax=docker/dockerfile:1
 
+FROM python:3.10-slim
+
+# Устанавливаем всё, что нужно для VAD, pyannote-pipeline, ffmpeg и сборки C-расширений
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      build-essential gcc python3-dev ffmpeg ca-certificates \
+      build-essential \
+      gcc \
+      python3-dev \
+      ffmpeg \
  && rm -rf /var/lib/apt/lists/*
 
-# non-root run
-RUN useradd --create-home appuser
 WORKDIR /app
-USER appuser
 
-COPY --chown=appuser:appuser requirements.txt .
+COPY requirements.txt .
+
 RUN pip install --upgrade pip \
  && pip install --no-cache-dir -r requirements.txt
 
-COPY --chown=appuser:appuser . .
+COPY . .
 
-HEALTHCHECK --interval=30s --timeout=5s \
-  CMD curl --fail http://127.0.0.1:8000/health || exit 1
-
-# default (API)
+# По умолчанию запускаем API.
+# CPU-воркер будет переопределять команду в docker-compose.yml
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
