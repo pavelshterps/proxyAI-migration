@@ -16,7 +16,7 @@ services:
     ports:
       - "8000:8000"
     healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      test: [ "CMD", "curl", "-f", "http://localhost:8000/health" ]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -36,6 +36,11 @@ services:
     depends_on:
       - redis
     restart: unless-stopped
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8000/health" ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
     command:
       [
         "celery",
@@ -62,6 +67,11 @@ services:
       - redis
     runtime: nvidia
     restart: unless-stopped
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8000/health" ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
     command:
       [
         "celery",
