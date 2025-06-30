@@ -1,4 +1,5 @@
 import time
+import uuid
 from pathlib import Path
 
 import structlog
@@ -7,6 +8,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
+
+# ★ Новый rate‐limiter
+from slowapi import Limiter
+from slowapi.middleware import SlowAPIMiddleware
+from slowapi.util import get_remote_address
 
 from config.settings import settings
 from routes import router as api_router
@@ -21,13 +27,17 @@ structlog.configure(
 )
 log = structlog.get_logger()
 
-# Ensure directories exist
+# rate limiter: 20 запросов в минуту с одного IP
+limiter = Limiter(key_func=get_remote_address)
+app = FastAPI(title="proxyAI", version="13.7.6.1")
+app.state.limiter = limiter
+app.add_middleware(SlowAPIMiddleware)
+
+# Ensure dirs
 for d in (settings.upload_folder, settings.results_folder, settings.diarizer_cache_dir):
     Path(d).mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="proxyAI", version="13.7.6")
-
-# Host validation (keep localhost + origin list)
+# Host validation
 app.add_middleware(
     TrustedHostMiddleware,
     allowed_hosts=["127.0.0.1", "localhost"] + settings.allowed_origins
@@ -55,19 +65,25 @@ async def metrics_middleware(request, call_next):
     return response
 
 @app.get("/health")
+@limiter.limit("30/minute")
 async def health():
     return {"status": "ok", "version": app.version}
 
 @app.get("/metrics")
+@limiter.limit("10/minute")
 async def metrics():
     data = generate_latest()
     return Response(content=data, media_type=CONTENT_TYPE_LATEST)
 
 @app.post("/upload/")
+@limiter.limit("10/minute")
 async def upload(
     file: UploadFile = File(...),
     x_correlation_id: str | None = Header(None)
 ):
+    # ▶️ Correlation-ID
+    cid = x_correlation_id or str(uuid.uuid4())
+
     if file.content_type not in ("audio/wav", "audio/x-wav", "audio/mpeg"):
         raise HTTPException(status_code=415, detail="Unsupported file type")
     data = await file.read()
@@ -78,13 +94,18 @@ async def upload(
     dest = Path(settings.upload_folder) / upload_id
     dest.write_bytes(data)
 
-    log.bind(correlation_id=x_correlation_id, upload_id=upload_id, size=len(data)).info("upload accepted")
+    log.bind(correlation_id=cid, upload_id=upload_id, size=len(data)).info("upload accepted")
 
     from tasks import transcribe_segments, diarize_full
-    transcribe_segments.delay(upload_id, correlation_id=x_correlation_id)
-    diarize_full.delay(upload_id, correlation_id=x_correlation_id)
+    # передаём сквозной Correlation-ID
+    transcribe_segments.delay(upload_id, correlation_id=cid)
+    diarize_full.delay(upload_id, correlation_id=cid)
 
-    return {"upload_id": upload_id}
+    # возвращаем Correlation-ID в заголовке
+    return Response(
+        content={"upload_id": upload_id},
+        headers={"X-Correlation-ID": cid}
+    )
 
 app.include_router(api_router, tags=["proxyAI"])
 app.mount("/static", StaticFiles(directory="static"), name="static")
