@@ -3,42 +3,38 @@ from pydantic import BaseSettings
 
 class Settings(BaseSettings):
     # Celery
-    CELERY_BROKER_URL: str
-    CELERY_RESULT_BACKEND: str
+    celery_broker_url: str
+    celery_result_backend: str
 
-    # FastAPI
-    API_WORKERS: int = 1
+    # API / workers
+    api_workers: int = 1
+    cpu_concurrency: int = 1
+    gpu_concurrency: int = 1
 
-    # Concurrency
-    CPU_CONCURRENCY: int = 1
-    GPU_CONCURRENCY: int = 1
+    # Paths
+    upload_folder: str = "/tmp/uploads"
+    results_folder: str = "/tmp/results"
+    whisper_model_path: str = "/hf_cache/models--guillaumekln--faster-whisper-medium"
+    diarizer_cache_dir: str = "/tmp/diarizer_cache"
 
-    # Whisper
-    WHISPER_MODEL_PATH: str = "/hf_cache/models--guillaumekln--faster-whisper-medium"
-    WHISPER_DEVICE: str = "cuda"
-    WHISPER_COMPUTE_TYPE: str = "int8"
+    # Whisper settings
+    whisper_device: str = "cuda"
+    whisper_compute_type: str = "int8"
 
-    # Pyannote
-    DIARIZER_CACHE_DIR: str = "/tmp/diarizer_cache"
+    # Segmentation / VAD
+    segment_length_s: int = 30
 
-    # VAD
-    VAD_AGGRESSIVENESS: int = 3
-    VAD_FRAME_MS: int = 30
-    VAD_PADDING_MS: int = 300
-
-    # Audio segmentation
-    SEGMENT_LENGTH_S: int = 30  # fallback
-
-    # Timezone
-    TIMEZONE: str = "UTC"
+    # Timezone for Celery
+    timezone: str = "UTC"
 
     # Flower auth
-    FLOWER_USER: str
-    FLOWER_PASS: str
+    flower_user: str = ""
+    flower_pass: str = ""
 
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"
+        case_sensitive = False
 
 
 settings = Settings()
