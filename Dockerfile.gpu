@@ -1,28 +1,26 @@
-# syntax=docker/dockerfile:1
-
+# Dockerfile.gpu
 FROM nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04
 
-# Компиляторы, pip и заголовки Python
+# Устанавливаем системные зависимости
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
-       python3.10 \
-       python3-pip \
-       build-essential \
-       python3-dev \
-    && rm -rf /var/lib/apt/lists/*
+ && apt-get install -y --no-install-recommends \
+      python3.10 python3-pip python3-dev build-essential ffmpeg \
+ && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-COPY requirements.txt .
-
-# Ставим PyTorch+torchaudio из NVIDIA index, без torchvision, чтобы избежать конфликтов:
+# Обновляем pip и ставим PyTorch из официального индекса NVIDIA
 RUN pip install --upgrade pip \
-    && pip install --no-cache-dir \
-         --index-url https://download.pytorch.org/whl/cu118 \
-         torch==2.1.0+cu118 \
-         torchaudio==2.1.0+cu118 \
-    && pip install --no-cache-dir -r requirements.txt
+ && pip install --no-cache-dir \
+      --index-url https://download.pytorch.org/whl/cu118 \
+      torch==2.0.1+cu118 torchvision==0.15.2+cu118 torchaudio==2.0.2+cu118
 
+# Ставим остальные зависимости
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Копируем проект
 COPY . .
 
-# Entrypoint и команда запуска задаются в docker-compose (celery worker)
+# По-умолчанию запускаем Celery-воркер
+CMD ["celery", "-A", "celery_app", "worker", "--loglevel=info", "--queues=preprocess_gpu"]
