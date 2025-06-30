@@ -1,24 +1,19 @@
 # syntax=docker/dockerfile:1
+
 FROM python:3.10-slim
 
-# Устанавливаем все системные зависимости для ffmpeg, webrtcvad, julius и т.п.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      build-essential \
-      gcc \
-      python3-dev \
-      ffmpeg \
+      build-essential gcc python3-dev ffmpeg \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Сначала ставим зависимости
 COPY requirements.txt .
 RUN pip install --upgrade pip \
  && pip install --no-cache-dir -r requirements.txt
 
-# Копируем весь код
 COPY . .
 
-# Для API
+# По умолчанию запускаем API
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
