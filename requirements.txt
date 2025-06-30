@@ -15,3 +15,4 @@ structlog>=22.1.0
 pydub>=0.25.1
 pyannote.audio>=2.2.1
 prometheus-client>=0.16.0
+ctranslate2[cuda]>=4.6.0
