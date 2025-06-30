@@ -1,8 +1,14 @@
+import logging
+from pathlib import Path
+
 from celery import Celery
 from celery.schedules import crontab
 from celery.signals import worker_process_init
 
 from config.settings import settings
+
+# чтобы логи warm-up не терялись
+logger = logging.getLogger("celery_app")
 
 celery_app = Celery(
     "proxyai",
@@ -39,8 +45,34 @@ celery_app.conf.beat_schedule = {
 }
 
 @worker_process_init.connect
-def preload_models(**kwargs):
-    # Предзагрузка моделей для сокращения latency первой задачи
+def preload_and_warmup(**kwargs):
+    # предзагрузка моделей
     from tasks import get_whisper, get_diarizer
-    get_whisper()
-    get_diarizer()
+    whisper = get_whisper()
+    diarizer = get_diarizer()
+
+    # warm-up на коротком sample.wav
+    sample = Path(__file__).parent / "tests" / "fixtures" / "sample.wav"
+    if sample.exists():
+        try:
+            logger.info("warmup: whisper.transcribe start", path=str(sample))
+            whisper.transcribe(
+                str(sample),
+                offset=0.0,
+                duration=2.0,
+                language="ru",
+                vad_filter=True,
+                word_timestamps=False
+            )
+            logger.info("warmup: whisper.transcribe done")
+        except Exception as e:
+            logger.warning("warmup: whisper failed", exc_info=e)
+
+        try:
+            logger.info("warmup: diarizer start", path=str(sample))
+            diarizer(str(sample))
+            logger.info("warmup: diarizer done")
+        except Exception as e:
+            logger.warning("warmup: diarizer failed", exc_info=e)
+    else:
+        logger.warning("warmup: sample.wav not found, skipping")

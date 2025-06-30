@@ -25,13 +25,12 @@ log = structlog.get_logger()
 for d in (settings.upload_folder, settings.results_folder, settings.diarizer_cache_dir):
     Path(d).mkdir(parents=True, exist_ok=True)
 
-# bump version
-app = FastAPI(title="proxyAI", version="13.7.4")
+app = FastAPI(title="proxyAI", version="13.7.6")
 
-# Host validation (only localhost and your frontend domains)
+# Host validation (keep localhost + origin list)
 app.add_middleware(
     TrustedHostMiddleware,
-    allowed_hosts=["127.0.0.1", "localhost"] + settings.allowed_origins  # add your production domains here
+    allowed_hosts=["127.0.0.1", "localhost"] + settings.allowed_origins
 )
 
 # CORS
