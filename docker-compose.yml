@@ -86,6 +86,7 @@ services:
 
   flower:
     image: mher/flower:0.9.7
+    entrypoint: ["celery"]
     env_file: .env
     ports:
       - "5555:5555"
