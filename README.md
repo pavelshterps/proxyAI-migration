@@ -319,10 +319,18 @@ diarizer(sample.wav)
 
 ---
 
-## Дальнейшие улучшения
 
-- Kubernetes / Helm  
-- HTTPS + Nginx  
-- AuthN/AuthZ (JWT, API-Key)  
-- Rate-limiting & WAF  
-- Grafana dashboards & Alertmanager  
+## Demo UI
+
+A full single-page demo lives in `static/index.html`. It allows you to:
+
+1. Enter your **X-API-Key** (get it via `POST /admin/users`).  
+2. Upload an audio file to `POST /upload/`.  
+3. Poll progress at `GET /status/{upload_id}`.  
+4. Fetch results at `GET /results/{upload_id}`, view segments with **time codes** and **play buttons**.  
+5. Edit speaker labels inline and save via `POST /labels/{upload_id}`.
+
+## Running tests
+
+```bash
+pytest tests/test_labels_status.py

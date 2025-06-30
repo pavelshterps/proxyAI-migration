@@ -2,19 +2,19 @@
 <html lang="ru">
 <head>
   <meta charset="UTF-8" />
-  <title>proxyAI 13.7.9 Demo</title>
+  <title>proxyAI 13.8.2 Demo</title>
   <style>
     body { font-family: sans-serif; margin: 2rem; }
     label, button { margin: .5rem 0; display: block; }
     #transcriptContainer { margin-top: 1rem; }
     .segment { border-bottom: 1px solid #ccc; padding: .5rem 0; }
-    .segment input { width: 200px; margin-left: .5rem; }
+    .segment input { width: 180px; margin-left: .5rem; }
     .segment button { margin-left: .5rem; }
     .time { color: #666; margin-right: .5rem; }
   </style>
 </head>
 <body>
-  <h1>proxyAI 13.7.9 Demo</h1>
+  <h1>proxyAI 13.8.2 Demo UI</h1>
 
   <label>
     Ваш API-Key:
@@ -25,9 +25,9 @@
     Аудио-файл:
     <input type="file" id="audioFile" accept="audio/*" />
   </label>
-  <button id="uploadBtn">Загрузить и начать обработку</button>
+  <button id="uploadBtn">Загрузить и начать</button>
 
-  <div id="status"></div>
+  <div id="status" style="margin-top:1rem;"></div>
   <button id="fetchResultsBtn" disabled>Получить результаты</button>
 
   <h2>Плеер</h2>
@@ -39,7 +39,7 @@
   <button id="saveLabelsBtn" disabled>Сохранить метки спикеров</button>
 
 <script>
-(function(){
+(async function(){
   const apiKeyEl = document.getElementById('apiKey');
   const fileEl = document.getElementById('audioFile');
   const uploadBtn = document.getElementById('uploadBtn');
@@ -49,147 +49,113 @@
   const container = document.getElementById('transcriptContainer');
   const saveBtn = document.getElementById('saveLabelsBtn');
 
-  let uploadId = null;
-  let fileBlob = null;
-  let mapping = {};
+  let uploadId, fileBlob, mapping = {};
 
-  uploadBtn.addEventListener('click', async () => {
+  uploadBtn.onclick = async () => {
     const key = apiKeyEl.value.trim();
     if(!key){ alert("Введите API-Key"); return; }
     const file = fileEl.files[0];
     if(!file){ alert("Выберите аудио файл"); return; }
     fileBlob = file;
-    statusEl.textContent = "Загружаем…";
+    statusEl.textContent = "Загружаем...";
     const fd = new FormData();
     fd.append("file", file, file.name);
 
     const res = await fetch("/upload/", {
-      method: "POST",
-      headers: { "X-API-Key": key },
+      method:"POST",
+      headers:{"X-API-Key": key},
       body: fd
     });
-    if(!res.ok){
-      alert("Ошибка загрузки: " + res.status);
-      return;
-    }
-    const j = await res.json();
-    uploadId = j.upload_id;
-    statusEl.textContent = `Загружено, upload_id=${uploadId}. Ждём…`;
+    if(!res.ok){ alert("Upload error: "+res.status); return; }
+    const { upload_id } = await res.json();
+    uploadId = upload_id;
+    statusEl.textContent = `upload_id=${uploadId}. Ожидаем...`;
 
-    // сразу инициализируем Redis-ключ прогресса
-    checkStatus();
+    // poll status
     const interval = setInterval(async ()=>{
-      const st = await checkStatus();
-      if(st === "done"){
+      const st = await (await fetch(`/status/${uploadId}`, {
+        headers:{"X-API-Key": key}
+      })).json();
+      statusEl.textContent = `Статус: ${st.status}, прогресс: ${st.progress}`;
+      if(st.status==="done"){
         clearInterval(interval);
         fetchBtn.disabled = false;
       }
-    }, 2000);
-  });
+    },2000);
+  };
 
-  async function checkStatus(){
+  fetchBtn.onclick = async () => {
     const key = apiKeyEl.value.trim();
-    const res = await fetch(`/status/${uploadId}`, {
-      headers: { "X-API-Key": key }
-    });
-    if(!res.ok){
-      statusEl.textContent = "Статус: ошибка " + res.status;
-      return;
-    }
-    const j = await res.json();
-    statusEl.textContent = `Статус: ${j.status}, progress: ${j.progress}`;
-    return j.status;
-  }
-
-  fetchBtn.addEventListener('click', async () => {
-    const key = apiKeyEl.value.trim();
-    statusEl.textContent = "Получаем результаты…";
+    statusEl.textContent = "Получаем результаты...";
     const res = await fetch(`/results/${uploadId}`, {
-      headers: { "X-API-Key": key }
+      headers:{"X-API-Key": key}
     });
-    if(!res.ok){
-      alert("Не удалось получить результаты: " + res.status);
-      return;
-    }
-    const { transcript, diarization } = await res.json();
-    statusEl.textContent = "Результаты загружены";
-    renderTranscript(transcript);
-    // загружаем локальный файл в <audio>
+    if(!res.ok){ alert("Error fetching results"); return; }
+    const { transcript } = await res.json();
+    statusEl.textContent = "Результаты получены";
     audioEl.src = URL.createObjectURL(fileBlob);
+    renderTranscript(transcript);
     saveBtn.disabled = false;
-  });
+  };
 
   function renderTranscript(list){
     container.innerHTML = "";
-    mapping = {};  // сброс маппинга
-    // собираем уникальных спикеров
-    const speakers = [...new Set(list.map(s=>s.speaker))];
-    // инициализируем mapping
-    speakers.forEach(s=> mapping[s] = s);
-    // рендер сегментов
-    list.forEach((seg,i) => {
-      const div = document.createElement('div');
+    mapping = {};
+    // init mapping
+    list.forEach(s=> mapping[s.speaker]=s.speaker);
+    list.forEach(seg=>{
+      const div = document.createElement("div");
       div.className = "segment";
-      const t = document.createElement('span');
+      const t = document.createElement("span");
       t.className = "time";
       t.textContent = seg.time || "--:--:--";
-      const txt = document.createElement('span');
-      txt.textContent = seg.text;
-      const btnPlay = document.createElement('button');
-      btnPlay.textContent = "▶️";
-      btnPlay.onclick = () => {
+      const btn = document.createElement("button");
+      btn.textContent = "▶️";
+      btn.onclick = () => {
         audioEl.currentTime = seg.start;
         audioEl.play();
-        setTimeout(()=>audioEl.pause(), (seg.end - seg.start)*1000 + 200);
+        setTimeout(()=>audioEl.pause(), (seg.end-seg.start)*1000+200);
       };
-      const input = document.createElement('input');
-      input.value = seg.speaker;
-      input.onchange = () => {
-        const newName = input.value.trim();
-        if(newName && newName.length<=50){
-          const old = seg.speaker;
-          mapping[old] = newName;
-          // обновить все input’ы на странице
-          document.querySelectorAll('.segment input').forEach(inp=>{
-            if(inp.value === old) inp.value = newName;
+      const inp = document.createElement("input");
+      inp.value = seg.speaker;
+      inp.onchange = () => {
+        const old = seg.speaker, neu = inp.value.trim();
+        if(neu && neu.length<=50){
+          mapping[old]=neu;
+          document.querySelectorAll('.segment input').forEach(i=>{
+            if(i.value===old) i.value = neu;
           });
         } else {
-          alert("Имя от 1 до 50 символов");
-          input.value = mapping[seg.speaker] || seg.speaker;
+          alert("Имя 1–50 символов");
+          inp.value = mapping[old];
         }
       };
-      div.append(t, btnPlay, input, txt);
+      const txt = document.createElement("span");
+      txt.textContent = seg.text;
       container.append(div);
+      div.append(t, btn, inp, txt);
     });
   }
 
-  saveBtn.addEventListener('click', async () => {
+  saveBtn.onclick = async () => {
     const key = apiKeyEl.value.trim();
-    // инфа для POST /labels
     const payload = {};
-    Object.entries(mapping).forEach(([oldName,newName])=>{
-      if(oldName!==newName) payload[oldName] = newName;
-    });
-    if(Object.keys(payload).length===0){
-      alert("Нет изменённых имён");
-      return;
-    }
+    Object.entries(mapping).forEach(([o,n])=>{ if(o!==n) payload[o]=n; });
+    if(!Object.keys(payload).length){ alert("Нет изменений"); return; }
     const res = await fetch(`/labels/${uploadId}`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
+      method:"POST",
+      headers:{
+        "Content-Type":"application/json",
         "X-API-Key": key
       },
       body: JSON.stringify(payload)
     });
     if(!res.ok){
-      const err = await res.json();
-      alert("Ошибка сохранения меток: " + JSON.stringify(err));
+      alert("Ошибка: "+(await res.json()).detail);
       return;
     }
     alert("Метки сохранены");
-  });
-
+  };
 })();
 </script>
 </body>
