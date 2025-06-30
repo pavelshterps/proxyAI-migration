@@ -107,7 +107,7 @@ services:
       - upload-data:/data
 
   flower:
-    image: mher/flower:latest
+    image: mher/flower:0.9.7
     container_name: proxyai-flower
     env_file: .env
     ports:
