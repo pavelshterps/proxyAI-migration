@@ -45,6 +45,8 @@ class Settings(BaseSettings):
     # Metrics exporter
     metrics_port: int = Field(8001, gt=0, env="METRICS_PORT")
 
+    admin_api_key: str = Field(..., env="ADMIN_API_KEY")
+
     # Database (SQLite for dev; override to PostgreSQL in prod)
     database_url: str = Field("sqlite+aiosqlite:///./app.db", env="DATABASE_URL")
 
