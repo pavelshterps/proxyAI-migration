@@ -1,3 +1,5 @@
+# proxyAI v13.6 – requirements.txt
+
 fastapi>=0.95.0
 uvicorn[standard]>=0.22.0
 celery>=5.5.3
@@ -8,11 +10,8 @@ pydantic<2.0,>=1.10
 transformers>=4.28.1
 faster-whisper==1.1.1
 ctranslate2>=4.6.0
-torch==2.0.1+cu118
-torchvision==0.15.2+cu118
-torchaudio==2.0.2+cu118
-structlog>=22.1.0
-pydub>=0.25.1
 pyannote.audio>=2.2.1
+pydub>=0.25.1
+structlog>=22.1.0
 prometheus-client>=0.16.0
-webrtcvad
+webrtcvad  # now builds OK thanks to build-essential in Dockerfiles

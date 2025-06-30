@@ -1,33 +1,35 @@
-import os
-from pathlib import Path
-from pydantic import BaseSettings
+# proxyAI v13.6 – config/settings.py
+
+from pydantic import BaseSettings, Field
+
 
 class Settings(BaseSettings):
-    # Upload / result paths
-    UPLOAD_FOLDER: str = os.getenv("UPLOAD_FOLDER", "/tmp/uploads")
-    RESULTS_FOLDER: str = os.getenv("RESULTS_FOLDER", "/tmp/results")
-
     # Celery
     CELERY_BROKER_URL: str
     CELERY_RESULT_BACKEND: str
 
-    # Concurrency
-    CPU_CONCURRENCY: int = int(os.getenv("CPU_CONCURRENCY", "1"))
-    GPU_CONCURRENCY: int = int(os.getenv("GPU_CONCURRENCY", "1"))
+    # Paths
+    UPLOAD_FOLDER: str = Field("/tmp/uploads", env="UPLOAD_FOLDER")
+    RESULTS_FOLDER: str = Field("/tmp/results", env="RESULTS_FOLDER")
+    DIARIZER_CACHE_DIR: str = Field("/tmp/diarizer_cache", env="DIARIZER_CACHE_DIR")
 
-    # Model cache
-    DIARIZER_CACHE_DIR: str = os.getenv("DIARIZER_CACHE_DIR", "/tmp/diarizer_cache")
-    WHISPER_MODEL_PATH: str = os.getenv("WHISPER_MODEL_PATH", "/hf_cache/models--guillaumekln--faster-whisper-medium")
-    WHISPER_DEVICE: str = os.getenv("WHISPER_DEVICE", "cuda")
-    WHISPER_COMPUTE_TYPE: str = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
-    SEGMENT_LENGTH_S: int = int(os.getenv("SEGMENT_LENGTH_S", "30"))
+    # Whisper
+    WHISPER_MODEL_PATH: str = Field("/hf_cache/models--guillaumekln--faster-whisper-medium", env="WHISPER_MODEL_PATH")
+    WHISPER_DEVICE: str = Field("cuda", env="WHISPER_DEVICE")
+    WHISPER_COMPUTE_TYPE: str = Field("int8", env="WHISPER_COMPUTE_TYPE")
 
-    # App settings
-    TIMEZONE: str = os.getenv("TIMEZONE", "UTC")
-    API_WORKERS: int = int(os.getenv("API_WORKERS", "1"))
+    # Segmentation
+    SEGMENT_LENGTH_S: int = Field(30, env="SEGMENT_LENGTH_S")
+
+    # API & Celery
+    API_WORKERS: int = Field(1, env="API_WORKERS")
+    CPU_CONCURRENCY: int = Field(1, env="CPU_CONCURRENCY")
+    GPU_CONCURRENCY: int = Field(1, env="GPU_CONCURRENCY")
+    TIMEZONE: str = Field("UTC", env="TIMEZONE")
 
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"
+
 
 settings = Settings()
