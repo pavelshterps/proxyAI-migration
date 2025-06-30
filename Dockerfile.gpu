@@ -1,16 +1,21 @@
+# syntax=docker/dockerfile:1
+
 FROM nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04
 
+# Компиляторы, pip и заголовки Python
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-       python3.10 python3-pip build-essential \
+       python3.10 \
+       python3-pip \
+       build-essential \
+       python3-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
 COPY requirements.txt .
 
-# Сначала ставим «чистый» PyTorch+torchaudio под CU118,
-# без torchvision — чтобы не лезть в конфликты версий.
+# Ставим PyTorch+torchaudio из NVIDIA index, без torchvision, чтобы избежать конфликтов:
 RUN pip install --upgrade pip \
     && pip install --no-cache-dir \
          --index-url https://download.pytorch.org/whl/cu118 \
@@ -19,4 +24,5 @@ RUN pip install --upgrade pip \
     && pip install --no-cache-dir -r requirements.txt
 
 COPY . .
-# Точка входа ― в docker-compose командой celery
+
+# Entrypoint и команда запуска задаются в docker-compose (celery worker)
