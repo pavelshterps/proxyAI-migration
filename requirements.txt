@@ -8,6 +8,13 @@ pydantic<2.0,>=1.10
 transformers>=4.28.1
 faster-whisper==1.1.1
 ctranslate2>=4.6.0
-pyannote.audio>=2.2.0
+
+# Speaker diarization
+pyannote.audio>=2.1.1
+
+# Audio segmentation (VAD)
+webrtcvad>=2.0.10
 pydub>=0.25.1
-webrtcvad>=2.0.10   # ставится в CPU-образе, теперь gcc есть
+
+# Prometheus metrics
+prometheus_client>=0.16.0

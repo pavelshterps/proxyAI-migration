@@ -1,31 +1,30 @@
 # syntax=docker/dockerfile:1
 
+########################################
+# GPU worker image: faster-whisper only #
+########################################
 FROM nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04
 
-# Устанавливаем Python, pip, ffmpeg и сборочное окружение
+# Install python & dependencies
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      python3.10 \
-      python3-pip \
-      build-essential \
-      gcc \
-      python3-dev \
-      ffmpeg \
+      python3.10 python3-pip ffmpeg \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
+# Copy only requirements first (leverages layer cache)
 COPY requirements.txt .
 
-# Сначала подтягиваем torch из NVIDIA-индекса, затем всё остальное
+# Upgrade pip, install faster-whisper[cuda] and CTranslate2, then the rest
 RUN pip install --upgrade pip \
  && pip install --no-cache-dir \
-      --index-url https://download.pytorch.org/whl/cu118 \
-      torch==2.0.1+cu118 \
-      torchvision==0.15.2+cu118 \
-      torchaudio==2.0.2+cu118 \
+      faster-whisper[cuda] \
+      ctranslate2 \
  && pip install --no-cache-dir -r requirements.txt
 
+# Copy application code
 COPY . .
 
-# GPU-воркер будет задавать свою команду в docker-compose.yml
+# Start a single‐queue Celery worker for GPU preprocessing
+CMD ["celery", "-A", "celery_app", "worker", "--loglevel=info", "--concurrency=${GPU_CONCURRENCY}", "--hostname=gpu-worker", "--queues=preprocess_gpu"]
