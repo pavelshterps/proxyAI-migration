@@ -7,26 +7,22 @@ services:
       dockerfile: Dockerfile
     container_name: proxyai-api
     env_file: .env
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:${FASTAPI_PORT}/health"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
     volumes:
       - upload-data:/tmp/uploads
       - results-data:/tmp/results
     depends_on:
-      redis:
-        condition: service_healthy
-      tusd:
-        condition: service_started
+      - redis
+      - tusd
     ports:
-      - "${FASTAPI_PORT}:${FASTAPI_PORT}"
+      - "${API_PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:${API_PORT:-8000}/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
     command: >
-      uvicorn main:app
-        --host 0.0.0.0
-        --port ${FASTAPI_PORT}
-        --workers ${API_WORKERS}
+      uvicorn main:app --host 0.0.0.0 --port ${API_PORT:-8000} --workers ${API_WORKERS}
 
   cpu-worker:
     build:
@@ -39,8 +35,8 @@ services:
       - results-data:/tmp/results
       - diarizer-cache:/tmp/diarizer_cache
     depends_on:
-      redis:
-        condition: service_healthy
+      - redis
+    restart: unless-stopped
     command: >
       celery -A celery_app worker
         --loglevel=info
@@ -60,9 +56,9 @@ services:
       - /path/to/hf_cache_host:/hf_cache:rw
       - ctranslate2-cache:/root/.cache/ctranslate2
     depends_on:
-      redis:
-        condition: service_healthy
+      - redis
     runtime: nvidia
+    restart: unless-stopped
     command: >
       celery -A celery_app worker
         --loglevel=info
@@ -74,14 +70,13 @@ services:
     image: mher/flower:latest
     container_name: proxyai-flower
     env_file: .env
-    depends_on:
-      redis:
-        condition: service_healthy
     ports:
-      - "5555:5555"
+      - "${FLOWER_PORT:-5555}:5555"
+    depends_on:
+      - redis
+    restart: unless-stopped
     command: >
       celery -A celery_app flower
-        --port=5555
         --basic_auth=${FLOWER_USER}:${FLOWER_PASS}
 
   redis:
@@ -93,9 +88,10 @@ services:
       - "6379:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
-      interval: 30s
+      interval: 10s
       timeout: 5s
-      retries: 3
+      retries: 5
+    restart: unless-stopped
 
   tusd:
     image: tusproject/tusd:latest
@@ -108,6 +104,11 @@ services:
       - --host=0.0.0.0
       - --port=1080
       - --dir=/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:1080/files"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
     volumes:
       - upload-data:/data
 
