@@ -8,7 +8,7 @@ celery_app = Celery(
     "proxyai",
     broker=settings.celery_broker_url,
     backend=settings.celery_result_backend,
-    include=["tasks"]
+    include=["tasks"],
 )
 
 celery_app.conf.update(
@@ -22,6 +22,7 @@ celery_app.conf.update(
     task_soft_time_limit=550,
     task_acks_late=True,
     task_reject_on_worker_lost=True,
+    worker_prefetch_multiplier=1,
 )
 
 celery_app.conf.task_routes = {
@@ -39,6 +40,7 @@ celery_app.conf.beat_schedule = {
 
 @worker_process_init.connect
 def preload_models(**kwargs):
+    # Предзагрузка моделей для сокращения latency первой задачи
     from tasks import get_whisper, get_diarizer
     get_whisper()
     get_diarizer()

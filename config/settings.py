@@ -1,6 +1,7 @@
-from typing import List
 from functools import lru_cache
-from pydantic import BaseSettings, Field, validator
+
+from pydantic import Field, field_validator
+from pydantic_settings import BaseSettings
 
 class Settings(BaseSettings):
     # Celery
@@ -18,8 +19,11 @@ class Settings(BaseSettings):
     results_folder: str = Field("/data/results", env="RESULTS_FOLDER")
     diarizer_cache_dir: str = Field("/data/diarizer_cache", env="DIARIZER_CACHE_DIR")
 
-    # Models
-    whisper_model_path: str = Field(str = Field("/hf_cache/models--guillaumekln--faster-whisper-medium", env="WHISPER_MODEL_PATH")
+    # Models (quantized faster-whisper-medium by default)
+    whisper_model_path: str = Field(
+        "/hf_cache/models--guillaumekln--faster-whisper-medium",
+        env="WHISPER_MODEL_PATH"
+    )
     whisper_device: str = Field("cuda", env="WHISPER_DEVICE")
     whisper_compute_type: str = Field("int8", env="WHISPER_COMPUTE_TYPE")
     pyannote_protocol: str = Field(..., env="PYANNOTE_PROTOCOL")
@@ -37,16 +41,19 @@ class Settings(BaseSettings):
     tus_endpoint: str = Field(..., env="TUS_ENDPOINT")
 
     # Frontend / CORS
-    allowed_origins: List[str] = Field(["*"], env="ALLOWED_ORIGINS")
+    allowed_origins: list[str] = Field(["*"], env="ALLOWED_ORIGINS")
 
     # Metrics exporter
     metrics_port: int = Field(8001, gt=0, env="METRICS_PORT")
 
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
+    model_config = {
+        "env_file": ".env",
+        "env_file_encoding": "utf-8",
+        "extra": "ignore",
+    }
 
-    @validator("allowed_origins", pre=True)
+    @field_validator("allowed_origins", mode="before")
+    @classmethod
     def split_origins(cls, v):
         if isinstance(v, str):
             return [o.strip() for o in v.split(",")]
