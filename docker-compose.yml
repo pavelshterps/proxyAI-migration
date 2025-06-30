@@ -7,8 +7,12 @@ services:
       dockerfile: Dockerfile
     container_name: proxyai-api
     restart: unless-stopped
-    env_file:
-      - .env
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:${FASTAPI_PORT}/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    env_file: .env
     volumes:
       - upload-data:/tmp/uploads
       - results-data:/tmp/results
@@ -16,14 +20,12 @@ services:
       - redis
       - tusd
     ports:
-      - "8000:8000"
+      - "${FASTAPI_PORT}:${FASTAPI_PORT}"
     command: >
-      sh -c "uvicorn main:app --host 0.0.0.0 --port 8000 --workers ${API_WORKERS}"
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
+      uvicorn main:app
+      --host ${FASTAPI_HOST}
+      --port ${FASTAPI_PORT}
+      --workers ${api_workers}
 
   cpu-worker:
     build:
@@ -31,25 +33,25 @@ services:
       dockerfile: Dockerfile
     container_name: proxyai-cpu-worker
     restart: unless-stopped
-    env_file:
-      - .env
+    healthcheck:
+      test: ["CMD", "celery", "-A", "celery_app", "status"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    env_file: .env
     volumes:
       - upload-data:/tmp/uploads
       - results-data:/tmp/results
       - diarizer-cache:/tmp/diarizer_cache
     depends_on:
       - redis
+    network_mode: internal_net
     command: >
       celery -A celery_app worker
       --loglevel=info
-      --concurrency=${CPU_CONCURRENCY}
+      --concurrency=${cpu_concurrency}
       --hostname=cpu-worker
       --queues=preprocess_cpu
-    healthcheck:
-      test: ["CMD", "celery", "-A", "celery_app", "status"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
 
   gpu-worker:
     build:
@@ -57,49 +59,63 @@ services:
       dockerfile: Dockerfile.gpu
     container_name: proxyai-gpu-worker
     restart: unless-stopped
-    env_file:
-      - .env
+    healthcheck:
+      test: ["CMD", "celery", "-A", "celery_app", "status"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    env_file: .env
     volumes:
       - upload-data:/tmp/uploads
       - results-data:/tmp/results
-      # Бинд-маунт с кавычками, чтобы YAML не путался с двоеточиями
-      - "/path/to/hf_cache_host:/hf_cache:rw"
+      - /path/to/hf_cache_host:/hf_cache:rw
       - ctranslate2-cache:/root/.cache/ctranslate2
     depends_on:
       - redis
     runtime: nvidia
+    network_mode: internal_net
     command: >
       celery -A celery_app worker
       --loglevel=info
-      --concurrency=${GPU_CONCURRENCY}
+      --concurrency=${gpu_concurrency}
       --hostname=gpu-worker
       --queues=preprocess_gpu
-    healthcheck:
-      test: ["CMD", "nvidia-smi"]
-      interval: 60s
-      timeout: 15s
-      retries: 2
+
+  flower:
+    image: mher/flower
+    container_name: proxyai-flower
+    restart: unless-stopped
+    ports:
+      - "5555:5555"
+    environment:
+      - FLOWER_PORT=5555
+      - FLOWER_BASIC_AUTH=user:pass
+      - CELERY_BROKER_API=redis://redis:6379/0
 
   redis:
     image: redis:7-alpine
     container_name: proxyai-redis
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
     volumes:
       - redis-data:/data
     ports:
       - "6379:6379"
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
+    network_mode: internal_net
 
   tusd:
     image: tusproject/tusd:latest
     container_name: proxyai-tusd
     restart: unless-stopped
-    ports:
-      - "1080:1080"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:1080/files/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
     command:
       - tusd
       - --host=0.0.0.0
@@ -107,11 +123,12 @@ services:
       - --dir=/data
     volumes:
       - upload-data:/data
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:1080/files/"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
+    network_mode: internal_net
+
+networks:
+  internal_net:
+    driver: bridge
+    internal: true
 
 volumes:
   upload-data:

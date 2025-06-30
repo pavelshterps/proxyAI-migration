@@ -1,15 +1,15 @@
-import structlog
+# celery_app.py
+import logging
 from celery import Celery
 from config.settings import settings
 
 # Structured logging
+import structlog
 structlog.configure(
     processors=[
-        structlog.processors.TimeStamper(fmt="iso"),
         structlog.processors.JSONRenderer()
-    ]
+    ],
 )
-
 logger = structlog.get_logger()
 
 celery_app = Celery(
@@ -19,13 +19,13 @@ celery_app = Celery(
     include=["tasks"],
 )
 
-# Route tasks to dedicated queues
+# Task routing
 celery_app.conf.task_routes = {
     "tasks.diarize_full": {"queue": "preprocess_cpu"},
     "tasks.transcribe_segments": {"queue": "preprocess_gpu"},
 }
 
-# Serialization, timeouts, concurrency
+# Serialization, timeouts, limits
 celery_app.conf.update(
     task_serializer="json",
     result_serializer="json",
@@ -38,4 +38,5 @@ celery_app.conf.update(
 )
 
 if __name__ == "__main__":
+    logger.info("Starting Celery")
     celery_app.start()
