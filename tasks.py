@@ -1,129 +1,189 @@
+# tasks.py
+
 import os
 import json
-from celery import Celery, signals
+import logging
+from celery import signals
 from celery.utils.log import get_task_logger
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
 from faster_whisper import WhisperModel
 from pyannote.audio import Pipeline as DiarizationPipeline
+
 from config.settings import settings
 from crud import update_upload_status
 
 logger = get_task_logger(__name__)
-app = Celery("proxyai")
-app.config_from_object("config.celery")
 
-# Асинхронный движок и фабрика сессий
+# ---------- SQLAlchemy setup ----------
 engine = create_async_engine(settings.DATABASE_URL, echo=False, future=True)
-AsyncSessionLocal = sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
+AsyncSessionLocal = sessionmaker(
+    engine, expire_on_commit=False, class_=AsyncSession
+)
 
-_whisper_model: WhisperModel | None = None
+# ---------- Model handles ----------
+_whisper: WhisperModel | None = None
 _diarizer: DiarizationPipeline | None = None
 
 @signals.worker_process_init.connect
 def preload_and_warmup(**kwargs):
-    """При старте каждого worker’а:
-       1) грузим пайплайн диаризации на CPU
-       2) грузим quantized-Whisper на GPU из локального кэша (/hf_cache)"""
-    global _diarizer, _whisper_model
+    """
+    Предзагрузка моделей при старте Celery-воркера.
+    Диаризация идет на CPU, транскрипция на GPU через очередь.
+    """
+    global _whisper, _diarizer
 
-    # 1) DiarizationPipeline
+    # --- 1) Диаризация на CPU ---
     try:
-        _diarizer = DiarizationPipeline.from_pretrained(settings.PYANNOTE_PIPELINE)
+        _diarizer = DiarizationPipeline.from_pretrained(
+            settings.PYANNOTE_PIPELINE,
+            use_auth_token=settings.HUGGINGFACE_TOKEN
+        )
         logger.info(f"Diarizer loaded: {settings.PYANNOTE_PIPELINE}")
     except Exception as e:
-        logger.error(f"Cannot load diarization pipeline: {e}")
+        logger.error(f"Failed to load diarization pipeline `{settings.PYANNOTE_PIPELINE}`: {e}")
         raise
 
-    # 2) WhisperModel — используем уже скачанный quantized-модельный каталог
-    model_path = settings.WHISPER_MODEL_PATH
+    # --- 2) Whisper на GPU, локальный quantized model path ---
+    model_path = settings.WHISPER_MODEL_PATH  # ожидаем здесь уже готовый квантизированный каталог
     whisper_kwargs = {
         "device": settings.WHISPER_DEVICE,
         "compute_type": settings.WHISPER_COMPUTE_TYPE,
-        "batch_size": settings.WHISPER_BATCH_SIZE
+        # ctranslate2 Whiper не поддерживает batch_size и cache_dir в конструкторе
     }
-    if settings.HUGGINGFACE_CACHE_DIR:
-        whisper_kwargs["cache_dir"] = settings.HUGGINGFACE_CACHE_DIR
 
     try:
-        _whisper_model = WhisperModel(model_path, **whisper_kwargs)
-        logger.info(f"Whisper model loaded from local path: {model_path}")
+        _whisper = WhisperModel(model_path, **whisper_kwargs)
+        logger.info(f"Whisper model loaded from `{model_path}`")
     except Exception as e:
-        logger.error(f"Cannot load Whisper model: {e}")
+        logger.error(f"Cannot load Whisper model from `{model_path}`: {e}")
         raise
 
+def get_whisper() -> WhisperModel:
+    """Возвращает предзагруженную WhisperModel."""
+    if _whisper is None:
+        preload_and_warmup()
+    return _whisper
+
+def get_diarizer() -> DiarizationPipeline:
+    """Возвращает предзагруженный DiarizationPipeline."""
+    if _diarizer is None:
+        preload_and_warmup()
+    return _diarizer
+
+# ---------- Основная цепочка задач ----------
 @app.task(
     bind=True,
-    name="process_audio",
+    name="diarize_full",
     acks_late=True,
     autoretry_for=(Exception,),
     retry_backoff=True,
     retry_kwargs={"max_retries": 3},
 )
-async def process_audio(self, upload_id: str, file_path: str):
-    """Полный конвейер: диаризация → нарезка сегментов → транскрипция → JSON → статус"""
-    db: AsyncSession = AsyncSessionLocal()
+async def diarize_full(self, upload_id: int, file_path: str):
+    """
+    1) Диаризация CAП файла → выдаёт список сегментов с {start, end, speaker}.
+    2) Сразу же пушит transcribe_segments в GPU-очередь.
+    """
+    session = AsyncSessionLocal()
     try:
-        # отметим начало обработки
-        await update_upload_status(db, upload_id, "processing")
+        await update_upload_status(session, upload_id, "processing")
+        diarizer = get_diarizer()
+        diarization = diarizer({"uri": file_path, "audio": file_path})
 
-        # 1) Диаризация
-        diar = _diarizer({"uri": file_path, "audio": file_path})
-        segments = []
-        for turn, _, speaker in diar.itertracks(yield_label=True):
+        segments: list[dict] = []
+        for turn, _, speaker in diarization.itertracks(yield_label=True):
             segments.append({
                 "start": turn.start,
                 "end": turn.end,
-                "speaker": speaker
+                "speaker": speaker  # e.g. "SPEAKER_00"
             })
 
-        # 2) Транскрипция каждого сегмента
-        transcripts = []
-        for seg in segments:
-            whisper_res = _whisper_model.transcribe(
-                file_path,
-                language=settings.WHISPER_LANGUAGE,
-                word_timestamps=True,
-                segments=[(seg["start"], seg["end"])]
-            )
-            # faster-whisper возвращает список сегментов
-            words = []
-            text = ""
-            for part in whisper_res:
-                text += part.text + " "
-                words.extend(getattr(part, "words", []))
-            transcripts.append({
-                "start": seg["start"],
-                "end": seg["end"],
-                "speaker": seg["speaker"],
-                "text": text.strip(),
-                "words": words
-            })
-
-        # 3) Сохраняем в JSON
-        os.makedirs(settings.RESULTS_FOLDER, exist_ok=True)
-        output_path = os.path.join(settings.RESULTS_FOLDER, f"{upload_id}.json")
-        with open(output_path, "w", encoding="utf-8") as f:
-            json.dump(transcripts, f, ensure_ascii=False, indent=2)
-
-        # 4) Финальный статус + очистка исходников
-        await update_upload_status(db, upload_id, "completed")
-        cleanup_files(file_path)
+        # передаём на транскрипцию
+        from celery_app import celery_app
+        celery_app.send_task(
+            "transcribe_segments",
+            args=(upload_id, file_path, segments),
+            queue="preprocess_gpu"
+        )
 
     except Exception as e:
-        logger.exception(f"Error processing upload {upload_id}: {e}")
-        await update_upload_status(db, upload_id, "failed")
+        logger.exception(f"Error in diarize_full (upload_id={upload_id}): {e}")
+        await update_upload_status(session, upload_id, "failed")
         raise
     finally:
-        await db.close()
+        await session.close()
+
+@app.task(
+    bind=True,
+    name="transcribe_segments",
+    acks_late=True,
+    autoretry_for=(Exception,),
+    retry_backoff=True,
+    retry_kwargs={"max_retries": 3},
+)
+async def transcribe_segments(self, upload_id: int, file_path: str, segments: list[dict]):
+    """
+    GPU-транскрипция сегментов, запись JSON и чистка.
+    """
+    session = AsyncSessionLocal()
+    try:
+        whisper = get_whisper()
+        results: list[dict] = []
+
+        for seg in segments:
+            transcription = whisper.transcribe(
+                file_path,
+                language=settings.WHISPER_LANGUAGE,
+                word_timestamps=False,
+                segment=seg,
+                batch_size=settings.WHISPER_BATCH_SIZE
+            )
+            text = " ".join([s.text for s in transcription])
+            results.append({**seg, "text": text})
+
+        # сохраняем в JSON рядом с оригиналом
+        json_path = f"{file_path}.json"
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(results, f, ensure_ascii=False, indent=2)
+
+        await update_upload_status(session, upload_id, "completed")
+        cleanup_files(file_path, json_path)
+
+    except Exception as e:
+        logger.exception(f"Error in transcribe_segments (upload_id={upload_id}): {e}")
+        await update_upload_status(session, upload_id, "failed")
+        raise
+    finally:
+        await session.close()
+
+# ---------- Утилиты ----------
+@app.task(name="cleanup_old_files")
+def cleanup_old_files():
+    """
+    Удаляет файлы старше FILE_RETENTION_DAYS в UPLOAD_FOLDER и RESULTS_FOLDER.
+    """
+    now = int(time.time())
+    cutoff = now - settings.FILE_RETENTION_DAYS * 24 * 3600
+
+    for dir_path in (settings.UPLOAD_FOLDER, settings.RESULTS_FOLDER):
+        for root, _, files in os.walk(dir_path):
+            for fn in files:
+                full = os.path.join(root, fn)
+                if os.path.getmtime(full) < cutoff:
+                    try:
+                        os.remove(full)
+                        logger.info(f"Removed old file {full}")
+                    except Exception:
+                        logger.warning(f"Failed to remove {full}", exc_info=True)
 
 def cleanup_files(*paths: str):
-    """Безопасно удаляем файлы после обработки"""
+    """Мгновенная чистка конкретных файлов (оригинал + JSON)."""
     for p in paths:
         try:
             os.remove(p)
-            logger.info(f"Deleted file: {p}")
+            logger.info(f"Deleted file {p}")
         except FileNotFoundError:
             logger.warning(f"File not found for deletion: {p}")
         except Exception as e:
-            logger.warning(f"Could not delete {p}: {e}")
+            logger.warning(f"Failed to delete {p}: {e}")
