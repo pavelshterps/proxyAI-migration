@@ -26,7 +26,7 @@ class Settings(BaseSettings):
     WHISPER_DEVICE: str = Field(..., env="WHISPER_DEVICE")
     WHISPER_COMPUTE_TYPE: str = Field(..., env="WHISPER_COMPUTE_TYPE")
     WHISPER_BATCH_SIZE: int = Field(1, env="WHISPER_BATCH_SIZE")
-    WHISPER_LANGUAGE: str = Field("en", env="WHISPER_LANGUAGE")
+    WHISPER_LANGUAGE: Optional[str] = Field("en", env="WHISPER_LANGUAGE")
 
     # Куда faster-whisper / huggingface_hub будет кэшировать модели (по-умолчанию берётся локальный путь)
     HUGGINGFACE_CACHE_DIR: Optional[str] = Field(None, env="HUGGINGFACE_CACHE_DIR")

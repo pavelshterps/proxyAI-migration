@@ -1,3 +1,5 @@
+# crud.py
+
 from sqlalchemy.future import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from models import User, Upload
@@ -25,26 +27,27 @@ async def list_users(db: AsyncSession) -> list[User]:
     result = await db.execute(select(User))
     return result.scalars().all()
 
-async def create_upload_record(db: AsyncSession, user_id: int, upload_id: str) -> Upload:
-    upload = Upload(user_id=user_id, upload_id=upload_id)
+async def create_upload_record(db: AsyncSession, user_id: int, upload_uuid: str) -> Upload:
+    upload = Upload(user_id=user_id, upload_id=upload_uuid)
     db.add(upload)
     await db.commit()
     await db.refresh(upload)
     return upload
 
-async def get_upload_for_user(db: AsyncSession, user_id: int, upload_id: str) -> Upload | None:
+async def get_upload_for_user(db: AsyncSession, user_id: int, upload_uuid: str) -> Upload | None:
     result = await db.execute(
         select(Upload).where(
             Upload.user_id == user_id,
-            Upload.upload_id == upload_id
+            Upload.upload_id == upload_uuid
         )
     )
     return result.scalars().first()
 
-async def update_upload_status(db: AsyncSession, upload_id: str, status: str) -> None:
-    """Меняем статус обработки (queued → processing → completed/failed)"""
-    result = await db.execute(select(Upload).where(Upload.upload_id == upload_id))
-    upload = result.scalars().first()
+async def update_upload_status(db: AsyncSession, upload_pk: int, status: str) -> None:
+    """
+    Меняем статус обработки по primary key (id).
+    """
+    upload = await db.get(Upload, upload_pk)
     if upload:
         upload.status = status
         await db.commit()
