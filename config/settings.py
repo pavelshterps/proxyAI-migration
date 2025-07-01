@@ -36,32 +36,17 @@ class Settings(BaseSettings):
 
     TUS_ENDPOINT: str = Field(...)
 
-    ALLOWED_ORIGINS: List[str] = Field(['*'])
+    ALLOWED_ORIGINS: str = Field('["*"]', env="ALLOWED_ORIGINS")
 
     FLOWER_USER: Optional[str] = Field(None)
     FLOWER_PASS: Optional[str] = Field(None)
 
-    @validator('ALLOWED_ORIGINS', pre=True)
-    def parse_origins(cls, v):
-        if isinstance(v, str):
-            # JSON format or comma-separated
-            v = v.strip()
-            if v.startswith('['):
-                try:
-                    import json
-                    return json.loads(v)
-                except:
-                    pass
-            return [i.strip() for i in v.split(',') if i.strip()]
-        return v
-
-    @validator('ALLOWED_ORIGINS', each_item=True)
-    def validate_origin(cls, v):
-        if v == '*':
-            return v
-        parsed = urlparse(v)
-        if not parsed.scheme or not parsed.netloc:
-            raise ValueError(f"Invalid origin URL: {v}")
-        return v
+    @property
+    def ALLOWED_ORIGINS_LIST(self) -> List[str]:
+        import json
+        try:
+            return json.loads(self.ALLOWED_ORIGINS)
+        except Exception:
+            return [o.strip() for o in self.ALLOWED_ORIGINS.split(",") if o.strip()]
 
 settings = Settings()

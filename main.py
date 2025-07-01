@@ -6,7 +6,7 @@ import structlog
 import redis.asyncio as redis_async
 from fastapi import (
     FastAPI, UploadFile, File, HTTPException, Response, Header,
-    Depends, WebSocket, status, Request
+    Depends, WebSocket, status
 )
 import asyncio
 from sqlalchemy.ext.asyncio import AsyncEngine
@@ -20,7 +20,7 @@ from slowapi.middleware import SlowAPIMiddleware
 from slowapi.util import get_remote_address
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from config.settings import SETTINGS
+from config.settings import settings
 from database import get_db, engine
 from crud import (
     get_user_by_api_key,
@@ -37,7 +37,6 @@ async def init_models(async_engine: AsyncEngine):
     async with async_engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
-# structlog
 structlog.configure(
     processors=[
         structlog.processors.add_log_level,
@@ -47,18 +46,16 @@ structlog.configure(
 )
 log = structlog.get_logger()
 
-# rate limiter
 limiter = Limiter(key_func=get_remote_address)
 
-app = FastAPI(title="proxyAI", version="13.7.9")
+app = FastAPI(title="proxyAI", version="13.8.5.1")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.ALLOWED_ORIGINS,
+    allow_origins=settings.ALLOWED_ORIGINS_LIST,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 app.include_router(api_router)
 app.include_router(admin_router)
 app.state.limiter = limiter
@@ -78,20 +75,18 @@ for d in (
 ):
     Path(d).mkdir(parents=True, exist_ok=True)
 
-# Host validation & CORS
 app.add_middleware(
     TrustedHostMiddleware,
-    allowed_hosts=["127.0.0.1", "localhost"] + settings.ALLOWED_ORIGINS
+    allowed_hosts=["127.0.0.1", "localhost"] + settings.ALLOWED_ORIGINS_LIST
 )
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.ALLOWED_ORIGINS,
+    allow_origins=settings.ALLOWED_ORIGINS_LIST,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# HTTP metrics
 HTTP_REQ_COUNT = Counter("http_requests_total", "Total HTTP requests", ["method", "path"])
 HTTP_REQ_LATENCY = Histogram("http_request_duration_seconds", "HTTP request latency", ["path"])
 
@@ -109,16 +104,16 @@ async def metrics_middleware(request, call_next):
 
 @app.get("/health")
 @limiter.limit("30/minute")
-async def health(request: Request):
+async def health(request):
     return {"status": "ok", "version": app.version}
 
 @app.get("/ready")
-async def ready(request: Request):
+async def ready():
     return {"status": "ready", "version": app.version}
 
 @app.get("/metrics")
 @limiter.limit("10/minute")
-async def metrics(request: Request):
+async def metrics(request):
     data = generate_latest()
     return Response(content=data, media_type=CONTENT_TYPE_LATEST)
 
@@ -128,12 +123,10 @@ async def metrics(request: Request):
     responses={401: {"description": "Invalid X-API-Key"}, 404: {"description": "Not found"}}
 )
 async def get_status(
-    request: Request,
     upload_id: str,
     current_user=Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    # ownership check
     rec = await get_upload_for_user(db, current_user.id, upload_id)
     if not rec:
         raise HTTPException(status_code=404, detail="upload_id not found")
@@ -146,7 +139,6 @@ async def get_status(
         uploaded = (Path(settings.UPLOAD_FOLDER) / upload_id).exists()
         status_str = "processing" if uploaded else "queued"
 
-    # read last progress from Redis (set by upload + tasks)
     progress = await redis.get(f"progress:{upload_id}") or "0%"
     return {"status": status_str, "progress": progress}
 
@@ -157,7 +149,6 @@ async def get_status(
 )
 @limiter.limit("10/minute")
 async def upload(
-    request: Request,
     file: UploadFile = File(...),
     x_correlation_id: str | None = Header(None),
     current_user=Depends(get_current_user),
@@ -175,7 +166,6 @@ async def upload(
     dest = Path(settings.UPLOAD_FOLDER) / upload_id
     dest.write_bytes(data)
 
-    # record ownership
     await create_upload_record(db, current_user.id, upload_id)
 
     log.bind(
@@ -188,7 +178,6 @@ async def upload(
     transcribe_segments.delay(upload_id, correlation_id=cid)
     diarize_full.delay(upload_id, correlation_id=cid)
 
-    # publish initial progress
     await redis.publish(f"progress:{upload_id}", "0%")
     await redis.set(f"progress:{upload_id}", "0%")
 
