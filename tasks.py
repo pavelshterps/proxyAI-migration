@@ -41,7 +41,7 @@ def get_whisper() -> WhisperModel:
     """
     global _whisper
     if _whisper is None:
-        model_id = settings.WHISPER_MODEL  # например "guillaumekln/faster-whisper-medium"
+        model_id = settings.WHISPER_MODEL_PATH  # например "guillaumekln/faster-whisper-medium"
         init_kwargs: dict[str, str] = {
             "device": settings.WHISPER_DEVICE,
         }
