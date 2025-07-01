@@ -35,14 +35,10 @@ _diarizer = None
 
 
 def get_whisper():
-    """
-    Ленивая инициализация WhisperModel.
-    Используем local_files_only=True, чтобы точно не пытаться скачать модель из HF,
-    и кешируем в settings.HUGGINGFACE_CACHE_DIR, если он указан.
-    """
     global _whisper
     if _whisper is None:
         logger.info("loading whisper model", path=settings.WHISPER_MODEL_PATH)
+        # Формируем аргументы динамически, чтобы добавить cache_dir только при его наличии
         init_kwargs = {
             "model_size_or_path": settings.WHISPER_MODEL_PATH,
             "device": settings.WHISPER_DEVICE,
@@ -50,7 +46,6 @@ def get_whisper():
             "batch_size": settings.WHISPER_BATCH_SIZE,
             "local_files_only": True,
         }
-        # Если задан свой каталог кеша HF — используем его
         if settings.HUGGINGFACE_CACHE_DIR:
             init_kwargs["cache_dir"] = settings.HUGGINGFACE_CACHE_DIR
 
@@ -60,10 +55,6 @@ def get_whisper():
 
 
 def get_diarizer():
-    """
-    Ленивая инициализация Pyannote Pipeline.
-    Кешируется в settings.DIARIZER_CACHE_DIR.
-    """
     global _diarizer
     if _diarizer is None:
         cache = Path(settings.DIARIZER_CACHE_DIR)
@@ -83,10 +74,6 @@ def get_diarizer():
 
 
 def vad_segments(audio_path: Path):
-    """
-    Разбиваем файл на фрагменты речи через webrtcVAD,
-    иначе — на фиксированные окна settings.SEGMENT_LENGTH_S.
-    """
     start = perf_counter()
     try:
         audio = AudioSegment.from_file(str(audio_path)).set_channels(1).set_frame_rate(16000)
@@ -94,10 +81,9 @@ def vad_segments(audio_path: Path):
         vad = webrtcvad.Vad(settings.VAD_LEVEL)
         frame_ms = 30
         bytes_per_frame = int(16000 * frame_ms / 1000 * 2)
-
         segments, current, ts = [], None, 0.0
         for i in range(0, len(raw), bytes_per_frame):
-            frame = raw[i : i + bytes_per_frame]
+            frame = raw[i:i+bytes_per_frame]
             is_speech = vad.is_speech(frame, sample_rate=16000)
             if is_speech and current is None:
                 current = ts
@@ -124,12 +110,11 @@ def vad_segments(audio_path: Path):
     bind=True,
     autoretry_for=(Exception,),
     retry_backoff=True,
-    retry_kwargs={"max_retries": 3},
+    retry_kwargs={"max_retries": 3}
 )
 def transcribe_segments(self, upload_id: str, correlation_id: str | None = None):
     TASK_RUNS.labels(task="transcribe_segments").inc()
     whisper = get_whisper()
-
     src = Path(settings.UPLOAD_FOLDER) / upload_id
     dst = Path(settings.RESULTS_FOLDER) / upload_id
     dst.mkdir(exist_ok=True, parents=True)
@@ -147,20 +132,27 @@ def transcribe_segments(self, upload_id: str, correlation_id: str | None = None)
                     str(src),
                     offset=start,
                     duration=end - start,
-                    language=settings.WHISPER_LANGUAGE,
+                    language="ru",
                     vad_filter=True,
-                    word_timestamps=True,
+                    word_timestamps=True
                 )
                 text = " ".join(s["text"] for s in r["segments"])
                 out.append({"segment": idx, "start": start, "end": end, "text": text})
                 logger_ctx.debug("segment done", idx=idx)
             except Exception as e:
                 logger_ctx.error("segment error", idx=idx, error=str(e))
-                out.append(
-                    {"segment": idx, "start": start, "end": end, "text": "", "error": str(e)}
-                )
+                out.append({
+                    "segment": idx,
+                    "start": start,
+                    "end": end,
+                    "text": "",
+                    "error": str(e)
+                })
 
-    (dst / "transcript.json").write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
+    (dst / "transcript.json").write_text(
+        json.dumps(out, ensure_ascii=False, indent=2),
+        encoding="utf-8"
+    )
     logger_ctx.info("transcription complete")
 
 
@@ -169,12 +161,11 @@ def transcribe_segments(self, upload_id: str, correlation_id: str | None = None)
     bind=True,
     autoretry_for=(Exception,),
     retry_backoff=True,
-    retry_kwargs={"max_retries": 2},
+    retry_kwargs={"max_retries": 2}
 )
 def diarize_full(self, upload_id: str, correlation_id: str | None = None):
     TASK_RUNS.labels(task="diarize_full").inc()
     diarizer = get_diarizer()
-
     src = Path(settings.UPLOAD_FOLDER) / upload_id
     dst = Path(settings.RESULTS_FOLDER) / upload_id
     dst.mkdir(exist_ok=True, parents=True)
@@ -184,12 +175,18 @@ def diarize_full(self, upload_id: str, correlation_id: str | None = None):
 
     try:
         res = diarizer(str(src))
-        segs = [{"start": t.start, "end": t.end, "speaker": s} for t, _, s in res.itertracks(yield_label=True)]
+        segs = [
+            {"start": t.start, "end": t.end, "speaker": s}
+            for t, _, s in res.itertracks(yield_label=True)
+        ]
     except Exception as e:
         logger_ctx.error("diarization error", error=str(e))
         segs = []
 
-    (dst / "diarization.json").write_text(json.dumps(segs, ensure_ascii=False, indent=2), encoding="utf-8")
+    (dst / "diarization.json").write_text(
+        json.dumps(segs, ensure_ascii=False, indent=2),
+        encoding="utf-8"
+    )
     logger_ctx.info("diarization complete")
 
 
@@ -201,6 +198,7 @@ def cleanup_old_files():
     for f in Path(settings.UPLOAD_FOLDER).iterdir():
         if f.is_file() and datetime.utcfromtimestamp(f.stat().st_mtime) < cutoff:
             f.unlink(missing_ok=True)
+
     for d in Path(settings.RESULTS_FOLDER).iterdir():
         if d.is_dir() and datetime.utcfromtimestamp(d.stat().st_mtime) < cutoff:
             shutil.rmtree(d, ignore_errors=True)
