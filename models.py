@@ -11,8 +11,12 @@ class User(Base):
     name = Column(String, nullable=False)
     api_key = Column(String, unique=True, index=True)
 
-    uploads = relationship("Upload", back_populates="user")
-
+    # Загружаем uploads с selectin (eager-load), избегаем lazy
+    uploads = relationship(
+        "Upload",
+        back_populates="user",
+        lazy="selectin"
+    )
 
 class Upload(Base):
     __tablename__ = "uploads"
@@ -22,4 +26,8 @@ class Upload(Base):
     upload_id = Column(String, unique=True, index=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
-    user = relationship("User", back_populates="uploads")
+    user = relationship(
+        "User",
+        back_populates="uploads",
+        lazy="selectin"
+    )

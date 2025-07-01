@@ -8,6 +8,8 @@ from fastapi import (
     FastAPI, UploadFile, File, HTTPException, Response, Header,
     Depends, WebSocket, status
 )
+import asyncio
+from sqlalchemy.ext.asyncio import AsyncEngine
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.trustedhost import TrustedHostMiddleware
@@ -27,10 +29,14 @@ from crud import (
 )
 from models import Base
 from routes import router as api_router
+from dependencies import get_current_user
 from admin_routes import router as admin_router
 
 # создаём таблицы
-Base.metadata.create_all(bind=engine.sync_engine)
+#Base.metadata.create_all(bind=engine.sync_engine)
+async def init_models(async_engine: AsyncEngine):
+    async with async_engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
 
 # structlog
 structlog.configure(
@@ -64,16 +70,7 @@ redis = redis_async.from_url(settings.celery_broker_url, decode_responses=True)
 
 # API-Key → User
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
-async def get_current_user(
-    key: str = Depends(api_key_header),
-    db: AsyncSession = Depends(get_db)
-):
-    if not key:
-        raise HTTPException(status_code=401, detail="Missing X-API-Key")
-    user = await get_user_by_api_key(db, key)
-    if not user:
-        raise HTTPException(status_code=401, detail="Invalid X-API-Key")
-    return user
+
 
 # Ensure dirs
 for d in (
@@ -99,7 +96,9 @@ app.add_middleware(
 # HTTP metrics
 HTTP_REQ_COUNT = Counter("http_requests_total", "Total HTTP requests", ["method", "path"])
 HTTP_REQ_LATENCY = Histogram("http_request_duration_seconds", "HTTP request latency", ["path"])
-
+@app.on_event("startup")
+async def on_startup():
+    await init_models(engine)
 @app.middleware("http")
 async def metrics_middleware(request, call_next):
     start = time.time()
@@ -107,6 +106,7 @@ async def metrics_middleware(request, call_next):
     HTTP_REQ_COUNT.labels(request.method, request.url.path).inc()
     HTTP_REQ_LATENCY.labels(request.url.path).observe(time.time() - start)
     return response
+
 
 @app.get("/health")
 @limiter.limit("30/minute")
