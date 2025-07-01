@@ -35,6 +35,7 @@ services:
       - upload-data:/data/uploads
       - results-data:/data/results
       - diarizer-cache:/data/diarizer_cache
+      - /path/to/hf_cache_host:/hf_cache:rw
     depends_on:
       - redis
     command:
@@ -58,7 +59,7 @@ services:
       - results-data:/data/results
       - diarizer-cache:/data/diarizer_cache
       - ctranslate2-cache:/root/.cache/ctranslate2
-      - hf-cache:/hf_cache
+      - /path/to/hf_cache_host:/hf_cache:rw
     depends_on:
       - redis
     command:
