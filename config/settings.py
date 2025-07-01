@@ -1,5 +1,6 @@
 import json
 from functools import lru_cache
+from typing import List
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings
 
@@ -36,60 +37,38 @@ class Settings(BaseSettings):
 
     # Segmentation / VAD
     segment_length_s: int = Field(30, gt=0, env="SEGMENT_LENGTH_S")
-    vad_level: int = Field(2, ge=0, le=3, env="VAD_LEVEL")
+    vad_threshold: float = Field(0.35, env="VAD_THRESHOLD")
+    vad_min_duration_on: float = Field(0.5, env="VAD_MIN_DURATION_ON")
+    vad_min_duration_off: float = Field(0.3, env="VAD_MIN_DURATION_OFF")
 
-    # File limits & retention
-    max_file_size: int = Field(1_073_741_824, gt=0, env="MAX_FILE_SIZE")
-    file_retention_days: int = Field(7, gt=0, env="FILE_RETENTION_DAYS")
-    clean_up_uploads: bool = Field(True, env="CLEAN_UP_UPLOADS")
+    # File Handling
+    tusd_endpoint: str = Field(..., env="TUSD_ENDPOINT")
     snippet_format: str = Field("wav", env="SNIPPET_FORMAT")
+    clean_up_uploads: bool = Field(True, env="CLEAN_UP_UPLOADS")
+    file_retention_days: int = Field(7, env="FILE_RETENTION_DAYS")
+    max_file_size: int = Field(1073741824, env="MAX_FILE_SIZE")  # 1GB
 
-    # Tus endpoint
-    tus_endpoint: str = Field(..., env="TUS_ENDPOINT")
-
-    # Frontend / CORS
-    allowed_origins: list[str] = Field(["*"], env="ALLOWED_ORIGINS")
-
-    # Metrics exporter
-    metrics_port: int = Field(8001, gt=0, env="METRICS_PORT")
-
-    # Admin
-    admin_api_key: str = Field(..., env="ADMIN_API_KEY")
-
-    # Database
-    database_url: str = Field("sqlite+aiosqlite:///./app.db", env="DATABASE_URL")
-
-    model_config = {
-        "env_file": ".env",
-        "env_file_encoding": "utf-8",
-        "extra": "ignore",
-    }
+    # CORS
+    allowed_origins: List[str] = Field(default_factory=lambda: ["*"], env="ALLOWED_ORIGINS")
 
     @field_validator("allowed_origins", mode="before")
     @classmethod
-    def split_allowed_origins(cls, v):
-        """
-        - None or blank string → wildcard ["*"]
-        - JSON list string → parse via json.loads
-        - comma-separated string → split on commas
-        """
-        if v is None or (isinstance(v, str) and not v.strip()):
-            return ["*"]
+    def parse_allowed_origins(cls, v):
         if isinstance(v, str):
-            s = v.strip()
-            # JSON list?
-            if s.startswith("[") and s.endswith("]"):
-                try:
-                    return json.loads(s)
-                except json.JSONDecodeError:
-                    pass
-            # Fallback: comma-separated
-            return [o.strip() for o in s.split(",") if o.strip()]
+            try:
+                return json.loads(v)
+            except Exception:
+                # fallback: comma-separated string
+                return [s.strip() for s in v.split(",") if s.strip()]
         return v
+
+    class Config:
+        env_file = ".env"
+        env_file_encoding = "utf-8"
 
 
 @lru_cache()
-def get_settings() -> Settings:
+def get_settings():
     return Settings()
 
 
