@@ -10,7 +10,7 @@ from config.settings import settings
 @pytest.fixture
 async def client(tmp_path, anyio_backend):
     # point storage to tmp dirs
-    settings.upload_folder = str(tmp_path/"uploads")
+    settings.UPLOAD_FOLDER = str(tmp_path/"uploads")
     settings.results_folder = str(tmp_path/"results")
     Path(settings.upload_folder).mkdir()
     Path(settings.results_folder).mkdir()
@@ -27,7 +27,7 @@ async def test_status_endpoints_work(client, monkeypatch):
     assert res.status_code == status.HTTP_404_NOT_FOUND
 
     # simulate file exists but no results => processing
-    Path(settings.upload_folder + "/u1").write_text("x")
+    Path(settings.UPLOAD_FOLDER + "/u1").write_text("x")
     # also set Redis progress
     await client.app.state.limiter.redis.set("progress:u1","42%")
     res = await client.get("/status/u1", headers={"X-API-Key":"dummy"})
@@ -35,7 +35,7 @@ async def test_status_endpoints_work(client, monkeypatch):
     assert res.json()["progress"] == "42%"
 
     # simulate results complete
-    base = Path(settings.results_folder)/"u1"
+    base = Path(settings.RESULTS_FOLDER)/"u1"
     base.mkdir()
     (base/"transcript.json").write_text("[]")
     (base/"diarization.json").write_text("[]")
@@ -48,7 +48,7 @@ async def test_labels_validation(client, monkeypatch):
     async def fake_user(db, key): return type("U",(object,),{"id":1})
     monkeypatch.setattr("crud.get_user_by_api_key", fake_user)
     # create transcript.json
-    base = Path(settings.results_folder)/"u2"
+    base = Path(settings.RESULTS_FOLDER)/"u2"
     base.mkdir()
     segs = [{"start":0,"end":1,"speaker":"sp0","text":"hi"}]
     (base/"transcript.json").write_text(json.dumps(segs))

@@ -74,9 +74,9 @@ api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 # Ensure dirs
 for d in (
-    settings.upload_folder,
-    settings.results_folder,
-    settings.diarizer_cache_dir
+    settings.UPLOAD_FOLDER,
+    settings.RESULTS_FOLDER,
+    settings.DIARIZER_CACHE_DIR
 ):
     Path(d).mkdir(parents=True, exist_ok=True)
 
@@ -84,7 +84,7 @@ for d in (
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.allowed_origins,
+    allow_origins=settings.ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -135,12 +135,12 @@ async def get_status(
     if not rec:
         raise HTTPException(status_code=404, detail="upload_id not found")
 
-    base = Path(settings.results_folder) / upload_id
+    base = Path(settings.RESULTS_FOLDER) / upload_id
     done = (base / "transcript.json").exists() and (base / "diarization.json").exists()
     if done:
         status_str = "done"
     else:
-        uploaded = (Path(settings.upload_folder) / upload_id).exists()
+        uploaded = (Path(settings.UPLOAD_FOLDER) / upload_id).exists()
         status_str = "processing" if uploaded else "queued"
 
     # read last progress from Redis (set by upload + tasks)
@@ -164,11 +164,11 @@ async def upload(
     if file.content_type not in ("audio/wav", "audio/x-wav", "audio/mpeg"):
         raise HTTPException(status_code=415, detail="Unsupported file type")
     data = await file.read()
-    if len(data) > settings.max_file_size:
+    if len(data) > settings.MAX_FILE_SIZE:
         raise HTTPException(status_code=413, detail="File too large")
 
     upload_id = file.filename
-    dest = Path(settings.upload_folder) / upload_id
+    dest = Path(settings.UPLOAD_FOLDER) / upload_id
     dest.write_bytes(data)
 
     # record ownership

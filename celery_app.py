@@ -22,7 +22,7 @@ celery_app.conf.update(
     result_serializer="json",
     accept_content=["json"],
     enable_utc=True,
-    timezone=settings.timezone,
+    timezone=settings.CELERY_TIMEZONE,
     result_expires=3600,
     task_time_limit=600,
     task_soft_time_limit=550,

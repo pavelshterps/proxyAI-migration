@@ -17,13 +17,13 @@ def sample_wav(tmp_path_factory):
     dest = dest_dir / "sample.wav"
     dest.write_bytes(src.read_bytes())
     # override upload_folder
-    settings.upload_folder = str(dest_dir)
-    settings.results_folder = str(tmp_path_factory.mktemp("results"))
+    settings.UPLOAD_FOLDER = str(dest_dir)
+    settings.RESULTS_FOLDER = str(tmp_path_factory.mktemp("results"))
     return "sample.wav"
 
 def test_upload_and_process(sample_wav):
     # Upload
-    r1 = client.post("/upload/", files={"file": ("sample.wav", open(Path(settings.upload_folder) / sample_wav, "rb"), "audio/wav")})
+    r1 = client.post("/upload/", files={"file": ("sample.wav", open(Path(settings.UPLOAD_FOLDER) / sample_wav, "rb"), "audio/wav")})
     assert r1.status_code == 200, r1.text
     upload_id = r1.json()["upload_id"]
 

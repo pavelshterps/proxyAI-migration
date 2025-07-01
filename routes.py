@@ -25,7 +25,7 @@ async def get_results(
     if not rec:
         raise HTTPException(status_code=404, detail="upload_id not found")
 
-    base = Path(settings.results_folder) / upload_id
+    base = Path(settings.RESULTS_FOLDER) / upload_id
     if not base.exists():
         raise HTTPException(status_code=404, detail="Results not yet available")
 
@@ -65,7 +65,7 @@ async def set_labels(
     if not rec:
         raise HTTPException(status_code=404, detail="upload_id not found")
 
-    base = Path(settings.results_folder) / upload_id
+    base = Path(settings.RESULTS_FOLDER) / upload_id
     if not base.exists():
         raise HTTPException(status_code=404, detail="Results not yet available")
 

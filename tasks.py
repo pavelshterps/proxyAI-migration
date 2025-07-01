@@ -37,11 +37,11 @@ _diarizer = None
 def get_whisper():
     global _whisper
     if _whisper is None:
-        logger.info("loading whisper model", path=settings.whisper_model_path)
+        logger.info("loading whisper model", path=settings.WHISPER_MODEL_PATH)
         _whisper = WhisperModel(
-            settings.whisper_model_path,
-            device=settings.whisper_device,
-            compute_type=settings.whisper_compute_type
+            settings.WHISPER_MODEL_PATH,
+            device=settings.WHISPER_DEVICE,
+            compute_type=settings.WHISPER_COMPUTE_TYPE
         )
         logger.info("whisper model loaded")
     return _whisper
@@ -49,14 +49,14 @@ def get_whisper():
 def get_diarizer():
     global _diarizer
     if _diarizer is None:
-        cache = Path(settings.diarizer_cache_dir)
+        cache = Path(settings.DIARIZER_CACHE_DIR)
         cache.mkdir(parents=True, exist_ok=True)
-        logger.info("loading diarizer model", protocol=settings.pyannote_protocol)
+        logger.info("loading diarizer model", protocol=settings.PYANNOTE_PROTOCOL)
         try:
             _diarizer = Pipeline.from_pretrained(
-                settings.pyannote_protocol,
+                settings.PYANNOTE_PROTOCOL,
                 cache_dir=str(cache),
-                use_auth_token=settings.huggingface_token
+                use_auth_token=settings.HUGGINGFACE_TOKEN
             )
             logger.info("diarizer model loaded")
         except ModelNotFoundError as e:
@@ -69,7 +69,7 @@ def vad_segments(audio_path: Path):
     try:
         audio = AudioSegment.from_file(str(audio_path)).set_channels(1).set_frame_rate(16000)
         raw = audio.raw_data
-        vad = webrtcvad.Vad(settings.vad_level)
+        vad = webrtcvad.Vad(settings.VAD_LEVEL)
         frame_ms = 30
         bytes_per_frame = int(16000 * frame_ms / 1000 * 2)
         segments, current, ts = [], None, 0.0
@@ -90,7 +90,7 @@ def vad_segments(audio_path: Path):
     except Exception as e:
         logger.warning("VAD failed, using fixed windows", error=str(e))
         length = AudioSegment.from_file(str(audio_path)).duration_seconds
-        seg = settings.segment_length_s
+        seg = settings.SEGMENT_LENGTH_S
         return [(i, min(i+seg, length)) for i in range(0, int(length), seg)]
     finally:
         VAD_TIME.observe(perf_counter() - start)
@@ -100,8 +100,8 @@ def vad_segments(audio_path: Path):
 def transcribe_segments(self, upload_id: str, correlation_id: str | None = None):
     TASK_RUNS.labels(task="transcribe_segments").inc()
     whisper = get_whisper()
-    src = Path(settings.upload_folder) / upload_id
-    dst = Path(settings.results_folder) / upload_id
+    src = Path(settings.UPLOAD_FOLDER) / upload_id
+    dst = Path(settings.RESULTS_FOLDER) / upload_id
     dst.mkdir(exist_ok=True, parents=True)
     logger_ctx = logger.bind(upload_id=upload_id, correlation_id=correlation_id)
     logger_ctx.info("transcription start")
@@ -134,8 +134,8 @@ def transcribe_segments(self, upload_id: str, correlation_id: str | None = None)
 def diarize_full(self, upload_id: str, correlation_id: str | None = None):
     TASK_RUNS.labels(task="diarize_full").inc()
     diarizer = get_diarizer()
-    src = Path(settings.upload_folder) / upload_id
-    dst = Path(settings.results_folder) / upload_id
+    src = Path(settings.UPLOAD_FOLDER) / upload_id
+    dst = Path(settings.RESULTS_FOLDER) / upload_id
     dst.mkdir(exist_ok=True, parents=True)
     logger_ctx = logger.bind(upload_id=upload_id, correlation_id=correlation_id)
     logger_ctx.info("diarization start")
@@ -154,11 +154,11 @@ def diarize_full(self, upload_id: str, correlation_id: str | None = None):
 @shared_task(name="tasks.cleanup_old_files")
 def cleanup_old_files():
     TASK_RUNS.labels(task="cleanup_old_files").inc()
-    cutoff = datetime.utcnow() - timedelta(days=settings.file_retention_days)
-    for f in Path(settings.upload_folder).iterdir():
+    cutoff = datetime.utcnow() - timedelta(days=settings.FILE_RETENTION_DAYS)
+    for f in Path(settings.UPLOAD_FOLDER).iterdir():
         if f.is_file() and datetime.utcfromtimestamp(f.stat().st_mtime) < cutoff:
             f.unlink(missing_ok=True)
-    for d in Path(settings.results_folder).iterdir():
+    for d in Path(settings.RESULTS_FOLDER).iterdir():
         if d.is_dir() and datetime.utcfromtimestamp(d.stat().st_mtime) < cutoff:
             shutil.rmtree(d, ignore_errors=True)
-    logger.info("cleanup complete", retention=settings.file_retention_days)
+    logger.info("cleanup complete", retention=settings.FILE_RETENTION_DAYS)
