@@ -66,7 +66,7 @@ app.state.limiter = limiter
 app.add_middleware(SlowAPIMiddleware)
 
 # Redis Pub/Sub + key/value
-redis = redis_async.from_url(settings.celery_broker_url, decode_responses=True)
+redis = redis_async.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
 
 # API-Key → User
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
@@ -81,10 +81,7 @@ for d in (
     Path(d).mkdir(parents=True, exist_ok=True)
 
 # Host validation & CORS
-app.add_middleware(
-    TrustedHostMiddleware,
-    allowed_hosts=["127.0.0.1", "localhost"] + settings.allowed_origins
-)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.allowed_origins,
