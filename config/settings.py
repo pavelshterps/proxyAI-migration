@@ -3,6 +3,7 @@ from functools import lru_cache
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings
 
+
 class Settings(BaseSettings):
     # Celery
     celery_broker_url: str = Field(..., env="CELERY_BROKER_URL")
@@ -18,13 +19,18 @@ class Settings(BaseSettings):
     upload_folder: str = Field("/data/uploads", env="UPLOAD_FOLDER")
     results_folder: str = Field("/data/results", env="RESULTS_FOLDER")
     diarizer_cache_dir: str = Field("/data/diarizer_cache", env="DIARIZER_CACHE_DIR")
+    hf_cache_dir: str = Field("/hf_cache", env="HF_CACHE_DIR")
 
     # Models
     whisper_model_path: str = Field(
-        "/hf_cache/models--guillaumekln--faster-whisper-medium", env="WHISPER_MODEL_PATH"
+        "/hf_cache/models--guillaumekln--faster-whisper-medium",
+        env="WHISPER_MODEL_PATH"
     )
     whisper_device: str = Field("cuda", env="WHISPER_DEVICE")
+    whisper_device_index: int = Field(0, env="WHISPER_DEVICE_INDEX")
     whisper_compute_type: str = Field("int8", env="WHISPER_COMPUTE_TYPE")
+    whisper_beam_size: int = Field(5, ge=1, env="WHISPER_BEAM_SIZE")
+
     pyannote_protocol: str = Field(..., env="PYANNOTE_PROTOCOL")
     huggingface_token: str = Field(..., env="HUGGINGFACE_TOKEN")
 
@@ -35,6 +41,8 @@ class Settings(BaseSettings):
     # File limits & retention
     max_file_size: int = Field(1_073_741_824, gt=0, env="MAX_FILE_SIZE")
     file_retention_days: int = Field(7, gt=0, env="FILE_RETENTION_DAYS")
+    clean_up_uploads: bool = Field(True, env="CLEAN_UP_UPLOADS")
+    snippet_format: str = Field("wav", env="SNIPPET_FORMAT")
 
     # Tus endpoint
     tus_endpoint: str = Field(..., env="TUS_ENDPOINT")
@@ -59,12 +67,11 @@ class Settings(BaseSettings):
 
     @field_validator("allowed_origins", mode="before")
     @classmethod
-    def split_origins(cls, v):
+    def split_allowed_origins(cls, v):
         """
-        Accepts:
-          - blank / missing → default ["*"]
-          - JSON list (e.g. '["a","b"]')
-          - comma-separated string (e.g. "a,b,c")
+        - None or blank string → wildcard ["*"]
+        - JSON list string → parse via json.loads
+        - comma-separated string → split on commas
         """
         if v is None or (isinstance(v, str) and not v.strip()):
             return ["*"]
@@ -76,12 +83,14 @@ class Settings(BaseSettings):
                     return json.loads(s)
                 except json.JSONDecodeError:
                     pass
-            # Fallback to comma split
+            # Fallback: comma-separated
             return [o.strip() for o in s.split(",") if o.strip()]
         return v
+
 
 @lru_cache()
 def get_settings() -> Settings:
     return Settings()
+
 
 settings = get_settings()

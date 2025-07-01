@@ -17,3 +17,5 @@ structlog>=23.3.0           # structured logging
 SQLAlchemy>=2.0.0
 aiosqlite
 prometheus-client>=0.14.1
+slowapi>=0.1.5         # FastAPI-compatible rate limiting
+limits>=2.8.0
