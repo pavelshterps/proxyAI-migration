@@ -1,218 +1,158 @@
-import json
+# tasks.py
+
+from __future__ import annotations
+
+import os
 import shutil
-from datetime import datetime, timedelta
+import uuid
 from pathlib import Path
-from time import perf_counter
 
 import structlog
-import webrtcvad
-from celery import shared_task
+from celery import Celery
+from celery.utils.log import get_task_logger
+from fastapi import HTTPException
 from faster_whisper import WhisperModel
-from pyannote.audio import Pipeline
-from pydub import AudioSegment
-from prometheus_client import Counter, Summary
+from pyannote.audio import Pipeline as DiarizationPipeline
+from pydantic.error_wrappers import ValidationError
 
 from config.settings import settings
 
-# Configure structlog
-structlog.configure(
-    processors=[
-        structlog.processors.add_log_level,
-        structlog.processors.TimeStamper(fmt="iso"),
-        structlog.processors.JSONRenderer(),
-    ]
-)
+# Инициализация Celery
+app = Celery("proxyai")
+app.conf.broker_url = settings.CELERY_BROKER_URL
+app.conf.result_backend = settings.CELERY_RESULT_BACKEND
+app.conf.task_queues = {
+    "preprocess_cpu": {"exchange": "preprocess_cpu", "binding_key": "preprocess_cpu"},
+}
+
 logger = structlog.get_logger()
+task_logger = get_task_logger(__name__)
 
-# Metrics
-TASK_RUNS = Counter("celery_task_runs_total", "Celery task runs", ["task"])
-VAD_TIME = Summary("vad_segmentation_seconds", "VAD segmentation duration")
-TRANSCRIBE_TIME = Summary("whisper_transcription_seconds", "Whisper transcription duration")
+# Singleton-модели
+_whisper: WhisperModel | None = None
+_diarizer: DiarizationPipeline | None = None
 
-# Singletons
-_whisper = None
-_diarizer = None
 
-def get_whisper():
+def get_whisper() -> WhisperModel:
+    """
+    Возвращает единственный экземпляр WhisperModel.
+    Загружает модель по её HF-идентификатору, используя указанный cache_dir
+    и compute_type.
+    """
     global _whisper
     if _whisper is None:
-        model_path = settings.WHISPER_MODEL_PATH
-        logger.info("loading whisper model", model_path=model_path)
-        init_kwargs = {
-            "model_size_or_path": model_path,
+        model_id = settings.WHISPER_MODEL  # например "guillaumekln/faster-whisper-medium"
+        init_kwargs: dict[str, str] = {
             "device": settings.WHISPER_DEVICE,
-            "compute_type": settings.WHISPER_COMPUTE_TYPE,
-            "batch_size": settings.WHISPER_BATCH_SIZE,
         }
-        # if user specified a huggingface cache, use it
+        # если указан compute_type (int8, fp16 и т.п.)
+        if settings.WHISPER_COMPUTE_TYPE:
+            init_kwargs["compute_type"] = settings.WHISPER_COMPUTE_TYPE
+        # если задан каталог кеша HF, передаём его
         if settings.HUGGINGFACE_CACHE_DIR:
             init_kwargs["cache_dir"] = settings.HUGGINGFACE_CACHE_DIR
 
-        # if model_path points to a local directory, load files only
-        path_obj = Path(model_path)
-        if path_obj.is_absolute() and path_obj.is_dir():
-            init_kwargs["local_files_only"] = True
+        logger.info("loading whisper model", model=model_id, **init_kwargs)
+        _whisper = WhisperModel(model_id, **init_kwargs)
+        logger.info("whisper model loaded", model=model_id)
 
-        _whisper = WhisperModel(**init_kwargs)
-        logger.info("whisper model loaded")
     return _whisper
 
-def get_diarizer():
+
+def get_diarizer() -> DiarizationPipeline:
+    """
+    Возвращает единственный экземпляр пайплайна диаризации pyannote.
+    """
     global _diarizer
     if _diarizer is None:
-        cache_dir = settings.DIARIZER_CACHE_DIR
-        Path(cache_dir).mkdir(parents=True, exist_ok=True)
-        logger.info("loading diarizer model", pipeline=settings.PYANNOTE_PROTOCOL)
         try:
-            _diarizer = Pipeline.from_pretrained(
-                settings.PYANNOTE_PROTOCOL,
-                cache_dir=cache_dir,
+            _diarizer = DiarizationPipeline.from_pretrained(
+                settings.PYANNO_PIPELINE,
                 use_auth_token=settings.HUGGINGFACE_TOKEN,
             )
-            logger.info("diarizer model loaded")
         except Exception as e:
-            logger.error("diarizer loading failed", error=str(e))
+            task_logger.error("Failed to load diarization pipeline", error=str(e))
             raise
     return _diarizer
 
-def vad_segments(audio_path: Path):
-    start = perf_counter()
+
+@app.task(name="tasks.cleanup_old_files")
+def cleanup_old_files(path: str):
+    """
+    Удаляет временные файлы по указанному пути, если они старше retention.
+    """
     try:
-        audio = (
-            AudioSegment.from_file(str(audio_path))
-            .set_channels(1)
-            .set_frame_rate(16000)
-        )
-        raw = audio.raw_data
-        vad = webrtcvad.Vad(settings.VAD_LEVEL)
-        frame_ms = 30
-        bytes_per_frame = int(16000 * frame_ms / 1000 * 2)
-
-        segments = []
-        current = None
-        ts = 0.0
-        for i in range(0, len(raw), bytes_per_frame):
-            frame = raw[i : i + bytes_per_frame]
-            is_speech = vad.is_speech(frame, sample_rate=16000)
-            if is_speech and current is None:
-                current = ts
-            elif not is_speech and current is not None:
-                segments.append((current, ts))
-                current = None
-            ts += frame_ms / 1000
-
-        if current is not None:
-            segments.append((current, ts))
-        if not segments:
-            raise RuntimeError("no speech detected")
-        return segments
-
+        shutil.rmtree(path)
+        logger.info("cleaned up files", path=path)
     except Exception as e:
-        logger.warning("VAD failed, using fixed windows", error=str(e))
-        length = AudioSegment.from_file(str(audio_path)).duration_seconds
-        seg_len = settings.SEGMENT_LENGTH_S
-        return [
-            (i, min(i + seg_len, length))
-            for i in range(0, int(length), int(seg_len))
-        ]
-    finally:
-        VAD_TIME.observe(perf_counter() - start)
+        logger.warning("failed to cleanup files", path=path, error=str(e))
 
-@shared_task(
-    name="tasks.transcribe_segments",
-    bind=True,
-    autoretry_for=(Exception,),
-    retry_backoff=True,
-    retry_kwargs={"max_retries": 3},
-)
-def transcribe_segments(self, upload_id: str, correlation_id: str | None = None):
-    TASK_RUNS.labels(task="transcribe_segments").inc()
+
+@app.task(name="tasks.transcribe_segments", bind=True)
+def transcribe_segments(self, audio_path: str, segments: list[tuple[float, float]]) -> list[dict]:
+    """
+    Транскрибирует список сегментов аудио с помощью WhisperModel.
+    """
     whisper = get_whisper()
-
-    src = Path(settings.UPLOAD_FOLDER) / upload_id
-    dst = Path(settings.RESULTS_FOLDER) / upload_id
-    dst.mkdir(exist_ok=True, parents=True)
-
-    logger_ctx = logger.bind(upload_id=upload_id, correlation_id=correlation_id)
-    logger_ctx.info("transcription start")
-
-    segments = vad_segments(src)
-    out = []
-    for idx, (start, end) in enumerate(segments):
-        with TRANSCRIBE_TIME.time():
-            try:
-                result = whisper.transcribe(
-                    str(src),
-                    offset=start,
-                    duration=end - start,
-                    language="ru",
-                    vad_filter=True,
-                    word_timestamps=True,
-                )
-                text = " ".join(seg["text"] for seg in result["segments"])
-                out.append({"segment": idx, "start": start, "end": end, "text": text})
-                logger_ctx.debug("segment done", segment=idx)
-            except Exception as e:
-                logger_ctx.error("segment error", segment=idx, error=str(e))
-                out.append(
-                    {
-                        "segment": idx,
-                        "start": start,
-                        "end": end,
-                        "text": "",
-                        "error": str(e),
-                    }
-                )
-
-    (dst / "transcript.json").write_text(
-        json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
-    logger_ctx.info("transcription complete")
-
-@shared_task(
-    name="tasks.diarize_full",
-    bind=True,
-    autoretry_for=(Exception,),
-    retry_backoff=True,
-    retry_kwargs={"max_retries": 2},
-)
-def diarize_full(self, upload_id: str, correlation_id: str | None = None):
-    TASK_RUNS.labels(task="diarize_full").inc()
-    diarizer = get_diarizer()
-
-    src = Path(settings.UPLOAD_FOLDER) / upload_id
-    dst = Path(settings.RESULTS_FOLDER) / upload_id
-    dst.mkdir(exist_ok=True, parents=True)
-
-    logger_ctx = logger.bind(upload_id=upload_id, correlation_id=correlation_id)
-    logger_ctx.info("diarization start")
-
+    results: list[dict] = []
     try:
-        result = diarizer(str(src))
-        segments = [
-            {"start": turn.start, "end": turn.end, "speaker": spk}
-            for turn, _, spk in result.itertracks(yield_label=True)
-        ]
+        # faster-whisper возвращает (segment, text, logprob, tokens) для каждого сегмента
+        for start, end in segments:
+            segment = whisper.transcribe(
+                audio_path,
+                beam_size=settings.WHISPER_BEAM_SIZE,
+                initial_prompt=None,
+                language=None,
+                vad_filter=True,
+                word_timestamps=True,
+                condition_on_previous_text=True,
+                prompt=None,
+                segment_offsets=[(start, end)],
+            )
+            results.append({
+                "start": start,
+                "end": end,
+                "text": segment[0].text,
+                "tokens": segment[0].tokens,
+                "logprob": segment[0].avg_logprob,
+            })
     except Exception as e:
-        logger_ctx.error("diarization error", error=str(e))
+        task_logger.error("Whisper transcription failed", error=str(e))
+        raise HTTPException(status_code=500, detail="Transcription error")
+    return results
+
+
+@app.task(name="tasks.diarize_full")
+def diarize_full(audio_path: str) -> list[dict]:
+    """
+    Диаризует всё аудио, возвращая список сегментов с канальным указанием спикера.
+    """
+    pipeline = get_diarizer()
+    try:
+        diarization = pipeline(audio_path)
         segments = []
+        for turn, _, speaker in diarization.itertracks(yield_label=True):
+            segments.append({
+                "start": turn.start,
+                "end": turn.end,
+                "speaker": speaker,
+            })
+        return segments
+    except ValidationError as e:
+        task_logger.error("Diarization validation failed", error=str(e))
+        raise HTTPException(status_code=400, detail="Diarization pipeline error")
+    except Exception as e:
+        task_logger.error("Diarization failed", error=str(e))
+        raise HTTPException(status_code=500, detail="Diarization error")
 
-    (dst / "diarization.json").write_text(
-        json.dumps(segments, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
-    logger_ctx.info("diarization complete")
 
-@shared_task(name="tasks.cleanup_old_files")
-def cleanup_old_files():
-    TASK_RUNS.labels(task="cleanup_old_files").inc()
-    cutoff = datetime.utcnow() - timedelta(days=settings.FILE_RETENTION_DAYS)
-
-    for f in Path(settings.UPLOAD_FOLDER).iterdir():
-        if f.is_file() and datetime.utcfromtimestamp(f.stat().st_mtime) < cutoff:
-            f.unlink(missing_ok=True)
-
-    for d in Path(settings.RESULTS_FOLDER).iterdir():
-        if d.is_dir() and datetime.utcfromtimestamp(d.stat().st_mtime) < cutoff:
-            shutil.rmtree(d, ignore_errors=True)
-
-    logger.info("cleanup complete", retention=settings.FILE_RETENTION_DAYS)
+# Планировщик (beat) может посылать этот таск по расписанию
+@app.task(name="tasks.cleanup_all_old_files")
+def cleanup_all_old_files():
+    """
+    Тут можно обойти все рабочие директории и удалить всё старое.
+    """
+    base = Path(settings.UPLOAD_FOLDER)
+    for sub in base.iterdir():
+        if sub.is_dir():
+            cleanup_old_files.delay(str(sub))
