@@ -1,14 +1,16 @@
 import os
-from pydantic_settings import BaseSettings, SettingsConfigDict
-from pydantic import Field, validator
-from typing import List
+from typing import List, Optional
 from functools import lru_cache
 from urllib.parse import urlparse
 
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import Field, validator
+
+
 class Settings(BaseSettings):
-    # ProxyAI 13.7.4 example environment
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 
+    # Admin
     ADMIN_API_KEY: str = Field(..., env='ADMIN_API_KEY')
 
     # Celery
@@ -45,22 +47,22 @@ class Settings(BaseSettings):
     TUS_ENDPOINT: str = Field(..., env='TUS_ENDPOINT')
 
     # Frontend/CORS
-    ALLOWED_ORIGINS: str = Field('["*"]', env='ALLOWED_ORIGINS')
+    ALLOWED_ORIGINS: List[str] = Field(default_factory=lambda: ["*"], env='ALLOWED_ORIGINS')
 
     # Flower UI auth
     FLOWER_USER: Optional[str] = Field(None, env='FLOWER_USER')
     FLOWER_PASS: Optional[str] = Field(None, env='FLOWER_PASS')
 
-    @validator("allowed_origins", pre=True)
-    def split_origins(cls, v):
+    @validator("ALLOWED_ORIGINS", pre=True)
+    def parse_allowed_origins(cls, v):
         if isinstance(v, str):
-            return [origin.strip() for origin in v.split(",") if origin.strip()]
+            return [origin.strip() for origin in v.strip("[]").split(",") if origin.strip()]
         if isinstance(v, list):
             return v
         return []
 
-    @validator("allowed_origins", each_item=True)
-    def check_origin_valid(cls, v):
+    @validator("ALLOWED_ORIGINS", each_item=True)
+    def validate_origin_url(cls, v):
         parsed = urlparse(v)
         if not parsed.scheme or not parsed.netloc:
             raise ValueError(f"Invalid origin URL: {v}")
@@ -68,5 +70,3 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
-
-settings = get_settings()
