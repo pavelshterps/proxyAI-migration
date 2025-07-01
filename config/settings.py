@@ -25,7 +25,7 @@ class Settings(BaseSettings):
     WHISPER_MODEL_PATH: str = Field(...)
     WHISPER_DEVICE: str = Field(...)
     WHISPER_COMPUTE_TYPE: str = Field(...)
-    BATCH_SIZE: int = 1
+    WHISPER_BATCH_SIZE: int = 1
     # Куда faster-whisper / huggingface_hub будет кэшировать модель
     HUGGINGFACE_CACHE_DIR: Optional[str] = Field(None, env="HUGGINGFACE_CACHE_DIR")
     PYANNOTE_PROTOCOL: str = Field(...)
