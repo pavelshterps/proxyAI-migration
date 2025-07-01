@@ -6,10 +6,10 @@ import structlog
 import redis.asyncio as redis_async
 from fastapi import (
     FastAPI, UploadFile, File, HTTPException, Response, Header,
-    Depends, WebSocket, status
+    Depends, WebSocket, status, Request
 )
 import asyncio
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.trustedhost import TrustedHostMiddleware
@@ -18,7 +18,6 @@ from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_
 from slowapi import Limiter
 from slowapi.middleware import SlowAPIMiddleware
 from slowapi.util import get_remote_address
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from config.settings import settings
 from database import get_db, engine
@@ -33,7 +32,6 @@ from dependencies import get_current_user
 from admin_routes import router as admin_router
 
 # создаём таблицы
-#Base.metadata.create_all(bind=engine.sync_engine)
 async def init_models(async_engine: AsyncEngine):
     async with async_engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
@@ -54,7 +52,7 @@ limiter = Limiter(key_func=get_remote_address)
 app = FastAPI(title="proxyAI", version="13.7.9")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.ALLOWED_ORIGINS,
+    allow_origins=settings.allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -66,25 +64,27 @@ app.state.limiter = limiter
 app.add_middleware(SlowAPIMiddleware)
 
 # Redis Pub/Sub + key/value
-redis = redis_async.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
+redis = redis_async.from_url(settings.celery_broker_url, decode_responses=True)
 
 # API-Key → User
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
-
 # Ensure dirs
 for d in (
-    settings.UPLOAD_FOLDER,
-    settings.RESULTS_FOLDER,
-    settings.DIARIZER_CACHE_DIR
+    settings.upload_folder,
+    settings.results_folder,
+    settings.diarizer_cache_dir
 ):
     Path(d).mkdir(parents=True, exist_ok=True)
 
 # Host validation & CORS
-
+app.add_middleware(
+    TrustedHostMiddleware,
+    allowed_hosts=["127.0.0.1", "localhost"] + settings.allowed_origins
+)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.ALLOWED_ORIGINS,
+    allow_origins=settings.allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -93,9 +93,11 @@ app.add_middleware(
 # HTTP metrics
 HTTP_REQ_COUNT = Counter("http_requests_total", "Total HTTP requests", ["method", "path"])
 HTTP_REQ_LATENCY = Histogram("http_request_duration_seconds", "HTTP request latency", ["path"])
+
 @app.on_event("startup")
 async def on_startup():
     await init_models(engine)
+
 @app.middleware("http")
 async def metrics_middleware(request, call_next):
     start = time.time()
@@ -104,10 +106,10 @@ async def metrics_middleware(request, call_next):
     HTTP_REQ_LATENCY.labels(request.url.path).observe(time.time() - start)
     return response
 
-
+# --- Исправленные эндпоинты ---
 @app.get("/health")
 @limiter.limit("30/minute")
-async def health():
+async def health(request: Request):
     return {"status": "ok", "version": app.version}
 
 @app.get("/ready")
@@ -116,7 +118,7 @@ async def ready():
 
 @app.get("/metrics")
 @limiter.limit("10/minute")
-async def metrics():
+async def metrics(request: Request):
     data = generate_latest()
     return Response(content=data, media_type=CONTENT_TYPE_LATEST)
 
@@ -135,12 +137,12 @@ async def get_status(
     if not rec:
         raise HTTPException(status_code=404, detail="upload_id not found")
 
-    base = Path(settings.RESULTS_FOLDER) / upload_id
+    base = Path(settings.results_folder) / upload_id
     done = (base / "transcript.json").exists() and (base / "diarization.json").exists()
     if done:
         status_str = "done"
     else:
-        uploaded = (Path(settings.UPLOAD_FOLDER) / upload_id).exists()
+        uploaded = (Path(settings.upload_folder) / upload_id).exists()
         status_str = "processing" if uploaded else "queued"
 
     # read last progress from Redis (set by upload + tasks)
@@ -164,11 +166,11 @@ async def upload(
     if file.content_type not in ("audio/wav", "audio/x-wav", "audio/mpeg"):
         raise HTTPException(status_code=415, detail="Unsupported file type")
     data = await file.read()
-    if len(data) > settings.MAX_FILE_SIZE:
+    if len(data) > settings.max_file_size:
         raise HTTPException(status_code=413, detail="File too large")
 
     upload_id = file.filename
-    dest = Path(settings.UPLOAD_FOLDER) / upload_id
+    dest = Path(settings.upload_folder) / upload_id
     dest.write_bytes(data)
 
     # record ownership
