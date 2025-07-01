@@ -41,6 +41,9 @@ def get_whisper():
             settings.WHISPER_MODEL_PATH,
             device=settings.WHISPER_DEVICE,
             compute_type=settings.WHISPER_COMPUTE_TYPE
+            batch_size = settings.BATCH_SIZE,
+            cache_dir = settings.DIARIZER_CACHE_DIR,
+            local_files_only = True
         )
         logger.info("whisper model loaded")
     return _whisper

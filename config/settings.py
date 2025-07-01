@@ -25,6 +25,7 @@ class Settings(BaseSettings):
     WHISPER_MODEL_PATH: str = Field(...)
     WHISPER_DEVICE: str = Field(...)
     WHISPER_COMPUTE_TYPE: str = Field(...)
+    BATCH_SIZE: int = 1
     PYANNOTE_PROTOCOL: str = Field(...)
     HUGGINGFACE_TOKEN: str = Field(...)
 
