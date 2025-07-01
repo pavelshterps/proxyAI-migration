@@ -14,7 +14,7 @@ from prometheus_client import Counter, Summary
 
 from config.settings import settings
 
-# structlog
+# Configure structlog
 structlog.configure(
     processors=[
         structlog.processors.add_log_level,
@@ -33,38 +33,41 @@ TRANSCRIBE_TIME = Summary("whisper_transcription_seconds", "Whisper transcriptio
 _whisper = None
 _diarizer = None
 
-
 def get_whisper():
     global _whisper
     if _whisper is None:
-        logger.info("loading whisper model", path=settings.WHISPER_MODEL_PATH)
-        # Формируем аргументы динамически, чтобы добавить cache_dir только при его наличии
+        model_path = settings.WHISPER_MODEL_PATH
+        logger.info("loading whisper model", model_path=model_path)
         init_kwargs = {
-            "model_size_or_path": settings.WHISPER_MODEL_PATH,
+            "model_size_or_path": model_path,
             "device": settings.WHISPER_DEVICE,
             "compute_type": settings.WHISPER_COMPUTE_TYPE,
             "batch_size": settings.WHISPER_BATCH_SIZE,
-            "local_files_only": True,
         }
+        # if user specified a huggingface cache, use it
         if settings.HUGGINGFACE_CACHE_DIR:
             init_kwargs["cache_dir"] = settings.HUGGINGFACE_CACHE_DIR
+
+        # if model_path points to a local directory, load files only
+        path_obj = Path(model_path)
+        if path_obj.is_absolute() and path_obj.is_dir():
+            init_kwargs["local_files_only"] = True
 
         _whisper = WhisperModel(**init_kwargs)
         logger.info("whisper model loaded")
     return _whisper
 
-
 def get_diarizer():
     global _diarizer
     if _diarizer is None:
-        cache = Path(settings.DIARIZER_CACHE_DIR)
-        cache.mkdir(parents=True, exist_ok=True)
-        logger.info("loading diarizer model", protocol=settings.PYANNOTE_PROTOCOL)
+        cache_dir = settings.DIARIZER_CACHE_DIR
+        Path(cache_dir).mkdir(parents=True, exist_ok=True)
+        logger.info("loading diarizer model", pipeline=settings.PYANNOTE_PROTOCOL)
         try:
             _diarizer = Pipeline.from_pretrained(
                 settings.PYANNOTE_PROTOCOL,
-                cache_dir=str(cache),
-                use_auth_token=settings.HUGGINGFACE_TOKEN
+                cache_dir=cache_dir,
+                use_auth_token=settings.HUGGINGFACE_TOKEN,
             )
             logger.info("diarizer model loaded")
         except Exception as e:
@@ -72,49 +75,60 @@ def get_diarizer():
             raise
     return _diarizer
 
-
 def vad_segments(audio_path: Path):
     start = perf_counter()
     try:
-        audio = AudioSegment.from_file(str(audio_path)).set_channels(1).set_frame_rate(16000)
+        audio = (
+            AudioSegment.from_file(str(audio_path))
+            .set_channels(1)
+            .set_frame_rate(16000)
+        )
         raw = audio.raw_data
         vad = webrtcvad.Vad(settings.VAD_LEVEL)
         frame_ms = 30
         bytes_per_frame = int(16000 * frame_ms / 1000 * 2)
-        segments, current, ts = [], None, 0.0
+
+        segments = []
+        current = None
+        ts = 0.0
         for i in range(0, len(raw), bytes_per_frame):
-            frame = raw[i:i+bytes_per_frame]
+            frame = raw[i : i + bytes_per_frame]
             is_speech = vad.is_speech(frame, sample_rate=16000)
             if is_speech and current is None:
                 current = ts
-            if not is_speech and current is not None:
+            elif not is_speech and current is not None:
                 segments.append((current, ts))
                 current = None
             ts += frame_ms / 1000
+
         if current is not None:
             segments.append((current, ts))
         if not segments:
             raise RuntimeError("no speech detected")
         return segments
+
     except Exception as e:
         logger.warning("VAD failed, using fixed windows", error=str(e))
         length = AudioSegment.from_file(str(audio_path)).duration_seconds
-        seg = settings.SEGMENT_LENGTH_S
-        return [(i, min(i + seg, length)) for i in range(0, int(length), seg)]
+        seg_len = settings.SEGMENT_LENGTH_S
+        return [
+            (i, min(i + seg_len, length))
+            for i in range(0, int(length), int(seg_len))
+        ]
     finally:
         VAD_TIME.observe(perf_counter() - start)
-
 
 @shared_task(
     name="tasks.transcribe_segments",
     bind=True,
     autoretry_for=(Exception,),
     retry_backoff=True,
-    retry_kwargs={"max_retries": 3}
+    retry_kwargs={"max_retries": 3},
 )
 def transcribe_segments(self, upload_id: str, correlation_id: str | None = None):
     TASK_RUNS.labels(task="transcribe_segments").inc()
     whisper = get_whisper()
+
     src = Path(settings.UPLOAD_FOLDER) / upload_id
     dst = Path(settings.RESULTS_FOLDER) / upload_id
     dst.mkdir(exist_ok=True, parents=True)
@@ -124,48 +138,48 @@ def transcribe_segments(self, upload_id: str, correlation_id: str | None = None)
 
     segments = vad_segments(src)
     out = []
-
     for idx, (start, end) in enumerate(segments):
         with TRANSCRIBE_TIME.time():
             try:
-                r = whisper.transcribe(
+                result = whisper.transcribe(
                     str(src),
                     offset=start,
                     duration=end - start,
                     language="ru",
                     vad_filter=True,
-                    word_timestamps=True
+                    word_timestamps=True,
                 )
-                text = " ".join(s["text"] for s in r["segments"])
+                text = " ".join(seg["text"] for seg in result["segments"])
                 out.append({"segment": idx, "start": start, "end": end, "text": text})
-                logger_ctx.debug("segment done", idx=idx)
+                logger_ctx.debug("segment done", segment=idx)
             except Exception as e:
-                logger_ctx.error("segment error", idx=idx, error=str(e))
-                out.append({
-                    "segment": idx,
-                    "start": start,
-                    "end": end,
-                    "text": "",
-                    "error": str(e)
-                })
+                logger_ctx.error("segment error", segment=idx, error=str(e))
+                out.append(
+                    {
+                        "segment": idx,
+                        "start": start,
+                        "end": end,
+                        "text": "",
+                        "error": str(e),
+                    }
+                )
 
     (dst / "transcript.json").write_text(
-        json.dumps(out, ensure_ascii=False, indent=2),
-        encoding="utf-8"
+        json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     logger_ctx.info("transcription complete")
-
 
 @shared_task(
     name="tasks.diarize_full",
     bind=True,
     autoretry_for=(Exception,),
     retry_backoff=True,
-    retry_kwargs={"max_retries": 2}
+    retry_kwargs={"max_retries": 2},
 )
 def diarize_full(self, upload_id: str, correlation_id: str | None = None):
     TASK_RUNS.labels(task="diarize_full").inc()
     diarizer = get_diarizer()
+
     src = Path(settings.UPLOAD_FOLDER) / upload_id
     dst = Path(settings.RESULTS_FOLDER) / upload_id
     dst.mkdir(exist_ok=True, parents=True)
@@ -174,21 +188,19 @@ def diarize_full(self, upload_id: str, correlation_id: str | None = None):
     logger_ctx.info("diarization start")
 
     try:
-        res = diarizer(str(src))
-        segs = [
-            {"start": t.start, "end": t.end, "speaker": s}
-            for t, _, s in res.itertracks(yield_label=True)
+        result = diarizer(str(src))
+        segments = [
+            {"start": turn.start, "end": turn.end, "speaker": spk}
+            for turn, _, spk in result.itertracks(yield_label=True)
         ]
     except Exception as e:
         logger_ctx.error("diarization error", error=str(e))
-        segs = []
+        segments = []
 
     (dst / "diarization.json").write_text(
-        json.dumps(segs, ensure_ascii=False, indent=2),
-        encoding="utf-8"
+        json.dumps(segments, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     logger_ctx.info("diarization complete")
-
 
 @shared_task(name="tasks.cleanup_old_files")
 def cleanup_old_files():
