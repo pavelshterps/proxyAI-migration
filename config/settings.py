@@ -8,6 +8,7 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 
     ADMIN_API_KEY: str = Field(...)
+    DATABASE_URL: str = Field(..., env='DATABASE_URL')
 
     CELERY_BROKER_URL: str = Field(...)
     CELERY_RESULT_BACKEND: str = Field(...)
