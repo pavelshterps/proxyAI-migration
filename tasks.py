@@ -47,7 +47,7 @@ def get_whisper():
             "model_size_or_path": settings.WHISPER_MODEL_PATH,
             "device": settings.WHISPER_DEVICE,
             "compute_type": settings.WHISPER_COMPUTE_TYPE,
-            "batch_size": settings.BATCH_SIZE,
+            "batch_size": settings.WHISPER_BATCH_SIZE,
             "local_files_only": True,
         }
         # Если задан свой каталог кеша HF — используем его
