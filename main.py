@@ -46,6 +46,16 @@ log = structlog.get_logger()
 limiter = Limiter(key_func=get_remote_address)
 
 app = FastAPI(title="proxyAI", version="13.7.9")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.allowed_origins_list,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.include_router(api_router)
+app.include_router(admin_router)
 app.state.limiter = limiter
 app.add_middleware(SlowAPIMiddleware)
 
