@@ -9,7 +9,6 @@ import webrtcvad
 from celery import shared_task
 from faster_whisper import WhisperModel
 from pyannote.audio import Pipeline
-from pyannote.audio.exceptions import ModelNotFoundError
 from pydub import AudioSegment
 from prometheus_client import Counter, Summary
 
@@ -59,8 +58,8 @@ def get_diarizer():
                 use_auth_token=settings.HUGGINGFACE_TOKEN
             )
             logger.info("diarizer model loaded")
-        except ModelNotFoundError as e:
-            logger.error("diarizer not found", error=str(e))
+        except Exception as e:
+            logger.error("diarizer loading failed", error=str(e))
             raise
     return _diarizer
 
@@ -95,8 +94,7 @@ def vad_segments(audio_path: Path):
     finally:
         VAD_TIME.observe(perf_counter() - start)
 
-@shared_task(name="tasks.transcribe_segments", bind=True,
-             autoretry_for=(Exception,), retry_backoff=True, retry_kwargs={"max_retries": 3})
+@shared_task(name="tasks.transcribe_segments", bind=True, autoretry_for=(Exception,), retry_backoff=True, retry_kwargs={"max_retries": 3})
 def transcribe_segments(self, upload_id: str, correlation_id: str | None = None):
     TASK_RUNS.labels(task="transcribe_segments").inc()
     whisper = get_whisper()
@@ -105,7 +103,6 @@ def transcribe_segments(self, upload_id: str, correlation_id: str | None = None)
     dst.mkdir(exist_ok=True, parents=True)
     logger_ctx = logger.bind(upload_id=upload_id, correlation_id=correlation_id)
     logger_ctx.info("transcription start")
-
     segments = vad_segments(src)
     out = []
     for idx, (start, end) in enumerate(segments):
@@ -125,12 +122,10 @@ def transcribe_segments(self, upload_id: str, correlation_id: str | None = None)
             except Exception as e:
                 logger_ctx.error("segment error", idx=idx, error=str(e))
                 out.append({"segment": idx, "start": start, "end": end, "text": "", "error": str(e)})
-
     (dst / "transcript.json").write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
     logger_ctx.info("transcription complete")
 
-@shared_task(name="tasks.diarize_full", bind=True,
-             autoretry_for=(Exception,), retry_backoff=True, retry_kwargs={"max_retries": 2})
+@shared_task(name="tasks.diarize_full", bind=True, autoretry_for=(Exception,), retry_backoff=True, retry_kwargs={"max_retries": 2})
 def diarize_full(self, upload_id: str, correlation_id: str | None = None):
     TASK_RUNS.labels(task="diarize_full").inc()
     diarizer = get_diarizer()
@@ -139,15 +134,12 @@ def diarize_full(self, upload_id: str, correlation_id: str | None = None):
     dst.mkdir(exist_ok=True, parents=True)
     logger_ctx = logger.bind(upload_id=upload_id, correlation_id=correlation_id)
     logger_ctx.info("diarization start")
-
     try:
         res = diarizer(str(src))
-        segs = [{"start": t.start, "end": t.end, "speaker": s}
-                for t, _, s in res.itertracks(yield_label=True)]
+        segs = [{"start": t.start, "end": t.end, "speaker": s} for t, _, s in res.itertracks(yield_label=True)]
     except Exception as e:
         logger_ctx.error("diarization error", error=str(e))
         segs = []
-
     (dst / "diarization.json").write_text(json.dumps(segs, ensure_ascii=False, indent=2), encoding="utf-8")
     logger_ctx.info("diarization complete")
 
