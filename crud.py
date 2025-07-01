@@ -1,78 +1,50 @@
-# crud.py
-from sqlalchemy import select
+from sqlalchemy.future import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from models import Upload, User
-from schemas import UserCreate, UploadCreate  # предположим, в проекте есть эти схемы
+from models import User, Upload
 
 async def get_user_by_api_key(db: AsyncSession, api_key: str) -> User | None:
-    """
-    Находит пользователя по его API-ключу.
-    """
-    result = await db.execute(
-        select(User).where(User.api_key == api_key)
-    )
-    return result.scalar_one_or_none()
+    result = await db.execute(select(User).where(User.api_key == api_key))
+    return result.scalars().first()
 
-async def create_user(db: AsyncSession, user_data: UserCreate) -> User:
-    """
-    Создаёт нового пользователя.
-    """
-    user = User(**user_data.dict())
+async def create_user(db: AsyncSession, name: str, api_key: str) -> User:
+    user = User(name=name, api_key=api_key)
     db.add(user)
     await db.commit()
     await db.refresh(user)
     return user
 
-async def create_upload_record(
-    db: AsyncSession,
-    user_id: str,
-    filename: str,
-    **kwargs
-) -> Upload:
-    """
-    Создаёт запись об загрузке: статус 'uploaded' по умолчанию.
-    """
-    upload = Upload(
-        user_id=user_id,
-        filename=filename,
-        status='uploaded',
-        created_at=kwargs.get('created_at'),
-        expires_at=kwargs.get('expires_at'),
-        **{k: v for k, v in kwargs.items() if k not in ('created_at', 'expires_at')}
-    )
+async def delete_user(db: AsyncSession, user_id: int) -> bool:
+    user = await db.get(User, user_id)
+    if not user:
+        return False
+    await db.delete(user)
+    await db.commit()
+    return True
+
+async def list_users(db: AsyncSession) -> list[User]:
+    result = await db.execute(select(User))
+    return result.scalars().all()
+
+async def create_upload_record(db: AsyncSession, user_id: int, upload_id: str) -> Upload:
+    upload = Upload(user_id=user_id, upload_id=upload_id)
     db.add(upload)
     await db.commit()
     await db.refresh(upload)
     return upload
 
-async def get_upload_for_user(
-    db: AsyncSession,
-    user_id: str,
-    upload_id: str
-) -> Upload | None:
-    """
-    Возвращает upload по его ID, принадлежащий заданному пользователю.
-    """
+async def get_upload_for_user(db: AsyncSession, user_id: int, upload_id: str) -> Upload | None:
     result = await db.execute(
-        select(Upload)
-        .where(Upload.id == upload_id, Upload.user_id == user_id)
+        select(Upload).where(
+            Upload.user_id == user_id,
+            Upload.upload_id == upload_id
+        )
     )
-    return result.scalar_one_or_none()
+    return result.scalars().first()
 
-async def update_upload_status(
-    db: AsyncSession,
-    upload_id: str,
-    status: str
-) -> Upload:
-    """
-    Обновляет поле status для существующего upload.
-    """
-    result = await db.execute(
-        select(Upload).where(Upload.id == upload_id)
-    )
-    upload = result.scalar_one()
-    upload.status = status
-    db.add(upload)
-    await db.commit()
-    await db.refresh(upload)
-    return upload
+async def update_upload_status(db: AsyncSession, upload_id: str, status: str) -> None:
+    """Меняем статус обработки (queued → processing → completed/failed)"""
+    result = await db.execute(select(Upload).where(Upload.upload_id == upload_id))
+    upload = result.scalars().first()
+    if upload:
+        upload.status = status
+        await db.commit()
