@@ -14,7 +14,8 @@ pyannote.audio>=2.1.1
 webrtcvad>=2.0.10           # VAD segmentation
 structlog>=23.3.0           # structured logging
 # database & auth
-SQLAlchemy>=2.0.0
+sqlalchemy[asyncio]
+asyncpg
 aiosqlite
 prometheus-client>=0.14.1
 slowapi>=0.1.5         # FastAPI-compatible rate limiting
