@@ -1,218 +1,138 @@
+# tasks.py
+
 import os
 import json
 import shutil
 import tempfile
-import uuid
-import datetime
-import logging
-import subprocess
 from pathlib import Path
+from datetime import datetime, timedelta
 
+from celery import Celery, signals
+from sqlalchemy.ext.asyncio import AsyncSession
 from faster_whisper import WhisperModel
-from pyannote.audio import Pipeline
-from celery import Celery
-from celery.schedules import crontab
-from celery.signals import worker_ready
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
-from sqlalchemy.orm import sessionmaker
+import traceback
+import logging
 
 from config.settings import settings
-from crud import update_upload_status
-
-# === Logging ===
-logger = logging.getLogger("proxyai.tasks")
-logger.setLevel(logging.INFO)
-handler = logging.StreamHandler()
-formatter = logging.Formatter(
-    '%(asctime)s %(levelname)s [%(task_id)s] %(message)s'
+from crud import (
+    create_upload_record,
+    get_upload_for_user,
+    update_upload_status  # we just added this  [oai_citation:3‡raw.githubusercontent.com](https://raw.githubusercontent.com/pavelshterps/proxyAI/main/crud.py)
 )
-handler.setFormatter(formatter)
-logger.addHandler(handler)
 
-def log_context(task_id: str):
-    return {"task_id": task_id}
+logger = logging.getLogger(__name__)
 
-# === Celery ===
-app = Celery(
-    "proxyai",
-    broker=settings.CELERY_BROKER_URL,
-    backend=settings.CELERY_RESULT_BACKEND,
-)
-app.conf.task_default_queue = "preprocess_cpu"
-app.conf.beat_schedule = {
-    "cleanup-old-files-every-day": {
-        "task": "tasks.cleanup_old_files",
-        "schedule": crontab(hour=0, minute=0),
-    },
-}
+# Celery app setup
+app = Celery("proxyai")
+app.conf.broker_url = settings.CELERY_BROKER_URL
+app.conf.result_backend = settings.CELERY_RESULT_BACKEND
 
-# === SQLAlchemy ===
-engine = create_async_engine(settings.DATABASE_URL, future=True, echo=False)
-AsyncSessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+_whisper = None
 
-# === Pyannote диаризация (CPU) ===
-pyannote_pipeline = Pipeline.from_pretrained(settings.PYANNO_PIPELINE)
-
-def extract_audio_segment(src_path: str, dst_path: str, start: float, end: float):
-    """
-    Вырезает отрезок audio [start, end) из src_path и сохраняет в dst_path.
-    Использует ffmpeg.
-    """
-    cmd = [
-        "ffmpeg",
-        "-y",
-        "-i", src_path,
-        "-ss", str(start),
-        "-to", str(end),
-        "-c", "copy",
-        dst_path
-    ]
-    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-@app.task(bind=True, name="tasks.diarize_full")
-def diarize_full(self, upload_id: str):
-    ctx = log_context(upload_id)
-    logger.info("Starting diarization", extra=ctx)
-    try:
-        src = Path(settings.UPLOAD_FOLDER) / upload_id
-        if not src.exists():
-            raise FileNotFoundError(f"Input file not found: {src}")
-        audio = {"uri": upload_id, "audio": str(src)}
-        diarization = pyannote_pipeline(audio)
-        out = Path(settings.RESULTS_FOLDER) / upload_id
-        out.mkdir(parents=True, exist_ok=True)
-        with open(out / "diarization.json", "w") as f:
-            f.write(diarization.to_json())
-        logger.info("Diarization finished", extra=ctx)
-        update_status.delay(upload_id, "diarized")
-    except Exception:
-        logger.exception("Error in diarize_full", extra=ctx)
-        update_status.delay(upload_id, "error_diarization")
-        raise
-
-# === Whisper предзагрузка (GPU) ===
-_whisper_instance = None
-
-def get_whisper():
-    global _whisper_instance
-    if _whisper_instance:
-        return _whisper_instance
-
-    raw = settings.WHISPER_MODEL_PATH
-    # Если путь локальный к кэшу HF, преобразуем к нормальному repo_id
-    if raw.startswith("/") and Path(raw).exists():
-        name = Path(raw).name
-        if name.startswith("models--"):
-            repo = name[len("models--"):].replace("--", "/")
+def get_whisper() -> WhisperModel:
+    global _whisper
+    if _whisper is None:
+        raw = settings.WHISPER_MODEL_PATH  # e.g. local "/hf_cache/..." or "guillaumekln/faster-whisper-medium"
+        # If raw is a local path and exists, use it directly (no download)
+        if raw.startswith("/") and Path(raw).exists():
+            model_source = raw
+            init_kwargs = {
+                "device": settings.WHISPER_DEVICE,
+                "compute_type": settings.WHISPER_COMPUTE_TYPE,
+                "batch_size": settings.WHISPER_BATCH_SIZE,
+            }
         else:
-            repo = raw
-        model_id = repo
-    else:
-        model_id = raw
+            # Otherwise treat as HF repo ID, pull from cache only
+            model_source = raw
+            init_kwargs = {
+                "cache_dir": settings.HUGGINGFACE_CACHE_DIR,
+                "local_files_only": True,
+                "device": settings.WHISPER_DEVICE,
+                "compute_type": settings.WHISPER_COMPUTE_TYPE,
+                "batch_size": settings.WHISPER_BATCH_SIZE,
+            }
 
-    init_kwargs = {
-        "cache_dir": settings.HUGGINGFACE_CACHE_DIR,
-        "device": settings.WHISPER_DEVICE,
-        "compute_type": settings.WHISPER_COMPUTE_TYPE,
-        "batch_size": settings.WHISPER_BATCH_SIZE,
-        "local_files_only": True,
-    }
+        logger.info(
+            f"loading whisper model          "
+            f"model={model_source} "
+            f"cache_dir={init_kwargs.get('cache_dir')} "
+            f"compute_type={init_kwargs.get('compute_type')} "
+            f"device={init_kwargs.get('device')}"
+        )
 
-    logger.info(f"Loading Whisper model `{model_id}`", extra={"task_id": "whisper_init"})
-    _whisper_instance = WhisperModel(model_id, **init_kwargs)
-    logger.info("Whisper model loaded", extra={"task_id": "whisper_init"})
-    return _whisper_instance
+        # Passing a local path here lets faster_whisper skip any HF download  [oai_citation:4‡knowledge.zhaoweiguo.com](https://knowledge.zhaoweiguo.com/build/html/ai/llms/huggingfaces/lib_python?utm_source=chatgpt.com)
+        _whisper = WhisperModel(model_source, **init_kwargs)
+    return _whisper
 
-@app.task(bind=True, name="tasks.transcribe_segments")
-def transcribe_segments(self, upload_id: str, correlation_id: str = None):
-    ctx = log_context(upload_id)
-    logger.info("Starting transcription", extra=ctx)
-    try:
-        src = Path(settings.UPLOAD_FOLDER) / upload_id
-        outdir = Path(settings.RESULTS_FOLDER) / upload_id
-        if not outdir.exists() or not (outdir / "diarization.json").exists():
-            raise FileNotFoundError("Diarization JSON not found")
-        segments = json.loads((outdir / "diarization.json").read_text())
-
-        whisper = get_whisper()
-        transcript = []
-        for seg in segments:
-            start, end, speaker = seg["start"], seg["end"], seg["speaker"]
-            # создаём временный WAV-файл сегмента
-            tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-            tmp.close()
-            extract_audio_segment(str(src), tmp.name, start, end)
-
-            # транскрипция сегмента
-            result = whisper.transcribe(
-                tmp.name,
-                word_timestamps=True,
-                vad_filter=True,
-                vad_parameters=settings.VAD_PARAMS,
-                chunk_silence_threshold=settings.SILENCE_THRESHOLD
-            )
-            for s in result["segments"]:
-                transcript.append({
-                    "start": s.start,
-                    "end": s.end,
-                    "speaker": speaker,
-                    "text": s.text
-                })
-            os.unlink(tmp.name)
-
-        with open(outdir / "transcript.json", "w", encoding="utf-8") as f:
-            json.dump(transcript, f, ensure_ascii=False, indent=2)
-
-        logger.info("Transcription finished", extra=ctx)
-        update_status.delay(upload_id, "transcribed")
-    except Exception:
-        logger.exception("Error in transcribe_segments", extra=ctx)
-        update_status.delay(upload_id, "error_transcription")
-        raise
-
-@app.task(bind=True, name="tasks.update_status")
-def update_status(self, upload_id: str, status: str):
-    ctx = log_context(upload_id)
-    logger.info(f"Updating status to `{status}`", extra=ctx)
-    try:
-        async def _update():
-            async with AsyncSessionLocal() as session:
-                await update_upload_status(session, upload_id, status)
-        import asyncio
-        asyncio.get_event_loop().run_until_complete(_update())
-        logger.info("Status updated", extra=ctx)
-    except Exception:
-        logger.exception("Error in update_status", extra=ctx)
-        # не пробрасываем, чтобы не прерывать цепочку
-
-@app.task(bind=True, name="tasks.cleanup_old_files")
-def cleanup_old_files(self):
-    logger.info("Starting cleanup_old_files", extra={"task_id": "cleanup"})
-    try:
-        cutoff = datetime.datetime.utcnow() - datetime.timedelta(days=settings.FILE_RETENTION_DAYS)
-        for base in (settings.UPLOAD_FOLDER, settings.RESULTS_FOLDER):
-            folder = Path(base)
-            for item in folder.iterdir():
-                try:
-                    mtime = datetime.datetime.utcfromtimestamp(item.stat().st_mtime)
-                    if mtime < cutoff:
-                        if item.is_dir():
-                            shutil.rmtree(item)
-                            logger.info(f"Removed directory {item}", extra={"task_id": "cleanup"})
-                        else:
-                            item.unlink()
-                            logger.info(f"Removed file {item}", extra={"task_id": "cleanup"})
-                except Exception:
-                    logger.exception(f"Failed to remove {item}", extra={"task_id": "cleanup"})
-        logger.info("cleanup_old_files completed", extra={"task_id": "cleanup"})
-    except Exception:
-        logger.exception("Error in cleanup_old_files", extra={"task_id": "cleanup"})
-        raise
-
-@worker_ready.connect
+@signals.worker_ready.connect
 def preload_and_warmup(**kwargs):
-    # при старте воркера прогружаем модель в память
+    """Preload the model on worker startup to reduce latency."""
     try:
         get_whisper()
     except Exception:
-        logger.exception("Error in preload_and_warmup", extra={"task_id": "preload"})
+        logger.exception("Failed to preload Whisper model")
+        raise
+
+@app.task(name="process_upload")
+async def process_upload(upload_id: str):
+    """Top-level task: diarize entire file (CPU), then split & transcribe (GPU)."""
+    # 1) mark as processing
+    async with AsyncSession(settings.DB_ENGINE) as db:
+        await update_upload_status(db, upload_id, "processing")
+
+    # 2) fetch upload record and file path
+    async with AsyncSession(settings.DB_ENGINE) as db:
+        record = await get_upload_for_user(db, None, upload_id)
+        filepath = record.path
+
+    # 3) CPU-bound diarization phase
+    try:
+        speakers = diarize_full(filepath)  # returns list of (start, end, speaker_id)
+        logger.info(f"Diarization complete, {len(speakers)} segments")
+    except Exception:
+        logger.exception("Diarization failed")
+        async with AsyncSession(settings.DB_ENGINE) as db:
+            await update_upload_status(db, upload_id, "failed")
+        return
+
+    # 4) GPU-bound transcription phase
+    transcriptions = []
+    whisper = get_whisper()
+    for start, end, speaker in speakers:
+        try:
+            result = whisper.transcribe_segment(filepath, start, end)
+            text = result.text
+            transcriptions.append({
+                "start": start,
+                "end": end,
+                "speaker": speaker,
+                "text": text
+            })
+        except Exception:
+            logger.exception(f"Transcription failed for segment {start}-{end}")
+            # continue with others
+
+    # 5) write JSON output
+    out_path = Path(filepath).with_suffix(".json")
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump({"segments": transcriptions}, f, ensure_ascii=False, indent=2)
+
+    # 6) mark as completed
+    async with AsyncSession(settings.DB_ENGINE) as db:
+        await update_upload_status(db, upload_id, "completed")
+
+def cleanup_all_old_files():
+    """Periodically delete temp/uploads older than retention period."""
+    root = Path(settings.UPLOAD_DIR)
+    cutoff = datetime.utcnow() - timedelta(days=settings.RETENTION_DAYS)
+    for file in root.glob("**/*"):
+        mtime = datetime.utcfromtimestamp(file.stat().st_mtime)
+        if mtime < cutoff:
+            try:
+                if file.is_dir():
+                    shutil.rmtree(file)
+                else:
+                    file.unlink()
+                logger.info(f"Removed old file {file}")
+            except Exception:
+                logger.exception(f"Error removing {file}")

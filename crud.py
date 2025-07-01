@@ -1,44 +1,38 @@
-from sqlalchemy import delete
-from sqlalchemy.future import select
+# config/crud.py
+
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from models import User, Upload
+from .models import Upload, User  # adjust imports as needed
 
-async def get_user_by_api_key(db: AsyncSession, api_key: str) -> User | None:
-    result = await db.execute(select(User).where(User.api_key == api_key))
-    return result.scalars().first()
+async def get_user_by_api_key(db: AsyncSession, api_key: str) -> User:
+    ...
 
-async def create_user(db: AsyncSession, name: str, api_key: str) -> User:
-    user = User(name=name, api_key=api_key)
-    db.add(user)
-    await db.commit()
-    await db.refresh(user)
-    return user
+async def create_user(db: AsyncSession, user: UserCreate) -> User:
+    ...
 
-async def delete_user(db: AsyncSession, user_id: int) -> bool:
-    user = await db.get(User, user_id)
-    if not user:
-        return False
-    await db.delete(user)
-    await db.commit()
-    return True
+# existing upload helpers
+async def create_upload_record(db: AsyncSession, user_id: str, filename: str, **kwargs) -> Upload:
+    ...
 
-async def list_users(db: AsyncSession) -> list[User]:
-    result = await db.execute(select(User))
-    return result.scalars().all()
+async def get_upload_for_user(db: AsyncSession, user_id: str, upload_id: str) -> Upload:
+    ...
 
-async def create_upload_record(db: AsyncSession, user_id: int, upload_id: str) -> Upload:
-    upload = Upload(user_id=user_id, upload_id=upload_id)
+# NEW: update status field of an existing upload
+async def update_upload_status(
+    db: AsyncSession,
+    upload_id: str,
+    status: str
+) -> Upload:
+    """
+    Update the `status` of an upload (e.g. 'processing', 'completed', 'failed').
+    """
+    result = await db.execute(
+        select(Upload).where(Upload.id == upload_id)
+    )
+    upload = result.scalar_one()
+    upload.status = status
     db.add(upload)
-    await db.commit()
+    await db.commit()  # commit the change  [oai_citation:0‡huggingface.co](https://huggingface.co/docs/huggingface_hub/en/guides/download?utm_source=chatgpt.com)
     await db.refresh(upload)
     return upload
-
-async def get_upload_for_user(db: AsyncSession, user_id: int, upload_id: str) -> Upload | None:
-    result = await db.execute(
-        select(Upload).where(
-            Upload.user_id == user_id,
-            Upload.upload_id == upload_id
-        )
-    )
-    return result.scalars().first()
