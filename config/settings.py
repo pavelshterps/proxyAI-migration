@@ -1,10 +1,14 @@
 import os
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import Field, validator
+from typing import List
 from functools import lru_cache
-from typing import List, Optional
-from pydantic import BaseSettings, Field, validator
+from urllib.parse import urlparse
 
 class Settings(BaseSettings):
     # ProxyAI 13.7.4 example environment
+    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
+
     ADMIN_API_KEY: str = Field(..., env='ADMIN_API_KEY')
 
     # Celery
@@ -47,18 +51,22 @@ class Settings(BaseSettings):
     FLOWER_USER: Optional[str] = Field(None, env='FLOWER_USER')
     FLOWER_PASS: Optional[str] = Field(None, env='FLOWER_PASS')
 
-    @property
-    def allowed_origins_list(self) -> List[str]:
-        # Преобразует строку '["*"]' или '["http://localhost"]' в список Python
-        import json
-        try:
-            return json.loads(self.ALLOWED_ORIGINS)
-        except Exception:
-            # fallback: разделение по запятой (например: 'http://localhost,http://127.0.0.1')
-            return [o.strip() for o in self.ALLOWED_ORIGINS.split(",") if o.strip()]
+    @validator("allowed_origins", pre=True)
+    def split_origins(cls, v):
+        if isinstance(v, str):
+            return [origin.strip() for origin in v.split(",") if origin.strip()]
+        if isinstance(v, list):
+            return v
+        return []
 
-@lru_cache()
-def get_settings():
-    return Settings()
+    @validator("allowed_origins", each_item=True)
+    def check_origin_valid(cls, v):
+        parsed = urlparse(v)
+        if not parsed.scheme or not parsed.netloc:
+            raise ValueError(f"Invalid origin URL: {v}")
+        return v
+
+
+settings = Settings()
 
 settings = get_settings()
