@@ -11,7 +11,7 @@ from crud import (
     get_upload_for_user,
     create_upload_record
 )
-from main import get_current_user
+from dependencies import get_current_user
 
 router = APIRouter()
 

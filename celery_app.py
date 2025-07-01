@@ -12,8 +12,8 @@ logger = logging.getLogger("celery_app")
 
 celery_app = Celery(
     "proxyai",
-    broker=settings.celery_broker_url,
-    backend=settings.celery_result_backend,
+    broker=settings.CELERY_BROKER_URL,
+    backend=settings.CELERY_RESULT_BACKEND,
     include=["tasks"],
 )
 
