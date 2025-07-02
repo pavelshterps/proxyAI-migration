@@ -37,7 +37,7 @@ def preload_and_warmup(**kwargs):
     try:
         _diarizer = DiarizationPipeline.from_pretrained(
             settings.PYANNOTE_PIPELINE,
-            use_auth_token=settings.HF_TOKEN  # если нужен токен для gated pipeline
+            use_auth_token=settings.HUGGINGFACE_TOKEN  # если нужен токен для gated pipeline
         )
         logger.info(f"✅ Loaded diarization pipeline `{settings.PYANNOTE_PIPELINE}`")
     except Exception as e:
