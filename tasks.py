@@ -64,7 +64,7 @@ def get_whisper():
         batch   = settings.WHISPER_BATCH_SIZE
 
         init_kwargs = {
-            "cache_dir": settings.HUGGINGFACE_CACHE_DIR,
+            "download_root": settings.HUGGINGFACE_CACHE_DIR,
             "device": device,
             "compute_type": compute,
             "batch_size": batch,
