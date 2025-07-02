@@ -51,6 +51,13 @@ services:
       - DATABASE_URL=${DATABASE_URL}
       - NVIDIA_VISIBLE_DEVICES=all
       - WHISPER_DEVICE=gpu
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [ gpu ]
     env_file: .env
     runtime: nvidia
     volumes:
