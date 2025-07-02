@@ -11,29 +11,39 @@ services:
       - postgres_data:/var/lib/postgresql/data
     networks:
       - proxyai_net
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - redis-data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      retries: 3
+
   api:
     build:
       context: .
       dockerfile: Dockerfile
+    restart: unless-stopped
     depends_on:
       - db
-    environment:
-      - DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_NAME}
-      - API_WORKERS=2
-      - DATABASE_URL=${DATABASE_URL}
-
+      - redis
     env_file: .env
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_NAME}
+      - API_WORKERS=${API_WORKERS}
     volumes:
       - upload-data:/data/uploads
       - results-data:/data/results
       - diarizer-cache:/data/diarizer_cache
-      - hf-cache:/hf_cache
+      - /path/to/hf_cache_host:/hf_cache:rw
       - ./app.db:/app/app.db
     ports:
       - "8000:8000"
-    depends_on:
-      - redis
-    restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
@@ -43,29 +53,50 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    environment:
-      - DATABASE_URL=${DATABASE_URL}
-      - WHISPER_DEVICE=cpu
+    restart: unless-stopped
+    depends_on:
+      - redis
     env_file: .env
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_NAME}
+      - WHISPER_DEVICE=cpu
     volumes:
       - upload-data:/data/uploads
       - results-data:/data/results
       - diarizer-cache:/data/diarizer_cache
       - /path/to/hf_cache_host:/hf_cache:rw
-    depends_on:
-      - redis
-    command:
-      ["celery", "-A", "tasks", "worker", "--loglevel=info", "--concurrency=1"]
-    restart: unless-stopped
+    command: >
+      celery -A tasks worker
+      --loglevel=info
+      --concurrency=${CPU_CONCURRENCY}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      retries: 3
 
   gpu-worker:
     build:
       context: .
       dockerfile: Dockerfile.gpu
+    restart: unless-stopped
+    depends_on:
+      - redis
+    env_file: .env
     environment:
-      - DATABASE_URL=${DATABASE_URL}
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_NAME}
+      - WHISPER_DEVICE=cuda
       - NVIDIA_VISIBLE_DEVICES=all
-      - WHISPER_DEVICE=gpu
+    volumes:
+      - upload-data:/data/uploads
+      - results-data:/data/results
+      - diarizer-cache:/data/diarizer_cache
+      - hf-cache:/hf_cache:rw
+      - ctranslate2-cache:/root/.cache/ctranslate2
+    command: >
+      celery -A tasks worker
+      --loglevel=info
+      --concurrency=${GPU_CONCURRENCY}
+      --queues=preprocess_gpu
     deploy:
       resources:
         reservations:
@@ -73,45 +104,31 @@ services:
             - driver: nvidia
               count: all
               capabilities: [ gpu ]
-    env_file: .env
     runtime: nvidia
-    volumes:
-      - upload-data:/data/uploads
-      - results-data:/data/results
-      - diarizer-cache:/data/diarizer_cache
-      - ctranslate2-cache:/root/.cache/ctranslate2
-      - /path/to/hf_cache_host:/hf_cache:rw
-    depends_on:
-      - redis
-    command:
-      ["celery", "-A", "tasks", "worker", "--loglevel=info", "--concurrency=1", "--queues=preprocess_gpu"]
-    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      retries: 3
 
   beat:
     build:
       context: .
       dockerfile: Dockerfile
-    env_file: .env
+    restart: unless-stopped
     depends_on:
       - redis
-    command: ["celery", "-A", "tasks", "beat", "--loglevel=info"]
-    restart: unless-stopped
-
-  redis:
-    image: redis:7-alpine
-    volumes:
-      - redis-data:/data
-    ports:
-      - "6379:6379"
+    env_file: .env
+    command: >
+      celery -A tasks beat
+      --loglevel=info
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
       retries: 3
-    restart: unless-stopped
 
   flower:
     image: mher/flower:0.9.7
-    entrypoint: ["celery"]
+    restart: unless-stopped
     env_file: .env
     ports:
       - "5555:5555"
@@ -120,32 +137,19 @@ services:
       - "--broker=${CELERY_BROKER_URL}"
       - "--basic_auth=${FLOWER_USER}:${FLOWER_PASS}"
       - "--port=5555"
-    restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:5555"]
       interval: 30s
       retries: 3
 
-  # GPU-мониторинг (dcgm-exporter) убран, чтобы избежать ошибок с несуществующими тегами.
-  # Если нужен, раскомментируйте и подставьте актуальный существующий тег.
-  # dcgm-exporter:
-  #   image: nvidia/dcgm-exporter:2.6.13-2.6.13-ubi8
-  #   runtime: nvidia
-  #   environment:
-  #     - DCGM_EXPORTER_EXPORT_PER_PROCESS_METRICS=true
-  #   ports:
-  #     - "9400:9400"
-  #   depends_on:
-  #     - gpu-worker
-  #   restart: unless-stopped
-
 volumes:
   postgres_data:
+  redis-data:
   upload-data:
   results-data:
   diarizer-cache:
-  ctranslate2-cache:
   hf-cache:
-  redis-data:
+  ctranslate2-cache:
+
 networks:
   proxyai_net:
