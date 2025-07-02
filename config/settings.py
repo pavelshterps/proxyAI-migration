@@ -8,6 +8,9 @@ class Settings(BaseSettings):
 
     ADMIN_API_KEY: str = Field(...)
     DATABASE_URL: str = Field(..., env='DATABASE_URL')
+    POSTGRES_NAME: str = Field(...)
+    POSTGRES_USER: str = Field(...)
+    POSTGRES_PASSWORD: str = Field(...)
 
     CELERY_BROKER_URL: str = Field(...)
     CELERY_RESULT_BACKEND: str = Field(...)
