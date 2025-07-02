@@ -1,8 +1,13 @@
 # Dockerfile.gpu — for CUDA 12.2 / host driver 535.161.08 compatibility
 FROM nvidia/cuda:12.2.0-devel-ubuntu22.04
 
-# Basic system deps (тут build-essential и gcc уже доступны)
+# Use HTTPS apt repos and add universe/multiverse
 RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+         software-properties-common ca-certificates \
+    && add-apt-repository "deb [arch=amd64] https://archive.ubuntu.com/ubuntu jammy main universe multiverse restricted" \
+    && add-apt-repository "deb [arch=amd64] https://security.ubuntu.com/ubuntu jammy-security main universe multiverse restricted" \
+    && apt-get update \
     && apt-get install -y --no-install-recommends \
          python3-pip ffmpeg build-essential gcc python3-dev \
     && rm -rf /var/lib/apt/lists/*
