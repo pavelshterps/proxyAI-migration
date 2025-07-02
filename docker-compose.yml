@@ -60,7 +60,7 @@ services:
     volumes:
       - upload-data:/data/uploads
       - results-data:/data/results
-      - diarizer-cache:/data/diarizer_cache
+      - /path/to/hf_cache_host:/data/diarizer_cache:ro
       # Вот оно, монтирование локального кеша Whisper:
       - /path/to/hf_cache_host:/hf_cache:rw
     depends_on:
