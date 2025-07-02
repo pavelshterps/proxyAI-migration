@@ -1,30 +1,26 @@
-# 1) Базовый образ CUDA + cuDNN (runtime)
+# Dockerfile.gpu — for CUDA 12.1 / host driver 535.161.08 compatibility
 FROM nvidia/cuda:12.1.0-cudnn8-runtime-ubuntu22.04
 
-# 2) Устанавливаем только Python и pip, без ffmpeg/system-deps
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-      python3 python3-pip && \
-    rm -rf /var/lib/apt/lists/*
+# 1) Install runtime deps + build deps for native wheels, then remove build tools
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends \
+       # runtime
+       ffmpeg libsndfile1 \
+       # build deps for webrtcvad, speechbrain, etc.
+       build-essential python3-dev \
+  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# 3) Копируем requirements и ставим всё сразу
+# 2) Install Python deps (faster-whisper + our requirements)
 COPY requirements.txt .
+RUN pip3 install --upgrade pip \
+  && pip3 install --no-cache-dir \
+       ctranslate2[cuda12] faster-whisper[cuda12] \
+  && pip3 install --no-cache-dir -r requirements.txt
 
-# 3.1) Сначала ставим утилиту для ffmpeg (статический бинарь)
-#      вместо системного apt-get мы используем пакет imageio-ffmpeg,
-#      который автоматически привозит свой ffmpeg
-RUN pip3 install --upgrade pip && \
-    pip3 install --no-cache-dir imageio-ffmpeg
-
-# 3.2) Теперь ставим основные зависимости
-RUN pip3 install --no-cache-dir \
-      ctranslate2[cuda12] faster-whisper[cuda12] && \
-    pip3 install --no-cache-dir -r requirements.txt
-
-# 4) Копируем остальной код
+# 3) Copy project
 COPY . .
 
-# 5) Запускаем GPU-воркер
+# 4) Run the GPU Celery worker
 CMD ["celery", "-A", "tasks", "worker", "--loglevel=info", "--concurrency=1", "--queues=preprocess_gpu"]
