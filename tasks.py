@@ -3,28 +3,26 @@ import os
 import json
 import logging
 from pathlib import Path
+
 from celery import shared_task
 from celery.signals import worker_process_init
 from faster_whisper import WhisperModel
 from pyannote.audio import Pipeline
 from pydub import AudioSegment
-from config.settings import UPLOAD_FOLDER, RESULTS_FOLDER
+
+from config.settings import settings  # ← импортируем объект настроек
 
 logger = logging.getLogger(__name__)
 
-# Singletons so we only load each model once per worker process
 _whisper_model = None
 _diarizer = None
 
 def get_whisper_model():
     global _whisper_model
     if _whisper_model is None:
-        model_path = os.getenv(
-            "WHISPER_MODEL_PATH",
-            "/hf_cache/models--guillaumekln--faster-whisper-medium"
-        )
-        device = os.getenv("WHISPER_DEVICE", "cuda").lower()
-        compute = os.getenv("WHISPER_COMPUTE_TYPE", "int8").lower()
+        model_path = settings.WHISPER_MODEL_PATH
+        device = settings.WHISPER_DEVICE.lower()
+        compute = settings.WHISPER_COMPUTE_TYPE.lower()
 
         # На CPU float16 не поддерживается — принудительно int8
         if device == "cpu" and compute in ("float16", "fp16"):
@@ -40,17 +38,18 @@ def get_whisper_model():
             _whisper_model = WhisperModel(
                 model_path,
                 device=device,
-                compute_type=compute
+                compute_type=compute,
+                batch_size=settings.WHISPER_BATCH_SIZE
             )
         except ValueError as e:
-            # Если всё же упало — пробуем с int8
             logger.warning(
-                f"Failed to init WhisperModel with compute_type={compute}: {e}; retrying with compute_type='int8'"
+                f"Failed to init WhisperModel with compute_type={compute}: {e}; retrying with 'int8'"
             )
             _whisper_model = WhisperModel(
                 model_path,
                 device=device,
-                compute_type="int8"
+                compute_type="int8",
+                batch_size=settings.WHISPER_BATCH_SIZE
             )
         logger.info("WhisperModel loaded")
     return _whisper_model
@@ -58,12 +57,13 @@ def get_whisper_model():
 def get_diarizer():
     global _diarizer
     if _diarizer is None:
-        cache_dir = os.getenv("DIARIZER_CACHE_DIR", "/tmp/diarizer_cache")
+        cache_dir = settings.DIARIZER_CACHE_DIR
         os.makedirs(cache_dir, exist_ok=True)
         logger.info(f"Loading pyannote Pipeline into cache '{cache_dir}'")
         _diarizer = Pipeline.from_pretrained(
-            os.getenv("PYANNOTE_PROTOCOL", "pyannote/speaker-diarization"),
-            cache_dir=cache_dir
+            settings.PYANNOTE_PIPELINE,
+            cache_dir=cache_dir,
+            use_auth_token=settings.HUGGINGFACE_TOKEN
         )
         logger.info("Diarizer loaded")
     return _diarizer
@@ -71,20 +71,21 @@ def get_diarizer():
 @worker_process_init.connect
 def preload_and_warmup(**kwargs):
     """
-    При старте воркера разогреваем модели,
-    но на CPU не пытаемся инициализировать float16-Whisper.
+    При старте воркера разогреваем модели:
+     - diarizer всегда,
+     - Whisper только на GPU (чтобы на CPU не пытаться float16).
     """
-    device = os.getenv("WHISPER_DEVICE", "cuda").lower()
+    device = settings.WHISPER_DEVICE.lower()
+    sample = Path(settings.UPLOAD_FOLDER) / "warmup.wav"
 
-    # Warm-up diarizer всегда
+    # Warm-up diarizer
     try:
-        sample = Path(UPLOAD_FOLDER) / "warmup.wav"
         get_diarizer()(str(sample))
         logger.info("✅ Warm-up diarizer complete")
     except Exception as e:
         logger.warning(f"Warm-up diarizer failed: {e}")
 
-    # Warm-up Whisper только если устройство не CPU
+    # Warm-up WhisperModel только на GPU
     if device != "cpu":
         try:
             whisper = get_whisper_model()
@@ -92,7 +93,7 @@ def preload_and_warmup(**kwargs):
                 str(sample),
                 offset=0,
                 duration=2.0,
-                language=os.getenv("WHISPER_LANGUAGE", "ru"),
+                language=settings.WHISPER_LANGUAGE,
                 vad_filter=True
             )
             logger.info("✅ Warm-up WhisperModel complete")
@@ -102,24 +103,21 @@ def preload_and_warmup(**kwargs):
 @shared_task(name="tasks.transcribe_segments")
 def transcribe_segments(upload_id: str):
     whisper = get_whisper_model()
-    src = Path(UPLOAD_FOLDER) / f"{upload_id}.wav"
-    dst_dir = Path(RESULTS_FOLDER) / upload_id
+    src = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
+    dst_dir = Path(settings.RESULTS_FOLDER) / upload_id
     dst_dir.mkdir(parents=True, exist_ok=True)
 
     logger.info(f"Starting transcription for '{src}'")
-    segments = split_audio_fixed_windows(src)
-    logger.info(
-        f" -> {len(segments)} segments of up to "
-        f"{os.getenv('SEGMENT_LENGTH_S','30')}s"
-    )
+    segments = split_audio_fixed_windows(src, settings.SEGMENT_LENGTH_S)
+    logger.info(f" -> {len(segments)} segments of up to {settings.SEGMENT_LENGTH_S}s")
 
     transcript = []
     for idx, (start, end) in enumerate(segments):
         logger.debug(f" Transcribing segment {idx}: {start:.1f}s → {end:.1f}s")
         result = whisper.transcribe(
             str(src),
-            beam_size=int(os.getenv("WHISPER_BEAM_SIZE", "5")),
-            language=os.getenv("WHISPER_LANGUAGE", "ru"),
+            beam_size=settings.WHISPER_BATCH_SIZE,
+            language=settings.WHISPER_LANGUAGE,
             vad_filter=True,
             word_timestamps=True,
             offset=start,
@@ -132,6 +130,7 @@ def transcribe_segments(upload_id: str):
             "end": end,
             "text": text
         })
+
     out_path = dst_dir / "transcript.json"
     out_path.write_text(
         json.dumps(transcript, ensure_ascii=False, indent=2),
@@ -142,8 +141,8 @@ def transcribe_segments(upload_id: str):
 @shared_task(name="tasks.diarize_full")
 def diarize_full(upload_id: str):
     diarizer = get_diarizer()
-    src = Path(UPLOAD_FOLDER) / f"{upload_id}.wav"
-    dst_dir = Path(RESULTS_FOLDER) / upload_id
+    src = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
+    dst_dir = Path(settings.RESULTS_FOLDER) / upload_id
     dst_dir.mkdir(parents=True, exist_ok=True)
 
     logger.info(f"Starting diarization for '{src}'")
@@ -162,13 +161,12 @@ def diarize_full(upload_id: str):
     )
     logger.info(f"Diarization complete: saved to '{out_path}'")
 
-def split_audio_fixed_windows(audio_path: Path):
-    window_s = int(os.getenv("SEGMENT_LENGTH_S", "30"))
+def split_audio_fixed_windows(audio_path: Path, window_s: int):
     audio = AudioSegment.from_file(str(audio_path))
     length_ms = len(audio)
     window_ms = window_s * 1000
     segments = []
     for start_ms in range(0, length_ms, window_ms):
         end_ms = min(start_ms + window_ms, length_ms)
-        segments.append((start_ms/1000.0, end_ms/1000.0))
+        segments.append((start_ms / 1000.0, end_ms / 1000.0))
     return segments
