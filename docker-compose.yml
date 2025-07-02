@@ -39,11 +39,7 @@ services:
     depends_on:
       - redis
     command:
-      ["celery", "-A", "celery_app", "worker",
-       "--loglevel=info",
-       "--concurrency=${CPU_CONCURRENCY}",
-       "--queues=preprocess_cpu",
-       "--prefetch-multiplier=1"]
+      ["celery", "-A", "tasks", "worker", "--loglevel=info", "--concurrency=1"]
     restart: unless-stopped
 
   gpu-worker:
@@ -64,11 +60,7 @@ services:
     depends_on:
       - redis
     command:
-      ["celery", "-A", "celery_app", "worker",
-       "--loglevel=info",
-       "--concurrency=1",
-       "--queues=preprocess_gpu",
-       "--prefetch-multiplier=1"]
+      ["celery", "-A", "tasks", "worker", "--loglevel=info", "--concurrency=1", "--queues=preprocess_gpu"]
     restart: unless-stopped
 
   beat:
@@ -78,7 +70,7 @@ services:
     env_file: .env
     depends_on:
       - redis
-    command: ["celery", "-A", "celery_app", "beat", "--loglevel=info"]
+    command: ["celery", "-A", "tasks", "beat", "--loglevel=info"]
     restart: unless-stopped
 
   redis:
