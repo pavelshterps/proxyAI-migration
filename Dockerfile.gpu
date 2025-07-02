@@ -1,25 +1,33 @@
-# Dockerfile.gpu — для CUDA 12.1 + cuDNN8 на Ubuntu 22.04
-FROM nvidia/cuda:12.1.0-cudnn8-runtime-ubuntu22.04
+# 1) Stage «builder» — берём Ubuntu Jammy, ставим ffmpeg и libsndfile
+FROM ubuntu:22.04 AS builder
 
-# Системные зависимости: Python, pip, ffmpeg и libsndfile для аудио
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-      python3 python3-pip ffmpeg libsndfile1 && \
+      ffmpeg libsndfile1 && \
+    rm -rf /var/lib/apt/lists/*
+
+# 2) Stage «final» — CUDA runtime, копируем из builder только нужное
+FROM nvidia/cuda:12.1.0-cudnn8-runtime-ubuntu22.04
+
+# Системные зависимости Python
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+      python3 python3-pip && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Сначала ставим свежий pip и ускоренные сборки ctranslate2/faster-whisper под CUDA12
+# Копируем бинарники FFmpeg и libsndfile из builder
+COPY --from=builder /usr/bin/ffmpeg /usr/bin/ffmpeg
+COPY --from=builder /usr/lib/x86_64-linux-gnu/libsndfile.so.* /usr/lib/x86_64-linux-gnu/
+
+# Ставим Python-зависимости
 COPY requirements.txt .
 RUN pip3 install --upgrade pip && \
     pip3 install --no-cache-dir \
       ctranslate2[cuda12] faster-whisper[cuda12] && \
     pip3 install --no-cache-dir -r requirements.txt
 
-# Копируем всё приложение
 COPY . .
 
-# Не забыть при запуске монтировать квантованную модель в /hf_cache:
-#  volumes:
-#    - /path/to/hf_cache_host:/hf_cache:rw
 CMD ["celery", "-A", "tasks", "worker", "--loglevel=info", "--concurrency=1", "--queues=preprocess_gpu"]
