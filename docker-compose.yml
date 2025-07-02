@@ -1,5 +1,4 @@
 version: "3.8"
-
 services:
   db:
     image: postgres:15
@@ -15,7 +14,6 @@ services:
 
   redis:
     image: redis:7-alpine
-    restart: unless-stopped
     volumes:
       - redis-data:/data
     ports:
@@ -24,12 +22,12 @@ services:
       test: ["CMD", "redis-cli", "ping"]
       interval: 30s
       retries: 3
+    restart: unless-stopped
 
   api:
     build:
       context: .
       dockerfile: Dockerfile
-    restart: unless-stopped
     depends_on:
       - db
       - redis
@@ -41,22 +39,19 @@ services:
       - upload-data:/data/uploads
       - results-data:/data/results
       - diarizer-cache:/data/diarizer_cache
-      - /path/to/hf_cache_host:/hf_cache:rw
-      - ./app.db:/app/app.db
+      - hf-cache:/hf_cache
     ports:
       - "8000:8000"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
       retries: 3
+    restart: unless-stopped
 
   cpu-worker:
     build:
       context: .
       dockerfile: Dockerfile
-    restart: unless-stopped
-    depends_on:
-      - redis
     env_file: .env
     environment:
       - DATABASE_URL=${DATABASE_URL}
@@ -65,24 +60,23 @@ services:
       - upload-data:/data/uploads
       - results-data:/data/results
       - diarizer-cache:/data/diarizer_cache
-      - /path/to/hf_cache_host:/hf_cache:rw
-    command: >
-      celery -A tasks worker
-      --loglevel=info
-      --concurrency=${CPU_CONCURRENCY}
+      - hf-cache:/hf_cache:rw               # <== тут ваша папка с моделями
+    depends_on:
+      - redis
+    command:
+      ["celery", "-A", "tasks", "worker", "--loglevel=info", "--concurrency=1"]
+    restart: unless-stopped
 
   gpu-worker:
     build:
       context: .
       dockerfile: Dockerfile.gpu
-    restart: unless-stopped
-    depends_on:
-      - redis
     env_file: .env
     environment:
       - DATABASE_URL=${DATABASE_URL}
       - WHISPER_DEVICE=cuda
       - NVIDIA_VISIBLE_DEVICES=all
+    runtime: nvidia
     deploy:
       resources:
         reservations:
@@ -90,38 +84,30 @@ services:
             - driver: nvidia
               count: all
               capabilities: [ gpu ]
-    runtime: nvidia
     volumes:
       - upload-data:/data/uploads
       - results-data:/data/results
       - diarizer-cache:/data/diarizer_cache
-      - /path/to/hf_cache_host:/hf_cache:rw
-      - ctranslate2-cache:/root/.cache/ctranslate2
-    command: >
-      celery -A tasks worker
-      --loglevel=info
-      --concurrency=${GPU_CONCURRENCY}
-      --queues=preprocess_gpu
+      - hf-cache:/hf_cache:rw               # <== здесь тоже
+    depends_on:
+      - redis
+    command:
+      ["celery", "-A", "tasks", "worker", "--loglevel=info", "--concurrency=1", "--queues=preprocess_gpu"]
+    restart: unless-stopped
 
   beat:
     build:
       context: .
       dockerfile: Dockerfile
-    restart: unless-stopped
+    env_file: .env
     depends_on:
       - redis
-    env_file: .env
-    command: >
-      celery -A tasks beat
-      --loglevel=info
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
-      interval: 30s
-      retries: 3
+    command:
+      ["celery", "-A", "tasks", "beat", "--loglevel=info"]
+    restart: unless-stopped
 
   flower:
     image: mher/flower:0.9.7
-    restart: unless-stopped
     env_file: .env
     ports:
       - "5555:5555"
@@ -130,10 +116,7 @@ services:
       - "--broker=${CELERY_BROKER_URL}"
       - "--basic_auth=${FLOWER_USER}:${FLOWER_PASS}"
       - "--port=5555"
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:5555"]
-      interval: 30s
-      retries: 3
+    restart: unless-stopped
 
 volumes:
   postgres_data:
@@ -142,7 +125,6 @@ volumes:
   results-data:
   diarizer-cache:
   hf-cache:
-  ctranslate2-cache:
 
 networks:
   proxyai_net:
