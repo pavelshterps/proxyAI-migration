@@ -1,3 +1,5 @@
+# tasks.py
+
 import os
 import json
 import logging
@@ -14,30 +16,31 @@ from crud import update_upload_status
 
 logger = get_task_logger(__name__)
 
-# Initialize Celery from our config/celery.py
+# Инициализация Celery через внешний файл config/celery.py
 app = Celery("proxyai")
 app.config_from_object("config.celery")
 
-# Async SQLAlchemy engine and session factory
+# Асинхронный движок и фабрика сессий SQLAlchemy
 engine = create_async_engine(settings.DATABASE_URL, echo=False, future=True)
 AsyncSessionLocal = sessionmaker(
     engine, expire_on_commit=False, class_=AsyncSession
 )
 
-# Global singletons
+# Глобальные объекты моделей
 _whisper: WhisperModel | None = None
 _diarizer: DiarizationPipeline | None = None
+
 
 @signals.worker_process_init.connect
 def preload_and_warmup(**kwargs):
     """
-    Preload models on worker start:
-      1) pyannote diarization (CPU)
-      2) faster-whisper WhisperModel (FP16 quantized)
+    Предзагружаем модели при старте воркера:
+      1) Диаризация (pyannote)
+      2) Whisper (попытка на GPU FP16 → при ошибке тихий fallback на CPU FP16)
     """
     global _whisper, _diarizer
 
-    # 1) load diarization
+    # 1) Диаризация на CPU
     try:
         _diarizer = DiarizationPipeline.from_pretrained(settings.PYANNOTE_PIPELINE)
         logger.info(f"✅ Loaded diarization pipeline `{settings.PYANNOTE_PIPELINE}`")
@@ -45,21 +48,40 @@ def preload_and_warmup(**kwargs):
         logger.error(f"❌ Failed to load diarization pipeline: {e}", exc_info=True)
         raise
 
-    # 2) load Whisper (quantized FP16)
+    # 2) Whisper (локальная float16-квантованная модель)
     model_path = settings.WHISPER_MODEL_PATH
-    whisper_kwargs = {
-        "device": settings.WHISPER_DEVICE,             # e.g. "cuda" or "cpu"
-        "device_index": 0,                             # first GPU
-        "compute_type": settings.WHISPER_COMPUTE_TYPE, # "float16"
-        # NB: faster-whisper no longer needs inter_threads/intra_threads here
-    }
 
+    # Сначала пробуем запустить на GPU FP16
     try:
-        _whisper = WhisperModel(model_path, **whisper_kwargs)
-        logger.info(f"✅ Loaded Whisper model from `{model_path}` on `{settings.WHISPER_DEVICE}`")
-    except Exception as e:
-        logger.error(f"❌ Failed to load Whisper model: {e}", exc_info=True)
-        raise
+        _whisper = WhisperModel(
+            model_path,
+            device="cuda",
+            device_index=0,
+            compute_type="float16"
+        )
+        logger.info(f"✅ Loaded Whisper FP16 on GPU `{model_path}`")
+    except Exception as e_gpu:
+        logger.warning(
+            f"⚠️ GPU load failed ({e_gpu}), falling back to CPU FP16",
+            exc_info=True
+        )
+        # Фоллбек на CPU FP16
+        try:
+            _whisper = WhisperModel(
+                model_path,
+                device="cpu",
+                compute_type="float16"
+            )
+            logger.info(f"✅ Loaded Whisper FP16 on CPU `{model_path}`")
+        except Exception as e_cpu:
+            logger.error(
+                "❌ Both GPU and CPU Whisper load failed:\n"
+                f"  GPU error: {e_gpu}\n"
+                f"  CPU error: {e_cpu}",
+                exc_info=True
+            )
+            raise
+
 
 @app.task(
     bind=True,
@@ -70,19 +92,25 @@ def preload_and_warmup(**kwargs):
     retry_kwargs={"max_retries": 3},
 )
 async def process_audio(self, upload_id: int, file_path: str):
+    """
+    Основная задача:
+      1) Диаризация аудио
+      2) Транскрипция сегментов Whisper
+      3) Сохранение JSON и обновление статуса
+    """
     session: AsyncSession = AsyncSessionLocal()
     try:
-        # mark as processing
+        # 0) Помечаем запись как "processing"
         await update_upload_status(session, upload_id, "processing")
 
-        # diarize
+        # 1) Диаризация
         diarization = _diarizer({"uri": file_path, "audio": file_path})
         segments = [
             {"start": turn.start, "end": turn.end, "speaker": speaker}
             for turn, _, speaker in diarization.itertracks(yield_label=True)
         ]
 
-        # transcribe each segment
+        # 2) Транскрипция каждого сегмента
         transcriptions = []
         for seg in segments:
             result = _whisper.transcribe(
@@ -91,15 +119,15 @@ async def process_audio(self, upload_id: int, file_path: str):
                 word_timestamps=False,
                 segment=seg
             )
-            text = " ".join([chunk.text for chunk in result])
+            text = " ".join(chunk.text for chunk in result)
             transcriptions.append({**seg, "text": text})
 
-        # write JSON
+        # 3) Сохраняем результат в JSON-файл
         json_path = f"{file_path}.json"
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(transcriptions, f, ensure_ascii=False, indent=2)
 
-        # done
+        # 4) Обновляем статус и удаляем временные файлы
         await update_upload_status(session, upload_id, "completed")
         cleanup_files(file_path, json_path)
 
@@ -110,7 +138,11 @@ async def process_audio(self, upload_id: int, file_path: str):
     finally:
         await session.close()
 
+
 def cleanup_files(*paths: str):
+    """
+    Удаление временных файлов после обработки.
+    """
     for p in paths:
         try:
             os.remove(p)
