@@ -30,6 +30,7 @@ services:
       dockerfile: Dockerfile
     environment:
       - DATABASE_URL=${DATABASE_URL}
+      - WHISPER_DEVICE=cpu
     env_file: .env
     volumes:
       - upload-data:/data/uploads
@@ -49,6 +50,7 @@ services:
     environment:
       - DATABASE_URL=${DATABASE_URL}
       - NVIDIA_VISIBLE_DEVICES=all
+      - WHISPER_DEVICE=gpu
     env_file: .env
     runtime: nvidia
     volumes:
