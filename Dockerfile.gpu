@@ -1,26 +1,25 @@
-# Dockerfile.gpu — для GPU-воркера Celery на CUDA 12.2 + cuDNN8
-FROM nvidia/cuda:12.2.0-cudnn8-runtime-ubuntu22.04
+# Dockerfile.gpu — для CUDA 12.1 + cuDNN8 на Ubuntu 22.04
+FROM nvidia/cuda:12.1.0-cudnn8-runtime-ubuntu22.04
 
-# Устанавливаем только необходимое для аудио и сборки Python-зависимостей
-RUN apt-get update && apt-get install -y --no-install-recommends \
-      ffmpeg \
-      libsndfile1 \
-      libjpeg-dev \
-      libpng-dev \
-      python3-pip \
-    && rm -rf /var/lib/apt/lists/*
+# Системные зависимости: Python, pip, ffmpeg и libsndfile для аудио
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+      python3 python3-pip ffmpeg libsndfile1 && \
+    rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Сначала ставим ctranslate2 и faster-whisper, сборки под CUDA 12
+# Сначала ставим свежий pip и ускоренные сборки ctranslate2/faster-whisper под CUDA12
 COPY requirements.txt .
-RUN pip install --no-cache-dir --upgrade pip \
-  && pip install --no-cache-dir \
-       ctranslate2[cuda12] faster-whisper[cuda12] \
-  && pip install --no-cache-dir -r requirements.txt
+RUN pip3 install --upgrade pip && \
+    pip3 install --no-cache-dir \
+      ctranslate2[cuda12] faster-whisper[cuda12] && \
+    pip3 install --no-cache-dir -r requirements.txt
 
-# Копируем весь код
+# Копируем всё приложение
 COPY . .
 
-# Запускаем Celery GPU-воркер
+# Не забыть при запуске монтировать квантованную модель в /hf_cache:
+#  volumes:
+#    - /path/to/hf_cache_host:/hf_cache:rw
 CMD ["celery", "-A", "tasks", "worker", "--loglevel=info", "--concurrency=1", "--queues=preprocess_gpu"]
