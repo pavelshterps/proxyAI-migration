@@ -1,29 +1,27 @@
-# Dockerfile.gpu — for CUDA 12.1.0-cudnn8-runtime on Ubuntu 22.04
+# Dockerfile.gpu — GPU worker
 FROM nvidia/cuda:12.1.0-cudnn8-runtime-ubuntu22.04
 
-# Устанавливаем системные зависимости
+# 1) Включаем основные Ubuntu-репозитории (main, universe, multiverse, restricted)
+RUN sed -i.bak \
+      -e 's@^# deb http://archive.ubuntu.com/ubuntu/@deb http://archive.ubuntu.com/ubuntu/@' \
+      -e 's@^# deb-src http://archive.ubuntu.com/ubuntu/@deb-src http://archive.ubuntu.com/ubuntu/@' \
+      /etc/apt/sources.list \
+  && echo "deb http://security.ubuntu.com/ubuntu jammy-security main universe multiverse restricted" >> /etc/apt/sources.list \
+  && echo "deb http://archive.ubuntu.com/ubuntu jammy-updates main universe multiverse restricted" >> /etc/apt/sources.list
+
+# 2) Устанавливаем системные зависимости
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
-         python3-pip \
-         ffmpeg \
-         build-essential \
-         gcc \
-         python3-dev \
-    && rm -rf /var/lib/apt/lists/*
+ && apt-get install -y --no-install-recommends \
+      python3-pip ffmpeg build-essential gcc python3-dev \
+ && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-
-# Копируем только список зависимостей и ставим сначала ctranslate2/faster-whisper
 COPY requirements.txt ./
 
 RUN pip install --upgrade pip \
-    # ускоренные сборки под CUDA12
-    && pip install --no-cache-dir \
-         ctranslate2[cuda12] faster-whisper[cuda12] \
-    && pip install --no-cache-dir -r requirements.txt
+ && pip install --no-cache-dir \
+      ctranslate2[cuda12] faster-whisper[cuda12] \
+ && pip install --no-cache-dir -r requirements.txt
 
-# Добавляем код приложения
 COPY . .
-
-# Запуск GPU-воркера Celery
 CMD ["celery", "-A", "tasks", "worker", "--loglevel=info", "--concurrency=1", "--queues=preprocess_gpu"]
