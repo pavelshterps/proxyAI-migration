@@ -56,7 +56,7 @@ AsyncSessionLocal = sessionmaker(
 )
 
 # === Pyannote диаризация (CPU) ===
-pyannote_pipeline = Pipeline.from_pretrained(settings.PYANNO_PIPELINE)
+pyannote_pipeline = Pipeline.from_pretrained(settings.PYANNOTE_PIPELINE)
 
 def extract_audio_segment(src_path: str, dst_path: str, start: float, end: float):
     """Вырезает отрезок audio [start, end) из src_path и сохраняет в dst_path."""
