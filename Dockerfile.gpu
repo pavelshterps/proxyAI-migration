@@ -1,23 +1,33 @@
-# Dockerfile.gpu — для CUDA 11.8 + cuDNN8 на Ubuntu 22.04
-FROM nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04
+# Dockerfile.gpu — for CUDA 12.1 + cuDNN8 + Ubuntu 22.04 + Russian mirror
+FROM nvidia/cuda:12.1.0-cudnn8-runtime-ubuntu22.04
 
-# Системные зависимости
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-      python3-pip python3-dev \
-      ffmpeg libsndfile1 && \
-    rm -rf /var/lib/apt/lists/*
+# 1) Подменяем все mirror'ы на российское зеркало
+RUN sed -i 's|http://archive.ubuntu.com/ubuntu/|http://ru.archive.ubuntu.com/ubuntu/|g' /etc/apt/sources.list \
+ && sed -i 's|http://security.ubuntu.com/ubuntu|http://ru.archive.ubuntu.com/ubuntu|g' /etc/apt/sources.list
+
+# 2) Минимальный набор зависимостей для сборки и работы аудио- и C-расширений
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+       python3-pip python3-dev build-essential \
+       ffmpeg libsndfile1 \
+ && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
+
+# 3) Устанавливаем ускоренные бинарники CTranslate2 и faster-whisper под CUDA12
 COPY requirements.txt ./
+RUN pip3 install --no-cache-dir --upgrade pip \
+ && pip3 install --no-cache-dir \
+       ctranslate2[cuda12] faster-whisper[cuda12] \
+ && pip3 install --no-cache-dir -r requirements.txt
 
-# Устанавливаем GPU-билды быстрее-whisper/ctranslate2 под CUDA 11
-RUN pip3 install --upgrade pip && \
-    pip3 install --no-cache-dir \
-      ctranslate2[cuda11] faster-whisper[cuda11] && \
-    pip3 install --no-cache-dir -r requirements.txt
-
+# 4) Копируем весь код
 COPY . .
 
-# Запускаем только очередь preprocess_gpu
+# 5) При запуске монтируется хост-директория с вашей quantized FP16-моделью:
+#    docker run … -v /path/to/hf_cache_host:/hf_cache:rw
+ENV HUGGINGFACE_CACHE_DIR=/hf_cache
+ENV WHISPER_DEVICE=cuda
+ENV WHISPER_COMPUTE_TYPE=float16
+
 CMD ["celery", "-A", "tasks", "worker", "--loglevel=info", "--concurrency=1", "--queues=preprocess_gpu"]
