@@ -1,5 +1,3 @@
-# tasks.py
-
 import os
 import json
 import logging
@@ -35,52 +33,57 @@ def preload_and_warmup(**kwargs):
     """
     Предзагрузка моделей при старте каждого воркера:
     1) Диаризация (CPU)
-    2) Whisper (попытка GPU FP16 → жёсткий fallback CPU float32)
+    2) Whisper (FP16 на GPU → фэйловер на CPU default float32)
     """
     global _whisper, _diarizer
 
     # 1) Диаризация на CPU
     try:
-        _diarizer = DiarizationPipeline.from_pretrained(settings.PYANNOTE_PIPELINE)
+        _diarizer = DiarizationPipeline.from_pretrained(
+            settings.PYANNOTE_PIPELINE,
+            use_auth_token=settings.HUGGINGFACE_TOKEN
+        )
         logger.info(f"✅ Loaded diarization pipeline `{settings.PYANNOTE_PIPELINE}`")
     except Exception as e:
         logger.error(f"❌ Failed to load diarization pipeline: {e}", exc_info=True)
         raise
 
     model_path = settings.WHISPER_MODEL_PATH
-    whisper_model = None
+    gpu_exc: Exception | None = None
 
-    # 2a) Попытка загрузить на GPU float16
+    # 2a) Попытка GPU FP16
     if settings.WHISPER_DEVICE.startswith("cuda"):
         try:
-            whisper_model = WhisperModel(
+            _whisper = WhisperModel(
                 model_path,
-                device=settings.WHISPER_DEVICE,    # e.g. "cuda"
+                device=settings.WHISPER_DEVICE,
                 device_index=0,
-                compute_type=settings.WHISPER_COMPUTE_TYPE  # "float16"
+                compute_type=settings.WHISPER_COMPUTE_TYPE  # float16
             )
-            logger.info(f"✅ Loaded Whisper on GPU `{settings.WHISPER_DEVICE}` (compute_type={settings.WHISPER_COMPUTE_TYPE})")
-        except Exception as gpu_err:
+            logger.info(f"✅ Loaded Whisper (FP16) on `{settings.WHISPER_DEVICE}`")
+            return
+        except Exception as e:
+            gpu_exc = e
             logger.warning(
-                f"⚠️ GPU load failed ({gpu_err}), falling back to CPU float32",
-                exc_info=True
+                f"⚠️ GPU load failed ({e}), falling back to CPU default compute_type"
             )
 
-    # 2b) Жёсткий fallback на CPU float32
-    if whisper_model is None:
-        try:
-            whisper_model = WhisperModel(
-                model_path,
-                device="cpu",
-                compute_type="default"  # float32
-            )
-            logger.info(f"✅ Loaded Whisper on CPU (compute_type=default)")
-        except Exception as cpu_err:
-            logger.error(f"❌ Failed to load Whisper model on CPU: {cpu_err}", exc_info=True)
-            # Блокируем стартап, без модели бессмысленно продолжать
-            raise
-
-    _whisper = whisper_model
+    # 2b) Фэйловер на CPU default (float32)
+    try:
+        _whisper = WhisperModel(
+            model_path,
+            device="cpu",
+            compute_type="default"
+        )
+        logger.info(f"✅ Loaded Whisper on `cpu` (`compute_type=default`) from `{model_path}`")
+    except Exception as cpu_err:
+        logger.error(
+            f"❌ Both GPU and CPU Whisper load failed:\n"
+            f"   GPU error: {gpu_exc}\n"
+            f"   CPU error: {cpu_err}",
+            exc_info=True
+        )
+        raise RuntimeError(f"WhisperModel init failed (GPU:{gpu_exc}, CPU:{cpu_err})")
 
 @app.task(
     bind=True,
@@ -99,7 +102,6 @@ async def process_audio(self, upload_id: int, file_path: str):
     """
     session: AsyncSession = AsyncSessionLocal()
     try:
-        # 0) Помечаем запись как "processing"
         await update_upload_status(session, upload_id, "processing")
 
         # 1) Диаризация
@@ -118,7 +120,7 @@ async def process_audio(self, upload_id: int, file_path: str):
                 word_timestamps=False,
                 segment=seg
             )
-            text = " ".join([chunk.text for chunk in result])
+            text = " ".join(chunk.text for chunk in result)
             transcriptions.append({**seg, "text": text})
 
         # 3) Сохраняем результат в JSON-файл
@@ -126,7 +128,7 @@ async def process_audio(self, upload_id: int, file_path: str):
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(transcriptions, f, ensure_ascii=False, indent=2)
 
-        # 4) Обновляем статус на "completed" и удаляем временные файлы
+        # 4) Обновляем статус и удаляем временные файлы
         await update_upload_status(session, upload_id, "completed")
         cleanup_files(file_path, json_path)
 
