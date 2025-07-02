@@ -1,28 +1,25 @@
-# Dockerfile.gpu — минимальный образ для GPU-воркера Celery
-# ----------------------------------------------------------------
-# Берём CUDA-образ только с runtime (+ cuDNN)
-FROM nvidia/cuda:12.1.0-cudnn8-runtime-ubuntu22.04
+# Dockerfile.gpu — for CUDA 12.2 / host driver 535.161.08 compatibility
+FROM nvidia/cuda:12.2.0-runtime-ubuntu22.04
 
-# Рабочая папка
+# Basic system deps & Python/pip
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      python3-pip \
+      python3-dev \
+      ffmpeg \
+      libsndfile1 \
+ && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
+COPY requirements.txt ./
 
-# Копируем только список зависимостей
-COPY requirements.txt .
+# Use python3 -m pip everywhere to guarantee pip is present
+RUN python3 -m pip install --upgrade pip \
+ && python3 -m pip install --no-cache-dir \
+      ctranslate2[cuda12] faster-whisper[cuda12] imageio-ffmpeg \
+ && python3 -m pip install --no-cache-dir -r requirements.txt
 
-# Устанавливаем Python-библиотеки:
-# - imageio-ffmpeg даёт встроенный ffmpeg (нет нужды в apt-get)
-# - ctranslate2 и faster-whisper для GPU
-# - остальное из вашего requirements.txt (API/CPU-части не понадобятся здесь)
-# --no-cache-dir делает слой компактнее
-RUN pip install --upgrade pip \
-    && pip install --no-cache-dir \
-         imageio-ffmpeg \
-         ctranslate2[cuda12] faster-whisper[cuda12] \
-    && pip install --no-cache-dir -r requirements.txt
-
-# Копируем код приложения
 COPY . .
 
-# Запускаем только preprocess_gpu-очередь
-CMD ["celery", "-A", "tasks", "worker", \
-     "--loglevel=info", "--concurrency=1", "--queues=preprocess_gpu"]
+# Celery GPU worker, pointing at your tasks module
+CMD ["celery", "-A", "tasks", "worker", "--loglevel=info", "--concurrency=1", "--queues=preprocess_gpu"]
