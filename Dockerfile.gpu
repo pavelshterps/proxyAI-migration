@@ -1,22 +1,26 @@
-# Dockerfile.gpu — for CUDA 12.2 / host driver 535.161.08 compatibility
+# Dockerfile.gpu — CUDA 12.2 + devkit + Ubuntu Jammy репозитории
 FROM nvidia/cuda:12.2.0-devel-ubuntu22.04
 
-# Use HTTPS apt repos and add universe/multiverse
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
-         software-properties-common ca-certificates \
-    && add-apt-repository "deb [arch=amd64] https://archive.ubuntu.com/ubuntu jammy main universe multiverse restricted" \
-    && add-apt-repository "deb [arch=amd64] https://security.ubuntu.com/ubuntu jammy-security main universe multiverse restricted" \
-    && apt-get update \
-    && apt-get install -y --no-install-recommends \
-         python3-pip ffmpeg build-essential gcc python3-dev \
-    && rm -rf /var/lib/apt/lists/*
+# Подключаем стандартные Ubuntu-репозитории и ставим системные пакеты
+RUN sed -i.bak \
+      -e 's@^# deb http://archive.ubuntu.com/ubuntu/@deb http://archive.ubuntu.com/ubuntu/@' \
+      -e 's@^# deb-src http://archive.ubuntu.com/ubuntu/@deb-src http://archive.ubuntu.com/ubuntu/@' \
+      /etc/apt/sources.list && \
+    echo "deb http://security.ubuntu.com/ubuntu jammy-security main universe multiverse restricted" >> /etc/apt/sources.list && \
+    echo "deb http://archive.ubuntu.com/ubuntu jammy-updates main universe multiverse restricted"      >> /etc/apt/sources.list && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+        python3-pip \
+        ffmpeg \
+        build-essential \
+        gcc \
+        python3-dev && \
+    rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 COPY requirements.txt ./
 
 RUN pip install --upgrade pip \
-    # Match host CUDA 12.2: install cuda12 builds
     && pip install --no-cache-dir \
          ctranslate2[cuda12] faster-whisper[cuda12] \
     && pip install --no-cache-dir -r requirements.txt
