@@ -92,7 +92,7 @@ def preload_and_warmup(**kwargs):
     - Whisper только на GPU (чтобы на CPU не пытаться float16).
     """
     device = settings.WHISPER_DEVICE.lower()
-    sample = Path(settings.UPLOAD_FOLDER) / "warmup.wav"
+    sample = Path(__file__).resolve().parent / "tests" / "fixtures" / "sample.wav"
 
     # Warm-up diarizer
     try:
