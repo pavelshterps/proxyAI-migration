@@ -1,19 +1,19 @@
-# Dockerfile.gpu
+# Dockerfile.gpu — for CUDA 12.2 / host driver 535.161.08 compatibility
+FROM nvidia/cuda:12.2.0-runtime-ubuntu22.04
 
-FROM nvidia/cuda:11.8.0-runtime-ubuntu22.04
-
+# Basic system deps
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        python3-pip ffmpeg build-essential gcc python3-dev \
+         python3-pip ffmpeg build-essential gcc python3-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 COPY requirements.txt ./
 
 RUN pip install --upgrade pip \
-    # ускоренные бинарники ctranslate2/faster-whisper под CUDA 11
+    # Match host CUDA 12.2: install cuda12 builds
     && pip install --no-cache-dir \
-         ctranslate2[cuda11] faster-whisper[cuda11] \
+         ctranslate2[cuda12] faster-whisper[cuda12] \
     && pip install --no-cache-dir -r requirements.txt
 
 COPY . .

@@ -1,15 +1,11 @@
-# tasks.py
-
 import os
 import json
 import logging
 
 from celery import Celery, signals
 from celery.utils.log import get_task_logger
-
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
-
 from faster_whisper import WhisperModel
 from pyannote.audio import Pipeline as DiarizationPipeline
 
@@ -17,6 +13,7 @@ from config.settings import settings
 from crud import update_upload_status
 
 logger = get_task_logger(__name__)
+
 app = Celery("proxyai")
 app.config_from_object("config.celery")
 
@@ -29,39 +26,54 @@ AsyncSessionLocal = sessionmaker(
 _whisper: WhisperModel | None = None
 _diarizer: DiarizationPipeline | None = None
 
+
 @signals.worker_process_init.connect
 def preload_and_warmup(**kwargs):
     global _whisper, _diarizer
 
-    # 1) Диаризация на CPU
+    # 1) Инициализация пайплайна диаризации на CPU
     try:
-        _diarizer = DiarizationPipeline.from_pretrained(
-            settings.PYANNOTE_PIPELINE,
-            use_auth_token=settings.HUGGINGFACE_TOKEN  # если нужен токен для gated pipeline
-        )
+        # Если для gated pipeline нужен токен, можно добавить use_auth_token=settings.HF_TOKEN
+        _diarizer = DiarizationPipeline.from_pretrained(settings.PYANNOTE_PIPELINE)
         logger.info(f"✅ Loaded diarization pipeline `{settings.PYANNOTE_PIPELINE}`")
     except Exception as e:
         logger.error(f"❌ Failed to load diarization pipeline: {e}")
         raise
 
-    # 2) Whisper (FP16‐квантованная модель)
+    # 2) Предзагрузка Whisper (модель уже скачана и заквантована в float16)
     model_path = settings.WHISPER_MODEL_PATH
-    whisper_init_kwargs = {
-        "device": settings.WHISPER_DEVICE,
-        "device_index": 0,
-        "compute_type": settings.WHISPER_COMPUTE_TYPE,
-        # flash_attention / tensor_parallel — оставляем, если нужны
+
+    # Общие параметры для CTranslate2
+    whisper_kwargs = {
+        "device": settings.WHISPER_DEVICE,                              # "cuda" или "cpu"
+        "device_index": 0,                                              # для GPU
+        "compute_type": settings.WHISPER_COMPUTE_TYPE,                  # "float16"
+        "inter_threads": settings.GPU_CONCURRENCY if settings.WHISPER_DEVICE.startswith("cuda") else 1,
+        "intra_threads": settings.CPU_CONCURRENCY if settings.WHISPER_DEVICE == "cpu" else 0,
         "flash_attention": False,
         "tensor_parallel": False,
-        # при желании можно добавить batch_size, cache_dir и т.д.
     }
 
-    try:
-        _whisper = WhisperModel(model_path, **whisper_init_kwargs)
-        logger.info(f"✅ Loaded Whisper model from `{model_path}` on {settings.WHISPER_DEVICE}")
-    except Exception as e:
-        logger.error(f"❌ Failed to load Whisper model: {e}")
-        raise
+    # Пытаемся загрузить на GPU, иначе плавно откатываемся на CPU
+    if settings.WHISPER_DEVICE.startswith("cuda"):
+        try:
+            _whisper = WhisperModel(model_path, **whisper_kwargs)
+            logger.info(f"✅ Loaded Whisper model from `{model_path}` on GPU")
+        except RuntimeError as gpu_err:
+            logger.warning(f"❌ GPU load failed ({gpu_err}); falling back to CPU")
+            cpu_kwargs = whisper_kwargs.copy()
+            cpu_kwargs.update({
+                "device": "cpu",
+                "compute_type": "default",    # автоподбор оптимального для CPU
+            })
+            cpu_kwargs.pop("device_index", None)
+            # для CPU не нужны inter_threads/intra_threads — они будут браться из настроек по умолчанию
+            _whisper = WhisperModel(model_path, **cpu_kwargs)
+            logger.info(f"✅ Loaded Whisper model from `{model_path}` on CPU fallback")
+    else:
+        _whisper = WhisperModel(model_path, **whisper_kwargs)
+        logger.info(f"✅ Loaded Whisper model from `{model_path}` on CPU")
+
 
 @app.task(
     bind=True,
@@ -74,7 +86,7 @@ def preload_and_warmup(**kwargs):
 async def process_audio(self, upload_id: int, file_path: str):
     session = AsyncSessionLocal()
     try:
-        # Сменить статус на «processing»
+        # Переводим запись в состояние processing
         await update_upload_status(session, upload_id, "processing")
 
         # 1) Диаризация
@@ -96,12 +108,12 @@ async def process_audio(self, upload_id: int, file_path: str):
             text = " ".join([s.text for s in result])
             transcriptions.append({**seg, "text": text})
 
-        # 3) Сохраняем в JSON
+        # 3) Сохраняем результат в JSON
         json_path = f"{file_path}.json"
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(transcriptions, f, ensure_ascii=False, indent=2)
 
-        # 4) Обновляем статус и чистим файлы
+        # 4) Завершаем задачу
         await update_upload_status(session, upload_id, "completed")
         cleanup_files(file_path, json_path)
 
@@ -111,6 +123,7 @@ async def process_audio(self, upload_id: int, file_path: str):
         raise
     finally:
         await session.close()
+
 
 def cleanup_files(*paths: str):
     for p in paths:
