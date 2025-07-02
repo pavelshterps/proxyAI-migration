@@ -52,6 +52,7 @@ services:
       dockerfile: Dockerfile.gpu
     environment:
       - DATABASE_URL=${DATABASE_URL}
+      - NVIDIA_VISIBLE_DEVICES=all
     env_file: .env
     runtime: nvidia
     volumes:
