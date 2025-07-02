@@ -1,4 +1,5 @@
 version: "3.8"
+
 services:
   db:
     image: postgres:15
@@ -58,7 +59,7 @@ services:
       - redis
     env_file: .env
     environment:
-      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_NAME}
+      - DATABASE_URL=${DATABASE_URL}
       - WHISPER_DEVICE=cpu
     volumes:
       - upload-data:/data/uploads
@@ -69,10 +70,6 @@ services:
       celery -A tasks worker
       --loglevel=info
       --concurrency=${CPU_CONCURRENCY}
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
-      interval: 30s
-      retries: 3
 
   gpu-worker:
     build:
@@ -83,20 +80,9 @@ services:
       - redis
     env_file: .env
     environment:
-      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_NAME}
+      - DATABASE_URL=${DATABASE_URL}
       - WHISPER_DEVICE=cuda
       - NVIDIA_VISIBLE_DEVICES=all
-    volumes:
-      - upload-data:/data/uploads
-      - results-data:/data/results
-      - diarizer-cache:/data/diarizer_cache
-      - hf-cache:/hf_cache:rw
-      - ctranslate2-cache:/root/.cache/ctranslate2
-    command: >
-      celery -A tasks worker
-      --loglevel=info
-      --concurrency=${GPU_CONCURRENCY}
-      --queues=preprocess_gpu
     deploy:
       resources:
         reservations:
@@ -105,10 +91,17 @@ services:
               count: all
               capabilities: [ gpu ]
     runtime: nvidia
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
-      interval: 30s
-      retries: 3
+    volumes:
+      - upload-data:/data/uploads
+      - results-data:/data/results
+      - diarizer-cache:/data/diarizer_cache
+      - /path/to/hf_cache_host:/hf_cache:rw
+      - ctranslate2-cache:/root/.cache/ctranslate2
+    command: >
+      celery -A tasks worker
+      --loglevel=info
+      --concurrency=${GPU_CONCURRENCY}
+      --queues=preprocess_gpu
 
   beat:
     build:
