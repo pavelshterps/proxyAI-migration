@@ -5,13 +5,26 @@ import json
 import logging
 from pathlib import Path
 
-from celery import shared_task
+from celery import Celery, shared_task
 from celery.signals import worker_process_init
 from faster_whisper import WhisperModel
 from pyannote.audio import Pipeline
 from pydub import AudioSegment
 
 from config.settings import settings  # ← импортируем объект настроек
+
+# === Celery application ===
+app = Celery(
+    "proxyai",
+    broker=settings.CELERY_BROKER_URL,
+    backend=settings.CELERY_RESULT_BACKEND,
+)
+# алиас для CLI (celery -A tasks ...)
+celery = app
+
+# по умолчанию – CPU-очередь
+app.conf.task_default_queue = "preprocess_cpu"
+
 
 logger = logging.getLogger(__name__)
 
