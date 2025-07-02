@@ -107,10 +107,9 @@ def preload_and_warmup(**kwargs):
             whisper = get_whisper_model()
             whisper.transcribe(
                 str(sample),
-                offset=0,
-                duration=2.0,
                 language=settings.WHISPER_LANGUAGE,
-                vad_filter=True
+                vad_filter=True,
+                clip_timestamps = [{"start": 0.0, "end": 2.0}],
             )
             logger.info("✅ Warm-up WhisperModel complete")
         except Exception as e:
