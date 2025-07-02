@@ -1,98 +1,174 @@
 # tasks.py
-
 import os
 import json
 import logging
-
-from celery import Celery, signals
-from celery.utils.log import get_task_logger
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
-from sqlalchemy.orm import sessionmaker
+from pathlib import Path
+from celery import shared_task
+from celery.signals import worker_process_init
 from faster_whisper import WhisperModel
-from pyannote.audio import Pipeline as DiarizationPipeline
+from pyannote.audio import Pipeline
+from pydub import AudioSegment
+from config.settings import UPLOAD_FOLDER, RESULTS_FOLDER
 
-from config.settings import settings
-from crud import update_upload_status
+logger = logging.getLogger(__name__)
 
-logger = get_task_logger(__name__)
-app = Celery("proxyai")
-app.config_from_object("config.celery")
+# Singletons so we only load each model once per worker process
+_whisper_model = None
+_diarizer = None
 
-engine = create_async_engine(settings.DATABASE_URL, echo=False, future=True)
-AsyncSessionLocal = sessionmaker(
-    engine, expire_on_commit=False, class_=AsyncSession
-)
+def get_whisper_model():
+    global _whisper_model
+    if _whisper_model is None:
+        model_path = os.getenv(
+            "WHISPER_MODEL_PATH",
+            "/hf_cache/models--guillaumekln--faster-whisper-medium"
+        )
+        device = os.getenv("WHISPER_DEVICE", "cuda").lower()
+        compute = os.getenv("WHISPER_COMPUTE_TYPE", "int8").lower()
 
-_whisper: WhisperModel | None = None
-_diarizer: DiarizationPipeline | None = None
-
-@signals.worker_process_init.connect
-def preload_and_warmup(**kwargs):
-    global _whisper, _diarizer
-
-    # 1) Диаризация
-    _diarizer = DiarizationPipeline.from_pretrained(
-        settings.PYANNOTE_PIPELINE,
-        use_auth_token=settings.HUGGINGFACE_TOKEN,
-        cache_dir="/hf_cache"
-    )
-    logger.info(f"✅ Loaded diarization pipeline `{settings.PYANNOTE_PIPELINE}`")
-
-    # 2) Whisper (локально, FP16)
-    whisper_opts = {
-        "device": settings.WHISPER_DEVICE,
-        "device_index": 0,
-        "compute_type": settings.WHISPER_COMPUTE_TYPE,
-        "cpu_threads": settings.CPU_CONCURRENCY if settings.WHISPER_DEVICE == "cpu" else 0,
-        "num_workers": settings.GPU_CONCURRENCY if settings.WHISPER_DEVICE.startswith("cuda") else 1,
-        "download_root": "/hf_cache",
-        "local_files_only": True,
-    }
-    _whisper = WhisperModel(settings.WHISPER_MODEL_PATH, **whisper_opts)
-    logger.info(f"✅ Loaded Whisper model from `{settings.WHISPER_MODEL_PATH}` on `{settings.WHISPER_DEVICE}`")
-
-async def process_audio(self, upload_id: int, file_path: str):
-    session: AsyncSession = AsyncSessionLocal()
-    try:
-        await update_upload_status(session, upload_id, "processing")
-
-        diarization = _diarizer({"uri": file_path, "audio": file_path})
-        segments = [
-            {"start": turn.start, "end": turn.end, "speaker": speaker}
-            for turn, _, speaker in diarization.itertracks(yield_label=True)
-        ]
-
-        transcriptions = []
-        for seg in segments:
-            result = _whisper.transcribe(
-                file_path,
-                language=settings.WHISPER_LANGUAGE,
-                word_timestamps=False,
-                segment=seg
+        # На CPU float16 не поддерживается — принудительно int8
+        if device == "cpu" and compute in ("float16", "fp16"):
+            logger.warning(
+                f"Compute type '{compute}' not supported on CPU; falling back to 'int8'"
             )
-            text = " ".join([chunk.text for chunk in result])
-            transcriptions.append({**seg, "text": text})
+            compute = "int8"
 
-        json_path = f"{file_path}.json"
-        with open(json_path, "w", encoding="utf-8") as f:
-            json.dump(transcriptions, f, ensure_ascii=False, indent=2)
-
-        await update_upload_status(session, upload_id, "completed")
-        cleanup_files(file_path, json_path)
-
-    except Exception as e:
-        logger.exception(f"Error in process_audio (upload_id={upload_id}): {e}")
-        await update_upload_status(session, upload_id, "failed")
-        raise
-    finally:
-        await session.close()
-
-def cleanup_files(*paths: str):
-    for p in paths:
+        logger.info(
+            f"Loading WhisperModel {{'path': '{model_path}', 'device': '{device}', 'compute': '{compute}'}}"
+        )
         try:
-            os.remove(p)
-            logger.info(f"Deleted file {p}")
-        except FileNotFoundError:
-            logger.warning(f"File not found for deletion: {p}")
+            _whisper_model = WhisperModel(
+                model_path,
+                device=device,
+                compute_type=compute
+            )
+        except ValueError as e:
+            # Если всё же упало — пробуем с int8
+            logger.warning(
+                f"Failed to init WhisperModel with compute_type={compute}: {e}; retrying with compute_type='int8'"
+            )
+            _whisper_model = WhisperModel(
+                model_path,
+                device=device,
+                compute_type="int8"
+            )
+        logger.info("WhisperModel loaded")
+    return _whisper_model
+
+def get_diarizer():
+    global _diarizer
+    if _diarizer is None:
+        cache_dir = os.getenv("DIARIZER_CACHE_DIR", "/tmp/diarizer_cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        logger.info(f"Loading pyannote Pipeline into cache '{cache_dir}'")
+        _diarizer = Pipeline.from_pretrained(
+            os.getenv("PYANNOTE_PROTOCOL", "pyannote/speaker-diarization"),
+            cache_dir=cache_dir
+        )
+        logger.info("Diarizer loaded")
+    return _diarizer
+
+@worker_process_init.connect
+def preload_and_warmup(**kwargs):
+    """
+    При старте воркера разогреваем модели,
+    но на CPU не пытаемся инициализировать float16-Whisper.
+    """
+    device = os.getenv("WHISPER_DEVICE", "cuda").lower()
+
+    # Warm-up diarizer всегда
+    try:
+        sample = Path(UPLOAD_FOLDER) / "warmup.wav"
+        get_diarizer()(str(sample))
+        logger.info("✅ Warm-up diarizer complete")
+    except Exception as e:
+        logger.warning(f"Warm-up diarizer failed: {e}")
+
+    # Warm-up Whisper только если устройство не CPU
+    if device != "cpu":
+        try:
+            whisper = get_whisper_model()
+            whisper.transcribe(
+                str(sample),
+                offset=0,
+                duration=2.0,
+                language=os.getenv("WHISPER_LANGUAGE", "ru"),
+                vad_filter=True
+            )
+            logger.info("✅ Warm-up WhisperModel complete")
         except Exception as e:
-            logger.warning(f"Failed to delete {p}: {e}")
+            logger.warning(f"Warm-up WhisperModel failed: {e}")
+
+@shared_task(name="tasks.transcribe_segments")
+def transcribe_segments(upload_id: str):
+    whisper = get_whisper_model()
+    src = Path(UPLOAD_FOLDER) / f"{upload_id}.wav"
+    dst_dir = Path(RESULTS_FOLDER) / upload_id
+    dst_dir.mkdir(parents=True, exist_ok=True)
+
+    logger.info(f"Starting transcription for '{src}'")
+    segments = split_audio_fixed_windows(src)
+    logger.info(
+        f" -> {len(segments)} segments of up to "
+        f"{os.getenv('SEGMENT_LENGTH_S','30')}s"
+    )
+
+    transcript = []
+    for idx, (start, end) in enumerate(segments):
+        logger.debug(f" Transcribing segment {idx}: {start:.1f}s → {end:.1f}s")
+        result = whisper.transcribe(
+            str(src),
+            beam_size=int(os.getenv("WHISPER_BEAM_SIZE", "5")),
+            language=os.getenv("WHISPER_LANGUAGE", "ru"),
+            vad_filter=True,
+            word_timestamps=True,
+            offset=start,
+            duration=(end - start),
+        )
+        text = result["segments"][0]["text"]
+        transcript.append({
+            "segment": idx,
+            "start": start,
+            "end": end,
+            "text": text
+        })
+    out_path = dst_dir / "transcript.json"
+    out_path.write_text(
+        json.dumps(transcript, ensure_ascii=False, indent=2),
+        encoding="utf-8"
+    )
+    logger.info(f"Transcription complete: saved to '{out_path}'")
+
+@shared_task(name="tasks.diarize_full")
+def diarize_full(upload_id: str):
+    diarizer = get_diarizer()
+    src = Path(UPLOAD_FOLDER) / f"{upload_id}.wav"
+    dst_dir = Path(RESULTS_FOLDER) / upload_id
+    dst_dir.mkdir(parents=True, exist_ok=True)
+
+    logger.info(f"Starting diarization for '{src}'")
+    diarization = diarizer(str(src))
+    speakers = []
+    for turn, _, speaker in diarization.itertracks(yield_label=True):
+        speakers.append({
+            "start": turn.start,
+            "end": turn.end,
+            "speaker": speaker
+        })
+    out_path = dst_dir / "diarization.json"
+    out_path.write_text(
+        json.dumps(speakers, ensure_ascii=False, indent=2),
+        encoding="utf-8"
+    )
+    logger.info(f"Diarization complete: saved to '{out_path}'")
+
+def split_audio_fixed_windows(audio_path: Path):
+    window_s = int(os.getenv("SEGMENT_LENGTH_S", "30"))
+    audio = AudioSegment.from_file(str(audio_path))
+    length_ms = len(audio)
+    window_ms = window_s * 1000
+    segments = []
+    for start_ms in range(0, length_ms, window_ms):
+        end_ms = min(start_ms + window_ms, length_ms)
+        segments.append((start_ms/1000.0, end_ms/1000.0))
+    return segments
