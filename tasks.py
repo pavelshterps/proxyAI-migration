@@ -15,7 +15,6 @@ from config.settings import settings
 from crud import update_upload_status
 
 logger = get_task_logger(__name__)
-
 app = Celery("proxyai")
 app.config_from_object("config.celery")
 
@@ -29,59 +28,29 @@ _diarizer: DiarizationPipeline | None = None
 
 @signals.worker_process_init.connect
 def preload_and_warmup(**kwargs):
-    """
-    Предзагрузка моделей при старте воркера:
-    1) Pyannote-сегментация
-    2) Whisper (FP16 quantized) — без лишних аргументов
-    """
     global _whisper, _diarizer
 
     # 1) Диаризация
-    try:
-        _diarizer = DiarizationPipeline.from_pretrained(
-            settings.PYANNOTE_PIPELINE,
-            use_auth_token=settings.HUGGINGFACE_TOKEN,
-            cache_dir=settings.DIARIZER_CACHE_DIR
-        )
-        logger.info(f"✅ Loaded diarization pipeline `{settings.PYANNOTE_PIPELINE}`")
-    except Exception as e:
-        logger.error(f"❌ Failed to load diarization pipeline: {e}", exc_info=True)
-        raise
+    _diarizer = DiarizationPipeline.from_pretrained(
+        settings.PYANNOTE_PIPELINE,
+        use_auth_token=settings.HUGGINGFACE_TOKEN,
+        cache_dir="/hf_cache"
+    )
+    logger.info(f"✅ Loaded diarization pipeline `{settings.PYANNOTE_PIPELINE}`")
 
-    # 2) Whisper Quantized FP16
-    model_path = settings.WHISPER_MODEL_PATH
-    whisper_kwargs = {
+    # 2) Whisper (локально, FP16)
+    whisper_opts = {
         "device": settings.WHISPER_DEVICE,
         "device_index": 0,
-        "compute_type": settings.WHISPER_COMPUTE_TYPE,  # float16
-        "inter_threads": (
-            settings.GPU_CONCURRENCY
-            if settings.WHISPER_DEVICE.lower().startswith("cuda")
-            else settings.CPU_CONCURRENCY
-        ),
-        "intra_threads": (
-            settings.CPU_CONCURRENCY
-            if settings.WHISPER_DEVICE.lower() == "cpu"
-            else 0
-        ),
-        # больше никаких cache_dir/files — конструктор их не ждёт
+        "compute_type": settings.WHISPER_COMPUTE_TYPE,
+        "cpu_threads": settings.CPU_CONCURRENCY if settings.WHISPER_DEVICE == "cpu" else 0,
+        "num_workers": settings.GPU_CONCURRENCY if settings.WHISPER_DEVICE.startswith("cuda") else 1,
+        "download_root": "/hf_cache",
+        "local_files_only": True,
     }
+    _whisper = WhisperModel(settings.WHISPER_MODEL_PATH, **whisper_opts)
+    logger.info(f"✅ Loaded Whisper model from `{settings.WHISPER_MODEL_PATH}` on `{settings.WHISPER_DEVICE}`")
 
-    try:
-        _whisper = WhisperModel(model_path, **whisper_kwargs)
-        logger.info(f"✅ Loaded Whisper model from `{model_path}` on `{settings.WHISPER_DEVICE}`")
-    except Exception as e:
-        logger.error(f"❌ Failed to load Whisper model: {e}", exc_info=True)
-        raise
-
-@app.task(
-    bind=True,
-    name="process_audio",
-    acks_late=True,
-    autoretry_for=(Exception,),
-    retry_backoff=True,
-    retry_kwargs={"max_retries": 3},
-)
 async def process_audio(self, upload_id: int, file_path: str):
     session: AsyncSession = AsyncSessionLocal()
     try:
@@ -101,7 +70,7 @@ async def process_audio(self, upload_id: int, file_path: str):
                 word_timestamps=False,
                 segment=seg
             )
-            text = " ".join(chunk.text for chunk in result)
+            text = " ".join([chunk.text for chunk in result])
             transcriptions.append({**seg, "text": text})
 
         json_path = f"{file_path}.json"
