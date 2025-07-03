@@ -1,4 +1,17 @@
 version: "3.8"
+
+networks:
+  proxyai_net:
+
+volumes:
+  postgres_data:
+  redis-data:
+  upload-data:
+  results-data:
+  diarizer-cache:
+  ctranslate2-cache:
+  hf-cache:
+
 services:
   db:
     image: postgres:15
@@ -12,15 +25,9 @@ services:
     networks:
       - proxyai_net
 
-    # Heathcheck для того, чтобы Compose ждал, пока БД действительно примет соединения
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_NAME}"]
-      interval: 5s
-      timeout: 3s
-      retries: 10
-
   redis:
     image: redis:7-alpine
+    restart: unless-stopped
     volumes:
       - redis-data:/data
     ports:
@@ -29,7 +36,8 @@ services:
       test: ["CMD", "redis-cli", "ping"]
       interval: 30s
       retries: 3
-    restart: unless-stopped
+    networks:
+      - proxyai_net
 
   api:
     build:
@@ -43,18 +51,14 @@ services:
       - upload-data:/data/uploads
       - results-data:/data/results
       - diarizer-cache:/data/diarizer_cache
-      # Монтируем HF-кеш (модель квантована FP16) с хоста:
       - /path/to/hf_cache_host:/hf_cache:rw
     ports:
       - "8000:8000"
-
-    # Ждём, пока БД и Redis будут "healthy"
     depends_on:
-      db:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-
+      - db
+      - redis
+    networks:
+      - proxyai_net
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
@@ -72,11 +76,13 @@ services:
     volumes:
       - upload-data:/data/uploads
       - results-data:/data/results
-      - /path/to/hf_cache_host:/data/diarizer_cache:ro
+      - diarizer-cache:/data/diarizer_cache
       - /path/to/hf_cache_host:/hf_cache:rw
     depends_on:
-      redis:
-        condition: service_healthy
+      - redis
+      - db
+    networks:
+      - proxyai_net
     command:
       ["celery", "-A", "tasks", "worker", "--loglevel=info", "--concurrency=1"]
     restart: unless-stopped
@@ -98,8 +104,10 @@ services:
       - ctranslate2-cache:/root/.cache/ctranslate2
       - /path/to/hf_cache_host:/hf_cache:rw
     depends_on:
-      redis:
-        condition: service_healthy
+      - redis
+      - db
+    networks:
+      - proxyai_net
     command:
       ["celery", "-A", "tasks", "worker", "--loglevel=info", "--concurrency=1", "--queues=preprocess_gpu"]
     restart: unless-stopped
@@ -110,8 +118,10 @@ services:
       dockerfile: Dockerfile
     env_file: .env
     depends_on:
-      redis:
-        condition: service_healthy
+      - redis
+      - db
+    networks:
+      - proxyai_net
     command:
       ["celery", "-A", "tasks", "beat", "--loglevel=info"]
     restart: unless-stopped
@@ -131,15 +141,5 @@ services:
       test: ["CMD", "curl", "-f", "http://localhost:5555"]
       interval: 30s
       retries: 3
-
-volumes:
-  postgres_data:
-  redis-data:
-  upload-data:
-  results-data:
-  diarizer-cache:
-  ctranslate2-cache:
-  hf-cache:
-
-networks:
-  proxyai_net:
+    networks:
+      - proxyai_net
