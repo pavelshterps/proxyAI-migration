@@ -1,35 +1,38 @@
-# Dockerfile.gpu — для CUDA 12.1 + cuDNN8 + Ubuntu 22.04
+# Dockerfile.gpu — для CUDA 12.1 + cuDNN8-runtime + Ubuntu 22.04 (с российскими зеркалами)
+FROM nvidia/cuda:12.1.0-cudnn8-runtime-ubuntu22.04
 
-FROM nvidia/cuda:12.1.0-cudnn8-devel-ubuntu22.04
+# 1) Переключаемся на российские зеркала (ускорение apt)
+RUN sed -i \
+      -e 's|http://archive.ubuntu.com/ubuntu/|http://ru.archive.ubuntu.com/ubuntu/|g' \
+      -e 's|http://security.ubuntu.com/ubuntu|http://ru.archive.ubuntu.com/ubuntu|g' \
+      /etc/apt/sources.list
 
-# Российские зеркала
-RUN sed -i 's|http://archive.ubuntu.com/ubuntu/|http://ru.archive.ubuntu.com/ubuntu/|g' /etc/apt/sources.list \
- && sed -i 's|http://security.ubuntu.com/ubuntu|http://ru.archive.ubuntu.com/ubuntu|g' /etc/apt/sources.list
-
-# Зависимости и cuDNN-dev (для символов libcudnn_ops.so)
+# 2) Устанавливаем минимум зависимостей (без libcudnn8-dev!)
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-       python3-pip python3-dev build-essential \
-       ffmpeg libsndfile1 \
-       libcudnn8-dev \
+       python3-pip \
+       python3-dev \
+       build-essential \
+       ffmpeg \
+       libsndfile1 \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Устанавливаем CTranslate2 и faster-whisper с поддержкой CUDA12
+# 3) Устанавливаем CTranslate2 и faster-whisper для CUDA 12
 COPY requirements.txt ./
 RUN pip3 install --no-cache-dir --upgrade pip \
  && pip3 install --no-cache-dir \
-       ctranslate2[cuda12] faster-whisper[cuda12] \
+       ctranslate2[cuda12] \
+       faster-whisper[cuda12] \
  && pip3 install --no-cache-dir -r requirements.txt
 
-# Копируем код
+# 4) Копируем весь код приложения
 COPY . .
 
-# Переменные окружения
+# 5) По умолчанию — запускаем GPU-воркер Celery
 ENV HUGGINGFACE_CACHE_DIR=/hf_cache
 ENV WHISPER_DEVICE=cuda
 ENV WHISPER_COMPUTE_TYPE=float16
 
-# Запускаем GPU-воркер, слушающий только preprocess_gpu
 CMD ["celery", "-A", "tasks", "worker", "--loglevel=info", "--concurrency=1", "--queues=preprocess_gpu"]
