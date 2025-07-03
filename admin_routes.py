@@ -13,7 +13,7 @@ router = APIRouter(prefix="/admin", tags=["admin"])
 admin_key_header = APIKeyHeader(name="X-Admin-Key", auto_error=False)
 
 async def require_admin(key: str = Depends(admin_key_header)):
-    if not key or key != settings.admin_api_key:
+    if not key or key != settings.ADMIN_API_KEY:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid X-Admin-Key"
