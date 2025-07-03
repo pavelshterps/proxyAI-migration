@@ -191,8 +191,8 @@ async def upload(
     ).info("upload accepted")
 
     from tasks import transcribe_segments, diarize_full
-    transcribe_segments.delay(upload_id, cid)
-    diarize_full.delay(upload_id, cid)
+    transcribe_segments.delay(upload_id, correlation_id=cid)
+    diarize_full.delay(upload_id, correlation_id=cid)
 
     await redis.publish(f"progress:{upload_id}", "0%")
     await redis.set(f"progress:{upload_id}", "0%")
