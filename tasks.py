@@ -19,7 +19,7 @@ app = Celery(
     broker=settings.CELERY_BROKER_URL,
     backend=settings.CELERY_RESULT_BACKEND,
 )
-# по-умолчанию – CPU-очередь
+# default to CPU queue
 app.conf.task_default_queue = "preprocess_cpu"
 
 logger = logging.getLogger(__name__)
@@ -81,22 +81,21 @@ def get_diarizer():
 @worker_process_init.connect
 def preload_and_warmup(**kwargs):
     """
-    При старте воркера:
-    - CPU-воркеры прогревают только diarizer
-    - GPU-воркеры прогревают только WhisperModel
+    On worker start, warm up:
+    - diarizer always
+    - WhisperModel once on GPU
     """
     sample = Path(__file__).resolve().parent / "tests" / "fixtures" / "sample.wav"
-    device = settings.WHISPER_DEVICE.lower()
 
-    if device == "cpu":
-        # Warm-up для PyAnnote-диаризера
-        try:
-            get_diarizer()(str(sample))
-            logger.info("✅ Warm-up diarizer complete")
-        except Exception as e:
-            logger.warning(f"Warm-up diarizer failed: {e}")
-    else:
-        # Warm-up для WhisperModel
+    # Warm-up diarizer
+    try:
+        get_diarizer()(str(sample))
+        logger.info("✅ Warm-up diarizer complete")
+    except Exception as e:
+        logger.warning(f"Warm-up diarizer failed: {e}")
+
+    # Warm-up WhisperModel (only if GPU)
+    if settings.WHISPER_DEVICE.lower() != "cpu":
         try:
             get_whisper_model().transcribe(
                 str(sample),
@@ -109,9 +108,12 @@ def preload_and_warmup(**kwargs):
 
 @shared_task(
     name="tasks.transcribe_segments",
-    queue="preprocess_gpu"   # GPU-таски в GPU-очередь
+    queue="preprocess_gpu"
 )
 def transcribe_segments(upload_id: str, correlation_id: str):
+    """
+    Segment-by-segment transcription on GPU.
+    """
     adapter = logging.LoggerAdapter(logger, {"correlation_id": correlation_id})
     whisper = get_whisper_model()
 
@@ -123,21 +125,29 @@ def transcribe_segments(upload_id: str, correlation_id: str):
     windows = split_audio_fixed_windows(src, settings.SEGMENT_LENGTH_S)
     adapter.info(f" → {len(windows)} segments of up to {settings.SEGMENT_LENGTH_S}s")
 
-    transcript = []
     full_audio = AudioSegment.from_file(str(src))
+    transcript = []
 
     for idx, (start, end) in enumerate(windows):
         adapter.debug(f" Transcribing segment {idx}: {start:.1f}s → {end:.1f}s")
-        chunk = full_audio[int(start*1000) : int(end*1000)]
+        chunk = full_audio[int(start*1000):int(end*1000)]
         tmp_path = dst_dir / f"{upload_id}_{idx}.wav"
         chunk.export(tmp_path, format="wav")
 
-        segments, _ = whisper.transcribe(
-            str(tmp_path),
-            beam_size=settings.WHISPER_BATCH_SIZE,
-            language=settings.WHISPER_LANGUAGE,
-            word_timestamps=True,
-        )
+        try:
+            segments, _ = whisper.transcribe(
+                str(tmp_path),
+                beam_size=settings.WHISPER_BATCH_SIZE,
+                language=settings.WHISPER_LANGUAGE,
+                word_timestamps=True,
+            )
+        except Exception as e:
+            adapter.error(
+                f"❌ Transcription failed on segment {idx} ({start:.1f}-{end:.1f}s): {e}",
+                exc_info=True
+            )
+            tmp_path.unlink()
+            continue
 
         for seg in segments:
             transcript.append({
@@ -159,9 +169,12 @@ def transcribe_segments(upload_id: str, correlation_id: str):
 
 @shared_task(
     name="tasks.diarize_full"
-    # попадёт в preprocess_cpu по умолчанию
+    # default → preprocess_cpu
 )
 def diarize_full(upload_id: str, correlation_id: str):
+    """
+    Full-file diarization on CPU.
+    """
     adapter = logging.LoggerAdapter(logger, {"correlation_id": correlation_id})
     diarizer = get_diarizer()
 
@@ -189,10 +202,13 @@ def diarize_full(upload_id: str, correlation_id: str):
 
 
 def split_audio_fixed_windows(audio_path: Path, window_s: int):
+    """
+    Split audio into fixed-length windows (seconds).
+    """
     audio = AudioSegment.from_file(str(audio_path))
     length_ms = len(audio)
     window_ms = window_s * 1000
     return [
-        (start_ms/1000.0, min(start_ms + window_ms, length_ms)/1000.0)
+        (start_ms / 1000.0, min(start_ms + window_ms, length_ms) / 1000.0)
         for start_ms in range(0, length_ms, window_ms)
     ]

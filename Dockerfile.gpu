@@ -1,36 +1,39 @@
-# Dockerfile.gpu — для CUDA 12.1 + cuDNN8-runtime + Ubuntu 22.04 (с российскими зеркалами)
+# Dockerfile.gpu
 FROM nvidia/cuda:12.1.0-cudnn8-runtime-ubuntu22.04
 
-# 1) Переключаемся на российские зеркала (ускорение apt)
+# 1) Switch to a faster Russian mirror
 RUN sed -i \
       -e 's|http://archive.ubuntu.com/ubuntu/|http://ru.archive.ubuntu.com/ubuntu/|g' \
       -e 's|http://security.ubuntu.com/ubuntu|http://ru.archive.ubuntu.com/ubuntu|g' \
-      /etc/apt/sources.list
+    /etc/apt/sources.list
 
-# 2) Устанавливаем минимум зависимостей (без libcudnn8-dev!)
+# 2) Add NVIDIA’s cuDNN apt repo key and entry (for Ubuntu 22.04)
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl gnupg \
+ && curl -fsSL https://developer.download.nvidia.com/compute/cudnn/repos/ubuntu2204/x86_64/3bf863cc.pub \
+      | gpg --dearmor -o /usr/share/keyrings/cudnn-archive-keyring.gpg \
+ && echo "deb [signed-by=/usr/share/keyrings/cudnn-archive-keyring.gpg] \
+      https://developer.download.nvidia.com/compute/cudnn/repos/ubuntu2204/x86_64/ /" \
+      > /etc/apt/sources.list.d/cudnn.list
+
+# 3) Install runtime dependencies and matching libcudnn8
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-       python3-pip \
-       python3-dev \
-       build-essential \
-       ffmpeg \
-       libsndfile1 \
+       python3-pip python3-dev build-essential \
+       ffmpeg libsndfile1 \
+       libcudnn8 \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# 3) Устанавливаем CTranslate2 и faster-whisper для CUDA 12
+# 4) Install CTranslate2, Faster-Whisper and the rest
 COPY requirements.txt ./
 RUN pip3 install --no-cache-dir --upgrade pip \
  && pip3 install --no-cache-dir \
-       ctranslate2[cuda12] \
-       faster-whisper[cuda12] \
+       ctranslate2[cuda12] faster-whisper[cuda12] \
  && pip3 install --no-cache-dir -r requirements.txt
 
-# 4) Копируем весь код приложения
 COPY . .
 
-# 5) По умолчанию — запускаем GPU-воркер Celery
 ENV HUGGINGFACE_CACHE_DIR=/hf_cache
 ENV WHISPER_DEVICE=cuda
 ENV WHISPER_COMPUTE_TYPE=float16
