@@ -25,7 +25,7 @@ celery = app
 # по умолчанию – CPU-очередь
 app.conf.task_default_queue = "preprocess_cpu"
 
-
+# общий логгер модуля
 logger = logging.getLogger(__name__)
 
 _whisper_model = None
@@ -39,23 +39,23 @@ def get_whisper_model():
         device = settings.WHISPER_DEVICE.lower()
         compute = settings.WHISPER_COMPUTE_TYPE.lower()
 
-        # На CPU float16 не поддерживается — принудительно int8
+        # На CPU float16 / fp16 не поддерживается — принудительно int8
         if device == "cpu" and compute in ("float16", "fp16"):
             logger.warning(
                 f"Compute type '{compute}' not supported on CPU; falling back to 'int8'"
             )
             compute = "int8"
 
-        logger.info(f"Loading WhisperModel {{'path': '{model_path}', 'device': '{device}', 'compute': '{compute}'}}")
+        logger.info(
+            f"Loading WhisperModel {{'path': '{model_path}', 'device': '{device}', 'compute': '{compute}'}}"
+        )
         try:
-            # Убраны batch_size и use_auth_token, соответствие текущему API faster-whisper
             _whisper_model = WhisperModel(
                 model_path,
                 device=device,
                 compute_type=compute
             )
         except Exception as e:
-            # Ловим любые ошибки (TypeError, ValueError и т.д.)
             logger.warning(
                 f"Failed to init WhisperModel with compute_type={compute}: {e}; retrying with 'int8'"
             )
@@ -109,7 +109,7 @@ def preload_and_warmup(**kwargs):
                 str(sample),
                 language=settings.WHISPER_LANGUAGE,
                 vad_filter=True,
-                clip_timestamps = [{"start": 0.0, "end": 2.0}],
+                clip_timestamps=[{"start": 0.0, "end": 2.0}],
             )
             logger.info("✅ Warm-up WhisperModel complete")
         except Exception as e:
@@ -117,19 +117,25 @@ def preload_and_warmup(**kwargs):
 
 
 @shared_task(name="tasks.transcribe_segments")
-def transcribe_segments(upload_id: str):
+def transcribe_segments(upload_id: str, correlation_id: str):
+    """
+    Транскрипция аудио по сегментам.
+    """
+    # добавляем correlation_id в логи
+    adapter = logging.LoggerAdapter(logger, {"correlation_id": correlation_id})
+
     whisper = get_whisper_model()
     src = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
     dst_dir = Path(settings.RESULTS_FOLDER) / upload_id
     dst_dir.mkdir(parents=True, exist_ok=True)
 
-    logger.info(f"Starting transcription for '{src}'")
+    adapter.info(f"Starting transcription for '{src}'")
     segments = split_audio_fixed_windows(src, settings.SEGMENT_LENGTH_S)
-    logger.info(f" -> {len(segments)} segments of up to {settings.SEGMENT_LENGTH_S}s")
+    adapter.info(f" -> {len(segments)} segments of up to {settings.SEGMENT_LENGTH_S}s")
 
     transcript = []
     for idx, (start, end) in enumerate(segments):
-        logger.debug(f" Transcribing segment {idx}: {start:.1f}s → {end:.1f}s")
+        adapter.debug(f" Transcribing segment {idx}: {start:.1f}s → {end:.1f}s")
         result = whisper.transcribe(
             str(src),
             beam_size=settings.WHISPER_BATCH_SIZE,
@@ -152,17 +158,22 @@ def transcribe_segments(upload_id: str):
         json.dumps(transcript, ensure_ascii=False, indent=2),
         encoding="utf-8"
     )
-    logger.info(f"Transcription complete: saved to '{out_path}'")
+    adapter.info(f"Transcription complete: saved to '{out_path}'")
 
 
 @shared_task(name="tasks.diarize_full")
-def diarize_full(upload_id: str):
+def diarize_full(upload_id: str, correlation_id: str):
+    """
+    Диатеризация всего файла.
+    """
+    adapter = logging.LoggerAdapter(logger, {"correlation_id": correlation_id})
+
     diarizer = get_diarizer()
     src = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
     dst_dir = Path(settings.RESULTS_FOLDER) / upload_id
     dst_dir.mkdir(parents=True, exist_ok=True)
 
-    logger.info(f"Starting diarization for '{src}'")
+    adapter.info(f"Starting diarization for '{src}'")
     diarization = diarizer(str(src))
     speakers = []
     for turn, _, speaker in diarization.itertracks(yield_label=True):
@@ -177,10 +188,13 @@ def diarize_full(upload_id: str):
         json.dumps(speakers, ensure_ascii=False, indent=2),
         encoding="utf-8"
     )
-    logger.info(f"Diarization complete: saved to '{out_path}'")
+    adapter.info(f"Diarization complete: saved to '{out_path}'")
 
 
 def split_audio_fixed_windows(audio_path: Path, window_s: int):
+    """
+    Разбивает аудио на равные куски длиной window_s секунд.
+    """
     audio = AudioSegment.from_file(str(audio_path))
     length_ms = len(audio)
     window_ms = window_s * 1000
