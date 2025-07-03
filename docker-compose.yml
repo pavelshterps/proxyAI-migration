@@ -12,6 +12,13 @@ services:
     networks:
       - proxyai_net
 
+    # Heathcheck для того, чтобы Compose ждал, пока БД действительно примет соединения
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_NAME}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
   redis:
     image: redis:7-alpine
     volumes:
@@ -40,9 +47,14 @@ services:
       - /path/to/hf_cache_host:/hf_cache:rw
     ports:
       - "8000:8000"
+
+    # Ждём, пока БД и Redis будут "healthy"
     depends_on:
-      - db
-      - redis
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
@@ -61,10 +73,10 @@ services:
       - upload-data:/data/uploads
       - results-data:/data/results
       - /path/to/hf_cache_host:/data/diarizer_cache:ro
-      # Вот оно, монтирование локального кеша Whisper:
       - /path/to/hf_cache_host:/hf_cache:rw
     depends_on:
-      - redis
+      redis:
+        condition: service_healthy
     command:
       ["celery", "-A", "tasks", "worker", "--loglevel=info", "--concurrency=1"]
     restart: unless-stopped
@@ -84,13 +96,12 @@ services:
       - results-data:/data/results
       - diarizer-cache:/data/diarizer_cache
       - ctranslate2-cache:/root/.cache/ctranslate2
-      # И здесь тоже:
       - /path/to/hf_cache_host:/hf_cache:rw
     depends_on:
-      - redis
+      redis:
+        condition: service_healthy
     command:
-      ["celery", "-A", "tasks", "worker", "--loglevel=info",
-       "--concurrency=1", "--queues=preprocess_gpu"]
+      ["celery", "-A", "tasks", "worker", "--loglevel=info", "--concurrency=1", "--queues=preprocess_gpu"]
     restart: unless-stopped
 
   beat:
@@ -99,7 +110,8 @@ services:
       dockerfile: Dockerfile
     env_file: .env
     depends_on:
-      - redis
+      redis:
+        condition: service_healthy
     command:
       ["celery", "-A", "tasks", "beat", "--loglevel=info"]
     restart: unless-stopped
