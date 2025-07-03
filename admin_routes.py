@@ -1,7 +1,8 @@
-from fastapi import APIRouter, HTTPException, Depends, status, Body
+from fastapi import APIRouter, HTTPException, Depends, status
 from fastapi.security.api_key import APIKeyHeader
 from sqlalchemy.ext.asyncio import AsyncSession
 import uuid
+from pydantic import BaseModel
 
 from database import get_db
 from crud import create_user, delete_user, list_users
@@ -9,7 +10,6 @@ from config.settings import settings
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
-# Use FastAPI's APIKeyHeader for admin key
 admin_key_header = APIKeyHeader(name="X-Admin-Key", auto_error=False)
 
 async def require_admin(key: str = Depends(admin_key_header)):
@@ -20,13 +20,16 @@ async def require_admin(key: str = Depends(admin_key_header)):
         )
     return key
 
+class UserCreateRequest(BaseModel):
+    name: str
+
 @router.post("/users", dependencies=[Depends(require_admin)])
 async def admin_create_user(
-    name: str = Body(..., embed=True),     # <-- вот эта правка
-    db: AsyncSession = Depends(get_db)
+    payload: UserCreateRequest,
+    db: AsyncSession = Depends(get_db),
 ):
     key = uuid.uuid4().hex
-    user = await create_user(db, name, key)
+    user = await create_user(db, payload.name, key)
     return {"id": user.id, "name": user.name, "api_key": user.api_key}
 
 @router.get("/users", dependencies=[Depends(require_admin)])
@@ -37,9 +40,9 @@ async def admin_list_users(db: AsyncSession = Depends(get_db)):
 @router.delete("/users/{user_id}", dependencies=[Depends(require_admin)])
 async def admin_delete_user(
     user_id: int,
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
 ):
     ok = await delete_user(db, user_id)
     if not ok:
-        raise HTTPException(status_code=404, detail="User not found")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
     return {"status": "deleted", "user_id": user_id}

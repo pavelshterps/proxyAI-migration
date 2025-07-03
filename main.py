@@ -1,5 +1,6 @@
 import time
 import uuid
+import asyncio
 from pathlib import Path
 import structlog
 import redis.asyncio as redis_async
@@ -33,21 +34,50 @@ from routes import router as api_router
 from admin_routes import router as admin_router
 
 # —————————————————————————————————————————————
+# Функция блокирующей проверки доступности БД по хосту
+# —————————————————————————————————————————————
+def wait_for_db(url: str, timeout: int = 10):
+    from urllib.parse import urlparse
+    import socket
+
+    parsed = urlparse(url)
+    host = parsed.hostname or "localhost"
+    port = parsed.port or 5432
+
+    start = time.time()
+    while time.time() - start < timeout:
+        try:
+            with socket.create_connection((host, port), timeout=1):
+                return
+        except Exception:
+            time.sleep(0.5)
+    raise TimeoutError(f"Cannot connect to database at {host}:{port}")
+
+# —————————————————————————————————————————————
 # async‐contextmanager для старта/остановки приложения
 # —————————————————————————————————————————————
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # попытка создать все таблицы (если нет — залогируем и пойдём дальше)
+    # 1) Ждём БД, но не падаем по таймауту
+    try:
+        # Python 3.9+: to_thread
+        await asyncio.to_thread(wait_for_db, settings.DATABASE_URL)
+    except TimeoutError as e:
+        structlog.get_logger().warning(f"Timeout waiting for DB, continuing startup: {e}")
+
+    # 2) Пытаемся инициализировать модели (создать таблицы)
     try:
         await init_models(engine)
     except Exception as e:
         structlog.get_logger().warning(f"init_models failed: {e}")
+
     yield
-    # при shutdown здесь можно закрыть соединения, очистить кеши и т.п.
+
+    # тут можно, при необходимости, закрыть соединения, кеши и т.п.
 
 app = FastAPI(
     title="proxyAI",
-    version=settings.APP_VERSION,   # убедитесь, что в settings есть APP_VERSION
+    version=settings.APP_VERSION,
     lifespan=lifespan,
 )
 
