@@ -30,7 +30,7 @@ services:
       dockerfile: Dockerfile
     env_file: .env
     environment:
-      - DATABASE_URL
+      - DATABASE_URL=postgresql+asyncpg://postgres:secret@db:5432/proxyai
       - API_WORKERS
     volumes:
       - upload-data:/data/uploads
@@ -55,7 +55,7 @@ services:
       dockerfile: Dockerfile
     env_file: .env
     environment:
-      - DATABASE_URL
+      - DATABASE_URL=postgresql+asyncpg://postgres:secret@db:5432/proxyai
       - WHISPER_DEVICE=cpu
     volumes:
       - upload-data:/data/uploads
@@ -75,7 +75,7 @@ services:
       dockerfile: Dockerfile.gpu
     env_file: .env
     environment:
-      - DATABASE_URL
+      - DATABASE_URL=postgresql+asyncpg://postgres:secret@db:5432/proxyai
       - NVIDIA_VISIBLE_DEVICES=all
       - WHISPER_DEVICE=cuda
     runtime: nvidia
