@@ -1,5 +1,6 @@
 from fastapi import APIRouter, HTTPException, Depends, status
 from fastapi.security.api_key import APIKeyHeader
+from fastapi import Body
 from sqlalchemy.ext.asyncio import AsyncSession
 import uuid
 
@@ -22,7 +23,7 @@ async def require_admin(key: str = Depends(admin_key_header)):
 
 @router.post("/users", dependencies=[Depends(require_admin)])
 async def admin_create_user(
-    name: str,
+    name: str = Body(...),
     db: AsyncSession = Depends(get_db)
 ):
     key = uuid.uuid4().hex
