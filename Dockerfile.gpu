@@ -1,41 +1,37 @@
 # Dockerfile.gpu
+
 FROM nvidia/cuda:12.1.0-cudnn8-runtime-ubuntu22.04
 
-# 1) Switch to a faster Russian mirror
-RUN sed -i \
-      -e 's|http://archive.ubuntu.com/ubuntu/|http://ru.archive.ubuntu.com/ubuntu/|g' \
-      -e 's|http://security.ubuntu.com/ubuntu|http://ru.archive.ubuntu.com/ubuntu|g' \
-    /etc/apt/sources.list
+# 1) российские зеркала
+RUN sed -i 's|http://archive.ubuntu.com/ubuntu/|http://ru.archive.ubuntu.com/ubuntu/|g' /etc/apt/sources.list \
+ && sed -i 's|http://security.ubuntu.com/ubuntu|http://ru.archive.ubuntu.com/ubuntu|g' /etc/apt/sources.list
 
-# 2) Add NVIDIA’s cuDNN apt repo key and entry (for Ubuntu 22.04)
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl gnupg \
- && curl -fsSL https://developer.download.nvidia.com/compute/cudnn/repos/ubuntu2204/x86_64/3bf863cc.pub \
-      | gpg --dearmor -o /usr/share/keyrings/cudnn-archive-keyring.gpg \
- && echo "deb [signed-by=/usr/share/keyrings/cudnn-archive-keyring.gpg] \
-      https://developer.download.nvidia.com/compute/cudnn/repos/ubuntu2204/x86_64/ /" \
-      > /etc/apt/sources.list.d/cudnn.list
-
-# 3) Install runtime dependencies and matching libcudnn8
+# 2) системные зависимости
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
        python3-pip python3-dev build-essential \
        ffmpeg libsndfile1 \
-       libcudnn8 \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# 4) Install CTranslate2, Faster-Whisper and the rest
+# 3) Пингуем CTranslate2 под cuDNN8 и устанавливаем faster-whisper
 COPY requirements.txt ./
 RUN pip3 install --no-cache-dir --upgrade pip \
  && pip3 install --no-cache-dir \
-       ctranslate2[cuda12] faster-whisper[cuda12] \
+       ctranslate2[cuda12]==4.4.0 \
+       faster-whisper[cuda12] \
  && pip3 install --no-cache-dir -r requirements.txt
 
+# 4) Копируем код
 COPY . .
 
+# 5) Переменные окружения
 ENV HUGGINGFACE_CACHE_DIR=/hf_cache
 ENV WHISPER_DEVICE=cuda
 ENV WHISPER_COMPUTE_TYPE=float16
+# (опционально) ограничить рост GPU-памяти, чтобы не вываливались OOM
+ENV TF_FORCE_GPU_ALLOW_GROWTH=true
+ENV CTRANSFORMER_MAX_CUDA_MEMORY=0.8
 
 CMD ["celery", "-A", "tasks", "worker", "--loglevel=info", "--concurrency=1", "--queues=preprocess_gpu"]
