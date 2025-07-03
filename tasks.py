@@ -121,17 +121,16 @@ def transcribe_segments(upload_id: str, correlation_id: str):
     """
     Транскрипция аудио по сегментам.
     """
-    # добавляем correlation_id в логи
     adapter = logging.LoggerAdapter(logger, {"correlation_id": correlation_id})
 
     whisper = get_whisper_model()
-    src = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
-    dst_dir = Path(settings.RESULTS_FOLDER) / upload_id
+    src = Path(settings.UPLOAD_FOLDER) / upload_id  # → upload_id уже содержит расширение
+    dst_dir = Path(settings.RESULTS_FOLDER) / upload_id.replace('.', '_')
     dst_dir.mkdir(parents=True, exist_ok=True)
 
     adapter.info(f"Starting transcription for '{src}'")
     segments = split_audio_fixed_windows(src, settings.SEGMENT_LENGTH_S)
-    adapter.info(f" -> {len(segments)} segments of up to {settings.SEGMENT_LENGTH_S}s")
+    adapter.info(f" → {len(segments)} segments of up to {settings.SEGMENT_LENGTH_S}s")
 
     transcript = []
     for idx, (start, end) in enumerate(segments):
@@ -169,8 +168,8 @@ def diarize_full(upload_id: str, correlation_id: str):
     adapter = logging.LoggerAdapter(logger, {"correlation_id": correlation_id})
 
     diarizer = get_diarizer()
-    src = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
-    dst_dir = Path(settings.RESULTS_FOLDER) / upload_id
+    src = Path(settings.UPLOAD_FOLDER) / upload_id  # → upload_id уже содержит расширение
+    dst_dir = Path(settings.RESULTS_FOLDER) / upload_id.replace('.', '_')
     dst_dir.mkdir(parents=True, exist_ok=True)
 
     adapter.info(f"Starting diarization for '{src}'")
