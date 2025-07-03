@@ -1,6 +1,5 @@
 import time
 import uuid
-import asyncio
 from pathlib import Path
 import structlog
 import redis.asyncio as redis_async
@@ -34,46 +33,15 @@ from routes import router as api_router
 from admin_routes import router as admin_router
 
 # —————————————————————————————————————————————
-# Функция блокирующей проверки доступности БД по хосту
-# —————————————————————————————————————————————
-def wait_for_db(url: str, timeout: int = 10):
-    from urllib.parse import urlparse
-    import socket
-
-    parsed = urlparse(url)
-    host = parsed.hostname or "localhost"
-    port = parsed.port or 5432
-
-    start = time.time()
-    while time.time() - start < timeout:
-        try:
-            with socket.create_connection((host, port), timeout=1):
-                return
-        except Exception:
-            time.sleep(0.5)
-    raise TimeoutError(f"Cannot connect to database at {host}:{port}")
-
-# —————————————————————————————————————————————
 # async‐contextmanager для старта/остановки приложения
 # —————————————————————————————————————————————
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 1) Ждём БД, но не падаем по таймауту
-    try:
-        # Python 3.9+: to_thread
-        await asyncio.to_thread(wait_for_db, settings.DATABASE_URL)
-    except TimeoutError as e:
-        structlog.get_logger().warning(f"Timeout waiting for DB, continuing startup: {e}")
-
-    # 2) Пытаемся инициализировать модели (создать таблицы)
     try:
         await init_models(engine)
     except Exception as e:
         structlog.get_logger().warning(f"init_models failed: {e}")
-
     yield
-
-    # тут можно, при необходимости, закрыть соединения, кеши и т.п.
 
 app = FastAPI(
     title="proxyAI",
@@ -81,9 +49,7 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# —————————————————————————————————————————————
 # structlog
-# —————————————————————————————————————————————
 structlog.configure(
     processors=[
         structlog.processors.add_log_level,
@@ -93,16 +59,12 @@ structlog.configure(
 )
 log = structlog.get_logger()
 
-# —————————————————————————————————————————————
 # rate limiter
-# —————————————————————————————————————————————
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 app.add_middleware(SlowAPIMiddleware)
 
-# —————————————————————————————————————————————
 # CORS и TrustedHost
-# —————————————————————————————————————————————
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.ALLOWED_ORIGINS_LIST,
@@ -115,19 +77,13 @@ app.add_middleware(
     allowed_hosts=["127.0.0.1", "localhost"] + settings.ALLOWED_ORIGINS_LIST
 )
 
-# —————————————————————————————————————————————
 # Redis Pub/Sub + key/value
-# —————————————————————————————————————————————
 redis = redis_async.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
 
-# —————————————————————————————————————————————
 # API-Key → User
-# —————————————————————————————————————————————
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
-# —————————————————————————————————————————————
 # Создание директорий
-# —————————————————————————————————————————————
 for d in (
     settings.UPLOAD_FOLDER,
     settings.RESULTS_FOLDER,
@@ -135,9 +91,7 @@ for d in (
 ):
     Path(d).mkdir(parents=True, exist_ok=True)
 
-# —————————————————————————————————————————————
 # Метрики Prometheus
-# —————————————————————————————————————————————
 HTTP_REQ_COUNT = Counter(
     "http_requests_total",
     "Total HTTP requests",
@@ -149,9 +103,7 @@ HTTP_REQ_LATENCY = Histogram(
     ["path"],
 )
 
-# —————————————————————————————————————————————
 # Middleware для метрик
-# —————————————————————————————————————————————
 @app.middleware("http")
 async def metrics_middleware(request: Request, call_next):
     start = time.time()
@@ -160,9 +112,7 @@ async def metrics_middleware(request: Request, call_next):
     HTTP_REQ_LATENCY.labels(request.url.path).observe(time.time() - start)
     return response
 
-# —————————————————————————————————————————————
 # Здоровье и готовность
-# —————————————————————————————————————————————
 @app.get("/health")
 @limiter.limit("30/minute")
 async def health(request: Request):
@@ -178,16 +128,12 @@ async def metrics(request: Request):
     data = generate_latest()
     return Response(content=data, media_type=CONTENT_TYPE_LATEST)
 
-# —————————————————————————————————————————————
 # Отдача фронтенда
-# —————————————————————————————————————————————
 @app.get("/", include_in_schema=False)
 async def root():
     return FileResponse("static/index.html")
 
-# —————————————————————————————————————————————
 # Проверка статуса обработки
-# —————————————————————————————————————————————
 @app.get(
     "/status/{upload_id}",
     summary="Check processing status",
@@ -210,9 +156,7 @@ async def get_status(
     progress = await redis.get(f"progress:{upload_id}") or "0%"
     return {"status": status_str, "progress": progress}
 
-# —————————————————————————————————————————————
 # Приём и запуск фоновых задач
-# —————————————————————————————————————————————
 @app.post(
     "/upload/",
     dependencies=[Depends(get_current_user)],
@@ -245,8 +189,9 @@ async def upload(
     ).info("upload accepted")
 
     from tasks import transcribe_segments, diarize_full
-    transcribe_segments.delay(upload_id, correlation_id=cid)
-    diarize_full.delay(upload_id, correlation_id=cid)
+    # ПРОПИСЫВАЕМ аргументы позиционно!
+    transcribe_segments.delay(upload_id, cid)
+    diarize_full.delay(upload_id, cid)
 
     await redis.publish(f"progress:{upload_id}", "0%")
     await redis.set(f"progress:{upload_id}", "0%")
@@ -256,9 +201,7 @@ async def upload(
         headers={"X-Correlation-ID": cid},
     )
 
-# —————————————————————————————————————————————
 # Роутеры и статика
-# —————————————————————————————————————————————
 app.include_router(
     api_router,
     tags=["proxyAI"],
