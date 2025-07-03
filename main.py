@@ -8,14 +8,8 @@ from contextlib import asynccontextmanager
 import structlog
 import redis.asyncio as redis_async
 from fastapi import (
-    FastAPI,
-    UploadFile,
-    File,
-    HTTPException,
-    Response,
-    Header,
-    Depends,
-    Request,
+    FastAPI, UploadFile, File, HTTPException, Response,
+    Header, Depends, Request,
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -34,14 +28,10 @@ from dependencies import get_current_user
 from routes import router as api_router
 from admin_routes import router as admin_router
 
-# ——————————————————————————————————————————————————————————
-# Жизненный цикл приложения: только один вызов init_models
-# ——————————————————————————————————————————————————————————
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_models(engine)
     yield
-    # при необходимости дочистить ресурсы
 
 app = FastAPI(
     title="proxyAI",
@@ -77,17 +67,17 @@ app.add_middleware(
     allowed_hosts=["127.0.0.1", "localhost"] + settings.ALLOWED_ORIGINS_LIST
 )
 
-# Redis Pub/Sub + key/value
+# Redis
 redis = redis_async.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
 
-# API-Key → User
+# API Key header
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
-# Директории
+# Создаём папки
 for d in (settings.UPLOAD_FOLDER, settings.RESULTS_FOLDER, settings.DIARIZER_CACHE_DIR):
     Path(d).mkdir(parents=True, exist_ok=True)
 
-# Метрики Prometheus
+# Prometheus metrics
 HTTP_REQ_COUNT = Counter("http_requests_total", "Total HTTP requests", ["method", "path"])
 HTTP_REQ_LATENCY = Histogram("http_request_duration_seconds", "HTTP request latency", ["path"])
 
@@ -114,20 +104,12 @@ async def metrics(request: Request):
     data = generate_latest()
     return Response(content=data, media_type=CONTENT_TYPE_LATEST)
 
-@app.get(
-    "/status/{upload_id}",
-    summary="Check processing status",
-    responses={401: {"description": "Invalid X-API-Key"}, 404: {"description": "Not found"}}
-)
-async def get_status(
-    upload_id: str,
-    current_user=Depends(get_current_user),
-    db: AsyncSession = Depends(get_db)
-):
+@app.get("/status/{upload_id}", responses={401:{"description":"Invalid X-API-Key"},404:{"description":"Not found"}})
+async def get_status(upload_id: str, current_user=Depends(get_current_user),
+                     db: AsyncSession = Depends(get_db)):
     rec = await get_upload_for_user(db, current_user.id, upload_id)
     if not rec:
         raise HTTPException(status_code=404, detail="upload_id not found")
-
     base = Path(settings.RESULTS_FOLDER) / upload_id
     done = (base / "transcript.json").exists() and (base / "diarization.json").exists()
     status_str = "done" if done else (
@@ -136,21 +118,14 @@ async def get_status(
     progress = await redis.get(f"progress:{upload_id}") or "0%"
     return {"status": status_str, "progress": progress}
 
-@app.post(
-    "/upload/",
-    dependencies=[Depends(get_current_user)],
-    responses={401: {"description": "Invalid X-API-Key"}}
-)
+@app.post("/upload/", dependencies=[Depends(get_current_user)], responses={401:{"description":"Invalid X-API-Key"}})
 @limiter.limit("10/minute")
-async def upload(
-    request: Request,
-    file: UploadFile = File(...),
-    x_correlation_id: str | None = Header(None),
-    current_user=Depends(get_current_user),
-    db: AsyncSession = Depends(get_db)
-):
+async def upload(request: Request, file: UploadFile = File(...),
+                 x_correlation_id: str | None = Header(None),
+                 current_user=Depends(get_current_user),
+                 db: AsyncSession = Depends(get_db)):
     cid = x_correlation_id or str(uuid.uuid4())
-    if file.content_type not in ("audio/wav", "audio/x-wav", "audio/mpeg"):
+    if file.content_type not in ("audio/wav","audio/x-wav","audio/mpeg"):
         raise HTTPException(status_code=415, detail="Unsupported file type")
     data = await file.read()
     if len(data) > settings.MAX_FILE_SIZE:

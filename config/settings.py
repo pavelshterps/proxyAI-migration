@@ -1,10 +1,15 @@
+# config/settings.py
+
 import os
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from pydantic import Field, validator
+from pydantic import Field
 from typing import List, Optional
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
+
+    # версия приложения, подхватывается из APP_VERSION
+    APP_VERSION: str = Field("0.0.0", env="APP_VERSION")
 
     ADMIN_API_KEY: str = Field(...)
     DATABASE_URL: str = Field(..., env='DATABASE_URL')
@@ -31,7 +36,6 @@ class Settings(BaseSettings):
     WHISPER_BATCH_SIZE: int = Field(1, env="WHISPER_BATCH_SIZE")
     WHISPER_LANGUAGE: Optional[str] = Field("en", env="WHISPER_LANGUAGE")
 
-    # Куда faster-whisper / huggingface_hub будет кэшировать модели (по-умолчанию берётся локальный путь)
     HUGGINGFACE_CACHE_DIR: Optional[str] = Field(None, env="HUGGINGFACE_CACHE_DIR")
 
     # -------- Pyannote ------------
