@@ -1,8 +1,15 @@
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
-from sqlalchemy.orm import sessionmaker
-from config.settings import settings
+# database.py
 
-# ваш движок
+import asyncio
+import time
+
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, AsyncEngine
+from sqlalchemy.orm import sessionmaker
+
+from config.settings import settings
+from models import Base  # декларативный Base с вашими моделями
+
+# создаём асинхронный движок
 engine = create_async_engine(settings.DATABASE_URL, echo=False, future=True)
 
 # фабрика асинхронных сессий
@@ -18,16 +25,18 @@ async def get_db():
     async with AsyncSessionLocal() as session:
         yield session
 
-# ——————————————————————————————————————————————————————————
-# Добавляем функцию для инициализации моделей (создания таблиц)
-# ——————————————————————————————————————————————————————————
-from models import Base  # импорт декларативного Base из models.py
-
-async def init_models(engine):
+async def init_models(engine: AsyncEngine, timeout: int = 30):
     """
-    Создаёт все таблицы на основе Base.metadata.
-    Вызывается при старте FastAPI (lifespan или @on_event("startup")).
+    Создаёт все таблицы на основе Base.metadata,
+    повторяя попытки подключения к БД в течение `timeout` секунд.
     """
-    async with engine.begin() as conn:
-        # синхронно выполняем create_all через run_sync
-        await conn.run_sync(Base.metadata.create_all)
+    deadline = time.time() + timeout
+    while True:
+        try:
+            async with engine.begin() as conn:
+                await conn.run_sync(Base.metadata.create_all)
+            break
+        except Exception:
+            if time.time() > deadline:
+                raise
+            await asyncio.sleep(1)
