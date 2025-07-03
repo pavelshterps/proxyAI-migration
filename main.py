@@ -16,7 +16,7 @@ from fastapi import (
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.security.api_key import APIKeyHeader
 from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
@@ -197,7 +197,7 @@ async def upload(
     await redis.publish(f"progress:{upload_id}", "0%")
     await redis.set(f"progress:{upload_id}", "0%")
 
-    return Response(
+    return JSONResponse(
         content={"upload_id": upload_id},
         headers={"X-Correlation-ID": cid},
     )
