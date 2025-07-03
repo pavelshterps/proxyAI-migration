@@ -13,6 +13,7 @@ from fastapi import (
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import RedirectResponse
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.security.api_key import APIKeyHeader
 from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
@@ -42,7 +43,9 @@ async def wait_for_db(url: str, timeout: int = 30):
             return
         except Exception:
             await asyncio.sleep(1)
-    structlog.get_logger().warning(f"Timeout waiting for database at {host}:{port}, continuing startup")
+    structlog.get_logger().warning(
+        f"Timeout waiting for database at {host}:{port}, continuing startup"
+    )
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -50,14 +53,18 @@ async def lifespan(app: FastAPI):
     try:
         await wait_for_db(settings.DATABASE_URL)
     except Exception:
-        structlog.get_logger().warning("wait_for_db timed out, продолжим без фатального падения")
-    # попробовать создать таблицы, но не падать, если подключения нет
+        structlog.get_logger().warning(
+            "wait_for_db timed out, продолжим без фатального падения"
+        )
+    # попытаться создать таблицы, но не падать, если соединение пока невозможно
     try:
         await init_models(engine)
     except Exception as e:
-        structlog.get_logger().warning(f"init_models failed: {e}, повторим при первом обращении к БД")
+        structlog.get_logger().warning(
+            f"init_models failed: {e}, повторим при первом обращении к БД"
+        )
     yield
-    # при shutdown (если нужно) – cleanup
+    # при shutdown при необходимости очищаем ресурсы
 
 app = FastAPI(
     title="proxyAI",
@@ -80,7 +87,7 @@ limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 app.add_middleware(SlowAPIMiddleware)
 
-# CORS + TrustedHosts
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.ALLOWED_ORIGINS_LIST,
@@ -99,11 +106,15 @@ redis = redis_async.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
 # API-Key → User
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
-# Создать необходимые папки
-for d in (settings.UPLOAD_FOLDER, settings.RESULTS_FOLDER, settings.DIARIZER_CACHE_DIR):
+# Директории
+for d in (
+    settings.UPLOAD_FOLDER,
+    settings.RESULTS_FOLDER,
+    settings.DIARIZER_CACHE_DIR
+):
     Path(d).mkdir(parents=True, exist_ok=True)
 
-# Prometheus-метрики
+# Метрики
 HTTP_REQ_COUNT = Counter(
     "http_requests_total",
     "Total HTTP requests",
@@ -153,9 +164,13 @@ async def get_status(
         raise HTTPException(status_code=404, detail="upload_id not found")
 
     base = Path(settings.RESULTS_FOLDER) / upload_id
-    done = (base / "transcript.json").exists() and (base / "diarization.json").exists()
-    status_str = "done" if done else (
-        "processing" if (Path(settings.UPLOAD_FOLDER) / upload_id).exists() else "queued"
+    done = (
+        (base / "transcript.json").exists()
+        and (base / "diarization.json").exists()
+    )
+    status_str = (
+        "done" if done else
+        ("processing" if (Path(settings.UPLOAD_FOLDER) / upload_id).exists() else "queued")
     )
     progress = await redis.get(f"progress:{upload_id}") or "0%"
     return {"status": status_str, "progress": progress}
@@ -203,10 +218,20 @@ async def upload(
         headers={"X-Correlation-ID": cid}
     )
 
+# serve Swagger UI and frontend index
+@app.get("/")
+async def root_redirect():
+    return RedirectResponse(url="/docs")
+
+# подключаем API
 app.include_router(
     api_router,
     tags=["proxyAI"],
     dependencies=[Depends(get_current_user)]
 )
 app.include_router(admin_router)
-app.mount("/static", StaticFiles(directory="static"), name="static")
+
+# статика для index.html, но доступ к другим элементам фронта
+app.mount(
+    "/static", StaticFiles(directory="static"), name="static"
+)
