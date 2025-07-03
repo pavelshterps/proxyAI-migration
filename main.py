@@ -2,7 +2,6 @@ import time
 import uuid
 import asyncio
 import socket
-
 from pathlib import Path
 from contextlib import asynccontextmanager
 
@@ -31,7 +30,6 @@ from routes import router as api_router
 from admin_routes import router as admin_router
 
 async def wait_for_db(url: str, timeout: int = 30):
-    """Ждёт, пока в DNS появится host и откроется порт, но не падает при таймауте."""
     u = make_url(url)
     host, port = u.host, u.port or 5432
     deadline = time.time() + timeout
@@ -44,19 +42,22 @@ async def wait_for_db(url: str, timeout: int = 30):
             return
         except Exception:
             await asyncio.sleep(1)
-    # >>> заменили raise на логирование
     structlog.get_logger().warning(f"Timeout waiting for database at {host}:{port}, continuing startup")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # >>> оборачиваем в try/except, чтобы не падать
+    # подождать пока появится сервис "db"
     try:
         await wait_for_db(settings.DATABASE_URL)
+    except Exception:
+        structlog.get_logger().warning("wait_for_db timed out, продолжим без фатального падения")
+    # попробовать создать таблицы, но не падать, если подключения нет
+    try:
+        await init_models(engine)
     except Exception as e:
-        structlog.get_logger().warning(f"Error in wait_for_db: {e}, continuing startup")
-    await init_models(engine)
+        structlog.get_logger().warning(f"init_models failed: {e}, повторим при первом обращении к БД")
     yield
-    # (при необходимости) освобождаем ресурсы
+    # при shutdown (если нужно) – cleanup
 
 app = FastAPI(
     title="proxyAI",
@@ -98,11 +99,11 @@ redis = redis_async.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
 # API-Key → User
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
-# Создаём папки
+# Создать необходимые папки
 for d in (settings.UPLOAD_FOLDER, settings.RESULTS_FOLDER, settings.DIARIZER_CACHE_DIR):
     Path(d).mkdir(parents=True, exist_ok=True)
 
-# Метрики
+# Prometheus-метрики
 HTTP_REQ_COUNT = Counter(
     "http_requests_total",
     "Total HTTP requests",
