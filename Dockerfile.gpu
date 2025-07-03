@@ -1,33 +1,35 @@
-# Dockerfile.gpu — for CUDA 12.1 + cuDNN8 + Ubuntu 22.04 + Russian mirror
-FROM nvidia/cuda:12.1.0-cudnn8-runtime-ubuntu22.04
+# Dockerfile.gpu — для CUDA 12.1 + cuDNN8 + Ubuntu 22.04
 
-# 1) Подменяем все mirror'ы на российское зеркало
+FROM nvidia/cuda:12.1.0-cudnn8-devel-ubuntu22.04
+
+# Российские зеркала
 RUN sed -i 's|http://archive.ubuntu.com/ubuntu/|http://ru.archive.ubuntu.com/ubuntu/|g' /etc/apt/sources.list \
  && sed -i 's|http://security.ubuntu.com/ubuntu|http://ru.archive.ubuntu.com/ubuntu|g' /etc/apt/sources.list
 
-# 2) Минимальный набор зависимостей для сборки и работы аудио- и C-расширений
+# Зависимости и cuDNN-dev (для символов libcudnn_ops.so)
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
        python3-pip python3-dev build-essential \
        ffmpeg libsndfile1 \
+       libcudnn8-dev \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# 3) Устанавливаем ускоренные бинарники CTranslate2 и faster-whisper под CUDA12
+# Устанавливаем CTranslate2 и faster-whisper с поддержкой CUDA12
 COPY requirements.txt ./
 RUN pip3 install --no-cache-dir --upgrade pip \
  && pip3 install --no-cache-dir \
        ctranslate2[cuda12] faster-whisper[cuda12] \
  && pip3 install --no-cache-dir -r requirements.txt
 
-# 4) Копируем весь код
+# Копируем код
 COPY . .
 
-# 5) При запуске монтируется хост-директория с вашей quantized FP16-моделью:
-#    docker run … -v /path/to/hf_cache_host:/hf_cache:rw
+# Переменные окружения
 ENV HUGGINGFACE_CACHE_DIR=/hf_cache
 ENV WHISPER_DEVICE=cuda
 ENV WHISPER_COMPUTE_TYPE=float16
 
+# Запускаем GPU-воркер, слушающий только preprocess_gpu
 CMD ["celery", "-A", "tasks", "worker", "--loglevel=info", "--concurrency=1", "--queues=preprocess_gpu"]

@@ -82,27 +82,23 @@ def get_diarizer():
 def preload_and_warmup(**kwargs):
     """
     При старте воркера разогреваем модели:
-    - на CPU-воркере: только пайплайн диаризации,
-    - на GPU-воркере: только WhisperModel.
+    - diarizer всегда,
+    - Whisper только один раз на GPU.
     """
-    device = settings.WHISPER_DEVICE.lower()
+    # Warm-up diarizer
     sample = Path(__file__).resolve().parent / "tests" / "fixtures" / "sample.wav"
+    try:
+        get_diarizer()(str(sample))
+        logger.info("✅ Warm-up diarizer complete")
+    except Exception as e:
+        logger.warning(f"Warm-up diarizer failed: {e}")
 
-    # CPU-воркер: прогреваем пайплайн диаризации
-    if device == "cpu":
+    # Только один warm-up Whisper на GPU
+    if settings.WHISPER_DEVICE.lower() != "cpu":
         try:
-            get_diarizer()(str(sample))
-            logger.info("✅ Warm-up diarizer complete")
-        except Exception as e:
-            logger.warning(f"Warm-up diarizer failed: {e}")
-
-    # GPU-воркер: прогреваем WhisperModel
-    if device != "cpu":
-        try:
-            whisper = get_whisper_model()
-            whisper.transcribe(
+            get_whisper_model().transcribe(
                 str(sample),
-                language=settings.WHISPER_LANGUAGE
+                language=settings.WHISPER_LANGUAGE,
             )
             logger.info("✅ Warm-up WhisperModel complete")
         except Exception as e:
@@ -115,7 +111,7 @@ def preload_and_warmup(**kwargs):
 )
 def transcribe_segments(upload_id: str, correlation_id: str):
     """
-    Транскрипция аудио по сегментам (на GPU-воркере, без VAD).
+    Транскрипция аудио по сегментам (на GPU-воркере).
     """
     adapter = logging.LoggerAdapter(logger, {"correlation_id": correlation_id})
     whisper = get_whisper_model()
@@ -137,7 +133,6 @@ def transcribe_segments(upload_id: str, correlation_id: str):
         tmp_path = dst_dir / f"{upload_id}_{idx}.wav"
         chunk.export(tmp_path, format="wav")
 
-        # убрали vad_filter=True!
         segments, _ = whisper.transcribe(
             str(tmp_path),
             beam_size=settings.WHISPER_BATCH_SIZE,
@@ -148,9 +143,9 @@ def transcribe_segments(upload_id: str, correlation_id: str):
         for seg in segments:
             transcript.append({
                 "segment": idx,
-                "start": start + seg.start,
-                "end":   start + seg.end,
-                "text":  seg.text
+                "start":  start + seg.start,
+                "end":    start + seg.end,
+                "text":   seg.text
             })
 
         tmp_path.unlink()
@@ -169,7 +164,7 @@ def transcribe_segments(upload_id: str, correlation_id: str):
 )
 def diarize_full(upload_id: str, correlation_id: str):
     """
-    Полная диаризация файла на CPU.
+    Полная диаризация файла (на CPU).
     """
     adapter = logging.LoggerAdapter(logger, {"correlation_id": correlation_id})
     diarizer = get_diarizer()
@@ -184,8 +179,8 @@ def diarize_full(upload_id: str, correlation_id: str):
     speakers = []
     for turn, _, speaker in diarization.itertracks(yield_label=True):
         speakers.append({
-            "start": turn.start,
-            "end":   turn.end,
+            "start":   turn.start,
+            "end":     turn.end,
             "speaker": speaker
         })
 
@@ -204,8 +199,7 @@ def split_audio_fixed_windows(audio_path: Path, window_s: int):
     audio = AudioSegment.from_file(str(audio_path))
     length_ms = len(audio)
     window_ms = window_s * 1000
-    segments = []
-    for start_ms in range(0, length_ms, window_ms):
-        end_ms = min(start_ms + window_ms, length_ms)
-        segments.append((start_ms/1000.0, end_ms/1000.0))
-    return segments
+    return [
+        (start_ms / 1000.0, min(start_ms + window_ms, length_ms) / 1000.0)
+        for start_ms in range(0, length_ms, window_ms)
+    ]
