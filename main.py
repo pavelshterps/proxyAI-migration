@@ -1,19 +1,23 @@
 import time
 import uuid
-import asyncio
-import socket
 from pathlib import Path
-from contextlib import asynccontextmanager
 
 import structlog
 import redis.asyncio as redis_async
 from fastapi import (
-    FastAPI, UploadFile, File, HTTPException, Response,
-    Header, Depends, Request,
+    FastAPI,
+    UploadFile,
+    File,
+    HTTPException,
+    Response,
+    Header,
+    Depends,
+    Request,
 )
+from fastapi.responses import FileResponse
+from contextlib import asynccontextmanager
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import RedirectResponse
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.security.api_key import APIKeyHeader
 from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
@@ -21,7 +25,6 @@ from slowapi import Limiter
 from slowapi.middleware import SlowAPIMiddleware
 from slowapi.util import get_remote_address
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.engine.url import make_url
 
 from config.settings import settings
 from database import get_db, engine, init_models
@@ -30,41 +33,36 @@ from dependencies import get_current_user
 from routes import router as api_router
 from admin_routes import router as admin_router
 
-async def wait_for_db(url: str, timeout: int = 30):
-    u = make_url(url)
-    host, port = u.host, u.port or 5432
-    deadline = time.time() + timeout
-    while time.time() < deadline:
+# Lifespan: инициализация БД и моделей
+def wait_for_db(url: str, timeout: int = 30):
+    import socket
+    host = settings.DATABASE_HOST
+    port = settings.DATABASE_PORT
+    start = time.time()
+    while True:
         try:
-            socket.gethostbyname(host)
-            reader, writer = await asyncio.open_connection(host, port)
-            writer.close()
-            await writer.wait_closed()
-            return
+            sock = socket.create_connection((host, port), timeout=1)
+            sock.close()
+            break
         except Exception:
-            await asyncio.sleep(1)
-    structlog.get_logger().warning(
-        f"Timeout waiting for database at {host}:{port}, continuing startup"
-    )
+            if time.time() - start > timeout:
+                structlog.get_logger().warning(
+                    f"Timeout waiting for database at {host}:{port}, continuing startup"
+                )
+                break
+            time.sleep(1)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # подождать пока появится сервис "db"
-    try:
-        await wait_for_db(settings.DATABASE_URL)
-    except Exception:
-        structlog.get_logger().warning(
-            "wait_for_db timed out, продолжим без фатального падения"
-        )
-    # попытаться создать таблицы, но не падать, если соединение пока невозможно
+    # Подождать доступности БД
+    await app.loop.run_in_executor(None, wait_for_db, settings.DATABASE_URL)
+    # Создать таблицы
     try:
         await init_models(engine)
     except Exception as e:
-        structlog.get_logger().warning(
-            f"init_models failed: {e}, повторим при первом обращении к БД"
-        )
+        structlog.get_logger().warning(f"init_models failed: {e}")
     yield
-    # при shutdown при необходимости очищаем ресурсы
+    # при shutdown очищаем ресурсы, если нужно
 
 app = FastAPI(
     title="proxyAI",
@@ -97,21 +95,17 @@ app.add_middleware(
 )
 app.add_middleware(
     TrustedHostMiddleware,
-    allowed_hosts=["127.0.0.1", "localhost"] + settings.ALLOWED_ORIGINS_LIST
+    allowed_hosts=["127.0.0.1", "localhost"] + settings.ALLOWED_ORIGINS_LIST,
 )
 
-# Redis Pub/Sub + key/value
+# Redis Pub/Sub + KV
 redis = redis_async.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
 
 # API-Key → User
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
-# Директории
-for d in (
-    settings.UPLOAD_FOLDER,
-    settings.RESULTS_FOLDER,
-    settings.DIARIZER_CACHE_DIR
-):
+# Создать директории
+for d in (settings.UPLOAD_FOLDER, settings.RESULTS_FOLDER, settings.DIARIZER_CACHE_DIR):
     Path(d).mkdir(parents=True, exist_ok=True)
 
 # Метрики
@@ -157,21 +151,18 @@ async def metrics(request: Request):
 async def get_status(
     upload_id: str,
     current_user=Depends(get_current_user),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
 ):
     rec = await get_upload_for_user(db, current_user.id, upload_id)
     if not rec:
         raise HTTPException(status_code=404, detail="upload_id not found")
 
     base = Path(settings.RESULTS_FOLDER) / upload_id
-    done = (
-        (base / "transcript.json").exists()
-        and (base / "diarization.json").exists()
+    done = (base / "transcript.json").exists() and (base / "diarization.json").exists()
+    status_str = "done" if done else (
+        "processing" if (Path(settings.UPLOAD_FOLDER) / upload_id).exists() else "queued"
     )
-    status_str = (
-        "done" if done else
-        ("processing" if (Path(settings.UPLOAD_FOLDER) / upload_id).exists() else "queued")
-    )
+
     progress = await redis.get(f"progress:{upload_id}") or "0%"
     return {"status": status_str, "progress": progress}
 
@@ -186,7 +177,7 @@ async def upload(
     file: UploadFile = File(...),
     x_correlation_id: str | None = Header(None),
     current_user=Depends(get_current_user),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
 ):
     cid = x_correlation_id or str(uuid.uuid4())
     if file.content_type not in ("audio/wav", "audio/x-wav", "audio/mpeg"):
@@ -215,23 +206,20 @@ async def upload(
 
     return Response(
         content={"upload_id": upload_id},
-        headers={"X-Correlation-ID": cid}
+        headers={"X-Correlation-ID": cid},
     )
 
-# serve Swagger UI and frontend index
-@app.get("/")
-async def root_redirect():
-    return RedirectResponse(url="/docs")
+# Swagger по умолчанию на /docs
+# монтируем фронтенд (если нужен) и отдаём index.html по корню
+app.mount("/static", StaticFiles(directory="static"), name="static")
+@app.get("/", include_in_schema=False)
+async def root():
+    return FileResponse(Path("static") / "index.html")
 
-# подключаем API
+# Подключаем API-роутеры
 app.include_router(
     api_router,
     tags=["proxyAI"],
-    dependencies=[Depends(get_current_user)]
+    dependencies=[Depends(get_current_user)],
 )
 app.include_router(admin_router)
-
-# статика для index.html, но доступ к другим элементам фронта
-app.mount(
-    "/static", StaticFiles(directory="static"), name="static"
-)
