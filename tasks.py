@@ -1,3 +1,5 @@
+# tasks.py
+
 import os
 import json
 import logging
@@ -17,11 +19,13 @@ app = Celery(
     broker=settings.CELERY_BROKER_URL,
     backend=settings.CELERY_RESULT_BACKEND,
 )
+# алиас для CLI (celery -A tasks ...)
 celery = app
 
 # по умолчанию – CPU-очередь
 app.conf.task_default_queue = "preprocess_cpu"
 
+# общий логгер модуля
 logger = logging.getLogger(__name__)
 
 _whisper_model = None
@@ -112,27 +116,27 @@ def preload_and_warmup(**kwargs):
             logger.warning(f"Warm-up WhisperModel failed: {e}")
 
 
-@shared_task(name="tasks.transcribe_segments")
+@shared_task(name="tasks.transcribe_segments", queue="preprocess_gpu")
 def transcribe_segments(upload_id: str, correlation_id: str):
     """
-    Транскрипция аудио по сегментам.
+    Транскрипция аудио по сегментам на GPU.
     """
     adapter = logging.LoggerAdapter(logger, {"correlation_id": correlation_id})
 
     whisper = get_whisper_model()
-    # используем точное имя файла upload_id (уже содержит расширение)
+    # upload_id уже содержит .wav
     src = Path(settings.UPLOAD_FOLDER) / upload_id
     dst_dir = Path(settings.RESULTS_FOLDER) / upload_id
     dst_dir.mkdir(parents=True, exist_ok=True)
 
     adapter.info(f"Starting transcription for '{src}'")
     segments = split_audio_fixed_windows(src, settings.SEGMENT_LENGTH_S)
-    adapter.info(f" → {len(segments)} segments of up to {settings.SEGMENT_LENGTH_S}s")
+    adapter.info(f" -> {len(segments)} segments of up to {settings.SEGMENT_LENGTH_S}s")
 
     transcript = []
     for idx, (start, end) in enumerate(segments):
         adapter.debug(f" Transcribing segment {idx}: {start:.1f}s → {end:.1f}s")
-        # вместо offset/duration — используем clip_timestamps
+        # use clip_timestamps instead of offset/duration
         result = whisper.transcribe(
             str(src),
             beam_size=settings.WHISPER_BATCH_SIZE,
@@ -141,18 +145,12 @@ def transcribe_segments(upload_id: str, correlation_id: str):
             word_timestamps=True,
             clip_timestamps=[{"start": start, "end": end}],
         )
-        # быстрее-whisper может вернуть (segments, info) или dict с ключом "segments"
-        if isinstance(result, tuple):
-            segs, _info = result
-        else:
-            segs = result.get("segments", [])
-        # собираем весь текст сегмента
-        text = "".join(seg["text"] for seg in segs)
+        text = result["segments"][0]["text"]
         transcript.append({
             "segment": idx,
             "start": start,
             "end": end,
-            "text": text.strip()
+            "text": text
         })
 
     out_path = dst_dir / "transcript.json"
@@ -163,15 +161,14 @@ def transcribe_segments(upload_id: str, correlation_id: str):
     adapter.info(f"Transcription complete: saved to '{out_path}'")
 
 
-@shared_task(name="tasks.diarize_full")
+@shared_task(name="tasks.diarize_full", queue="preprocess_cpu")
 def diarize_full(upload_id: str, correlation_id: str):
     """
-    Диатеризация всего файла.
+    Диатеризация всего файла на CPU.
     """
     adapter = logging.LoggerAdapter(logger, {"correlation_id": correlation_id})
 
     diarizer = get_diarizer()
-    # убираем лишнее .wav
     src = Path(settings.UPLOAD_FOLDER) / upload_id
     dst_dir = Path(settings.RESULTS_FOLDER) / upload_id
     dst_dir.mkdir(parents=True, exist_ok=True)
