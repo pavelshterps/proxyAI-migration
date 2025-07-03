@@ -1,6 +1,5 @@
 # Dockerfile.gpu
-
-FROM nvidia/cuda:12.1.0-cudnn8-runtime-ubuntu22.04
+FROM nvidia/cuda:12.1.0-cudnn8-devel-ubuntu22.04
 
 # 1) российские зеркала
 RUN sed -i 's|http://archive.ubuntu.com/ubuntu/|http://ru.archive.ubuntu.com/ubuntu/|g' /etc/apt/sources.list \
@@ -30,7 +29,7 @@ COPY . .
 ENV HUGGINGFACE_CACHE_DIR=/hf_cache
 ENV WHISPER_DEVICE=cuda
 ENV WHISPER_COMPUTE_TYPE=float16
-# (опционально) ограничить рост GPU-памяти, чтобы не вываливались OOM
+# ограничить рост GPU-памяти (чтобы не вываливались OOM)
 ENV TF_FORCE_GPU_ALLOW_GROWTH=true
 ENV CTRANSFORMER_MAX_CUDA_MEMORY=0.8
 
