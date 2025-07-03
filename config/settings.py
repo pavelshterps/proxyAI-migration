@@ -8,28 +8,36 @@ from typing import List, Optional
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 
-    # версия приложения, подхватывается из APP_VERSION
+    # версия приложения
     APP_VERSION: str = Field("0.0.0", env="APP_VERSION")
 
-    ADMIN_API_KEY: str = Field(...)
-    DATABASE_URL: str = Field(..., env='DATABASE_URL')
-    POSTGRES_NAME: str = Field(...)
-    POSTGRES_USER: str = Field(...)
-    POSTGRES_PASSWORD: str = Field(...)
+    # административный ключ
+    ADMIN_API_KEY: str = Field(..., env="ADMIN_API_KEY")
 
-    CELERY_BROKER_URL: str = Field(...)
-    CELERY_RESULT_BACKEND: str = Field(...)
-    CELERY_TIMEZONE: str = Field('UTC')
+    # подключение к БД (берётся из .env или docker-compose)
+    DATABASE_URL: str = Field(..., env="DATABASE_URL")
 
-    API_WORKERS: int = Field(1)
-    CPU_CONCURRENCY: int = Field(1)
-    GPU_CONCURRENCY: int = Field(1)
+    # имя базы, пользователь и пароль (на всякий случай, если вдруг понадобится)
+    POSTGRES_DB: str = Field(..., env="POSTGRES_DB")
+    POSTGRES_USER: str = Field(..., env="POSTGRES_USER")
+    POSTGRES_PASSWORD: str = Field(..., env="POSTGRES_PASSWORD")
 
-    UPLOAD_FOLDER: str = Field(...)
-    RESULTS_FOLDER: str = Field(...)
-    DIARIZER_CACHE_DIR: str = Field(...)
+    # Celery / Redis
+    CELERY_BROKER_URL: str = Field(..., env="CELERY_BROKER_URL")
+    CELERY_RESULT_BACKEND: str = Field(..., env="CELERY_RESULT_BACKEND")
+    CELERY_TIMEZONE: str = Field('UTC', env="CELERY_TIMEZONE")
 
-    # --------- Whisper settings ------------
+    # concurrency
+    API_WORKERS: int = Field(1, env="API_WORKERS")
+    CPU_CONCURRENCY: int = Field(1, env="CPU_CONCURRENCY")
+    GPU_CONCURRENCY: int = Field(1, env="GPU_CONCURRENCY")
+
+    # пути
+    UPLOAD_FOLDER: str = Field(..., env="UPLOAD_FOLDER")
+    RESULTS_FOLDER: str = Field(..., env="RESULTS_FOLDER")
+    DIARIZER_CACHE_DIR: str = Field(..., env="DIARIZER_CACHE_DIR")
+
+    # Whisper
     WHISPER_MODEL_PATH: str = Field(..., env="WHISPER_MODEL_PATH")
     WHISPER_DEVICE: str = Field(..., env="WHISPER_DEVICE")
     WHISPER_COMPUTE_TYPE: str = Field(..., env="WHISPER_COMPUTE_TYPE")
@@ -38,7 +46,7 @@ class Settings(BaseSettings):
 
     HUGGINGFACE_CACHE_DIR: Optional[str] = Field(None, env="HUGGINGFACE_CACHE_DIR")
 
-    # -------- Pyannote ------------
+    # Pyannote
     PYANNOTE_PIPELINE: str = Field(..., env="PYANNOTE_PIPELINE")
     HUGGINGFACE_TOKEN: str = Field(..., env="HUGGINGFACE_TOKEN")
 
