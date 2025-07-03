@@ -1,5 +1,3 @@
-# tasks.py
-
 import os
 import json
 import logging
@@ -19,13 +17,11 @@ app = Celery(
     broker=settings.CELERY_BROKER_URL,
     backend=settings.CELERY_RESULT_BACKEND,
 )
-# алиас для CLI (celery -A tasks ...)
 celery = app
 
 # по умолчанию – CPU-очередь
 app.conf.task_default_queue = "preprocess_cpu"
 
-# общий логгер модуля
 logger = logging.getLogger(__name__)
 
 _whisper_model = None
@@ -124,8 +120,9 @@ def transcribe_segments(upload_id: str, correlation_id: str):
     adapter = logging.LoggerAdapter(logger, {"correlation_id": correlation_id})
 
     whisper = get_whisper_model()
-    src = Path(settings.UPLOAD_FOLDER) / upload_id  # → upload_id уже содержит расширение
-    dst_dir = Path(settings.RESULTS_FOLDER) / upload_id.replace('.', '_')
+    # используем точное имя файла upload_id (уже содержит расширение)
+    src = Path(settings.UPLOAD_FOLDER) / upload_id
+    dst_dir = Path(settings.RESULTS_FOLDER) / upload_id
     dst_dir.mkdir(parents=True, exist_ok=True)
 
     adapter.info(f"Starting transcription for '{src}'")
@@ -135,21 +132,27 @@ def transcribe_segments(upload_id: str, correlation_id: str):
     transcript = []
     for idx, (start, end) in enumerate(segments):
         adapter.debug(f" Transcribing segment {idx}: {start:.1f}s → {end:.1f}s")
+        # вместо offset/duration — используем clip_timestamps
         result = whisper.transcribe(
             str(src),
             beam_size=settings.WHISPER_BATCH_SIZE,
             language=settings.WHISPER_LANGUAGE,
             vad_filter=True,
             word_timestamps=True,
-            offset=start,
-            duration=(end - start),
+            clip_timestamps=[{"start": start, "end": end}],
         )
-        text = result["segments"][0]["text"]
+        # быстрее-whisper может вернуть (segments, info) или dict с ключом "segments"
+        if isinstance(result, tuple):
+            segs, _info = result
+        else:
+            segs = result.get("segments", [])
+        # собираем весь текст сегмента
+        text = "".join(seg["text"] for seg in segs)
         transcript.append({
             "segment": idx,
             "start": start,
             "end": end,
-            "text": text
+            "text": text.strip()
         })
 
     out_path = dst_dir / "transcript.json"
@@ -168,8 +171,9 @@ def diarize_full(upload_id: str, correlation_id: str):
     adapter = logging.LoggerAdapter(logger, {"correlation_id": correlation_id})
 
     diarizer = get_diarizer()
-    src = Path(settings.UPLOAD_FOLDER) / upload_id  # → upload_id уже содержит расширение
-    dst_dir = Path(settings.RESULTS_FOLDER) / upload_id.replace('.', '_')
+    # убираем лишнее .wav
+    src = Path(settings.UPLOAD_FOLDER) / upload_id
+    dst_dir = Path(settings.RESULTS_FOLDER) / upload_id
     dst_dir.mkdir(parents=True, exist_ok=True)
 
     adapter.info(f"Starting diarization for '{src}'")
