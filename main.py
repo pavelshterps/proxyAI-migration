@@ -2,7 +2,6 @@ import time
 import uuid
 import asyncio
 import socket
-import re
 
 from pathlib import Path
 from contextlib import asynccontextmanager
@@ -32,31 +31,32 @@ from routes import router as api_router
 from admin_routes import router as admin_router
 
 async def wait_for_db(url: str, timeout: int = 30):
-    """Ждёт, пока в DNS появится host и откроется порт."""
+    """Ждёт, пока в DNS появится host и откроется порт, но не падает при таймауте."""
     u = make_url(url)
     host, port = u.host, u.port or 5432
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
-            # проверить резолв хоста
             socket.gethostbyname(host)
-            # проверить открытие TCP
             reader, writer = await asyncio.open_connection(host, port)
             writer.close()
             await writer.wait_closed()
             return
         except Exception:
             await asyncio.sleep(1)
-    raise RuntimeError(f"Cannot connect to database at {host}:{port}")
+    # >>> заменили raise на логирование
+    structlog.get_logger().warning(f"Timeout waiting for database at {host}:{port}, continuing startup")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 1) ждём пока сервис db заведётся в DNS и порт откроется
-    await wait_for_db(settings.DATABASE_URL)
-    # 2) создаём таблицы
+    # >>> оборачиваем в try/except, чтобы не падать
+    try:
+        await wait_for_db(settings.DATABASE_URL)
+    except Exception as e:
+        structlog.get_logger().warning(f"Error in wait_for_db: {e}, continuing startup")
     await init_models(engine)
     yield
-    # (опционально) тут можно освобождать ресурсы при shutdown
+    # (при необходимости) освобождаем ресурсы
 
 app = FastAPI(
     title="proxyAI",
