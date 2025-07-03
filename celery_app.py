@@ -1,14 +1,17 @@
+# celery.py
+
 from celery import Celery, signals
 from tasks import get_whisper, get_diarizer
 
 app = Celery("proxyai")
+# читаем всю конфигурацию из config/celery.py
 app.config_from_object("config.celery")
 
 @signals.worker_process_init.connect
 def preload_and_warmup(**kwargs):
     """
-    Для Celery < 5.4: перенаправляем на наши функции из tasks.py
+    При старте каждого воркера сразу инициализируем модели
+    (чтобы первый таск не тратил на это время).
     """
-    # триггерим загрузку моделей
     get_diarizer()
     get_whisper()

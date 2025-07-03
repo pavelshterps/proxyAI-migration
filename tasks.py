@@ -19,9 +19,6 @@ app = Celery(
     broker=settings.CELERY_BROKER_URL,
     backend=settings.CELERY_RESULT_BACKEND,
 )
-# алиас для CLI (celery -A tasks ...)
-celery = app
-
 # по умолчанию – CPU-очередь
 app.conf.task_default_queue = "preprocess_cpu"
 
@@ -39,7 +36,7 @@ def get_whisper_model():
         device = settings.WHISPER_DEVICE.lower()
         compute = settings.WHISPER_COMPUTE_TYPE.lower()
 
-        # На CPU float16 / fp16 не поддерживается — принудительно int8
+        # На CPU float16/fp16 не поддерживается — принудительно int8
         if device == "cpu" and compute in ("float16", "fp16"):
             logger.warning(
                 f"Compute type '{compute}' not supported on CPU; falling back to 'int8'"
@@ -116,28 +113,31 @@ def preload_and_warmup(**kwargs):
             logger.warning(f"Warm-up WhisperModel failed: {e}")
 
 
-@shared_task(name="tasks.transcribe_segments", queue="preprocess_gpu")
+@shared_task(
+    name="tasks.transcribe_segments",
+    queue="preprocess_gpu"   # убедитесь, что у вас есть GPU-воркер, слушающий эту очередь
+)
 def transcribe_segments(upload_id: str, correlation_id: str):
     """
-    Транскрипция аудио по сегментам на GPU.
+    Транскрипция аудио по сегментам (на GPU-воркере).
     """
     adapter = logging.LoggerAdapter(logger, {"correlation_id": correlation_id})
 
     whisper = get_whisper_model()
-    # upload_id уже содержит .wav
-    src = Path(settings.UPLOAD_FOLDER) / upload_id
+    src = Path(settings.UPLOAD_FOLDER) / f"{upload_id}"
     dst_dir = Path(settings.RESULTS_FOLDER) / upload_id
     dst_dir.mkdir(parents=True, exist_ok=True)
 
     adapter.info(f"Starting transcription for '{src}'")
-    segments = split_audio_fixed_windows(src, settings.SEGMENT_LENGTH_S)
-    adapter.info(f" -> {len(segments)} segments of up to {settings.SEGMENT_LENGTH_S}s")
+    windows = split_audio_fixed_windows(src, settings.SEGMENT_LENGTH_S)
+    adapter.info(f" -> {len(windows)} segments of up to {settings.SEGMENT_LENGTH_S}s")
 
     transcript = []
-    for idx, (start, end) in enumerate(segments):
+    for idx, (start, end) in enumerate(windows):
         adapter.debug(f" Transcribing segment {idx}: {start:.1f}s → {end:.1f}s")
-        # use clip_timestamps instead of offset/duration
-        result = whisper.transcribe(
+
+        # clip_timestamps хорошо поддерживается и на CPU, и на GPU
+        segments, _ = whisper.transcribe(
             str(src),
             beam_size=settings.WHISPER_BATCH_SIZE,
             language=settings.WHISPER_LANGUAGE,
@@ -145,13 +145,15 @@ def transcribe_segments(upload_id: str, correlation_id: str):
             word_timestamps=True,
             clip_timestamps=[{"start": start, "end": end}],
         )
-        text = result["segments"][0]["text"]
-        transcript.append({
-            "segment": idx,
-            "start": start,
-            "end": end,
-            "text": text
-        })
+
+        # segments — список NamedTuple Segment(id, seek, start, end, text)
+        for seg in segments:
+            transcript.append({
+                "segment": idx,
+                "start": seg.start,
+                "end": seg.end,
+                "text": seg.text
+            })
 
     out_path = dst_dir / "transcript.json"
     out_path.write_text(
@@ -161,15 +163,18 @@ def transcribe_segments(upload_id: str, correlation_id: str):
     adapter.info(f"Transcription complete: saved to '{out_path}'")
 
 
-@shared_task(name="tasks.diarize_full", queue="preprocess_cpu")
+@shared_task(
+    name="tasks.diarize_full"
+    # по умолчанию попадёт в preprocess_cpu
+)
 def diarize_full(upload_id: str, correlation_id: str):
     """
-    Диатеризация всего файла на CPU.
+    Диатеризация всего файла (на CPU-воркере).
     """
     adapter = logging.LoggerAdapter(logger, {"correlation_id": correlation_id})
 
     diarizer = get_diarizer()
-    src = Path(settings.UPLOAD_FOLDER) / upload_id
+    src = Path(settings.UPLOAD_FOLDER) / f"{upload_id}"
     dst_dir = Path(settings.RESULTS_FOLDER) / upload_id
     dst_dir.mkdir(parents=True, exist_ok=True)
 

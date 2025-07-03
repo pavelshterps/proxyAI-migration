@@ -70,7 +70,7 @@ services:
       - db
       - redis
     command:
-      ["celery", "-A", "tasks", "worker", "--loglevel=info", "--concurrency=${CPU_CONCURRENCY}"]
+      ["celery", "-A", "tasks", "worker", "--loglevel=info", "--concurrency=${CPU_CONCURRENCY}", "--queues=preprocess_cpu"]
     restart: unless-stopped
     networks:
       - proxyai_net
