@@ -1,9 +1,10 @@
 import time
 import uuid
+import asyncio
 from pathlib import Path
-
 import structlog
 import redis.asyncio as redis_async
+
 from fastapi import (
     FastAPI,
     UploadFile,
@@ -14,17 +15,16 @@ from fastapi import (
     Depends,
     Request,
 )
-from fastapi.responses import FileResponse
-from contextlib import asynccontextmanager
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.security.api_key import APIKeyHeader
 from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
 from slowapi import Limiter
 from slowapi.middleware import SlowAPIMiddleware
 from slowapi.util import get_remote_address
-from sqlalchemy.ext.asyncio import AsyncSession
+from contextlib import asynccontextmanager
 
 from config.settings import settings
 from database import get_db, engine, init_models
@@ -33,40 +33,42 @@ from dependencies import get_current_user
 from routes import router as api_router
 from admin_routes import router as admin_router
 
-# Lifespan: инициализация БД и моделей
-def wait_for_db(url: str, timeout: int = 30):
+# Функция для блокирующей проверки БД
+def wait_for_db(url: str, timeout: int = 10):
+    from urllib.parse import urlparse
     import socket
-    host = settings.DATABASE_HOST
-    port = settings.DATABASE_PORT
+    parsed = urlparse(url)
+    host = parsed.hostname or "localhost"
+    port = parsed.port or 5432
     start = time.time()
-    while True:
+    while time.time() - start < timeout:
         try:
-            sock = socket.create_connection((host, port), timeout=1)
-            sock.close()
-            break
+            with socket.create_connection((host, port), timeout=1):
+                return
         except Exception:
-            if time.time() - start > timeout:
-                structlog.get_logger().warning(
-                    f"Timeout waiting for database at {host}:{port}, continuing startup"
-                )
-                break
-            time.sleep(1)
+            time.sleep(0.5)
+    raise TimeoutError(f"Cannot connect to database at {host}:{port}")
 
+# async‐contextmanager для старта/остановки
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Подождать доступности БД
-    await app.loop.run_in_executor(None, wait_for_db, settings.DATABASE_URL)
-    # Создать таблицы
+    # сначала ждём БД (синхронная функция в executor)
     try:
-        await init_models(engine)
-    except Exception as e:
-        structlog.get_logger().warning(f"init_models failed: {e}")
+        # вариант A: через asyncio.get_event_loop()
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, wait_for_db, settings.DATABASE_URL)
+        # вариант B (py3.9+): await asyncio.to_thread(wait_for_db, settings.DATABASE_URL)
+    except TimeoutError as e:
+        structlog.get_logger().warning(f"Timeout waiting for DB, continuing startup: {e}")
+
+    # создаём таблицы
+    await init_models(engine)
     yield
-    # при shutdown очищаем ресурсы, если нужно
+    # при shutdown можно чистить ресурсы
 
 app = FastAPI(
     title="proxyAI",
-    version=settings.APP_VERSION,
+    version=settings.APP_VERSION,  # из settings прописать APP_VERSION
     lifespan=lifespan,
 )
 
@@ -85,7 +87,7 @@ limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 app.add_middleware(SlowAPIMiddleware)
 
-# CORS
+# CORS и TrustedHost
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.ALLOWED_ORIGINS_LIST,
@@ -95,31 +97,36 @@ app.add_middleware(
 )
 app.add_middleware(
     TrustedHostMiddleware,
-    allowed_hosts=["127.0.0.1", "localhost"] + settings.ALLOWED_ORIGINS_LIST,
+    allowed_hosts=["127.0.0.1", "localhost"] + settings.ALLOWED_ORIGINS_LIST
 )
 
-# Redis Pub/Sub + KV
+# Redis Pub/Sub + key/value
 redis = redis_async.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
 
 # API-Key → User
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
-# Создать директории
-for d in (settings.UPLOAD_FOLDER, settings.RESULTS_FOLDER, settings.DIARIZER_CACHE_DIR):
+# Создаём папки
+for d in (
+    settings.UPLOAD_FOLDER,
+    settings.RESULTS_FOLDER,
+    settings.DIARIZER_CACHE_DIR,
+):
     Path(d).mkdir(parents=True, exist_ok=True)
 
 # Метрики
 HTTP_REQ_COUNT = Counter(
     "http_requests_total",
     "Total HTTP requests",
-    ["method", "path"]
+    ["method", "path"],
 )
 HTTP_REQ_LATENCY = Histogram(
     "http_request_duration_seconds",
     "HTTP request latency",
-    ["path"]
+    ["path"],
 )
 
+# Встраиваемся в FastAPI lifecycle
 @app.middleware("http")
 async def metrics_middleware(request: Request, call_next):
     start = time.time()
@@ -143,15 +150,20 @@ async def metrics(request: Request):
     data = generate_latest()
     return Response(content=data, media_type=CONTENT_TYPE_LATEST)
 
+@app.get("/", include_in_schema=False)
+async def root():
+    # отдаём фронтенд
+    return FileResponse("static/index.html")
+
 @app.get(
     "/status/{upload_id}",
     summary="Check processing status",
-    responses={401: {"description": "Invalid X-API-Key"}, 404: {"description": "Not found"}}
+    responses={401: {"description": "Invalid X-API-Key"}, 404: {"description": "Not found"}},
 )
 async def get_status(
     upload_id: str,
     current_user=Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
+    db=Depends(get_db),
 ):
     rec = await get_upload_for_user(db, current_user.id, upload_id)
     if not rec:
@@ -162,14 +174,13 @@ async def get_status(
     status_str = "done" if done else (
         "processing" if (Path(settings.UPLOAD_FOLDER) / upload_id).exists() else "queued"
     )
-
     progress = await redis.get(f"progress:{upload_id}") or "0%"
     return {"status": status_str, "progress": progress}
 
 @app.post(
     "/upload/",
     dependencies=[Depends(get_current_user)],
-    responses={401: {"description": "Invalid X-API-Key"}}
+    responses={401: {"description": "Invalid X-API-Key"}},
 )
 @limiter.limit("10/minute")
 async def upload(
@@ -177,7 +188,7 @@ async def upload(
     file: UploadFile = File(...),
     x_correlation_id: str | None = Header(None),
     current_user=Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
+    db=Depends(get_db),
 ):
     cid = x_correlation_id or str(uuid.uuid4())
     if file.content_type not in ("audio/wav", "audio/x-wav", "audio/mpeg"):
@@ -194,7 +205,7 @@ async def upload(
     log.bind(
         correlation_id=cid,
         upload_id=upload_id,
-        user_id=current_user.id
+        user_id=current_user.id,
     ).info("upload accepted")
 
     from tasks import transcribe_segments, diarize_full
@@ -209,17 +220,11 @@ async def upload(
         headers={"X-Correlation-ID": cid},
     )
 
-# Swagger по умолчанию на /docs
-# монтируем фронтенд (если нужен) и отдаём index.html по корню
-app.mount("/static", StaticFiles(directory="static"), name="static")
-@app.get("/", include_in_schema=False)
-async def root():
-    return FileResponse(Path("static") / "index.html")
-
-# Подключаем API-роутеры
+# Роутеры и статика
 app.include_router(
     api_router,
     tags=["proxyAI"],
     dependencies=[Depends(get_current_user)],
 )
 app.include_router(admin_router)
+app.mount("/static", StaticFiles(directory="static"), name="static")
