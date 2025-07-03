@@ -107,11 +107,11 @@ def preload_and_warmup(**kwargs):
 
 @shared_task(
     name="tasks.transcribe_segments",
-    queue="preprocess_gpu"
+    queue="preprocess_gpu"   # GPU-таски в GPU-очередь
 )
 def transcribe_segments(upload_id: str, correlation_id: str):
     """
-    Транскрипция аудио по 30-секундным окнам на GPU.
+    Транскрипция аудио по сегментам (на GPU-воркере, без VAD).
     """
     adapter = logging.LoggerAdapter(logger, {"correlation_id": correlation_id})
     whisper = get_whisper_model()
@@ -125,36 +125,30 @@ def transcribe_segments(upload_id: str, correlation_id: str):
     adapter.info(f" → {len(windows)} segments of up to {settings.SEGMENT_LENGTH_S}s")
 
     transcript = []
-    # Загружаем всё аудио разом, потом режем в памяти
     full_audio = AudioSegment.from_file(str(src))
 
     for idx, (start, end) in enumerate(windows):
         adapter.debug(f" Transcribing segment {idx}: {start:.1f}s → {end:.1f}s")
-
-        # вырезаем чанк в памяти
         chunk = full_audio[int(start*1000) : int(end*1000)]
         tmp_path = dst_dir / f"{upload_id}_{idx}.wav"
         chunk.export(tmp_path, format="wav")
 
-        # собственно транскрипция чанка
+        # убрали vad_filter=True!
         segments, _ = whisper.transcribe(
             str(tmp_path),
             beam_size=settings.WHISPER_BATCH_SIZE,
             language=settings.WHISPER_LANGUAGE,
-            vad_filter=True,
-            word_timestamps=True
+            word_timestamps=True,
         )
 
-        # собираем результат и учитываем смещение
         for seg in segments:
             transcript.append({
                 "segment": idx,
                 "start": start + seg.start,
-                "end": start + seg.end,
-                "text": seg.text
+                "end":   start + seg.end,
+                "text":  seg.text
             })
 
-        # удаляем временный файл
         tmp_path.unlink()
 
     out_path = dst_dir / "transcript.json"
@@ -187,7 +181,7 @@ def diarize_full(upload_id: str, correlation_id: str):
     for turn, _, speaker in diarization.itertracks(yield_label=True):
         speakers.append({
             "start": turn.start,
-            "end": turn.end,
+            "end":   turn.end,
             "speaker": speaker
         })
 
@@ -209,5 +203,5 @@ def split_audio_fixed_windows(audio_path: Path, window_s: int):
     segments = []
     for start_ms in range(0, length_ms, window_ms):
         end_ms = min(start_ms + window_ms, length_ms)
-        segments.append((start_ms / 1000.0, end_ms / 1000.0))
+        segments.append((start_ms/1000.0, end_ms/1000.0))
     return segments
