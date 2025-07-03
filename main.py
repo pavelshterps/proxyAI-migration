@@ -9,10 +9,10 @@ from fastapi import (
     UploadFile,
     File,
     HTTPException,
-    Response,
     Header,
     Depends,
     Request,
+    Response,
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -177,7 +177,6 @@ async def upload(
     if len(data) > settings.MAX_FILE_SIZE:
         raise HTTPException(status_code=413, detail="File too large")
 
-    # Генерируем уникальный ID (UUID) с сохранением расширения
     ext = Path(file.filename).suffix
     upload_id = f"{uuid.uuid4().hex}{ext}"
     dest = Path(settings.UPLOAD_FOLDER) / upload_id
@@ -191,8 +190,9 @@ async def upload(
     ).info("upload accepted")
 
     from tasks import transcribe_segments, diarize_full
-    transcribe_segments.delay(upload_id, correlation_id=cid)
-    diarize_full.delay(upload_id, correlation_id=cid)
+    # правильно передаём два позиционных аргумента
+    transcribe_segments.delay(upload_id, cid)
+    diarize_full.delay(upload_id, cid)
 
     await redis.publish(f"progress:{upload_id}", "0%")
     await redis.set(f"progress:{upload_id}", "0%")
