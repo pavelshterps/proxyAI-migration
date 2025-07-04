@@ -1,50 +1,39 @@
 # Dockerfile.gpu
+FROM nvidia/cuda:12.2.2-cudnn8-runtime-ubuntu22.04
 
-# 1) базовый образ с CUDA 12.3.2 + cuDNN 9 на Ubuntu 22.04
-FROM nvidia/cuda:12.3.2-cudnn9-runtime-ubuntu22.04
-
-# 2) переключаем mirror’ы на российские
+# 1) Russian mirrors
 RUN sed -i \
       's|http://archive.ubuntu.com/ubuntu/|http://ru.archive.ubuntu.com/ubuntu/|g' \
       /etc/apt/sources.list \
-  && sed -i \
-      's|http://security.ubuntu.com/ubuntu|http://ru.archive.ubuntu.com/ubuntu|g' \
+ && sed -i \
+      's|http://security.ubuntu.com/ubuntu|http://ru.archive.ubuntu.com/ubuntu/|g' \
       /etc/apt/sources.list
 
-# 3) системные пакеты (без cudnn-dev!)
+# 2) System deps
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-       python3-pip python3-dev build-essential \
-       ffmpeg libsndfile1 \
+      python3-pip python3-dev build-essential \
+      ffmpeg libsndfile1 \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# 4) ускоренные бинарники CTranslate2 и faster-whisper для CUDA12
+# 3) Pin CTranslate2 to 3.24.0 (cuDNN 8) + Faster-Whisper
 COPY requirements.txt ./
 RUN pip3 install --no-cache-dir --upgrade pip \
  && pip3 install --no-cache-dir \
-       ctranslate2[cuda12]==4.4.0 \
-       faster-whisper[cuda12] \
+      ctranslate2[cuda12]==3.24.0 \
+      faster-whisper[cuda12] \
  && pip3 install --no-cache-dir -r requirements.txt
 
-# 5) DEV-only: создаём симлинки для cuDNN 9 (без этого faster-whisper падает)
-RUN ln -sf /usr/lib/x86_64-linux-gnu/libcudnn.so.9       /usr/lib/x86_64-linux-gnu/libcudnn.so \
- && ln -sf /usr/lib/x86_64-linux-gnu/libcudnn_ops_infer.so.9  /usr/lib/x86_64-linux-gnu/libcudnn_ops.so \
- && ln -sf /usr/lib/x86_64-linux-gnu/libcudnn_cnn_infer.so.9  /usr/lib/x86_64-linux-gnu/libcudnn_cnn.so \
- && ldconfig
-
-# 6) копируем весь код
+# 4) Copy code
 COPY . .
 
-# 7) переменные окружения
-ENV HUGGINGFACE_CACHE_DIR=/hf_cache
-ENV WHISPER_DEVICE=cuda
-ENV WHISPER_COMPUTE_TYPE=float16
-# ограничение роста потребления CUDA-памяти
-ENV TF_FORCE_GPU_ALLOW_GROWTH=true
-ENV CTRANSFORMER_MAX_CUDA_MEMORY=0.8
+# 5) Env vars
+ENV HUGGINGFACE_CACHE_DIR=/hf_cache \
+    WHISPER_DEVICE=cuda \
+    WHISPER_COMPUTE_TYPE=float16 \
+    TF_FORCE_GPU_ALLOW_GROWTH=true \
+    CTRANSFORMER_MAX_CUDA_MEMORY=0.8
 
-# 8) запуск GPU-воркера
-CMD ["celery", "-A", "tasks", "worker", \
-     "--loglevel=info", "--concurrency=1", "--queues=preprocess_gpu"]
+CMD ["celery", "-A", "tasks", "worker", "--loglevel=info", "--concurrency=1", "--queues=preprocess_gpu"]
