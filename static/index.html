@@ -71,12 +71,14 @@
     uploadId = upload_id;
     statusEl.textContent = `upload_id=${uploadId}. Ожидаем...`;
 
+    // опрос статуса
     const interval = setInterval(async ()=>{
       const st = await (await fetch(`/status/${uploadId}`, {
         headers:{ "X-API-Key": key }
       })).json();
       statusEl.textContent = `Статус: ${st.status}, прогресс: ${st.progress}`;
-      if (st.status === "done") {
+      // разблокируем кнопку, как только либо статус == done, либо прогресс == "100%"
+      if (st.status === "done" || st.progress === "100%") {
         clearInterval(interval);
         fetchBtn.disabled = false;
       }
@@ -92,7 +94,8 @@
     if(!res.ok){ alert("Error fetching results"); return; }
     // ВАЖНО: читаем JSON один раз
     const data = await res.json();
-    // поддерживаем оба варианта ключа
+    console.debug("DEBUG /results payload:", data);
+    // поддерживаем оба варианта: старый { transcript: [...] } и новый { results: [...] }
     const list = data.results ?? data.transcript;
     statusEl.textContent = "Результаты получены";
     audioEl.src = URL.createObjectURL(fileBlob);
