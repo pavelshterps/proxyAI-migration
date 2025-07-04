@@ -91,7 +91,6 @@
       headers:{ "X-API-Key": key }
     });
     if(!res.ok){ alert("Error fetching results"); return; }
-    const { results } = await res.json();
     const payload = await res.json();
     console.log("DEBUG /results payload:", payload);
     // поддерживаем старые и новые ключи
