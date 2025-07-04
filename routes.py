@@ -5,11 +5,15 @@ import json
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
 
 from config.settings import settings
 from dependencies import get_current_user
 
 router = APIRouter()
+
+class LabelUpdate(BaseModel):
+    __root__: dict[str, str]
 
 @router.get("/results/{upload_id}")
 async def get_results(
@@ -55,3 +59,38 @@ async def get_results(
 
     # возвращаем именно поле transcript, как ждёт фронтенд
     return {"transcript": enriched}
+
+
+@router.post("/labels/{upload_id}")
+async def save_labels(
+    upload_id: str,
+    payload: LabelUpdate,
+    current_user=Depends(get_current_user),
+):
+    """
+    Принимает словарь переименований { oldName: newName, ... }
+    и обновляет файл diarization.json, заменяя speaker → mapped value.
+    """
+    base = Path(settings.RESULTS_FOLDER) / upload_id
+    diarization_path = base / "diarization.json"
+
+    if not diarization_path.exists():
+        raise HTTPException(status_code=404, detail="Diarization not found")
+
+    # читаем текущие метки
+    diar = json.loads(diarization_path.read_text(encoding="utf-8"))
+    mapping: dict[str,str] = payload.__root__
+
+    # переименовываем
+    for turn in diar:
+        orig = turn.get("speaker")
+        if orig in mapping and mapping[orig].strip():
+            turn["speaker"] = mapping[orig].strip()
+
+    # сохраняем обратно
+    diarization_path.write_text(
+        json.dumps(diar, ensure_ascii=False, indent=2),
+        encoding="utf-8"
+    )
+
+    return {"status": "ok", "updated": mapping}
