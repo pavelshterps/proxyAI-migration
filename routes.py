@@ -1,4 +1,5 @@
 # routes.py
+
 import time
 import json
 from pathlib import Path
@@ -15,15 +16,31 @@ async def get_results(
     upload_id: str,
     current_user=Depends(get_current_user),
 ):
+    """
+    Возвращает список сегментов с текстом, временем и спикером.
+    Даже если диаризация ещё не готова, возвращаем транскрипт с speaker="unknown".
+    """
     base = Path(settings.RESULTS_FOLDER) / upload_id
+
     transcript_path = base / "transcript.json"
     diarization_path = base / "diarization.json"
-    if not transcript_path.exists() or not diarization_path.exists():
-        raise HTTPException(status_code=404, detail="Results not ready")
+
+    if not transcript_path.exists():
+        # транскрипции нет — ещё нельзя отдавать ничего
+        raise HTTPException(status_code=404, detail="Transcript not ready")
+
+    # всегда читаем транскрипт
     transcript = json.loads(transcript_path.read_text(encoding="utf-8"))
-    diarization = json.loads(diarization_path.read_text(encoding="utf-8"))
+
+    # пытаемся прочитать диаризацию, но если её нет — работаем без неё
+    if diarization_path.exists():
+        diarization = json.loads(diarization_path.read_text(encoding="utf-8"))
+    else:
+        diarization = []
+
     enriched = []
     for seg in transcript:
+        # ищем спикера, или ставим unknown
         spk = next(
             (d["speaker"] for d in diarization
              if d["start"] <= seg["start"] < d["end"]),
@@ -35,11 +52,8 @@ async def get_results(
             "end":     seg["end"],
             "text":    seg["text"],
             "speaker": spk or "unknown",
+            # строковое время
             "time": time.strftime("%H:%M:%S", time.gmtime(seg["start"]))
         })
-    # отдаем и под «results», и под «transcript», чтобы фронт мог жить обеими версиями
 
-    return {
-            "results": enriched,
-            "transcript": enriched,
-    }
+    return {"results": enriched}
