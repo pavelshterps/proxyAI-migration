@@ -92,10 +92,10 @@
       headers:{ "X-API-Key": key }
     });
     if(!res.ok){ alert("Error fetching results"); return; }
-    // ВАЖНО: читаем JSON один раз
+    // читаем JSON один раз
     const data = await res.json();
     console.debug("DEBUG /results payload:", data);
-    // поддерживаем оба варианта: старый { transcript: [...] } и новый { results: [...] }
+    // поддерживаем оба варианта: { results } или старый { transcript }
     const list = data.results ?? data.transcript;
     statusEl.textContent = "Результаты получены";
     audioEl.src = URL.createObjectURL(fileBlob);
@@ -106,6 +106,7 @@
   function renderTranscript(list){
     container.innerHTML = "";
     mapping = {};
+    // инициализация мэппинга спикеров
     list.forEach(s => mapping[s.speaker] = s.speaker);
     list.forEach(seg => {
       const div = document.createElement("div");
