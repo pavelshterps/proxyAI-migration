@@ -92,9 +92,13 @@
     });
     if(!res.ok){ alert("Error fetching results"); return; }
     const { results } = await res.json();
+    const payload = await res.json();
+    console.log("DEBUG /results payload:", payload);
+    // поддерживаем старые и новые ключи
+    const list = payload.results ?? payload.transcript;
     statusEl.textContent = "Результаты получены";
     audioEl.src = URL.createObjectURL(fileBlob);
-    renderTranscript(results);
+    renderTranscript(list);
     saveBtn.disabled = false;
   };
 

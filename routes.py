@@ -37,4 +37,9 @@ async def get_results(
             "speaker": spk or "unknown",
             "time": time.strftime("%H:%M:%S", time.gmtime(seg["start"]))
         })
-    return {"results": enriched}
+    # отдаем и под «results», и под «transcript», чтобы фронт мог жить обеими версиями
+
+    return {
+            "results": enriched,
+            "transcript": enriched,
+    }
