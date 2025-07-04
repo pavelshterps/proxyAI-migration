@@ -1,26 +1,25 @@
 # Dockerfile.gpu
-
-# 1) Правильный образ с CUDA12.2 + cuDNN8
+# 1) точный базовый образ с cudnn8, который существует
 FROM nvidia/cuda:12.2.2-cudnn8-runtime-ubuntu22.04
 
-# 2) Переключаем mirror'ы на российские
-RUN sed -i 's|http://archive.ubuntu.com/ubuntu/|http://ru.archive.ubuntu.com/ubuntu/|g' /etc/apt/sources.list \
- && sed -i 's|http://security.ubuntu.com/ubuntu|http://ru.archive.ubuntu.com/ubuntu|g' /etc/apt/sources.list
+# 2) зеркала на российские
+RUN sed -i \
+      's|http://archive.ubuntu.com/ubuntu/|http://ru.archive.ubuntu.com/ubuntu/|g' \
+      /etc/apt/sources.list \
+  && sed -i \
+      's|http://security.ubuntu.com/ubuntu|http://ru.archive.ubuntu.com/ubuntu|g' \
+      /etc/apt/sources.list
 
-# 3) Системные пакеты (без libcudnn8-dev!)
+# 3) системные пакеты (без cudnn-dev)
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      python3-pip \
-      python3-dev \
-      build-essential \
-      ffmpeg \
-      libsndfile1 \
+      python3-pip python3-dev build-essential \
+      ffmpeg libsndfile1 \
  && rm -rf /var/lib/apt/lists/*
 
-# 4) Рабочая директория
 WORKDIR /app
 
-# 5) Копируем файл зависимостей и устанавливаем accelerated wheels
+# 4) ускоренные бинарники
 COPY requirements.txt ./
 RUN pip3 install --no-cache-dir --upgrade pip \
  && pip3 install --no-cache-dir \
@@ -28,18 +27,20 @@ RUN pip3 install --no-cache-dir --upgrade pip \
       faster-whisper[cuda12] \
  && pip3 install --no-cache-dir -r requirements.txt
 
-# 6) Копируем код
+# 5) DEV-only: создаём нужные symlinks для libcudnn
+RUN ln -s /usr/lib/x86_64-linux-gnu/libcudnn.so.8    /usr/lib/x86_64-linux-gnu/libcudnn.so \
+ && ln -s /usr/lib/x86_64-linux-gnu/libcudnn_ops_infer.so.8 /usr/lib/x86_64-linux-gnu/libcudnn_ops.so \
+ && ldconfig
+
+# 6) копируем код
 COPY . .
 
-# 7) Подправляем LD_LIBRARY_PATH, чтобы cuDNN нашёлся
-ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+# 7) переменные окружения
+ENV HUGGINGFACE_CACHE_DIR=/hf_cache
+ENV WHISPER_DEVICE=cuda
+ENV WHISPER_COMPUTE_TYPE=float16
+ENV TF_FORCE_GPU_ALLOW_GROWTH=true
+ENV CTRANSFORMER_MAX_CUDA_MEMORY=0.8
 
-# 8) Переменные окружения для Whisper на GPU
-ENV HUGGINGFACE_CACHE_DIR=/hf_cache \
-    WHISPER_DEVICE=cuda \
-    WHISPER_COMPUTE_TYPE=float16 \
-    TF_FORCE_GPU_ALLOW_GROWTH=true \
-    CTRANSFORMER_MAX_CUDA_MEMORY=0.8
-
-# 9) По умолчанию — GPU-очередь Celery
+# 8) точная команда запуска GPU-воркера
 CMD ["celery", "-A", "tasks", "worker", "--loglevel=info", "--concurrency=1", "--queues=preprocess_gpu"]
