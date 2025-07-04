@@ -1,16 +1,17 @@
-# Dockerfile.gpu.cuda12.2
+# Dockerfile.gpu
 
+# 1) Use CUDA 12.2 with cuDNN 8 to match host driver
 FROM nvidia/cuda:12.2.2-cudnn8-runtime-ubuntu22.04
 
-# 1) Российские зеркала
+# 2) Switch Ubuntu mirrors to Russian for faster apt operations
 RUN sed -i \
       's|http://archive.ubuntu.com/ubuntu/|http://ru.archive.ubuntu.com/ubuntu/|g' \
       /etc/apt/sources.list \
  && sed -i \
-      's|http://security.ubuntu.com/ubuntu|http://ru.archive.ubuntu.com/ubuntu/|g' \
+      's|http://security.ubuntu.com/ubuntu|http://ru.archive.ubuntu.com/ubuntu|g' \
       /etc/apt/sources.list
 
-# 2) Системные пакеты
+# 3) Install system dependencies
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       python3-pip python3-dev build-essential \
@@ -19,35 +20,24 @@ RUN apt-get update \
 
 WORKDIR /app
 
-# 3) CTranslate2 + faster-whisper + остальные зависимости
+# 4) Install pinned versions of CTranslate2 and faster-whisper, then other Python deps
 COPY requirements.txt ./
 RUN pip3 install --upgrade pip \
  && pip3 install --no-cache-dir \
-      ctranslate2[cuda12]==4.4.0 \
-      faster-whisper[cuda12] \
+      ctranslate2[cuda12]==3.24.0 \
+      faster-whisper[cuda12]==0.5.7 \
  && pip3 install --no-cache-dir -r requirements.txt
 
-# 4) Добираем cuDNN 9 / cuBLAS 12 через pip-колёса NVIDIA
-RUN pip3 install --no-cache-dir \
-       nvidia-cudnn-cu12==9.* \
-       nvidia-cublas-cu12==12.* \
- && \
- # 5) Симлинки, чтобы в ldconfig появилась libcudnn_ops.so и прочие
- ln -sf /usr/lib/x86_64-linux-gnu/libcudnn.so.9 /usr/lib/x86_64-linux-gnu/libcudnn.so \
- && ln -sf /usr/lib/x86_64-linux-gnu/libcudnn_ops_infer.so.9 /usr/lib/x86_64-linux-gnu/libcudnn_ops.so \
- && ln -sf /usr/lib/x86_64-linux-gnu/libcudnn_cnn_infer.so.9  /usr/lib/x86_64-linux-gnu/libcudnn_cnn.so \
- && ldconfig
-
-# 6) Копируем код
+# 5) Copy application code
 COPY . .
 
-# 7) Переменные окружения для Whisper/CTranslate2
+# 6) Environment variables for Whisper/CTranslate2 GPU behavior
 ENV HUGGINGFACE_CACHE_DIR=/hf_cache \
     WHISPER_DEVICE=cuda \
     WHISPER_COMPUTE_TYPE=float16 \
     TF_FORCE_GPU_ALLOW_GROWTH=true \
     CTRANSFORMER_MAX_CUDA_MEMORY=0.8 \
-    LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
+    LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
 
-# 8) Запуск единственного GPU-воркера
+# 7) Launch the single GPU Celery worker for transcription
 CMD ["celery", "-A", "tasks", "worker", "--loglevel=info", "--concurrency=1", "--queues=preprocess_gpu"]
