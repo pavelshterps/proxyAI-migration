@@ -5,11 +5,15 @@ import json
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
 
 from config.settings import settings
 from dependencies import get_current_user
 
 router = APIRouter()
+
+class LabelsPayload(BaseModel):
+    __root__: dict[str, str]
 
 @router.get("/results/{upload_id}")
 async def get_results(
@@ -17,30 +21,20 @@ async def get_results(
     current_user=Depends(get_current_user),
 ):
     """
-    Возвращает список сегментов с текстом, временем и спикером.
-    Даже если диаризация ещё не готова, возвращаем транскрипт с speaker="unknown".
+    Возвращает объединённый список сегментов с текстом, временем и спикером.
     """
     base = Path(settings.RESULTS_FOLDER) / upload_id
-
     transcript_path = base / "transcript.json"
     diarization_path = base / "diarization.json"
 
-    if not transcript_path.exists():
-        # транскрипции нет — ещё нельзя отдавать ничего
-        raise HTTPException(status_code=404, detail="Transcript not ready")
+    if not transcript_path.exists() or not diarization_path.exists():
+        raise HTTPException(status_code=404, detail="Results not ready")
 
-    # всегда читаем транскрипт
-    transcript = json.loads(transcript_path.read_text(encoding="utf-8"))
-
-    # пытаемся прочитать диаризацию, но если её нет — работаем без неё
-    if diarization_path.exists():
-        diarization = json.loads(diarization_path.read_text(encoding="utf-8"))
-    else:
-        diarization = []
+    transcript  = json.loads(transcript_path.read_text(encoding="utf-8"))
+    diarization = json.loads(diarization_path.read_text(encoding="utf-8"))
 
     enriched = []
     for seg in transcript:
-        # ищем спикера, или ставим unknown
         spk = next(
             (d["speaker"] for d in diarization
              if d["start"] <= seg["start"] < d["end"]),
@@ -52,8 +46,40 @@ async def get_results(
             "end":     seg["end"],
             "text":    seg["text"],
             "speaker": spk or "unknown",
-            # строковое время
-            "time": time.strftime("%H:%M:%S", time.gmtime(seg["start"]))
+            "time":    time.strftime("%H:%M:%S", time.gmtime(seg["start"]))
         })
 
     return {"results": enriched}
+
+@router.post("/labels/{upload_id}")
+async def save_labels(
+    upload_id: str,
+    payload: LabelsPayload,
+    current_user=Depends(get_current_user),
+):
+    """
+    Перезаписывает файл diarization.json новым маппингом спикеров.
+    Ожидает JSON вида { "old_name": "new_name", ... }.
+    """
+    base = Path(settings.RESULTS_FOLDER) / upload_id
+    diarization_path = base / "diarization.json"
+    if not diarization_path.exists():
+        raise HTTPException(status_code=404, detail="Diarization not found")
+
+    # загрузим исходный json
+    diar = json.loads(diarization_path.read_text(encoding="utf-8"))
+    mapping = payload.__root__
+
+    # применим переименование
+    for turn in diar:
+        old = turn["speaker"]
+        if old in mapping:
+            turn["speaker"] = mapping[old]
+
+    # сохраним обратно
+    diarization_path.write_text(
+        json.dumps(diar, ensure_ascii=False, indent=2),
+        encoding="utf-8"
+    )
+
+    return {"detail": "Labels saved"}
