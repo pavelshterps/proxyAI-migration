@@ -1,5 +1,4 @@
 # tasks.py
-
 import os
 import json
 import logging
@@ -10,16 +9,15 @@ from celery.signals import worker_process_init
 from faster_whisper import WhisperModel
 from pyannote.audio import Pipeline
 from pydub import AudioSegment
+from redis import Redis
 
 from config.settings import settings
 
-# === Celery application ===
 app = Celery(
     "proxyai",
     broker=settings.CELERY_BROKER_URL,
     backend=settings.CELERY_RESULT_BACKEND,
 )
-# default to CPU queue
 app.conf.task_default_queue = "preprocess_cpu"
 
 logger = logging.getLogger(__name__)
@@ -27,20 +25,17 @@ logger = logging.getLogger(__name__)
 _whisper_model = None
 _diarizer = None
 
-
 def get_whisper_model():
     global _whisper_model
     if _whisper_model is None:
         model_path = settings.WHISPER_MODEL_PATH
         device = settings.WHISPER_DEVICE.lower()
         compute = settings.WHISPER_COMPUTE_TYPE.lower()
-
         if device == "cpu" and compute in ("float16", "fp16"):
             logger.warning(
                 f"Compute type '{compute}' not supported on CPU; falling back to 'int8'"
             )
             compute = "int8"
-
         logger.info(
             f"Loading WhisperModel {{'path': '{model_path}', 'device': '{device}', 'compute': '{compute}'}}"
         )
@@ -62,7 +57,6 @@ def get_whisper_model():
         logger.info("WhisperModel loaded")
     return _whisper_model
 
-
 def get_diarizer():
     global _diarizer
     if _diarizer is None:
@@ -77,25 +71,15 @@ def get_diarizer():
         logger.info("Diarizer loaded")
     return _diarizer
 
-
 @worker_process_init.connect
 def preload_and_warmup(**kwargs):
-    """
-    On worker start, warm up:
-    - diarizer only on CPU
-    - WhisperModel once on GPU
-    """
     sample = Path(__file__).resolve().parent / "tests" / "fixtures" / "sample.wav"
-
-    # Warm-up diarizer — only for CPU workers
     if settings.WHISPER_DEVICE.lower() == "cpu":
         try:
             get_diarizer()(str(sample))
             logger.info("✅ Warm-up diarizer complete")
         except Exception as e:
             logger.warning(f"Warm-up diarizer failed: {e}")
-
-    # Warm-up WhisperModel — only for GPU workers
     if settings.WHISPER_DEVICE.lower() != "cpu":
         try:
             get_whisper_model().transcribe(
@@ -106,15 +90,11 @@ def preload_and_warmup(**kwargs):
         except Exception as e:
             logger.warning(f"Warm-up WhisperModel failed: {e}")
 
-
 @shared_task(
     name="tasks.transcribe_segments",
     queue="preprocess_gpu"
 )
 def transcribe_segments(upload_id: str, correlation_id: str):
-    """
-    Segment-by-segment transcription on GPU.
-    """
     adapter = logging.LoggerAdapter(logger, {"correlation_id": correlation_id})
     whisper = get_whisper_model()
 
@@ -134,7 +114,6 @@ def transcribe_segments(upload_id: str, correlation_id: str):
         chunk = full_audio[int(start*1000):int(end*1000)]
         tmp_path = dst_dir / f"{upload_id}_{idx}.wav"
         chunk.export(tmp_path, format="wav")
-
         try:
             segments, _ = whisper.transcribe(
                 str(tmp_path),
@@ -149,7 +128,6 @@ def transcribe_segments(upload_id: str, correlation_id: str):
             )
             tmp_path.unlink()
             continue
-
         for seg in segments:
             transcript.append({
                 "segment": idx,
@@ -157,7 +135,6 @@ def transcribe_segments(upload_id: str, correlation_id: str):
                 "end":     start + seg.end,
                 "text":    seg.text
             })
-
         tmp_path.unlink()
 
     out_path = dst_dir / "transcript.json"
@@ -166,16 +143,15 @@ def transcribe_segments(upload_id: str, correlation_id: str):
         encoding="utf-8"
     )
     adapter.info(f"Transcription complete: saved to '{out_path}'")
-
+    # === здесь отмечаем 100%
+    redis = Redis.from_url(settings.CELERY_BROKER_URL)
+    redis.publish(f"progress:{upload_id}", "100%")
+    redis.set(f"progress:{upload_id}", "100%")
 
 @shared_task(
     name="tasks.diarize_full"
-    # default → preprocess_cpu
 )
 def diarize_full(upload_id: str, correlation_id: str):
-    """
-    Full-file diarization on CPU.
-    """
     adapter = logging.LoggerAdapter(logger, {"correlation_id": correlation_id})
     diarizer = get_diarizer()
 
@@ -199,14 +175,13 @@ def diarize_full(upload_id: str, correlation_id: str):
         json.dumps(speakers, ensure_ascii=False, indent=2),
         encoding="utf-8"
     )
-    # FIXED: added missing closing quote on f-string
     adapter.info(f"Diarization complete: saved to '{out_path}'")
-
+    # === и тут тоже
+    redis = Redis.from_url(settings.CELERY_BROKER_URL)
+    redis.publish(f"progress:{upload_id}", "100%")
+    redis.set(f"progress:{upload_id}", "100%")
 
 def split_audio_fixed_windows(audio_path: Path, window_s: int):
-    """
-    Split audio into fixed-length windows (seconds).
-    """
     audio = AudioSegment.from_file(str(audio_path))
     length_ms = len(audio)
     window_ms = window_s * 1000
