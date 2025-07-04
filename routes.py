@@ -5,15 +5,21 @@ import json
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import RootModel
 
 from config.settings import settings
 from dependencies import get_current_user
 
 router = APIRouter()
 
-class LabelUpdate(BaseModel):
-    __root__: dict[str, str]
+
+class LabelUpdate(RootModel[dict[str, str]]):
+    """
+    Ожидаем в теле запроса JSON-объект вида
+    { "oldSpeaker": "newSpeaker", ... }
+    """
+    pass
+
 
 @router.get("/results/{upload_id}")
 async def get_results(
@@ -21,8 +27,7 @@ async def get_results(
     current_user=Depends(get_current_user),
 ):
     """
-    Возвращает объединённый список сегментов с текстом, временем и (по возможности) спикером.
-    Если диагрмация ещё не готова — возвращаем всё равно текст.
+    Возвращает объединённый список сегментов с текстом, временем и спикером.
     """
     base = Path(settings.RESULTS_FOLDER) / upload_id
 
@@ -34,7 +39,7 @@ async def get_results(
 
     transcript = json.loads(transcript_path.read_text(encoding="utf-8"))
 
-    # если diarization доступна — загрузим, иначе пустой список
+    # если есть файл с диаризацией — загрузим, иначе оставим пустым список
     if diarization_path.exists():
         diarization = json.loads(diarization_path.read_text(encoding="utf-8"))
     else:
@@ -42,9 +47,10 @@ async def get_results(
 
     enriched = []
     for seg in transcript:
-        # находим спикера по началу сегмента, если есть
+        # сопоставляем сегмент с говорящим
         spk = next(
-            (d["speaker"] for d in diarization
+            (d["speaker"]
+             for d in diarization
              if d["start"] <= seg["start"] < d["end"]),
             None
         )
@@ -54,11 +60,12 @@ async def get_results(
             "end":     seg["end"],
             "text":    seg["text"],
             "speaker": spk or "unknown",
+            # строковое время ЧЧ:ММ:СС
             "time":    time.strftime("%H:%M:%S", time.gmtime(seg["start"]))
         })
 
-    # возвращаем именно поле transcript, как ждёт фронтенд
-    return {"transcript": enriched}
+    # возвращаем поле results, как ждёт фронтенд
+    return {"results": enriched}
 
 
 @router.post("/labels/{upload_id}")
@@ -68,8 +75,7 @@ async def save_labels(
     current_user=Depends(get_current_user),
 ):
     """
-    Принимает словарь переименований { oldName: newName, ... }
-    и обновляет файл diarization.json, заменяя speaker → mapped value.
+    Принимает переименования спикеров и правит diarization.json.
     """
     base = Path(settings.RESULTS_FOLDER) / upload_id
     diarization_path = base / "diarization.json"
@@ -79,9 +85,11 @@ async def save_labels(
 
     # читаем текущие метки
     diar = json.loads(diarization_path.read_text(encoding="utf-8"))
-    mapping: dict[str,str] = payload.__root__
 
-    # переименовываем
+    # mapping хранится в payload.root по стандарту RootModel
+    mapping: dict[str, str] = payload.root
+
+    # применяем новую раскладку имён
     for turn in diar:
         orig = turn.get("speaker")
         if orig in mapping and mapping[orig].strip():
