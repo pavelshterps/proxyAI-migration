@@ -7,7 +7,7 @@ RUN sed -i \
       's|http://archive.ubuntu.com/ubuntu/|http://ru.archive.ubuntu.com/ubuntu/|g' \
       /etc/apt/sources.list \
  && sed -i \
-      's|http://security.ubuntu.com/ubuntu|http://ru.archive.ubuntu.com/ubuntu|g' \
+      's|http://security.ubuntu.com/ubuntu|http://ru.archive.ubuntu.com/ubuntu/|g' \
       /etc/apt/sources.list
 
 # 2) Системные зависимости
@@ -17,16 +17,18 @@ RUN apt-get update \
       ffmpeg libsndfile1 \
  && rm -rf /var/lib/apt/lists/*
 
-# 3) Виртуальный рабочий каталог
 WORKDIR /app
 
-# 4) Устанавливаем CTranslate2 для CUDA12+cuDNN8 и Faster-Whisper
+# 3) Устанавливаем сначала все зависимости из requirements.txt
 COPY requirements.txt ./
 RUN pip3 install --upgrade pip \
- && pip3 install --no-cache-dir \
+ && pip3 install --no-cache-dir -r requirements.txt
+
+# 4) Поверх устанавливаем жёстко зафиксированные GPU-библиотеки
+RUN pip3 install --no-cache-dir \
       ctranslate2[cuda12]==4.4.0 \
       faster-whisper[cuda12] \
- && pip3 install --no-cache-dir -r requirements.txt
+ && pip3 check
 
 # 5) Копируем проект
 COPY . .
@@ -38,6 +40,6 @@ ENV HUGGINGFACE_CACHE_DIR=/hf_cache \
     TF_FORCE_GPU_ALLOW_GROWTH=true \
     CTRANSFORMER_MAX_CUDA_MEMORY=0.8
 
-# 7) Запуск GPU-воркера
+# 7) Запуск единственного GPU-воркера
 CMD ["celery", "-A", "tasks", "worker", \
      "--loglevel=info", "--concurrency=1", "--queues=preprocess_gpu"]
