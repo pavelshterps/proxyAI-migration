@@ -87,7 +87,7 @@ def preload_and_warmup(**kwargs):
     """
     sample = Path(__file__).resolve().parent / "tests" / "fixtures" / "sample.wav"
 
-    # Warm-up diarizer — only for CPU-worker
+    # Warm-up diarizer — only for CPU workers
     if settings.WHISPER_DEVICE.lower() == "cpu":
         try:
             get_diarizer()(str(sample))
@@ -95,7 +95,7 @@ def preload_and_warmup(**kwargs):
         except Exception as e:
             logger.warning(f"Warm-up diarizer failed: {e}")
 
-    # Warm-up WhisperModel — only for GPU-worker
+    # Warm-up WhisperModel — only for GPU workers
     if settings.WHISPER_DEVICE.lower() != "cpu":
         try:
             get_whisper_model().transcribe(
@@ -118,10 +118,8 @@ def transcribe_segments(upload_id: str, correlation_id: str):
     adapter = logging.LoggerAdapter(logger, {"correlation_id": correlation_id})
     whisper = get_whisper_model()
 
-    # normalize out any ".wav" extension so API & worker agree
-    base_name = Path(upload_id).stem
-    src      = Path(settings.UPLOAD_FOLDER)  / f"{base_name}.wav"
-    dst_dir  = Path(settings.RESULTS_FOLDER) / base_name
+    src = Path(settings.UPLOAD_FOLDER) / upload_id
+    dst_dir = Path(settings.RESULTS_FOLDER) / upload_id
     dst_dir.mkdir(parents=True, exist_ok=True)
 
     adapter.info(f"Starting transcription for '{src}'")
@@ -134,7 +132,7 @@ def transcribe_segments(upload_id: str, correlation_id: str):
     for idx, (start, end) in enumerate(windows):
         adapter.debug(f" Transcribing segment {idx}: {start:.1f}s → {end:.1f}s")
         chunk = full_audio[int(start*1000):int(end*1000)]
-        tmp_path = dst_dir / f"{base_name}_{idx}.wav"
+        tmp_path = dst_dir / f"{upload_id}_{idx}.wav"
         chunk.export(tmp_path, format="wav")
 
         try:
@@ -201,7 +199,8 @@ def diarize_full(upload_id: str, correlation_id: str):
         json.dumps(speakers, ensure_ascii=False, indent=2),
         encoding="utf-8"
     )
-    adapter.info(f"Diarization complete: saved to '{out_path}')
+    # FIXED: added missing closing quote on f-string
+    adapter.info(f"Diarization complete: saved to '{out_path}'")
 
 
 def split_audio_fixed_windows(audio_path: Path, window_s: int):
