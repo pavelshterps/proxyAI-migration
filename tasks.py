@@ -143,10 +143,10 @@ def transcribe_segments(upload_id: str, correlation_id: str):
         encoding="utf-8"
     )
     adapter.info(f"Transcription complete: saved to '{out_path}'")
-    # === здесь отмечаем 100%
+    # обновляем прогресс до 50%
     redis = Redis.from_url(settings.CELERY_BROKER_URL)
-    redis.publish(f"progress:{upload_id}", "100%")
-    redis.set(f"progress:{upload_id}", "100%")
+    redis.publish(f"progress:{upload_id}", "50%")
+    redis.set(f"progress:{upload_id}", "50%")
 
 @shared_task(
     name="tasks.diarize_full"
@@ -176,7 +176,7 @@ def diarize_full(upload_id: str, correlation_id: str):
         encoding="utf-8"
     )
     adapter.info(f"Diarization complete: saved to '{out_path}'")
-    # === и тут тоже
+    # теперь всё готово — помечаем прогресс 100%
     redis = Redis.from_url(settings.CELERY_BROKER_URL)
     redis.publish(f"progress:{upload_id}", "100%")
     redis.set(f"progress:{upload_id}", "100%")
