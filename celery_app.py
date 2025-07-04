@@ -5,7 +5,7 @@ from config.settings import settings
 from tasks import get_whisper_model, get_diarizer
 
 app = Celery("proxyai")
-# загружаем конфиг из config/celery.py
+# читаем всю конфигурацию из config/celery.py
 app.config_from_object("config.celery")
 
 @signals.worker_process_init.connect

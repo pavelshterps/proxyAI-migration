@@ -1,12 +1,14 @@
 # Dockerfile.gpu
 
-FROM nvidia/cuda:12.1.0-cudnn8-runtime-ubuntu22.04
+# 1) Переходим на образ с CUDA 12.2 и cuDNN 9 — чтобы совпала ABI-версия,
+#    которую ищет faster-whisper (libcudnn_ops.so.9.x)
+FROM nvidia/cuda:12.2.0-cudnn9-runtime-ubuntu22.04
 
-# переключаем mirror’ы
+# 2) Российские зеркала для apt
 RUN sed -i 's|http://archive.ubuntu.com/ubuntu/|http://ru.archive.ubuntu.com/ubuntu/|g' /etc/apt/sources.list \
  && sed -i 's|http://security.ubuntu.com/ubuntu|http://ru.archive.ubuntu.com/ubuntu|g' /etc/apt/sources.list
 
-# системные пакеты
+# 3) Системные зависимости
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
        python3-pip python3-dev build-essential \
@@ -15,7 +17,7 @@ RUN apt-get update \
 
 WORKDIR /app
 
-# ускоренные бинарники
+# 4) Устанавливаем ускоренные бинарники ctranslate2 и faster-whisper под CUDA12.2/cuDNN9
 COPY requirements.txt ./
 RUN pip3 install --no-cache-dir --upgrade pip \
  && pip3 install --no-cache-dir \
@@ -23,12 +25,21 @@ RUN pip3 install --no-cache-dir --upgrade pip \
        faster-whisper[cuda12] \
  && pip3 install --no-cache-dir -r requirements.txt
 
+# 5) Копируем весь код проекта
 COPY . .
 
+# 6) Переменные окружения
+# Пути к кешу HuggingFace и выбор устройства для Whisper
 ENV HUGGINGFACE_CACHE_DIR=/hf_cache
 ENV WHISPER_DEVICE=cuda
 ENV WHISPER_COMPUTE_TYPE=float16
+
+# Ограничиваем аллокацию GPU-памяти, чтобы не вываливались OOM
 ENV TF_FORCE_GPU_ALLOW_GROWTH=true
 ENV CTRANSFORMER_MAX_CUDA_MEMORY=0.8
 
+# Обеспечиваем, что runtime найдёт библиотеки CUDA/cuDNN
+ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH}
+
+# 7) Запускаем GPU-воркер только на очереди preprocess_gpu
 CMD ["celery", "-A", "tasks", "worker", "--loglevel=info", "--concurrency=1", "--queues=preprocess_gpu"]
