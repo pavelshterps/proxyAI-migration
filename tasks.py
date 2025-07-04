@@ -82,19 +82,20 @@ def get_diarizer():
 def preload_and_warmup(**kwargs):
     """
     On worker start, warm up:
-    - diarizer always
+    - diarizer only on CPU
     - WhisperModel once on GPU
     """
     sample = Path(__file__).resolve().parent / "tests" / "fixtures" / "sample.wav"
 
-    # Warm-up diarizer
-    try:
-        get_diarizer()(str(sample))
-        logger.info("✅ Warm-up diarizer complete")
-    except Exception as e:
-        logger.warning(f"Warm-up diarizer failed: {e}")
+    # Warm-up diarizer — только для CPU-воркера
+    if settings.WHISPER_DEVICE.lower() == "cpu":
+        try:
+            get_diarizer()(str(sample))
+            logger.info("✅ Warm-up diarizer complete")
+        except Exception as e:
+            logger.warning(f"Warm-up diarizer failed: {e}")
 
-    # Warm-up WhisperModel (only if GPU)
+    # Warm-up WhisperModel — только для GPU-воркера
     if settings.WHISPER_DEVICE.lower() != "cpu":
         try:
             get_whisper_model().transcribe(

@@ -1,11 +1,9 @@
-# Dockerfile.gpu
-FROM nvidia/cuda:12.1.0-cudnn8-devel-ubuntu22.04
+FROM nvidia/cuda:12.2.0-cudnn8-runtime-ubuntu22.04  # ← обновили на 12.2
 
-# 1) российские зеркала
+# Российские зеркала
 RUN sed -i 's|http://archive.ubuntu.com/ubuntu/|http://ru.archive.ubuntu.com/ubuntu/|g' /etc/apt/sources.list \
  && sed -i 's|http://security.ubuntu.com/ubuntu|http://ru.archive.ubuntu.com/ubuntu|g' /etc/apt/sources.list
 
-# 2) системные зависимости
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
        python3-pip python3-dev build-essential \
@@ -13,8 +11,6 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-
-# 3) Пингуем CTranslate2 под cuDNN8 и устанавливаем faster-whisper
 COPY requirements.txt ./
 RUN pip3 install --no-cache-dir --upgrade pip \
  && pip3 install --no-cache-dir \
@@ -22,14 +18,11 @@ RUN pip3 install --no-cache-dir --upgrade pip \
        faster-whisper[cuda12] \
  && pip3 install --no-cache-dir -r requirements.txt
 
-# 4) Копируем код
 COPY . .
 
-# 5) Переменные окружения
 ENV HUGGINGFACE_CACHE_DIR=/hf_cache
 ENV WHISPER_DEVICE=cuda
 ENV WHISPER_COMPUTE_TYPE=float16
-# ограничить рост GPU-памяти (чтобы не вываливались OOM)
 ENV TF_FORCE_GPU_ALLOW_GROWTH=true
 ENV CTRANSFORMER_MAX_CUDA_MEMORY=0.8
 
