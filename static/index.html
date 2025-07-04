@@ -2,7 +2,7 @@
 <html lang="ru">
 <head>
   <meta charset="UTF-8" />
-  <title>proxyAI 13.8.2 Demo</title>
+  <title>proxyAI Demo UI</title>
   <style>
     body { font-family: sans-serif; margin: 2rem; }
     label, button { margin: .5rem 0; display: block; }
@@ -14,7 +14,7 @@
   </style>
 </head>
 <body>
-  <h1>proxyAI 13.8.2 Demo UI</h1>
+  <h1>proxyAI Demo UI</h1>
 
   <label>
     Ваш API-Key:
@@ -41,13 +41,13 @@
 <script>
 (async function(){
   const apiKeyEl = document.getElementById('apiKey');
-  const fileEl = document.getElementById('audioFile');
-  const uploadBtn = document.getElementById('uploadBtn');
+  const fileEl   = document.getElementById('audioFile');
+  const uploadBtn= document.getElementById('uploadBtn');
   const statusEl = document.getElementById('status');
   const fetchBtn = document.getElementById('fetchResultsBtn');
-  const audioEl = document.getElementById('audio');
-  const container = document.getElementById('transcriptContainer');
-  const saveBtn = document.getElementById('saveLabelsBtn');
+  const audioEl  = document.getElementById('audio');
+  const container= document.getElementById('transcriptContainer');
+  const saveBtn  = document.getElementById('saveLabelsBtn');
 
   let uploadId, fileBlob, mapping = {};
 
@@ -62,8 +62,8 @@
     fd.append("file", file, file.name);
 
     const res = await fetch("/upload/", {
-      method:"POST",
-      headers:{"X-API-Key": key},
+      method: "POST",
+      headers:{ "X-API-Key": key },
       body: fd
     });
     if(!res.ok){ alert("Upload error: "+res.status); return; }
@@ -71,39 +71,39 @@
     uploadId = upload_id;
     statusEl.textContent = `upload_id=${uploadId}. Ожидаем...`;
 
-    // poll status
+    // опрос статуса
     const interval = setInterval(async ()=>{
       const st = await (await fetch(`/status/${uploadId}`, {
-        headers:{"X-API-Key": key}
+        headers:{ "X-API-Key": key }
       })).json();
       statusEl.textContent = `Статус: ${st.status}, прогресс: ${st.progress}`;
       if(st.status==="done"){
         clearInterval(interval);
         fetchBtn.disabled = false;
       }
-    },2000);
+    }, 2000);
   };
 
   fetchBtn.onclick = async () => {
     const key = apiKeyEl.value.trim();
     statusEl.textContent = "Получаем результаты...";
     const res = await fetch(`/results/${uploadId}`, {
-      headers:{"X-API-Key": key}
+      headers:{ "X-API-Key": key }
     });
     if(!res.ok){ alert("Error fetching results"); return; }
-    const { transcript } = await res.json();
+    const { results } = await res.json();
     statusEl.textContent = "Результаты получены";
     audioEl.src = URL.createObjectURL(fileBlob);
-    renderTranscript(transcript);
+    renderTranscript(results);
     saveBtn.disabled = false;
   };
 
   function renderTranscript(list){
     container.innerHTML = "";
     mapping = {};
-    // init mapping
-    list.forEach(s=> mapping[s.speaker]=s.speaker);
-    list.forEach(seg=>{
+    // инициализация мэппинга
+    list.forEach(s => mapping[s.speaker] = s.speaker);
+    list.forEach(seg => {
       const div = document.createElement("div");
       div.className = "segment";
       const t = document.createElement("span");
@@ -114,14 +114,14 @@
       btn.onclick = () => {
         audioEl.currentTime = seg.start;
         audioEl.play();
-        setTimeout(()=>audioEl.pause(), (seg.end-seg.start)*1000+200);
+        setTimeout(()=>audioEl.pause(), (seg.end - seg.start)*1000 + 200);
       };
       const inp = document.createElement("input");
       inp.value = seg.speaker;
       inp.onchange = () => {
         const old = seg.speaker, neu = inp.value.trim();
         if(neu && neu.length<=50){
-          mapping[old]=neu;
+          mapping[old] = neu;
           document.querySelectorAll('.segment input').forEach(i=>{
             if(i.value===old) i.value = neu;
           });
@@ -132,20 +132,22 @@
       };
       const txt = document.createElement("span");
       txt.textContent = seg.text;
-      container.append(div);
       div.append(t, btn, inp, txt);
+      container.append(div);
     });
   }
 
   saveBtn.onclick = async () => {
     const key = apiKeyEl.value.trim();
     const payload = {};
-    Object.entries(mapping).forEach(([o,n])=>{ if(o!==n) payload[o]=n; });
+    Object.entries(mapping).forEach(([o,n]) => {
+      if(o !== n) payload[o] = n;
+    });
     if(!Object.keys(payload).length){ alert("Нет изменений"); return; }
     const res = await fetch(`/labels/${uploadId}`, {
-      method:"POST",
-      headers:{
-        "Content-Type":"application/json",
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
         "X-API-Key": key
       },
       body: JSON.stringify(payload)
