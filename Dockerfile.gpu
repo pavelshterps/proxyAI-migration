@@ -1,17 +1,16 @@
-# Dockerfile.gpu
+# Dockerfile.gpu.cuda12.2
 
-# 1) Use CUDA 12.2 with cuDNN 8 to match host driver
 FROM nvidia/cuda:12.2.2-cudnn8-runtime-ubuntu22.04
 
-# 2) Switch Ubuntu mirrors to Russian for faster apt operations
+# 1) Russian mirrors
 RUN sed -i \
       's|http://archive.ubuntu.com/ubuntu/|http://ru.archive.ubuntu.com/ubuntu/|g' \
       /etc/apt/sources.list \
  && sed -i \
-      's|http://security.ubuntu.com/ubuntu|http://ru.archive.ubuntu.com/ubuntu|g' \
+      's|http://security.ubuntu.com/ubuntu|http://ru.archive.ubuntu.com/ubuntu/|g' \
       /etc/apt/sources.list
 
-# 3) Install system dependencies
+# 2) System deps
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       python3-pip python3-dev build-essential \
@@ -20,24 +19,23 @@ RUN apt-get update \
 
 WORKDIR /app
 
-# 4) Install pinned versions of CTranslate2 and faster-whisper, then other Python deps
+# 3) Pin CTranslate2 to 3.24.0 (cuDNN 8) + faster-whisper 0.5.1
 COPY requirements.txt ./
 RUN pip3 install --upgrade pip \
  && pip3 install --no-cache-dir \
       ctranslate2[cuda12]==3.24.0 \
-      faster-whisper[cuda12]==0.5.7 \
+      faster-whisper[cuda12]==0.5.1 \
  && pip3 install --no-cache-dir -r requirements.txt
 
-# 5) Copy application code
+# 4) Copy code
 COPY . .
 
-# 6) Environment variables for Whisper/CTranslate2 GPU behavior
+# 5) Env vars
 ENV HUGGINGFACE_CACHE_DIR=/hf_cache \
     WHISPER_DEVICE=cuda \
     WHISPER_COMPUTE_TYPE=float16 \
     TF_FORCE_GPU_ALLOW_GROWTH=true \
-    CTRANSFORMER_MAX_CUDA_MEMORY=0.8 \
-    LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
+    CTRANSFORMER_MAX_CUDA_MEMORY=0.8
 
-# 7) Launch the single GPU Celery worker for transcription
+# 6) Single-worker launch
 CMD ["celery", "-A", "tasks", "worker", "--loglevel=info", "--concurrency=1", "--queues=preprocess_gpu"]
