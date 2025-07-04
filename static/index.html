@@ -71,13 +71,12 @@
     uploadId = upload_id;
     statusEl.textContent = `upload_id=${uploadId}. Ожидаем...`;
 
-    // опрос статуса
     const interval = setInterval(async ()=>{
       const st = await (await fetch(`/status/${uploadId}`, {
         headers:{ "X-API-Key": key }
       })).json();
       statusEl.textContent = `Статус: ${st.status}, прогресс: ${st.progress}`;
-      if (st.status === "done" || st.progress === "100%") {
+      if (st.status === "done") {
         clearInterval(interval);
         fetchBtn.disabled = false;
       }
@@ -91,10 +90,10 @@
       headers:{ "X-API-Key": key }
     });
     if(!res.ok){ alert("Error fetching results"); return; }
-    const payload = await res.json();
-    console.log("DEBUG /results payload:", payload);
-    // поддерживаем старые и новые ключи
-    const list = payload.results ?? payload.transcript;
+    // ВАЖНО: читаем JSON один раз
+    const data = await res.json();
+    // поддерживаем оба варианта ключа
+    const list = data.results ?? data.transcript;
     statusEl.textContent = "Результаты получены";
     audioEl.src = URL.createObjectURL(fileBlob);
     renderTranscript(list);
@@ -104,7 +103,6 @@
   function renderTranscript(list){
     container.innerHTML = "";
     mapping = {};
-    // инициализация мэппинга
     list.forEach(s => mapping[s.speaker] = s.speaker);
     list.forEach(seg => {
       const div = document.createElement("div");
