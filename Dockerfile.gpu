@@ -1,40 +1,45 @@
 # Dockerfile.gpu
 
-# 1) Correct base image with matching cuDNN
-FROM nvidia/cuda:12.2.2-cudnn8-runtime-ubuntu22.04  # правильный тег есть на Docker Hub  [oai_citation:0‡hub.docker.com](https://hub.docker.com/r/nvidia/cuda/tags?name=ubuntu22.04&ordering=&page=1&page_size=100&utm_source=chatgpt.com)
+# 1) Правильный образ с CUDA12.2 + cuDNN8
+FROM nvidia/cuda:12.2.2-cudnn8-runtime-ubuntu22.04
 
-# 2) Switch to Russian mirrors for speed
+# 2) Переключаем mirror'ы на российские
 RUN sed -i 's|http://archive.ubuntu.com/ubuntu/|http://ru.archive.ubuntu.com/ubuntu/|g' /etc/apt/sources.list \
  && sed -i 's|http://security.ubuntu.com/ubuntu|http://ru.archive.ubuntu.com/ubuntu|g' /etc/apt/sources.list
 
-# 3) System deps (no libcudnn8-dev!)
+# 3) Системные пакеты (без libcudnn8-dev!)
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-       python3-pip python3-dev build-essential \
-       ffmpeg libsndfile1 \
+      python3-pip \
+      python3-dev \
+      build-essential \
+      ffmpeg \
+      libsndfile1 \
  && rm -rf /var/lib/apt/lists/*
 
+# 4) Рабочая директория
 WORKDIR /app
 
-# 4) Accelerated wheels
+# 5) Копируем файл зависимостей и устанавливаем accelerated wheels
 COPY requirements.txt ./
 RUN pip3 install --no-cache-dir --upgrade pip \
  && pip3 install --no-cache-dir \
-       ctranslate2[cuda12]==4.4.0 \
-       faster-whisper[cuda12] \
+      ctranslate2[cuda12]==4.4.0 \
+      faster-whisper[cuda12] \
  && pip3 install --no-cache-dir -r requirements.txt
 
-# 5) Copy your code
+# 6) Копируем код
 COPY . .
 
-# 6) Ensure CUDA libs are on the loader path
+# 7) Подправляем LD_LIBRARY_PATH, чтобы cuDNN нашёлся
 ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
 
-# 7) Whisper on GPU
-ENV HUGGINGFACE_CACHE_DIR=/hf_cache
-ENV WHISPER_DEVICE=cuda
-ENV WHISPER_COMPUTE_TYPE=float16
-ENV TF_FORCE_GPU_ALLOW_GROWTH=true
-ENV CTRANSFORMER_MAX_CUDA_MEMORY=0.8
+# 8) Переменные окружения для Whisper на GPU
+ENV HUGGINGFACE_CACHE_DIR=/hf_cache \
+    WHISPER_DEVICE=cuda \
+    WHISPER_COMPUTE_TYPE=float16 \
+    TF_FORCE_GPU_ALLOW_GROWTH=true \
+    CTRANSFORMER_MAX_CUDA_MEMORY=0.8
 
+# 9) По умолчанию — GPU-очередь Celery
 CMD ["celery", "-A", "tasks", "worker", "--loglevel=info", "--concurrency=1", "--queues=preprocess_gpu"]
