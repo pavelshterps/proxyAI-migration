@@ -1,13 +1,13 @@
 # Dockerfile.gpu
 
-# 1) Базовый образ с CUDA 12.2 + cuDNN 8 на Ubuntu 22.04
-FROM nvidia/cuda:12.2.0-cudnn8-runtime-ubuntu22.04
+# 1) Correct base image with matching cuDNN
+FROM nvidia/cuda:12.2.2-cudnn8-runtime-ubuntu22.04  # правильный тег есть на Docker Hub  [oai_citation:0‡hub.docker.com](https://hub.docker.com/r/nvidia/cuda/tags?name=ubuntu22.04&ordering=&page=1&page_size=100&utm_source=chatgpt.com)
 
-# 2) Переключаем mirror’ы на российские для скорости apt
+# 2) Switch to Russian mirrors for speed
 RUN sed -i 's|http://archive.ubuntu.com/ubuntu/|http://ru.archive.ubuntu.com/ubuntu/|g' /etc/apt/sources.list \
  && sed -i 's|http://security.ubuntu.com/ubuntu|http://ru.archive.ubuntu.com/ubuntu|g' /etc/apt/sources.list
 
-# 3) Системные пакеты (без libcudnn8-dev!)
+# 3) System deps (no libcudnn8-dev!)
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
        python3-pip python3-dev build-essential \
@@ -16,7 +16,7 @@ RUN apt-get update \
 
 WORKDIR /app
 
-# 4) Устанавливаем ускоренные бинары CTranslate2 и faster-whisper
+# 4) Accelerated wheels
 COPY requirements.txt ./
 RUN pip3 install --no-cache-dir --upgrade pip \
  && pip3 install --no-cache-dir \
@@ -24,16 +24,17 @@ RUN pip3 install --no-cache-dir --upgrade pip \
        faster-whisper[cuda12] \
  && pip3 install --no-cache-dir -r requirements.txt
 
-# 5) Копируем код приложения
+# 5) Copy your code
 COPY . .
 
-# 6) Переменные окружения для корректной работы CUDA/cuDNN и faster-whisper
-ENV HUGGINGFACE_CACHE_DIR=/hf_cache \
-    WHISPER_DEVICE=cuda \
-    WHISPER_COMPUTE_TYPE=float16 \
-    TF_FORCE_GPU_ALLOW_GROWTH=true \
-    CTRANSFORMER_MAX_CUDA_MEMORY=0.8 \
-    LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH}
+# 6) Ensure CUDA libs are on the loader path
+ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
 
-# 7) Запуск celery-воркера на GPU-очереди
+# 7) Whisper on GPU
+ENV HUGGINGFACE_CACHE_DIR=/hf_cache
+ENV WHISPER_DEVICE=cuda
+ENV WHISPER_COMPUTE_TYPE=float16
+ENV TF_FORCE_GPU_ALLOW_GROWTH=true
+ENV CTRANSFORMER_MAX_CUDA_MEMORY=0.8
+
 CMD ["celery", "-A", "tasks", "worker", "--loglevel=info", "--concurrency=1", "--queues=preprocess_gpu"]
