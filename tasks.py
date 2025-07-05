@@ -8,6 +8,7 @@ from celery.signals import worker_process_init
 from faster_whisper import WhisperModel
 from pyannote.audio import Pipeline
 from pydub import AudioSegment
+from utils.audio import convert_to_wav
 from redis import Redis
 
 from config.settings import settings
@@ -101,7 +102,12 @@ def transcribe_segments(upload_id: str, correlation_id: str):
     adapter = logging.LoggerAdapter(logger, {"correlation_id": correlation_id})
     whisper = get_whisper_model()
 
-    src = Path(settings.UPLOAD_FOLDER) / upload_id
+    src_orig = Path(settings.UPLOAD_FOLDER) / upload_id
+    dst_dir = Path(settings.RESULTS_FOLDER) / upload_id
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    wav_src = dst_dir / f"{upload_id}.wav"
+    convert_to_wav(src_orig, wav_src, sample_rate=16000, channels=1)
+    src = wav_src
     dst_dir = Path(settings.RESULTS_FOLDER) / upload_id
     dst_dir.mkdir(parents=True, exist_ok=True)
 
