@@ -1,9 +1,9 @@
+# main.py
 import time
 import uuid
 from pathlib import Path
 import structlog
 import redis.asyncio as redis_async
-
 from fastapi import (
     FastAPI,
     UploadFile,
@@ -24,6 +24,9 @@ from slowapi import Limiter
 from slowapi.middleware import SlowAPIMiddleware
 from slowapi.util import get_remote_address
 from contextlib import asynccontextmanager
+
+from asyncpg.exceptions import CannotConnectNowError
+from sqlalchemy.exc import InterfaceError
 
 from config.settings import settings
 from database import get_db, engine, init_models
@@ -103,11 +106,14 @@ HTTP_REQ_LATENCY = Histogram(
     ["path"],
 )
 
-# Middleware для метрик
+# Middleware для метрик с ловлей ошибок БД
 @app.middleware("http")
 async def metrics_middleware(request: Request, call_next):
     start = time.time()
-    response = await call_next(request)
+    try:
+        response = await call_next(request)
+    except (CannotConnectNowError, InterfaceError):
+        return JSONResponse(status_code=503, content={"detail": "Database not ready"})
     HTTP_REQ_COUNT.labels(request.method, request.url.path).inc()
     HTTP_REQ_LATENCY.labels(request.url.path).observe(time.time() - start)
     return response
@@ -144,7 +150,10 @@ async def get_status(
     current_user=Depends(get_current_user),
     db=Depends(get_db),
 ):
-    rec = await get_upload_for_user(db, current_user.id, upload_id)
+    try:
+        rec = await get_upload_for_user(db, current_user.id, upload_id)
+    except (CannotConnectNowError, InterfaceError):
+        raise HTTPException(status_code=503, detail="Database not ready")
     if not rec:
         raise HTTPException(status_code=404, detail="upload_id not found")
 
@@ -192,6 +201,7 @@ async def upload(
     ).info("upload accepted")
 
     from tasks import transcribe_segments, diarize_full
+    # передаём enqueue_time для измерения задержки в брокере
     now = time.time()
     transcribe_segments.apply_async(
         args=[upload_id, cid],
