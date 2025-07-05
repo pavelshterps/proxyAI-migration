@@ -22,4 +22,5 @@ async def get_current_user(
             raise HTTPException(status_code=401, detail="Invalid X-API-Key")
         return user
     except (CannotConnectNowError, InterfaceError):
+        # когда БД ещё не приняла соединения
         raise HTTPException(status_code=503, detail="Database not ready")

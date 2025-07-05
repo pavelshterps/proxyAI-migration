@@ -106,14 +106,19 @@ HTTP_REQ_LATENCY = Histogram(
     ["path"],
 )
 
-# Middleware для метрик с ловлей ошибок БД
+# Middleware для метрик с корректной обработкой HTTPException и ошибок БД
 @app.middleware("http")
 async def metrics_middleware(request: Request, call_next):
     start = time.time()
     try:
         response = await call_next(request)
+    except HTTPException:
+        # пропускаем HTTPException дальше, клиент получит свой статус
+        raise
     except (CannotConnectNowError, InterfaceError):
+        # БД ещё не готова — возвращаем 503
         return JSONResponse(status_code=503, content={"detail": "Database not ready"})
+    # любые другие исключения пусть пробрасываются в стандартный обработчик
     HTTP_REQ_COUNT.labels(request.method, request.url.path).inc()
     HTTP_REQ_LATENCY.labels(request.url.path).observe(time.time() - start)
     return response
@@ -150,10 +155,7 @@ async def get_status(
     current_user=Depends(get_current_user),
     db=Depends(get_db),
 ):
-    try:
-        rec = await get_upload_for_user(db, current_user.id, upload_id)
-    except (CannotConnectNowError, InterfaceError):
-        raise HTTPException(status_code=503, detail="Database not ready")
+    rec = await get_upload_for_user(db, current_user.id, upload_id)
     if not rec:
         raise HTTPException(status_code=404, detail="upload_id not found")
 
@@ -180,7 +182,6 @@ async def upload(
     db=Depends(get_db),
 ):
     cid = x_correlation_id or str(uuid.uuid4())
-    # accept all audio/* and video/* formats
     ct = file.content_type or ""
     if not (ct.startswith("audio/") or ct.startswith("video/")):
         raise HTTPException(status_code=415, detail="Unsupported file type")
@@ -201,7 +202,6 @@ async def upload(
     ).info("upload accepted")
 
     from tasks import transcribe_segments, diarize_full
-    # передаём enqueue_time для измерения задержки в брокере
     now = time.time()
     transcribe_segments.apply_async(
         args=[upload_id, cid],
