@@ -8,7 +8,7 @@ import torch
 from celery import Celery, shared_task
 from celery.signals import worker_process_init
 from faster_whisper import WhisperModel
-from pyannote.audio import Pipeline
+from pyannote.audio.pipelines import SpeakerDiarization
 from pydub import AudioSegment
 from utils.audio import convert_to_wav
 from redis import Redis
@@ -68,7 +68,7 @@ def get_diarizer():
         cache_dir = settings.DIARIZER_CACHE_DIR
         os.makedirs(cache_dir, exist_ok=True)
         logger.info(f"Loading pyannote Pipeline into cache '{cache_dir}'")
-        _diarizer = Pipeline.from_pretrained(
+        _diarizer = SpeakerDiarization.from_pretrained(
             settings.PYANNOTE_PIPELINE,
             cache_dir=cache_dir,
             use_auth_token=settings.HUGGINGFACE_TOKEN,
