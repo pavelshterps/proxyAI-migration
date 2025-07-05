@@ -111,7 +111,7 @@ def preload_and_warmup(**kwargs):
 @shared_task(
     bind=True,
     name="tasks.transcribe_segments",
-    queue="preprocess_cpu"
+    queue="preprocess_gpu"
 )
 def transcribe_segments(self, upload_id: str, correlation_id: str):
     adapter = logging.LoggerAdapter(logger, {"correlation_id": correlation_id})
@@ -128,11 +128,11 @@ def transcribe_segments(self, upload_id: str, correlation_id: str):
             adapter.warning(f"Invalid enqueue_time header: {enqueue_header}")
     task_start = time.time()
 
-    # универсальная конвертация в WAV — конвертируем исходный файл из UPLOAD_FOLDER
+    # универсальная конвертация в WAV в папку результатов
     src_orig = Path(settings.UPLOAD_FOLDER) / upload_id
-    # сохраняем сконвертированный WAV рядом с оригиналом
-    wav_name = Path(upload_id).stem + ".wav"
-    wav_src = Path(settings.UPLOAD_FOLDER) / wav_name
+    dst_dir = Path(settings.RESULTS_FOLDER) / upload_id
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    wav_src = dst_dir / f"{upload_id}.wav"
     convert_to_wav(src_orig, wav_src, sample_rate=16000, channels=1)
     src = wav_src
 
