@@ -4,6 +4,7 @@ import logging
 import time
 from pathlib import Path
 
+import torch
 from celery import Celery, shared_task
 from celery.signals import worker_process_init
 from faster_whisper import WhisperModel
@@ -64,12 +65,21 @@ def get_diarizer():
         cache_dir = settings.DIARIZER_CACHE_DIR
         os.makedirs(cache_dir, exist_ok=True)
         logger.info(f"Loading pyannote Pipeline into cache '{cache_dir}'")
+        # Загружаем пайплайн без device
         _diarizer = Pipeline.from_pretrained(
             settings.PYANNOTE_PIPELINE,
             cache_dir=cache_dir,
-            use_auth_token=settings.HUGGINGFACE_TOKEN,
-            device="cuda"  # чтобы диаризация шла на GPU
+            use_auth_token=settings.HUGGINGFACE_TOKEN
         )
+        # Переносим на GPU, если указано
+        pd = getattr(settings, "PYANNOTE_DEVICE", "cpu").lower()
+        if pd != "cpu":
+            try:
+                dev = torch.device(pd)
+                _diarizer.to(dev)
+                logger.info(f"Diarizer moved to {dev}")
+            except Exception as e:
+                logger.warning(f"Could not move diarizer to {pd}: {e}")
         logger.info("Diarizer loaded")
     return _diarizer
 
