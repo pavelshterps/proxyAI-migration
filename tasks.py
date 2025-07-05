@@ -117,8 +117,9 @@ def transcribe_segments(self, upload_id: str, correlation_id: str):
     adapter = logging.LoggerAdapter(logger, {"correlation_id": correlation_id})
     whisper = get_whisper_model()
 
-    # измеряем задержку в очереди
-    enqueue_header = self.request.headers.get("enqueue_time")
+    # измеряем задержку в очереди — безопасно достаём headers
+    headers = getattr(self.request, "headers", {}) or {}
+    enqueue_header = headers.get("enqueue_time")
     if enqueue_header:
         try:
             enqueue_ts = float(enqueue_header)
@@ -201,8 +202,9 @@ def diarize_full(self, upload_id: str, correlation_id: str):
     adapter = logging.LoggerAdapter(logger, {"correlation_id": correlation_id})
     diarizer = get_diarizer()
 
-    # измеряем задержку в очереди
-    enqueue_header = self.request.headers.get("enqueue_time")
+    # измеряем задержку в очереди — безопасно достаём headers
+    headers = getattr(self.request, "headers", {}) or {}
+    enqueue_header = headers.get("enqueue_time")
     if enqueue_header:
         try:
             enqueue_ts = float(enqueue_header)
