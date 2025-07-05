@@ -150,9 +150,11 @@ async def get_status(
 
     base = Path(settings.RESULTS_FOLDER) / upload_id
     done = (base / "transcript.json").exists() and (base / "diarization.json").exists()
-    status_str = "done" if done else (
-        "processing" if (Path(settings.UPLOAD_FOLDER) / upload_id).exists() else "queued"
-    )
+    if done:
+            status_str = "done"
+        else:
+            status_str = "processing"
+
     progress = await redis.get(f"progress:{upload_id}") or "0%"
     return {"status": status_str, "progress": progress}
 
