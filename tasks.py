@@ -133,8 +133,13 @@ def transcribe_segments(self, upload_id: str, correlation_id: str):
     src_orig = Path(settings.UPLOAD_FOLDER) / upload_id
     wav_name = Path(upload_id).stem + ".wav"
     wav_src = Path(settings.UPLOAD_FOLDER) / wav_name
-    convert_to_wav(src_orig, wav_src, sample_rate=16000, channels=1)
-    src = wav_src
+    # Конвертируем в WAV только если файл не WAV
+    if src_orig.suffix.lower() != ".wav":
+        convert_to_wav(src_orig, wav_src, sample_rate=16000, channels=1)
+        src = wav_src
+    else:
+        # Уже WAV — можно сразу использовать
+        src = src_orig
 
     dst_dir = Path(settings.RESULTS_FOLDER) / upload_id
     dst_dir.mkdir(parents=True, exist_ok=True)
