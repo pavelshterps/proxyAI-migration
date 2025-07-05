@@ -128,13 +128,15 @@ def transcribe_segments(self, upload_id: str, correlation_id: str):
             adapter.warning(f"Invalid enqueue_time header: {enqueue_header}")
     task_start = time.time()
 
-    # универсальная конвертация в WAV в папку результатов
+    # универсальная конвертация в WAV в папку uploads
     src_orig = Path(settings.UPLOAD_FOLDER) / upload_id
-    dst_dir = Path(settings.RESULTS_FOLDER) / upload_id
-    dst_dir.mkdir(parents=True, exist_ok=True)
-    wav_src = dst_dir / f"{upload_id}.wav"
+    wav_name = Path(upload_id).stem + ".wav"
+    wav_src = Path(settings.UPLOAD_FOLDER) / wav_name
     convert_to_wav(src_orig, wav_src, sample_rate=16000, channels=1)
     src = wav_src
+
+    dst_dir = Path(settings.RESULTS_FOLDER) / upload_id
+    dst_dir.mkdir(parents=True, exist_ok=True)
 
     adapter.info(f"Starting transcription for '{src}'")
     windows = split_audio_fixed_windows(src, settings.SEGMENT_LENGTH_S)
@@ -210,8 +212,9 @@ def diarize_full(self, upload_id: str, correlation_id: str):
             adapter.warning(f"Invalid enqueue_time header: {enqueue_header}")
     task_start = time.time()
 
-    # используем конвертированный WAV из папки результатов
-    src = Path(settings.RESULTS_FOLDER) / upload_id / f"{upload_id}.wav"
+    # используем сконвертированный WAV из папки uploads
+    wav_name = Path(upload_id).stem + ".wav"
+    src = Path(settings.UPLOAD_FOLDER) / wav_name
 
     dst_dir = Path(settings.RESULTS_FOLDER) / upload_id
     dst_dir.mkdir(parents=True, exist_ok=True)
