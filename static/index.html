@@ -91,7 +91,7 @@
       });
       if(!res.ok){ alert("Error fetching results"); return; }
       const payload = await res.json();
-      const list = payload.transcript;
+      const list = payload.results;
       statusEl.textContent = "Результаты получены";
       audioEl.src = URL.createObjectURL(fileBlob);
       renderTranscript(list);
