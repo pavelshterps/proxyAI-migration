@@ -10,7 +10,6 @@ from celery.signals import worker_process_init
 from faster_whisper import WhisperModel
 from pyannote.audio import Pipeline
 from pydub import AudioSegment
-from utils.audio import convert_to_wav
 from redis import Redis
 
 from config.settings import settings
@@ -20,12 +19,14 @@ app = Celery(
     broker=settings.CELERY_BROKER_URL,
     backend=settings.CELERY_RESULT_BACKEND,
 )
+# по умолчанию задачи берутся с CPU-очереди, но в декораторах можно указать preprocess_gpu
 app.conf.task_default_queue = "preprocess_cpu"
 
 logger = logging.getLogger(__name__)
 
 _whisper_model = None
 _diarizer = None
+
 
 def get_whisper_model():
     global _whisper_model
@@ -59,19 +60,18 @@ def get_whisper_model():
         logger.info("WhisperModel loaded")
     return _whisper_model
 
+
 def get_diarizer():
     global _diarizer
     if _diarizer is None:
         cache_dir = settings.DIARIZER_CACHE_DIR
         os.makedirs(cache_dir, exist_ok=True)
         logger.info(f"Loading pyannote Pipeline into cache '{cache_dir}'")
-        # Загружаем пайплайн без device
         _diarizer = Pipeline.from_pretrained(
             settings.PYANNOTE_PIPELINE,
             cache_dir=cache_dir,
             use_auth_token=settings.HUGGINGFACE_TOKEN
         )
-        # Переносим на GPU, если указано
         pd = getattr(settings, "PYANNOTE_DEVICE", "cpu").lower()
         if pd != "cpu":
             try:
@@ -83,32 +83,34 @@ def get_diarizer():
         logger.info("Diarizer loaded")
     return _diarizer
 
+
 @worker_process_init.connect
 def preload_and_warmup(**kwargs):
     sample = Path(__file__).resolve().parent / "tests" / "fixtures" / "sample.wav"
-    if settings.WHISPER_DEVICE.lower() == "cpu":
-        try:
-            get_diarizer()(str(sample))
-            logger.info("✅ Warm-up diarizer complete")
-        except Exception as e:
-            logger.warning(f"Warm-up diarizer failed: {e}")
-    if settings.WHISPER_DEVICE.lower() != "cpu":
-        try:
-            warm_opts = {}
-            if settings.WHISPER_LANGUAGE:
-                warm_opts["language"] = settings.WHISPER_LANGUAGE
-            get_whisper_model().transcribe(
-                str(sample),
-                **warm_opts
-            )
-            logger.info("✅ Warm-up WhisperModel complete")
-        except Exception as e:
-            logger.warning(f"Warm-up WhisperModel failed: {e}")
+    # теплая прогонка для диаризатора (CPU)
+    try:
+        get_diarizer()(str(sample))
+        logger.info("✅ Warm-up diarizer complete")
+    except Exception as e:
+        logger.warning(f"Warm-up diarizer failed: {e}")
+    # и для Whisper (GPU или CPU)
+    try:
+        warm_opts = {}
+        if settings.WHISPER_LANGUAGE:
+            warm_opts["language"] = settings.WHISPER_LANGUAGE
+        get_whisper_model().transcribe(
+            str(sample),
+            **warm_opts
+        )
+        logger.info("✅ Warm-up WhisperModel complete")
+    except Exception as e:
+        logger.warning(f"Warm-up WhisperModel failed: {e}")
+
 
 @shared_task(
     bind=True,
     name="tasks.transcribe_segments",
-    queue="preprocess_gpu"
+    queue="preprocess_cpu"
 )
 def transcribe_segments(self, upload_id: str, correlation_id: str):
     adapter = logging.LoggerAdapter(logger, {"correlation_id": correlation_id})
@@ -125,13 +127,10 @@ def transcribe_segments(self, upload_id: str, correlation_id: str):
             adapter.warning(f"Invalid enqueue_time header: {enqueue_header}")
     task_start = time.time()
 
-    # универсальная конвертация в WAV
-    src_orig = Path(settings.UPLOAD_FOLDER) / upload_id
+    # ** здесь уже upload_id указывает на готовый WAV-файл в UPLOAD_FOLDER **
+    src = Path(settings.UPLOAD_FOLDER) / upload_id
     dst_dir = Path(settings.RESULTS_FOLDER) / upload_id
     dst_dir.mkdir(parents=True, exist_ok=True)
-    wav_src = dst_dir / f"{upload_id}.wav"
-    convert_to_wav(src_orig, wav_src, sample_rate=16000, channels=1)
-    src = wav_src
 
     adapter.info(f"Starting transcription for '{src}'")
     windows = split_audio_fixed_windows(src, settings.SEGMENT_LENGTH_S)
@@ -142,7 +141,7 @@ def transcribe_segments(self, upload_id: str, correlation_id: str):
 
     for idx, (start, end) in enumerate(windows):
         adapter.debug(f" Transcribing segment {idx}: {start:.1f}s → {end:.1f}s")
-        chunk = full_audio[int(start*1000):int(end*1000)]
+        chunk = full_audio[int(start * 1000):int(end * 1000)]
         tmp_path = dst_dir / f"{upload_id}_{idx}.wav"
         chunk.export(tmp_path, format="wav")
         try:
@@ -180,15 +179,12 @@ def transcribe_segments(self, upload_id: str, correlation_id: str):
         encoding="utf-8"
     )
     adapter.info(f"Transcription complete: saved to '{out_path}'")
+    adapter.info(f"✅ Processing duration: {time.time() - task_start:.2f}s")
 
-    # логируем время выполнения
-    duration = time.time() - task_start
-    adapter.info(f"✅ Processing duration: {duration:.2f}s")
-
-    # обновляем прогресс до 50%
     redis = Redis.from_url(settings.CELERY_BROKER_URL)
     redis.publish(f"progress:{upload_id}", "50%")
     redis.set(f"progress:{upload_id}", "50%")
+
 
 @shared_task(
     bind=True,
@@ -210,6 +206,7 @@ def diarize_full(self, upload_id: str, correlation_id: str):
             adapter.warning(f"Invalid enqueue_time header: {enqueue_header}")
     task_start = time.time()
 
+    # ** upload_id тоже указывает на тот же WAV в UPLOAD_FOLDER **
     src = Path(settings.UPLOAD_FOLDER) / upload_id
     dst_dir = Path(settings.RESULTS_FOLDER) / upload_id
     dst_dir.mkdir(parents=True, exist_ok=True)
@@ -231,14 +228,12 @@ def diarize_full(self, upload_id: str, correlation_id: str):
         encoding="utf-8"
     )
     adapter.info(f"Diarization complete: saved to '{out_path}'")
+    adapter.info(f"✅ Diarization duration: {time.time() - task_start:.2f}s")
 
-    duration = time.time() - task_start
-    adapter.info(f"✅ Diarization duration: {duration:.2f}s")
-
-    # прогресс 100%
     redis = Redis.from_url(settings.CELERY_BROKER_URL)
     redis.publish(f"progress:{upload_id}", "100%")
     redis.set(f"progress:{upload_id}", "100%")
+
 
 def split_audio_fixed_windows(audio_path: Path, window_s: int):
     audio = AudioSegment.from_file(str(audio_path))
