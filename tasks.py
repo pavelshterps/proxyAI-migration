@@ -1,4 +1,3 @@
-# tasks.py
 import os
 import json
 import logging
@@ -82,9 +81,13 @@ def preload_and_warmup(**kwargs):
             logger.warning(f"Warm-up diarizer failed: {e}")
     if settings.WHISPER_DEVICE.lower() != "cpu":
         try:
+            # Use language only if explicitly set
+            warm_opts = {}
+            if settings.WHISPER_LANGUAGE:
+                warm_opts["language"] = settings.WHISPER_LANGUAGE
             get_whisper_model().transcribe(
                 str(sample),
-                language=settings.WHISPER_LANGUAGE,
+                **warm_opts
             )
             logger.info("✅ Warm-up WhisperModel complete")
         except Exception as e:
@@ -115,11 +118,17 @@ def transcribe_segments(upload_id: str, correlation_id: str):
         tmp_path = dst_dir / f"{upload_id}_{idx}.wav"
         chunk.export(tmp_path, format="wav")
         try:
+            # Build options dynamically to allow auto language detection
+            opts = {
+                "beam_size": settings.WHISPER_BATCH_SIZE,
+                "word_timestamps": True,
+            }
+            if settings.WHISPER_LANGUAGE:
+                opts["language"] = settings.WHISPER_LANGUAGE
+
             segments, _ = whisper.transcribe(
                 str(tmp_path),
-                beam_size=settings.WHISPER_BATCH_SIZE,
-                language=settings.WHISPER_LANGUAGE,
-                word_timestamps=True,
+                **opts
             )
         except Exception as e:
             adapter.error(

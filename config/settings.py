@@ -42,7 +42,7 @@ class Settings(BaseSettings):
     WHISPER_DEVICE: str = Field(..., env="WHISPER_DEVICE")
     WHISPER_COMPUTE_TYPE: str = Field(..., env="WHISPER_COMPUTE_TYPE")
     WHISPER_BATCH_SIZE: int = Field(1, env="WHISPER_BATCH_SIZE")
-    WHISPER_LANGUAGE: Optional[str] = Field("en", env="WHISPER_LANGUAGE")
+    WHISPER_LANGUAGE: Optional[str] = Field(None, env="WHISPER_LANGUAGE")
 
     HUGGINGFACE_CACHE_DIR: Optional[str] = Field(None, env="HUGGINGFACE_CACHE_DIR")
 
