@@ -32,6 +32,9 @@ from dependencies import get_current_user
 from routes import router as api_router
 from admin_routes import router as admin_router
 
+# —————————————————————————————————————————————
+# async‐contextmanager для старта/остановки приложения
+# —————————————————————————————————————————————
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     try:
@@ -74,10 +77,13 @@ app.add_middleware(
     allowed_hosts=["127.0.0.1", "localhost"] + settings.ALLOWED_ORIGINS_LIST
 )
 
+# Redis Pub/Sub + key/value
 redis = redis_async.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
 
+# API-Key → User
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
+# Создание директорий
 for d in (
     settings.UPLOAD_FOLDER,
     settings.RESULTS_FOLDER,
@@ -85,6 +91,7 @@ for d in (
 ):
     Path(d).mkdir(parents=True, exist_ok=True)
 
+# Метрики Prometheus
 HTTP_REQ_COUNT = Counter(
     "http_requests_total",
     "Total HTTP requests",
@@ -96,6 +103,7 @@ HTTP_REQ_LATENCY = Histogram(
     ["path"],
 )
 
+# Middleware для метрик
 @app.middleware("http")
 async def metrics_middleware(request: Request, call_next):
     start = time.time()
@@ -104,6 +112,7 @@ async def metrics_middleware(request: Request, call_next):
     HTTP_REQ_LATENCY.labels(request.url.path).observe(time.time() - start)
     return response
 
+# Здоровье и готовность
 @app.get("/health")
 @limiter.limit("30/minute")
 async def health(request: Request):
@@ -119,10 +128,12 @@ async def metrics(request: Request):
     data = generate_latest()
     return Response(content=data, media_type=CONTENT_TYPE_LATEST)
 
+# Отдача фронтенда
 @app.get("/", include_in_schema=False)
 async def root():
     return FileResponse("static/index.html")
 
+# Проверка статуса обработки
 @app.get(
     "/status/{upload_id}",
     summary="Check processing status",
@@ -145,6 +156,7 @@ async def get_status(
     progress = await redis.get(f"progress:{upload_id}") or "0%"
     return {"status": status_str, "progress": progress}
 
+# Приём и запуск фоновых задач
 @app.post(
     "/upload/",
     dependencies=[Depends(get_current_user)],
@@ -159,6 +171,7 @@ async def upload(
     db=Depends(get_db),
 ):
     cid = x_correlation_id or str(uuid.uuid4())
+    # accept all audio/* and video/* formats
     ct = file.content_type or ""
     if not (ct.startswith("audio/") or ct.startswith("video/")):
         raise HTTPException(status_code=415, detail="Unsupported file type")
@@ -179,15 +192,9 @@ async def upload(
     ).info("upload accepted")
 
     from tasks import transcribe_segments, diarize_full
-    now = time.time()
-    transcribe_segments.apply_async(
-        args=[upload_id, cid],
-        headers={"enqueue_time": str(now)},
-    )
-    diarize_full.apply_async(
-        args=[upload_id, cid],
-        headers={"enqueue_time": str(now)},
-    )
+    # правильно передаём два позиционных аргумента
+    transcribe_segments.delay(upload_id, cid)
+    diarize_full.delay(upload_id, cid)
 
     await redis.publish(f"progress:{upload_id}", "0%")
     await redis.set(f"progress:{upload_id}", "0%")
@@ -197,6 +204,7 @@ async def upload(
         headers={"X-Correlation-ID": cid},
     )
 
+# Роутеры и статика
 app.include_router(
     api_router,
     tags=["proxyAI"],
