@@ -149,11 +149,14 @@ async def get_status(
         raise HTTPException(status_code=404, detail="upload_id not found")
 
     base = Path(settings.RESULTS_FOLDER) / upload_id
+    # проверяем, есть ли оба файла — транскрипт и диаризация
     done = (base / "transcript.json").exists() and (base / "diarization.json").exists()
+
+    # ОЧЕНЬ ВАЖНО: отступы должны быть ровно такие
     if done:
-            status_str = "done"
-        else:
-            status_str = "processing"
+        status_str = "done"
+    else:
+        status_str = "processing"
 
     progress = await redis.get(f"progress:{upload_id}") or "0%"
     return {"status": status_str, "progress": progress}
