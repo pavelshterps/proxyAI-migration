@@ -72,7 +72,6 @@ def get_diarizer():
             settings.PYANNOTE_PIPELINE,
             cache_dir=cache_dir,
             use_auth_token=settings.HUGGINGFACE_TOKEN,
-            device = "cuda"
         )
         pd = getattr(settings, "PYANNOTE_DEVICE", "cpu").lower()
         if pd != "cpu":
