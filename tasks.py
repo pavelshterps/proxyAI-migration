@@ -1,6 +1,7 @@
 import os
 import json
 import logging
+import time
 from pathlib import Path
 
 from celery import Celery, shared_task
@@ -66,7 +67,8 @@ def get_diarizer():
         _diarizer = Pipeline.from_pretrained(
             settings.PYANNOTE_PIPELINE,
             cache_dir=cache_dir,
-            use_auth_token=settings.HUGGINGFACE_TOKEN
+            use_auth_token=settings.HUGGINGFACE_TOKEN,
+            device="cuda"  # чтобы диаризация шла на GPU
         )
         logger.info("Diarizer loaded")
     return _diarizer
@@ -82,7 +84,6 @@ def preload_and_warmup(**kwargs):
             logger.warning(f"Warm-up diarizer failed: {e}")
     if settings.WHISPER_DEVICE.lower() != "cpu":
         try:
-            # Use language only if explicitly set
             warm_opts = {}
             if settings.WHISPER_LANGUAGE:
                 warm_opts["language"] = settings.WHISPER_LANGUAGE
@@ -95,21 +96,32 @@ def preload_and_warmup(**kwargs):
             logger.warning(f"Warm-up WhisperModel failed: {e}")
 
 @shared_task(
+    bind=True,
     name="tasks.transcribe_segments",
     queue="preprocess_gpu"
 )
-def transcribe_segments(upload_id: str, correlation_id: str):
+def transcribe_segments(self, upload_id: str, correlation_id: str):
     adapter = logging.LoggerAdapter(logger, {"correlation_id": correlation_id})
     whisper = get_whisper_model()
 
+    # измеряем задержку в очереди
+    enqueue_header = self.request.headers.get("enqueue_time")
+    if enqueue_header:
+        try:
+            enqueue_ts = float(enqueue_header)
+            queue_delay = time.time() - enqueue_ts
+            adapter.info(f"⏳ Queue delay: {queue_delay:.2f}s")
+        except ValueError:
+            adapter.warning(f"Invalid enqueue_time header: {enqueue_header}")
+    task_start = time.time()
+
+    # универсальная конвертация в WAV
     src_orig = Path(settings.UPLOAD_FOLDER) / upload_id
     dst_dir = Path(settings.RESULTS_FOLDER) / upload_id
     dst_dir.mkdir(parents=True, exist_ok=True)
     wav_src = dst_dir / f"{upload_id}.wav"
     convert_to_wav(src_orig, wav_src, sample_rate=16000, channels=1)
     src = wav_src
-    dst_dir = Path(settings.RESULTS_FOLDER) / upload_id
-    dst_dir.mkdir(parents=True, exist_ok=True)
 
     adapter.info(f"Starting transcription for '{src}'")
     windows = split_audio_fixed_windows(src, settings.SEGMENT_LENGTH_S)
@@ -124,7 +136,6 @@ def transcribe_segments(upload_id: str, correlation_id: str):
         tmp_path = dst_dir / f"{upload_id}_{idx}.wav"
         chunk.export(tmp_path, format="wav")
         try:
-            # Build options dynamically to allow auto language detection
             opts = {
                 "beam_size": settings.WHISPER_BATCH_SIZE,
                 "word_timestamps": True,
@@ -143,6 +154,7 @@ def transcribe_segments(upload_id: str, correlation_id: str):
             )
             tmp_path.unlink()
             continue
+
         for seg in segments:
             transcript.append({
                 "segment": idx,
@@ -158,17 +170,35 @@ def transcribe_segments(upload_id: str, correlation_id: str):
         encoding="utf-8"
     )
     adapter.info(f"Transcription complete: saved to '{out_path}'")
+
+    # логируем время выполнения
+    duration = time.time() - task_start
+    adapter.info(f"✅ Processing duration: {duration:.2f}s")
+
     # обновляем прогресс до 50%
     redis = Redis.from_url(settings.CELERY_BROKER_URL)
     redis.publish(f"progress:{upload_id}", "50%")
     redis.set(f"progress:{upload_id}", "50%")
 
 @shared_task(
-    name="tasks.diarize_full"
+    bind=True,
+    name="tasks.diarize_full",
+    queue="preprocess_gpu"
 )
-def diarize_full(upload_id: str, correlation_id: str):
+def diarize_full(self, upload_id: str, correlation_id: str):
     adapter = logging.LoggerAdapter(logger, {"correlation_id": correlation_id})
     diarizer = get_diarizer()
+
+    # измеряем задержку в очереди
+    enqueue_header = self.request.headers.get("enqueue_time")
+    if enqueue_header:
+        try:
+            enqueue_ts = float(enqueue_header)
+            queue_delay = time.time() - enqueue_ts
+            adapter.info(f"⏳ Queue delay: {queue_delay:.2f}s")
+        except ValueError:
+            adapter.warning(f"Invalid enqueue_time header: {enqueue_header}")
+    task_start = time.time()
 
     src = Path(settings.UPLOAD_FOLDER) / upload_id
     dst_dir = Path(settings.RESULTS_FOLDER) / upload_id
@@ -191,7 +221,11 @@ def diarize_full(upload_id: str, correlation_id: str):
         encoding="utf-8"
     )
     adapter.info(f"Diarization complete: saved to '{out_path}'")
-    # теперь всё готово — помечаем прогресс 100%
+
+    duration = time.time() - task_start
+    adapter.info(f"✅ Diarization duration: {duration:.2f}s")
+
+    # прогресс 100%
     redis = Redis.from_url(settings.CELERY_BROKER_URL)
     redis.publish(f"progress:{upload_id}", "100%")
     redis.set(f"progress:{upload_id}", "100%")

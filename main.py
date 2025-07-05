@@ -171,7 +171,9 @@ async def upload(
     db=Depends(get_db),
 ):
     cid = x_correlation_id or str(uuid.uuid4())
-    if file.content_type not in ("audio/wav", "audio/x-wav", "audio/mpeg"):
+    # accept all audio/* and video/* formats
+    ct = file.content_type or ""
+    if not (ct.startswith("audio/") or ct.startswith("video/")):
         raise HTTPException(status_code=415, detail="Unsupported file type")
     data = await file.read()
     if len(data) > settings.MAX_FILE_SIZE:
@@ -190,9 +192,16 @@ async def upload(
     ).info("upload accepted")
 
     from tasks import transcribe_segments, diarize_full
-    # правильно передаём два позиционных аргумента
-    transcribe_segments.delay(upload_id, cid)
-    diarize_full.delay(upload_id, cid)
+    # передаём enqueue_time для измерения задержки в брокере
+    now = time.time()
+    transcribe_segments.apply_async(
+        args=[upload_id, cid],
+        headers={"enqueue_time": str(now)},
+    )
+    diarize_full.apply_async(
+        args=[upload_id, cid],
+        headers={"enqueue_time": str(now)},
+    )
 
     await redis.publish(f"progress:{upload_id}", "0%")
     await redis.set(f"progress:{upload_id}", "0%")
