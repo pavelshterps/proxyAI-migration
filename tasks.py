@@ -10,6 +10,7 @@ from celery.signals import worker_process_init
 from faster_whisper import WhisperModel
 from pyannote.audio import Pipeline
 from pydub import AudioSegment
+from utils.audio import convert_to_wav
 from redis import Redis
 
 from config.settings import settings
@@ -87,13 +88,13 @@ def get_diarizer():
 @worker_process_init.connect
 def preload_and_warmup(**kwargs):
     sample = Path(__file__).resolve().parent / "tests" / "fixtures" / "sample.wav"
-    # теплая прогонка для диаризатора (CPU)
+    # тёплая прогонка для диаризатора
     try:
         get_diarizer()(str(sample))
         logger.info("✅ Warm-up diarizer complete")
     except Exception as e:
         logger.warning(f"Warm-up diarizer failed: {e}")
-    # и для Whisper (GPU или CPU)
+    # тёплая прогонка для Whisper
     try:
         warm_opts = {}
         if settings.WHISPER_LANGUAGE:
@@ -127,8 +128,14 @@ def transcribe_segments(self, upload_id: str, correlation_id: str):
             adapter.warning(f"Invalid enqueue_time header: {enqueue_header}")
     task_start = time.time()
 
-    # ** здесь уже upload_id указывает на готовый WAV-файл в UPLOAD_FOLDER **
-    src = Path(settings.UPLOAD_FOLDER) / upload_id
+    # универсальная конвертация в WAV — конвертируем исходный файл из UPLOAD_FOLDER
+    src_orig = Path(settings.UPLOAD_FOLDER) / upload_id
+    # сохраняем сконвертированный WAV рядом с оригиналом
+    wav_name = Path(upload_id).stem + ".wav"
+    wav_src = Path(settings.UPLOAD_FOLDER) / wav_name
+    convert_to_wav(src_orig, wav_src, sample_rate=16000, channels=1)
+    src = wav_src
+
     dst_dir = Path(settings.RESULTS_FOLDER) / upload_id
     dst_dir.mkdir(parents=True, exist_ok=True)
 
@@ -206,8 +213,10 @@ def diarize_full(self, upload_id: str, correlation_id: str):
             adapter.warning(f"Invalid enqueue_time header: {enqueue_header}")
     task_start = time.time()
 
-    # ** upload_id тоже указывает на тот же WAV в UPLOAD_FOLDER **
-    src = Path(settings.UPLOAD_FOLDER) / upload_id
+    # используем тот же сконвертированный WAV из UPLOAD_FOLDER
+    wav_name = Path(upload_id).stem + ".wav"
+    src = Path(settings.UPLOAD_FOLDER) / wav_name
+
     dst_dir = Path(settings.RESULTS_FOLDER) / upload_id
     dst_dir.mkdir(parents=True, exist_ok=True)
 

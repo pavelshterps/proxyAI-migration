@@ -1,4 +1,3 @@
-# main.py
 import time
 import uuid
 from pathlib import Path
@@ -26,7 +25,6 @@ from slowapi.middleware import SlowAPIMiddleware
 from slowapi.util import get_remote_address
 from contextlib import asynccontextmanager
 
-from utils.audio import convert_to_wav
 from config.settings import settings
 from database import get_db, engine, init_models
 from crud import create_upload_record, get_upload_for_user
@@ -181,42 +179,34 @@ async def upload(
     if len(data) > settings.MAX_FILE_SIZE:
         raise HTTPException(status_code=413, detail="File too large")
 
-    # сохраняем оригинал
-    raw_ext   = Path(file.filename).suffix
-    base_uuid = uuid.uuid4().hex
-    orig_name = f"{base_uuid}{raw_ext}"
-    orig_path = Path(settings.UPLOAD_FOLDER) / orig_name
-    orig_path.write_bytes(data)
+    ext = Path(file.filename).suffix
+    upload_id = f"{uuid.uuid4().hex}{ext}"
+    dest = Path(settings.UPLOAD_FOLDER) / upload_id
+    dest.write_bytes(data)
 
-    # сразу конвертим в унифицированный WAV
-    wav_name = f"{base_uuid}.wav"
-    wav_path = Path(settings.UPLOAD_FOLDER) / wav_name
-    convert_to_wav(orig_path, wav_path, sample_rate=16000, channels=1)
-
-    # работаем уже с WAV
-    await create_upload_record(db, current_user.id, wav_name)
+    await create_upload_record(db, current_user.id, upload_id)
     log.bind(
         correlation_id=cid,
-        upload_id=wav_name,
+        upload_id=upload_id,
         user_id=current_user.id,
     ).info("upload accepted")
 
     from tasks import transcribe_segments, diarize_full
     now = time.time()
     transcribe_segments.apply_async(
-        args=[wav_name, cid],
+        args=[upload_id, cid],
         headers={"enqueue_time": str(now)},
     )
     diarize_full.apply_async(
-        args=[wav_name, cid],
+        args=[upload_id, cid],
         headers={"enqueue_time": str(now)},
     )
 
-    await redis.publish(f"progress:{wav_name}", "0%")
-    await redis.set(f"progress:{wav_name}", "0%")
+    await redis.publish(f"progress:{upload_id}", "0%")
+    await redis.set(f"progress:{upload_id}", "0%")
 
     return JSONResponse(
-        content={"upload_id": wav_name},
+        content={"upload_id": upload_id},
         headers={"X-Correlation-ID": cid},
     )
 
