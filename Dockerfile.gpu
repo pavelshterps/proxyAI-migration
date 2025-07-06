@@ -32,15 +32,14 @@ RUN pip3 install --no-cache-dir --no-deps \
       nvidia-cudnn-cu12==9.* \
       nvidia-cublas-cu12==12.*
 
-# 6) Устанавливаем FS-EEND (клонируем и ставим)
+# 6) Устанавливаем FS-EEND (клонируем и ставим локально)
 RUN git clone https://github.com/hitachi-speech/EEND.git /app/EEND && \
-    cd /app/EEND && \
-    pip3 install --no-cache-dir .
+    pip3 install --no-cache-dir /app/EEND
 
 # 7) Симлинки для cuDNN/cuBLAS
-RUN ln -sf /usr/lib/x86_64-linux-gnu/libcudnn.so.9 /usr/lib/x86_64-linux-gnu/libcudnn.so && \
-    ln -sf /usr/lib/x86_64-linux-gnu/libcudnn_ops_infer.so.9 /usr/lib/x86_64-linux-gnu/libcudnn_ops.so && \
-    ln -sf /usr/lib/x86_64-linux-gnu/libcudnn_cnn_infer.so.9 /usr/lib/x86_64-linux-gnu/libcudnn_cnn.so && \
+RUN ln -sf /usr/lib/x86_64-linux-gnu/libcudnn.so.9    /usr/lib/x86_64-linux-gnu/libcudnn.so && \
+    ln -sf /usr/lib/x86_64-linux-gnu/libcudnn_ops_infer.so.9  /usr/lib/x86_64-linux-gnu/libcudnn_ops.so && \
+    ln -sf /usr/lib/x86_64-linux-gnu/libcudnn_cnn_infer.so.9  /usr/lib/x86_64-linux-gnu/libcudnn_cnn.so && \
     ldconfig
 
 # 8) Копируем остальной код
