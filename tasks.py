@@ -13,9 +13,6 @@ from utils.audio import convert_to_wav
 from pydub import AudioSegment
 from redis import Redis
 
-# FS-EEND import
-from eend.inference import Inference as EENDInference
-
 from config.settings import settings
 
 # Инициализация Celery
@@ -41,7 +38,9 @@ def get_whisper_model():
         device = settings.WHISPER_DEVICE.lower()
         compute = settings.WHISPER_COMPUTE_TYPE.lower()
         if device == "cpu" and compute in ("float16", "fp16"):
-            logger.warning(f"Compute type '{compute}' not supported on CPU; falling back to int8")
+            logger.warning(
+                f"Compute type '{compute}' not supported on CPU; falling back to int8"
+            )
             compute = "int8"
         logger.info(f"Loading WhisperModel (path={model_path}, device={device}, compute={compute})")
         try:
@@ -60,7 +59,6 @@ def get_vad():
         _vad = VoiceActivityDetection.from_pretrained(
             model_id, use_auth_token=settings.HUGGINGFACE_TOKEN
         )
-        # Переносим на GPU, если нужно
         device = settings.FS_EEND_DEVICE.lower() if settings.USE_FS_EEND else settings.WHISPER_DEVICE.lower()
         if device != "cpu":
             try:
@@ -77,7 +75,6 @@ def get_clustering_diarizer():
     if _diarizer is None:
         cache_dir = settings.DIARIZER_CACHE_DIR
         os.makedirs(cache_dir, exist_ok=True)
-        logger.info(f"Loading clustering SpeakerDiarization into cache '{cache_dir}'")
         _diarizer = SpeakerDiarization.from_pretrained(
             settings.PYANNOTE_PIPELINE,
             cache_dir=cache_dir,
@@ -96,37 +93,46 @@ def get_clustering_diarizer():
 
 def get_eend_model():
     global _eend_model
+    if not settings.USE_FS_EEND or not settings.FS_EEND_MODEL_PATH:
+        raise RuntimeError("FS-EEND is not enabled or model path is not set")
+
     if _eend_model is None:
-        model_path = settings.FS_EEND_MODEL_PATH
-        device = settings.FS_EEND_DEVICE.lower()
-        _eend_model = EENDInference(model=model_path, device=device)
-        logger.info(f"FS-EEND model loaded (path={model_path}, device={device})")
+        try:
+            from eend.inference import Inference as EENDInference
+        except ImportError as e:
+            logger.error(f"FS-EEND module not found: {e}")
+            raise
+
+        _eend_model = EENDInference(
+            model=settings.FS_EEND_MODEL_PATH,
+            device=settings.FS_EEND_DEVICE
+        )
+        logger.info(f"FS-EEND model loaded (path={settings.FS_EEND_MODEL_PATH}, device={settings.FS_EEND_DEVICE})")
     return _eend_model
 
 
 @worker_process_init.connect
 def preload_and_warmup(**kwargs):
     sample = Path(__file__).resolve().parent / "tests" / "fixtures" / "sample.wav"
-    # Warm-up VAD
     try:
         get_vad().apply({"audio": str(sample)})
         logger.info("✅ Warm-up VAD complete")
     except Exception as e:
         logger.warning(f"Warm-up VAD failed: {e}")
-    # Warm-up clustering diarizer
+
     try:
         get_clustering_diarizer().apply({"audio": str(sample)})
         logger.info("✅ Warm-up clustering diarizer complete")
     except Exception as e:
         logger.warning(f"Warm-up clustering diarizer failed: {e}")
-    # Warm-up FS-EEND
+
     if settings.USE_FS_EEND and settings.FS_EEND_MODEL_PATH:
         try:
             get_eend_model().diarize(str(sample))
             logger.info("✅ Warm-up FS-EEND complete")
         except Exception as e:
             logger.warning(f"Warm-up FS-EEND failed: {e}")
-    # Warm-up Whisper
+
     try:
         opts = {}
         if settings.WHISPER_LANGUAGE:
