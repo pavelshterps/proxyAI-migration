@@ -30,8 +30,7 @@ RUN pip install --upgrade pip && \
 
 # 6) Install FS-EEND (Hitachi-speech) into both API and workers
 #     клонируем репозиторий и ставим локально — чтобы появился модуль eend.inference
-RUN git clone https://github.com/hitachi-speech/EEND.git /app/EEND && \
-    pip install --no-cache-dir /app/EEND
+RUN git clone https://github.com/hitachi-speech/EEND.git /app/eend
 
 # 7) Copy application code
 COPY . .
