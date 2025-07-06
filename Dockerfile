@@ -5,6 +5,7 @@ FROM python:3.10-slim
 
 # 2) Set workdir
 WORKDIR /app
+ENV PYTHONPATH="/app:$PYTHONPATH"
 
 # 3) (Optional) Switch to faster Russian mirrors if the default exists
 RUN if [ -f /etc/apt/sources.list ]; then \
@@ -28,10 +29,9 @@ COPY requirements.txt ./
 RUN pip install --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
-# 6) Install FS-EEND (Hitachi-speech) into both API and workers
-#     клонируем репозиторий и ставим локально — чтобы появился модуль eend.inference
-RUN git clone https://github.com/hitachi-speech/EEND.git /app/eend && \
-    pip install --no-cache-dir /app/eend
+# 6) Clone EEND repository into project root for direct import
+RUN git clone https://github.com/hitachi-speech/EEND.git /app && \
+    rm -rf /app/.git
 
 # 7) Copy application code
 COPY . .

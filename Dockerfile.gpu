@@ -3,11 +3,11 @@
 # 1) Base image with CUDA
 FROM nvidia/cuda:12.2.2-cudnn8-runtime-ubuntu22.04
 
-# 2) Переключение на российские зеркала
+# 2) Switch to Russian mirrors
 RUN sed -i 's|http://archive.ubuntu.com/ubuntu/|http://ru.archive.ubuntu.com/ubuntu/|g' /etc/apt/sources.list && \
     sed -i 's|http://security.ubuntu.com/ubuntu|http://ru.archive.ubuntu.com/ubuntu/|g' /etc/apt/sources.list
 
-# 3) Системные зависимости
+# 3) System dependencies
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
       python3-pip \
@@ -19,33 +19,34 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
+ENV PYTHONPATH="/app:$PYTHONPATH"
 
-# 4) Устанавливаем основной стек (FastAPI, Celery и т.д.)
+# 4) Install main Python deps (FastAPI, Celery…)
 COPY requirements.txt ./
 RUN pip3 install --upgrade pip && \
     pip3 install --no-cache-dir -r requirements.txt
 
-# 5) CTranslate2 / Faster-Whisper (без системных зависимостей)
+# 5) CTranslate2 / Faster-Whisper (no system deps)
 RUN pip3 install --no-cache-dir --no-deps \
       ctranslate2[cuda12]==4.4.0 \
       faster-whisper[cuda12] \
       nvidia-cudnn-cu12==9.* \
       nvidia-cublas-cu12==12.*
 
-# 6) Устанавливаем FS-EEND (клонируем и ставим локально)
-RUN git clone https://github.com/hitachi-speech/EEND.git /app/eend && \
-    pip install --no-cache-dir /app/eend
+# 6) Clone EEND repository into project root for direct import
+RUN git clone https://github.com/hitachi-speech/EEND.git /app && \
+    rm -rf /app/.git
 
-# 7) Симлинки для cuDNN/cuBLAS
+# 7) Symlinks for cuDNN/cuBLAS
 RUN ln -sf /usr/lib/x86_64-linux-gnu/libcudnn.so.9    /usr/lib/x86_64-linux-gnu/libcudnn.so && \
     ln -sf /usr/lib/x86_64-linux-gnu/libcudnn_ops_infer.so.9  /usr/lib/x86_64-linux-gnu/libcudnn_ops.so && \
     ln -sf /usr/lib/x86_64-linux-gnu/libcudnn_cnn_infer.so.9  /usr/lib/x86_64-linux-gnu/libcudnn_cnn.so && \
     ldconfig
 
-# 8) Копируем остальной код
+# 8) Copy the rest of your code
 COPY . .
 
-# 9) Среда для GPU и Whisper
+# 9) GPU / Whisper environment vars
 ENV HUGGINGFACE_CACHE_DIR=/hf_cache \
     WHISPER_DEVICE=cuda \
     WHISPER_COMPUTE_TYPE=float16 \
@@ -53,5 +54,5 @@ ENV HUGGINGFACE_CACHE_DIR=/hf_cache \
     CTRANSFORMER_MAX_CUDA_MEMORY=0.8 \
     LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
 
-# 10) Запуск GPU-воркера
+# 10) Launch the single GPU worker
 CMD ["celery", "-A", "tasks", "worker", "--loglevel=info", "--concurrency=1", "--queues=preprocess_gpu"]
