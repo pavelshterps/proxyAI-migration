@@ -1,5 +1,6 @@
 # Dockerfile
 
+
 # 1) Base image
 FROM python:3.10-slim
 
