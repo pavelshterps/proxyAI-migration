@@ -1,62 +1,58 @@
 # Dockerfile.gpu
 
+# 1) Base image with CUDA
 FROM nvidia/cuda:12.2.2-cudnn8-runtime-ubuntu22.04
 
-# 1) Российские зеркала (опционально)
-RUN if [ -f /etc/apt/sources.list ]; then \
-      sed -i \
-        's|http://archive.ubuntu.com/ubuntu/|http://ru.archive.ubuntu.com/ubuntu/|g' \
-        /etc/apt/sources.list && \
-      sed -i \
-        's|http://security.ubuntu.com/ubuntu|http://ru.archive.ubuntu.com/ubuntu/|g' \
-        /etc/apt/sources.list; \
-    fi
+# 2) Переключение на российские зеркала
+RUN sed -i 's|http://archive.ubuntu.com/ubuntu/|http://ru.archive.ubuntu.com/ubuntu/|g' /etc/apt/sources.list && \
+    sed -i 's|http://security.ubuntu.com/ubuntu|http://ru.archive.ubuntu.com/ubuntu/|g' /etc/apt/sources.list
 
-# 2) Системные зависимости + git для клонирования EEND
+# 3) Системные зависимости
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-      python3-pip python3-dev build-essential \
-      ffmpeg libsndfile1 git && \
+      python3-pip \
+      python3-dev \
+      build-essential \
+      ffmpeg \
+      libsndfile1 \
+      git && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# 3) Клонируем репозиторий EEND и ставим его как пакет
-RUN git clone https://github.com/hitachi-speech/EEND.git /app/EEND && \
-    cd /app/EEND && \
-    # в EEND нет setup.py, но там есть папка eend с __init__.py
-    pip3 install --upgrade pip && \
-    pip3 install --no-cache-dir torch torchaudio
-
-# 4) Основной стек Python (FastAPI, Celery, pyannote и т.д.)
+# 4) Устанавливаем основной стек (FastAPI, Celery и т.д.)
 COPY requirements.txt ./
 RUN pip3 install --upgrade pip && \
     pip3 install --no-cache-dir -r requirements.txt
 
-# 5) CTranslate2 / Faster-Whisper и NVIDIA-библиотеки
+# 5) CTranslate2 / Faster-Whisper (без системных зависимостей)
 RUN pip3 install --no-cache-dir --no-deps \
       ctranslate2[cuda12]==4.4.0 \
       faster-whisper[cuda12] \
       nvidia-cudnn-cu12==9.* \
-      nvidia-cublas-cu12==12.* \
- && ldconfig
+      nvidia-cublas-cu12==12.*
 
-# 6) Симлинки для cuDNN/cuBLAS
-RUN ln -sf /usr/lib/x86_64-linux-gnu/libcudnn.so.9   /usr/lib/x86_64-linux-gnu/libcudnn.so \
- && ln -sf /usr/lib/x86_64-linux-gnu/libcudnn_ops_infer.so.9 /usr/lib/x86_64-linux-gnu/libcudnn_ops.so \
- && ln -sf /usr/lib/x86_64-linux-gnu/libcudnn_cnn_infer.so.9  /usr/lib/x86_64-linux-gnu/libcudnn_cnn.so
+# 6) Устанавливаем FS-EEND (клонируем и ставим)
+RUN git clone https://github.com/hitachi-speech/EEND.git /app/EEND && \
+    cd /app/EEND && \
+    pip3 install --no-cache-dir .
 
-# 7) Копируем код приложения
+# 7) Симлинки для cuDNN/cuBLAS
+RUN ln -sf /usr/lib/x86_64-linux-gnu/libcudnn.so.9 /usr/lib/x86_64-linux-gnu/libcudnn.so && \
+    ln -sf /usr/lib/x86_64-linux-gnu/libcudnn_ops_infer.so.9 /usr/lib/x86_64-linux-gnu/libcudnn_ops.so && \
+    ln -sf /usr/lib/x86_64-linux-gnu/libcudnn_cnn_infer.so.9 /usr/lib/x86_64-linux-gnu/libcudnn_cnn.so && \
+    ldconfig
+
+# 8) Копируем остальной код
 COPY . .
 
-# 8) Обязательно добавляем EEND в PYTHONPATH
-ENV PYTHONPATH=/app/EEND:$PYTHONPATH \
-    HUGGINGFACE_CACHE_DIR=/hf_cache \
+# 9) Среда для GPU и Whisper
+ENV HUGGINGFACE_CACHE_DIR=/hf_cache \
     WHISPER_DEVICE=cuda \
     WHISPER_COMPUTE_TYPE=float16 \
     TF_FORCE_GPU_ALLOW_GROWTH=true \
     CTRANSFORMER_MAX_CUDA_MEMORY=0.8 \
     LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
 
-# 9) Запуск единственного GPU-воркера
+# 10) Запуск GPU-воркера
 CMD ["celery", "-A", "tasks", "worker", "--loglevel=info", "--concurrency=1", "--queues=preprocess_gpu"]

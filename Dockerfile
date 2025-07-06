@@ -15,8 +15,12 @@ RUN if [ -f /etc/apt/sources.list ]; then \
 # 4) Install system dependencies
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-      python3-pip python3-dev build-essential \
-      ffmpeg libsndfile1 && \
+      python3-pip \
+      ffmpeg \
+      build-essential \
+      gcc \
+      python3-dev \
+      git && \
     rm -rf /var/lib/apt/lists/*
 
 # 5) Install Python dependencies
@@ -24,8 +28,13 @@ COPY requirements.txt ./
 RUN pip install --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
-# 6) Copy application code
+# 6) Install FS-EEND (Hitachi-speech) into both API and workers
+RUN git clone https://github.com/hitachi-speech/EEND.git /app/EEND && \
+    cd /app/EEND && \
+    pip install --no-cache-dir .
+
+# 7) Copy application code
 COPY . .
 
-# 7) Default command — run the FastAPI app
+# 8) Default command — run the FastAPI app
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
