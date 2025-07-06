@@ -1,45 +1,58 @@
-# Dockerfile.gpu
+ # Dockerfile.gpu
 
-FROM nvidia/cuda:12.2.2-cudnn8-runtime-ubuntu22.04
+ FROM nvidia/cuda:12.2.2-cudnn8-runtime-ubuntu22.04
 
-# Russian mirrors
-RUN sed -i 's|http://archive.ubuntu.com/ubuntu/|http://ru.archive.ubuntu.com/ubuntu/|g' /etc/apt/sources.list \
- && sed -i 's|http://security.ubuntu.com/ubuntu|http://ru.archive.ubuntu.com/ubuntu/|g' /etc/apt/sources.list
+ # 1) Российские зеркала
+ RUN sed -i \
+       's|http://archive.ubuntu.com/ubuntu/|http://ru.archive.ubuntu.com/ubuntu/|g' \
+  && sed -i \
+       's|http://security.ubuntu.com/ubuntu|http://ru.archive.ubuntu.com/ubuntu/|g' \
+       /etc/apt/sources.list
 
-RUN apt-get update \
+ # 2) Системные зависимости
+ RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      python3-pip python3-dev build-essential ffmpeg libsndfile1 \
- && rm -rf /var/lib/apt/lists/*
+      python3-pip python3-dev build-essential \
+ && apt-get install -y --no-install-recommends \
+      git \                             # ← Добавляем git
+      python3-pip python3-dev build-essential \
+       ffmpeg libsndfile1 \
+  && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /app
+ WORKDIR /app
 
-COPY requirements.txt ./
-RUN pip3 install --upgrade pip \
- && pip3 install --no-cache-dir -r requirements.txt
+ # 3) Устанавливаем основной стек (FastAPI, Celery, pyannote и т.д.)
+ COPY requirements.txt ./
+ RUN pip3 install --upgrade pip \
+  && pip3 install --no-cache-dir -r requirements.txt
 
-# Faster-Whisper / CTranslate2
-RUN pip3 install --no-cache-dir --no-deps \
-      ctranslate2[cuda12]==4.4.0 \
-      faster-whisper[cuda12] \
-      nvidia-cudnn-cu12==9.* \
-      nvidia-cublas-cu12==12.*
+ # 4) Ставим CTranslate2/Faster-Whisper без их системных зависимостей
+ RUN pip3 install --no-cache-dir --no-deps \
+       ctranslate2[cuda12]==4.4.0 \
+       faster-whisper[cuda12] \
+       nvidia-cudnn-cu12==9.* \
+       nvidia-cublas-cu12==12.*
 
-# FS-EEND dependency
-RUN pip3 install --no-cache-dir git+https://github.com/hitachi-speech/EEND.git@main
+ # 5) FS-EEND dependency (требует git)
 
-# symlinks for cuDNN/cuBLAS
-RUN ln -sf /usr/lib/x86_64-linux-gnu/libcudnn.so.9    /usr/lib/x86_64-linux-gnu/libcudnn.so \
- && ln -sf /usr/lib/x86_64-linux-gnu/libcudnn_ops_infer.so.9  /usr/lib/x86_64-linux-gnu/libcudnn_ops.so \
- && ln -sf /usr/lib/x86_64-linux-gnu/libcudnn_cnn_infer.so.9  /usr/lib/x86_64-linux-gnu/libcudnn_cnn.so \
- && ldconfig
+ RUN pip3 install --no-cache-dir git+https://github.com/hitachi-speech/EEND.git@main
 
-COPY . .
+ # 6) Симлинки для cuDNN/cuBLAS
+ RUN ln -sf /usr/lib/x86_64-linux-gnu/libcudnn.so.9    /usr/lib/x86_64-linux-gnu/libcudnn.so \
+  && ln -sf /usr/lib/x86_64-linux-gnu/libcudnn_ops_infer.so.9  /usr/lib/x86_64-linux-gnu/libcudnn_ops.so \
+  && ln -sf /usr/lib/x86_64-linux-gnu/libcudnn_cnn_infer.so.9  /usr/lib/x86_64-linux-gnu/libcudnn_cnn.so \
+  && ldconfig
 
-ENV HUGGINGFACE_CACHE_DIR=/hf_cache \
-    WHISPER_DEVICE=cuda \
-    WHISPER_COMPUTE_TYPE=float16 \
-    TF_FORCE_GPU_ALLOW_GROWTH=true \
-    CTRANSFORMER_MAX_CUDA_MEMORY=0.8 \
-    LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
+ # 7) Копируем код
+ COPY . .
 
-CMD ["celery", "-A", "tasks", "worker", "--loglevel=info", "--concurrency=1", "--queues=preprocess_gpu"]
+ # 8) Переменные окружения для CUDA и Whisper
+ ENV HUGGINGFACE_CACHE_DIR=/hf_cache \
+     WHISPER_DEVICE=cuda \
+     WHISPER_COMPUTE_TYPE=float16 \
+     TF_FORCE_GPU_ALLOW_GROWTH=true \
+     CTRANSFORMER_MAX_CUDA_MEMORY=0.8 \
+     LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
+
+ # 9) Запуск единственного GPU-воркера
+ CMD ["celery", "-A", "tasks", "worker", "--loglevel=info", "--concurrency=1", "--queues=preprocess_gpu"]
