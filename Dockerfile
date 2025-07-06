@@ -1,6 +1,5 @@
 # Dockerfile
 
-
 # 1) Base image
 FROM python:3.10-slim
 
@@ -16,11 +15,8 @@ RUN if [ -f /etc/apt/sources.list ]; then \
 # 4) Install system dependencies
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-      python3-pip \
-      ffmpeg \
-      build-essential \
-      gcc \
-      python3-dev && \
+      python3-pip python3-dev build-essential \
+      ffmpeg libsndfile1 && \
     rm -rf /var/lib/apt/lists/*
 
 # 5) Install Python dependencies
