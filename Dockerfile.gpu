@@ -3,50 +3,56 @@
 # 1) Base image with CUDA
 FROM nvidia/cuda:12.2.2-cudnn8-runtime-ubuntu22.04
 
-# 2) Switch to Russian mirrors
+# 2) Russian mirrors
 RUN sed -i 's|http://archive.ubuntu.com/ubuntu/|http://ru.archive.ubuntu.com/ubuntu/|g' /etc/apt/sources.list && \
     sed -i 's|http://security.ubuntu.com/ubuntu|http://ru.archive.ubuntu.com/ubuntu/|g' /etc/apt/sources.list
 
-# 3) System dependencies
+# 3) System deps
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-      python3-pip \
-      python3-dev \
-      build-essential \
-      ffmpeg \
-      libsndfile1 \
-      git && \
+      python3-pip python3-dev build-essential ffmpeg libsndfile1 git && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-ENV PYTHONPATH="/app:$PYTHONPATH"
 
-# 4) Install main Python deps (FastAPI, Celery…)
+# 4) Install core Python deps
 COPY requirements.txt ./
 RUN pip3 install --upgrade pip && \
     pip3 install --no-cache-dir -r requirements.txt
 
-# 5) CTranslate2 / Faster-Whisper (no system deps)
+# 5) CTranslate2 / Faster-Whisper
 RUN pip3 install --no-cache-dir --no-deps \
       ctranslate2[cuda12]==4.4.0 \
       faster-whisper[cuda12] \
       nvidia-cudnn-cu12==9.* \
       nvidia-cublas-cu12==12.*
 
-# 6) Clone EEND repository into project root for direct import
-RUN git clone https://github.com/hitachi-speech/EEND.git /app && \
-    rm -rf /app/.git
+# 6) Clone & install FS-EEND locally
+RUN git clone https://github.com/hitachi-speech/EEND.git /app/eend && \
+    cat > /app/eend/setup.py << 'EOF'
+from setuptools import setup, find_packages
+
+setup(
+    name="eend",
+    version="0.1.0",
+    packages=find_packages(),
+)
+EOF
+    pip3 install --no-cache-dir /app/eend
 
 # 7) Symlinks for cuDNN/cuBLAS
-RUN ln -sf /usr/lib/x86_64-linux-gnu/libcudnn.so.9    /usr/lib/x86_64-linux-gnu/libcudnn.so && \
-    ln -sf /usr/lib/x86_64-linux-gnu/libcudnn_ops_infer.so.9  /usr/lib/x86_64-linux-gnu/libcudnn_ops.so && \
-    ln -sf /usr/lib/x86_64-linux-gnu/libcudnn_cnn_infer.so.9  /usr/lib/x86_64-linux-gnu/libcudnn_cnn.so && \
+RUN ln -sf /usr/lib/x86_64-linux-gnu/libcudnn.so.9 \
+          /usr/lib/x86_64-linux-gnu/libcudnn.so && \
+    ln -sf /usr/lib/x86_64-linux-gnu/libcudnn_ops_infer.so.9 \
+          /usr/lib/x86_64-linux-gnu/libcudnn_ops.so && \
+    ln -sf /usr/lib/x86_64-linux-gnu/libcudnn_cnn_infer.so.9 \
+          /usr/lib/x86_64-linux-gnu/libcudnn_cnn.so && \
     ldconfig
 
-# 8) Copy the rest of your code
+# 8) Copy your app
 COPY . .
 
-# 9) GPU / Whisper environment vars
+# 9) CUDA / Whisper env
 ENV HUGGINGFACE_CACHE_DIR=/hf_cache \
     WHISPER_DEVICE=cuda \
     WHISPER_COMPUTE_TYPE=float16 \
@@ -54,5 +60,5 @@ ENV HUGGINGFACE_CACHE_DIR=/hf_cache \
     CTRANSFORMER_MAX_CUDA_MEMORY=0.8 \
     LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
 
-# 10) Launch the single GPU worker
+# 10) Start GPU worker
 CMD ["celery", "-A", "tasks", "worker", "--loglevel=info", "--concurrency=1", "--queues=preprocess_gpu"]
