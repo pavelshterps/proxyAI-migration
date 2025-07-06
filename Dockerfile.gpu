@@ -2,46 +2,48 @@
 
 FROM nvidia/cuda:12.2.2-cudnn8-runtime-ubuntu22.04
 
-# 1) Российские зеркала
-RUN sed -i \
-      's|http://archive.ubuntu.com/ubuntu/|http://ru.archive.ubuntu.com/ubuntu/|g' \
- && sed -i \
-      's|http://security.ubuntu.com/ubuntu|http://ru.archive.ubuntu.com/ubuntu/|g' \
-      /etc/apt/sources.list
+# 1) Russian mirrors for faster apt
+RUN if [ -f /etc/apt/sources.list ]; then \
+      sed -i 's|http://archive.ubuntu.com/ubuntu/|http://ru.archive.ubuntu.com/ubuntu/|g' /etc/apt/sources.list && \
+      sed -i 's|http://security.ubuntu.com/ubuntu|http://ru.archive.ubuntu.com/ubuntu/|g' /etc/apt/sources.list; \
+    fi
 
-# 2) Системные зависимости (включая git)
+# 2) System dependencies (including git)
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-      python3-pip python3-dev build-essential \
-      ffmpeg libsndfile1 git && \
+      python3-pip \
+      python3-dev \
+      build-essential \
+      git \
+      ffmpeg \
+      libsndfile1 && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# 3) Устанавливаем основной стек (FastAPI, Celery, pyannote и т.д.)
+# 3) Install Python deps
 COPY requirements.txt ./
 RUN pip3 install --upgrade pip && \
     pip3 install --no-cache-dir -r requirements.txt
 
-# 4) Ставим CTranslate2 / Faster-Whisper без системных зависимостей
+# 4) CTranslate2 + Faster-Whisper (no extra apt deps)
 RUN pip3 install --no-cache-dir --no-deps \
       ctranslate2[cuda12]==4.4.0 \
       faster-whisper[cuda12]
 
-# 5) FS-EEND dependency (через git @ master)
-RUN pip3 install --no-cache-dir \
-      git+https://github.com/hitachi-speech/EEND.git@master
+# 5) FS-EEND (cluster-based diarization) via git
+RUN pip3 install --no-cache-dir git+https://github.com/hitachi-speech/EEND.git@master
 
-# 6) Симлинки, чтобы загрузчик ldconfig нашёл .so без суффиксов
-RUN ln -sf /usr/lib/x86_64-linux-gnu/libcudnn.so.9         /usr/lib/x86_64-linux-gnu/libcudnn.so \
- && ln -sf /usr/lib/x86_64-linux-gnu/libcudnn_ops_infer.so.9 /usr/lib/x86_64-linux-gnu/libcudnn_ops.so \
- && ln -sf /usr/lib/x86_64-linux-gnu/libcudnn_cnn_infer.so.9 /usr/lib/x86_64-linux-gnu/libcudnn_cnn.so \
- && ldconfig
+# 6) cuDNN / cuBLAS symlinks
+RUN ln -sf /usr/lib/x86_64-linux-gnu/libcudnn.so.9    /usr/lib/x86_64-linux-gnu/libcudnn.so && \
+    ln -sf /usr/lib/x86_64-linux-gnu/libcudnn_ops_infer.so.9  /usr/lib/x86_64-linux-gnu/libcudnn_ops.so && \
+    ln -sf /usr/lib/x86_64-linux-gnu/libcudnn_cnn_infer.so.9  /usr/lib/x86_64-linux-gnu/libcudnn_cnn.so && \
+    ldconfig
 
-# 7) Копируем код
+# 7) Copy app code
 COPY . .
 
-# 8) Переменные окружения для CUDA и Whisper
+# 8) CUDA & Whisper envs
 ENV HUGGINGFACE_CACHE_DIR=/hf_cache \
     WHISPER_DEVICE=cuda \
     WHISPER_COMPUTE_TYPE=float16 \
@@ -49,5 +51,5 @@ ENV HUGGINGFACE_CACHE_DIR=/hf_cache \
     CTRANSFORMER_MAX_CUDA_MEMORY=0.8 \
     LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
 
-# 9) Запуск единственного GPU-воркера
+# 9) Launch single‐worker GPU queue
 CMD ["celery", "-A", "tasks", "worker", "--loglevel=info", "--concurrency=1", "--queues=preprocess_gpu"]
