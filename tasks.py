@@ -8,10 +8,13 @@ import torch
 from celery import Celery, shared_task
 from celery.signals import worker_process_init
 from faster_whisper import WhisperModel
-from pyannote.audio.pipelines import SpeakerDiarization
-from pydub import AudioSegment
+from pyannote.audio.pipelines import VoiceActivityDetection, SpeakerDiarization
 from utils.audio import convert_to_wav
+from pydub import AudioSegment
 from redis import Redis
+
+# Импорт FS-EEND
+from eend.inference import Inference as EENDInference
 
 from config.settings import settings
 
@@ -26,7 +29,9 @@ app.conf.task_default_queue = "preprocess_cpu"
 logger = logging.getLogger(__name__)
 
 _whisper_model = None
+_vad = None
 _diarizer = None
+_eend_model = None
 
 
 def get_whisper_model():
@@ -62,12 +67,23 @@ def get_whisper_model():
     return _whisper_model
 
 
-def get_diarizer():
+def get_vad():
+    global _vad
+    if _vad is None:
+        _vad = VoiceActivityDetection.from_pretrained(
+            "pyannote/voice-activity-detection",
+            use_auth_token=settings.HUGGINGFACE_TOKEN
+        )
+        logger.info("VAD pipeline loaded")
+    return _vad
+
+
+def get_clustering_diarizer():
     global _diarizer
     if _diarizer is None:
         cache_dir = settings.DIARIZER_CACHE_DIR
         os.makedirs(cache_dir, exist_ok=True)
-        logger.info(f"Loading pyannote Pipeline into cache '{cache_dir}'")
+        logger.info(f"Loading pyannote SpeakerDiarization into cache '{cache_dir}'")
         _diarizer = SpeakerDiarization.from_pretrained(
             settings.PYANNOTE_PIPELINE,
             cache_dir=cache_dir,
@@ -81,31 +97,52 @@ def get_diarizer():
                 logger.info(f"Diarizer moved to {dev}")
             except Exception as e:
                 logger.warning(f"Could not move diarizer to {pd}: {e}")
-        logger.info("Diarizer loaded")
+        logger.info("Clustering-based diarizer loaded")
     return _diarizer
+
+
+def get_eend_model():
+    global _eend_model
+    if _eend_model is None:
+        _eend_model = EENDInference(
+            model=settings.FS_EEND_MODEL_PATH,
+            device=settings.FS_EEND_DEVICE
+        )
+        logger.info("FS-EEND model loaded")
+    return _eend_model
 
 
 @worker_process_init.connect
 def preload_and_warmup(**kwargs):
     sample = Path(__file__).resolve().parent / "tests" / "fixtures" / "sample.wav"
-    # тёплая прогонка для диаризатора
+    # тёплая прогонка: VAD
     try:
-        get_diarizer()(str(sample))
-        logger.info("✅ Warm-up diarizer complete")
-    except Exception as e:
-        logger.warning(f"Warm-up diarizer failed: {e}")
-    # тёплая прогонка для Whisper
+        get_vad().apply({"audio": str(sample)})
+        logger.info("✅ Warm-up VAD complete")
+    except Exception:
+        pass
+    # тёплая прогонка: clustering diarizer
     try:
-        warm_opts = {}
+        get_clustering_diarizer().apply({"audio": str(sample)})
+        logger.info("✅ Warm-up clustering diarizer complete")
+    except Exception:
+        pass
+    # тёплая прогонка: FS-EEND
+    if settings.USE_FS_EEND and settings.FS_EEND_MODEL_PATH:
+        try:
+            get_eend_model().diarize(str(sample))
+            logger.info("✅ Warm-up FS-EEND complete")
+        except Exception:
+            pass
+    # тёплая прогонка: Whisper
+    try:
+        opts = {}
         if settings.WHISPER_LANGUAGE:
-            warm_opts["language"] = settings.WHISPER_LANGUAGE
-        get_whisper_model().transcribe(
-            str(sample),
-            **warm_opts
-        )
+            opts["language"] = settings.WHISPER_LANGUAGE
+        get_whisper_model().transcribe(str(sample), **opts)
         logger.info("✅ Warm-up WhisperModel complete")
-    except Exception as e:
-        logger.warning(f"Warm-up WhisperModel failed: {e}")
+    except Exception:
+        pass
 
 
 @shared_task(
@@ -117,45 +154,41 @@ def transcribe_segments(self, upload_id: str, correlation_id: str):
     adapter = logging.LoggerAdapter(logger, {"correlation_id": correlation_id})
     whisper = get_whisper_model()
 
-    # измеряем задержку в очереди — безопасно достаём headers
+    # измеряем задержку в очереди
     headers = getattr(self.request, "headers", {}) or {}
     enqueue_header = headers.get("enqueue_time")
     if enqueue_header:
         try:
-            enqueue_ts = float(enqueue_header)
-            queue_delay = time.time() - enqueue_ts
-            adapter.info(f"⏳ Queue delay: {queue_delay:.2f}s")
+            delta = time.time() - float(enqueue_header)
+            adapter.info(f"⏳ Queue delay: {delta:.2f}s")
         except ValueError:
             adapter.warning(f"Invalid enqueue_time header: {enqueue_header}")
     task_start = time.time()
 
-    # универсальная конвертация в WAV в папку uploads
+    # конвертация в WAV, если нужно
     src_orig = Path(settings.UPLOAD_FOLDER) / upload_id
     wav_name = Path(upload_id).stem + ".wav"
     wav_src = Path(settings.UPLOAD_FOLDER) / wav_name
-    # Конвертируем в WAV только если файл не WAV
     if src_orig.suffix.lower() != ".wav":
         convert_to_wav(src_orig, wav_src, sample_rate=16000, channels=1)
         src = wav_src
     else:
-        # Уже WAV — можно сразу использовать
         src = src_orig
 
     dst_dir = Path(settings.RESULTS_FOLDER) / upload_id
     dst_dir.mkdir(parents=True, exist_ok=True)
 
     adapter.info(f"Starting transcription for '{src}'")
-    windows = split_audio_fixed_windows(src, settings.SEGMENT_LENGTH_S)
-    adapter.info(f" → {len(windows)} segments of up to {settings.SEGMENT_LENGTH_S}s")
-
     full_audio = AudioSegment.from_file(str(src))
     transcript = []
+    windows = split_audio_fixed_windows(src, settings.SEGMENT_LENGTH_S)
 
     for idx, (start, end) in enumerate(windows):
         adapter.debug(f" Transcribing segment {idx}: {start:.1f}s → {end:.1f}s")
         chunk = full_audio[int(start * 1000):int(end * 1000)]
-        tmp_path = dst_dir / f"{upload_id}_{idx}.wav"
-        chunk.export(tmp_path, format="wav")
+        tmp_wav = dst_dir / f"{upload_id}_{idx}.wav"
+        chunk.export(tmp_wav, format="wav")
+
         try:
             opts = {
                 "beam_size": settings.WHISPER_BATCH_SIZE,
@@ -164,16 +197,10 @@ def transcribe_segments(self, upload_id: str, correlation_id: str):
             if settings.WHISPER_LANGUAGE:
                 opts["language"] = settings.WHISPER_LANGUAGE
 
-            segments, _ = whisper.transcribe(
-                str(tmp_path),
-                **opts
-            )
+            segments, _ = whisper.transcribe(str(tmp_wav), **opts)
         except Exception as e:
-            adapter.error(
-                f"❌ Transcription failed on segment {idx} ({start:.1f}-{end:.1f}s): {e}",
-                exc_info=True
-            )
-            tmp_path.unlink()
+            adapter.error(f"❌ Transcription failed on segment {idx}: {e}", exc_info=True)
+            tmp_wav.unlink()
             continue
 
         for seg in segments:
@@ -183,15 +210,11 @@ def transcribe_segments(self, upload_id: str, correlation_id: str):
                 "end":     start + seg.end,
                 "text":    seg.text
             })
-        tmp_path.unlink()
+        tmp_wav.unlink()
 
     out_path = dst_dir / "transcript.json"
-    out_path.write_text(
-        json.dumps(transcript, ensure_ascii=False, indent=2),
-        encoding="utf-8"
-    )
-    adapter.info(f"Transcription complete: saved to '{out_path}'")
-    adapter.info(f"✅ Processing duration: {time.time() - task_start:.2f}s")
+    out_path.write_text(json.dumps(transcript, ensure_ascii=False, indent=2))
+    adapter.info(f"Transcription complete: saved to '{out_path}' ({time.time() - task_start:.2f}s)")
 
     redis = Redis.from_url(settings.CELERY_BROKER_URL)
     redis.publish(f"progress:{upload_id}", "50%")
@@ -205,45 +228,42 @@ def transcribe_segments(self, upload_id: str, correlation_id: str):
 )
 def diarize_full(self, upload_id: str, correlation_id: str):
     adapter = logging.LoggerAdapter(logger, {"correlation_id": correlation_id})
-    diarizer = get_diarizer()
-
-    # измеряем задержку в очереди — безопасно достаём headers
-    headers = getattr(self.request, "headers", {}) or {}
-    enqueue_header = headers.get("enqueue_time")
-    if enqueue_header:
-        try:
-            enqueue_ts = float(enqueue_header)
-            queue_delay = time.time() - enqueue_ts
-            adapter.info(f"⏳ Queue delay: {queue_delay:.2f}s")
-        except ValueError:
-            adapter.warning(f"Invalid enqueue_time header: {enqueue_header}")
     task_start = time.time()
 
-    # используем сконвертированный WAV из папки uploads
+    # путь до WAV
     wav_name = Path(upload_id).stem + ".wav"
     src = Path(settings.UPLOAD_FOLDER) / wav_name
 
+    # VAD предобработка
+    vad = get_vad()
+    speech = vad.apply({"audio": str(src)})
+    regions = speech.get_timeline().support()
+
+    # выбор алгоритма
+    speakers = []
+    if settings.USE_FS_EEND and settings.FS_EEND_MODEL_PATH:
+        adapter.info("Using FS-EEND diarization")
+        eend = get_eend_model()
+        labels = eend.diarize(str(src))
+        frame_shift = settings.FRAME_SHIFT
+        for frame_idx, row in enumerate(labels):
+            t0 = frame_idx * frame_shift
+            for spk_idx, active in enumerate(row):
+                if active:
+                    speakers.append({"start": t0, "end": t0 + frame_shift, "speaker": spk_idx})
+    else:
+        adapter.info("Using clustering-based pyannote diarization")
+        diar = get_clustering_diarizer()
+        ann = diar.apply({"audio": str(src)})
+        for turn, _, spk in ann.itertracks(yield_label=True):
+            speakers.append({"start": turn.start, "end": turn.end, "speaker": spk})
+
+    # сохраняем результат
     dst_dir = Path(settings.RESULTS_FOLDER) / upload_id
     dst_dir.mkdir(parents=True, exist_ok=True)
-
-    adapter.info(f"Starting diarization for '{src}'")
-    diarization = diarizer(str(src))
-
-    speakers = []
-    for turn, _, speaker in diarization.itertracks(yield_label=True):
-        speakers.append({
-            "start":   turn.start,
-            "end":     turn.end,
-            "speaker": speaker
-        })
-
     out_path = dst_dir / "diarization.json"
-    out_path.write_text(
-        json.dumps(speakers, ensure_ascii=False, indent=2),
-        encoding="utf-8"
-    )
-    adapter.info(f"Diarization complete: saved to '{out_path}'")
-    adapter.info(f"✅ Diarization duration: {time.time() - task_start:.2f}s")
+    out_path.write_text(json.dumps(speakers, ensure_ascii=False, indent=2))
+    adapter.info(f"Diarization complete: saved to '{out_path}' ({time.time() - task_start:.2f}s)")
 
     redis = Redis.from_url(settings.CELERY_BROKER_URL)
     redis.publish(f"progress:{upload_id}", "100%")

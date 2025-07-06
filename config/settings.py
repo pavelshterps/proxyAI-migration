@@ -14,10 +14,8 @@ class Settings(BaseSettings):
     # административный ключ
     ADMIN_API_KEY: str = Field(..., env="ADMIN_API_KEY")
 
-    # подключение к БД (берётся из .env или docker-compose)
+    # подключение к БД
     DATABASE_URL: str = Field(..., env="DATABASE_URL")
-
-    # имя базы, пользователь и пароль (на всякий случай, если вдруг понадобится)
     POSTGRES_DB: str = Field(..., env="POSTGRES_DB")
     POSTGRES_USER: str = Field(..., env="POSTGRES_USER")
     POSTGRES_PASSWORD: str = Field(..., env="POSTGRES_PASSWORD")
@@ -44,20 +42,31 @@ class Settings(BaseSettings):
     WHISPER_BATCH_SIZE: int = Field(1, env="WHISPER_BATCH_SIZE")
     WHISPER_LANGUAGE: Optional[str] = Field(None, env="WHISPER_LANGUAGE")
 
-    HUGGINGFACE_CACHE_DIR: Optional[str] = Field(None, env="HUGGINGFACE_CACHE_DIR")
+    # FS-EEND settings
+    USE_FS_EEND: bool = Field(False, env="USE_FS_EEND")
+    FS_EEND_MODEL_PATH: Optional[str] = Field(None, env="FS_EEND_MODEL_PATH")
+    FS_EEND_DEVICE: str = Field("cuda", env="FS_EEND_DEVICE")
+    FRAME_SHIFT: float = Field(0.01, env="FRAME_SHIFT")  # 10 ms
 
-    # Pyannote
-    PYANNOTE_PIPELINE: str = Field(..., env="PYANNOTE_PIPELINE")
+    # HF cache & token
+    HUGGINGFACE_CACHE_DIR: Optional[str] = Field(None, env="HUGGINGFACE_CACHE_DIR")
     HUGGINGFACE_TOKEN: str = Field(..., env="HUGGINGFACE_TOKEN")
 
+    # Pyannote (clustering-based)
+    PYANNOTE_PIPELINE: str = Field(..., env="PYANNOTE_PIPELINE")
+
+    # segmentation/VAD
     SEGMENT_LENGTH_S: int = Field(30, env="SEGMENT_LENGTH_S")
     VAD_LEVEL: int = Field(2, env="VAD_LEVEL")
 
+    # limits & retention
     MAX_FILE_SIZE: int = Field(1_073_741_824, env="MAX_FILE_SIZE")
     FILE_RETENTION_DAYS: int = Field(7, env="FILE_RETENTION_DAYS")
 
+    # tus endpoint
     TUS_ENDPOINT: str = Field(..., env="TUS_ENDPOINT")
 
+    # CORS / frontend
     ALLOWED_ORIGINS: str = Field('["*"]', env="ALLOWED_ORIGINS")
     FLOWER_USER: Optional[str] = Field(None, env="FLOWER_USER")
     FLOWER_PASS: Optional[str] = Field(None, env="FLOWER_PASS")

@@ -2,46 +2,39 @@
 
 FROM nvidia/cuda:12.2.2-cudnn8-runtime-ubuntu22.04
 
-# 1) Российские зеркала
-RUN sed -i \
-      's|http://archive.ubuntu.com/ubuntu/|http://ru.archive.ubuntu.com/ubuntu/|g' \
-      /etc/apt/sources.list \
- && sed -i \
-      's|http://security.ubuntu.com/ubuntu|http://ru.archive.ubuntu.com/ubuntu/|g' \
-      /etc/apt/sources.list
+# Russian mirrors
+RUN sed -i 's|http://archive.ubuntu.com/ubuntu/|http://ru.archive.ubuntu.com/ubuntu/|g' /etc/apt/sources.list \
+ && sed -i 's|http://security.ubuntu.com/ubuntu|http://ru.archive.ubuntu.com/ubuntu/|g' /etc/apt/sources.list
 
-# 2) Системные зависимости
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      python3-pip python3-dev build-essential \
-      ffmpeg libsndfile1 \
+      python3-pip python3-dev build-essential ffmpeg libsndfile1 \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# 3) Устанавливаем основной стек (FastAPI, Celery, pyannote и т.д.)
 COPY requirements.txt ./
 RUN pip3 install --upgrade pip \
  && pip3 install --no-cache-dir -r requirements.txt
 
-# 4) Ставим CTranslate2/Faster-Whisper без их системных зависимостей
-#    и «докачиваем» cuDNN9 + cuBLAS12 из wheel-пакетов NVIDIA
+# Faster-Whisper / CTranslate2
 RUN pip3 install --no-cache-dir --no-deps \
       ctranslate2[cuda12]==4.4.0 \
       faster-whisper[cuda12] \
       nvidia-cudnn-cu12==9.* \
-      nvidia-cublas-cu12==12.* \
- && \
- # 5) Симлинки, чтобы загрузчик ldconfig нашёл .so без суффиксов
- ln -sf /usr/lib/x86_64-linux-gnu/libcudnn.so.9    /usr/lib/x86_64-linux-gnu/libcudnn.so \
+      nvidia-cublas-cu12==12.*
+
+# FS-EEND dependency
+RUN pip3 install --no-cache-dir git+https://github.com/hitachi-speech/EEND.git@main
+
+# symlinks for cuDNN/cuBLAS
+RUN ln -sf /usr/lib/x86_64-linux-gnu/libcudnn.so.9    /usr/lib/x86_64-linux-gnu/libcudnn.so \
  && ln -sf /usr/lib/x86_64-linux-gnu/libcudnn_ops_infer.so.9  /usr/lib/x86_64-linux-gnu/libcudnn_ops.so \
  && ln -sf /usr/lib/x86_64-linux-gnu/libcudnn_cnn_infer.so.9  /usr/lib/x86_64-linux-gnu/libcudnn_cnn.so \
  && ldconfig
 
-# 6) Копируем код
 COPY . .
 
-# 7) Переменные окружения для CUDA и Whisper
 ENV HUGGINGFACE_CACHE_DIR=/hf_cache \
     WHISPER_DEVICE=cuda \
     WHISPER_COMPUTE_TYPE=float16 \
@@ -49,5 +42,4 @@ ENV HUGGINGFACE_CACHE_DIR=/hf_cache \
     CTRANSFORMER_MAX_CUDA_MEMORY=0.8 \
     LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
 
-# 8) Запуск единственного GPU-воркера
 CMD ["celery", "-A", "tasks", "worker", "--loglevel=info", "--concurrency=1", "--queues=preprocess_gpu"]
