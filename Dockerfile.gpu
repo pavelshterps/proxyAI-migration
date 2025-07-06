@@ -33,7 +33,8 @@ RUN pip3 install --no-cache-dir --no-deps \
       nvidia-cublas-cu12==12.*
 
 # 6) Устанавливаем FS-EEND (клонируем и ставим локально)
-RUN git clone https://github.com/hitachi-speech/EEND.git /app/eend
+RUN git clone https://github.com/hitachi-speech/EEND.git /app/eend && \
+    pip install --no-cache-dir /app/eend
 
 # 7) Симлинки для cuDNN/cuBLAS
 RUN ln -sf /usr/lib/x86_64-linux-gnu/libcudnn.so.9    /usr/lib/x86_64-linux-gnu/libcudnn.so && \

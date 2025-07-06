@@ -93,6 +93,18 @@ def get_clustering_diarizer():
 
 def get_eend_model():
     global _eend_model
+      # пытаемся локально импортировать FS-EEND
+
+    try:
+
+        from eend.inference import Inference as EENDInference
+        except ImportError:
+            logger.error(
+                    "FS-EEND module not found; установите пакет EEND или отключите USE_FS_EEND в настройках"
+        )
+      # пробросим дальше — caller поймает или упадет
+
+    raise
     if not settings.USE_FS_EEND or not settings.FS_EEND_MODEL_PATH:
         raise RuntimeError("FS-EEND is not enabled or model path is not set")
 
