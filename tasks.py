@@ -13,6 +13,12 @@ from utils.audio import convert_to_wav
 from pydub import AudioSegment
 from redis import Redis
 
+# Попытка импортировать FS-EEND, если установлен
+try:
+    from eend.inference import Inference as EENDInference
+except ImportError:
+    EENDInference = None
+
 from config.settings import settings
 
 # Инициализация Celery
@@ -93,58 +99,48 @@ def get_clustering_diarizer():
 
 def get_eend_model():
     global _eend_model
-      # пытаемся локально импортировать FS-EEND
-
-    try:
-
-        from eend.inference import Inference as EENDInference
-        except ImportError:
-            logger.error(
-                    "FS-EEND module not found; установите пакет EEND или отключите USE_FS_EEND в настройках"
-        )
-      # пробросим дальше — caller поймает или упадет
-
-    raise
+    # Проверяем флаг и путь
     if not settings.USE_FS_EEND or not settings.FS_EEND_MODEL_PATH:
         raise RuntimeError("FS-EEND is not enabled or model path is not set")
-
+    # Убедимся, что модуль импортирован
+    if EENDInference is None:
+        raise RuntimeError(
+            "FS-EEND module not found; клонируйте и установите https://github.com/hitachi-speech/EEND"
+        )
     if _eend_model is None:
-        try:
-            from eend.inference import Inference as EENDInference
-        except ImportError as e:
-            logger.error(f"FS-EEND module not found: {e}")
-            raise
-
         _eend_model = EENDInference(
             model=settings.FS_EEND_MODEL_PATH,
             device=settings.FS_EEND_DEVICE
         )
-        logger.info(f"FS-EEND model loaded (path={settings.FS_EEND_MODEL_PATH}, device={settings.FS_EEND_DEVICE})")
+        logger.info(
+            f"FS-EEND model loaded (path={settings.FS_EEND_MODEL_PATH}, device={settings.FS_EEND_DEVICE})"
+        )
     return _eend_model
 
 
 @worker_process_init.connect
 def preload_and_warmup(**kwargs):
     sample = Path(__file__).resolve().parent / "tests" / "fixtures" / "sample.wav"
+    # Warm-up VAD
     try:
         get_vad().apply({"audio": str(sample)})
         logger.info("✅ Warm-up VAD complete")
     except Exception as e:
         logger.warning(f"Warm-up VAD failed: {e}")
-
+    # Warm-up clustering diarizer
     try:
         get_clustering_diarizer().apply({"audio": str(sample)})
         logger.info("✅ Warm-up clustering diarizer complete")
     except Exception as e:
         logger.warning(f"Warm-up clustering diarizer failed: {e}")
-
+    # Warm-up FS-EEND
     if settings.USE_FS_EEND and settings.FS_EEND_MODEL_PATH:
         try:
             get_eend_model().diarize(str(sample))
             logger.info("✅ Warm-up FS-EEND complete")
         except Exception as e:
             logger.warning(f"Warm-up FS-EEND failed: {e}")
-
+    # Warm-up Whisper
     try:
         opts = {}
         if settings.WHISPER_LANGUAGE:
@@ -160,7 +156,6 @@ def transcribe_segments(self, upload_id: str, correlation_id: str):
     adapter = logging.LoggerAdapter(logger, {"correlation_id": correlation_id})
     whisper = get_whisper_model()
 
-    # Измеряем задержку в очереди
     headers = getattr(self.request, "headers", {}) or {}
     enqueue_ts = headers.get("enqueue_time")
     if enqueue_ts:
@@ -171,8 +166,6 @@ def transcribe_segments(self, upload_id: str, correlation_id: str):
             adapter.warning(f"Invalid enqueue_time header: {enqueue_ts}")
 
     start_time = time.time()
-
-    # Конвертация в WAV при необходимости
     upload_path = Path(settings.UPLOAD_FOLDER) / upload_id
     wav_name = Path(upload_id).stem + ".wav"
     wav_path = Path(settings.UPLOAD_FOLDER) / wav_name
@@ -184,7 +177,6 @@ def transcribe_segments(self, upload_id: str, correlation_id: str):
 
     dst_dir = Path(settings.RESULTS_FOLDER) / upload_id
     dst_dir.mkdir(parents=True, exist_ok=True)
-
     adapter.info(f"Starting transcription for '{src}'")
     audio = AudioSegment.from_file(str(src))
     transcript = []
@@ -229,11 +221,9 @@ def diarize_full(self, upload_id: str, correlation_id: str):
     adapter = logging.LoggerAdapter(logger, {"correlation_id": correlation_id})
     start_time = time.time()
 
-    # Путь к WAV
     wav_name = Path(upload_id).stem + ".wav"
     src = Path(settings.UPLOAD_FOLDER) / wav_name
 
-    # VAD-предобработка
     vad = get_vad()
     speech = vad.apply({"audio": str(src)})
     regions = speech.get_timeline().support()
@@ -265,6 +255,7 @@ def diarize_full(self, upload_id: str, correlation_id: str):
     redis = Redis.from_url(settings.CELERY_BROKER_URL)
     redis.publish(f"progress:{upload_id}", "100%")
     redis.set(f"progress:{upload_id}", "100%")
+
 
 def split_audio_fixed_windows(audio_path: Path, window_s: int):
     audio = AudioSegment.from_file(str(audio_path))
