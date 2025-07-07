@@ -74,7 +74,7 @@ def get_vad():
         )
         if device != "cpu":
             try:
-                _vad.to(torch.device(device))
+                _vad = _vad.to(torch.device(device))
                 logger.info(f"VAD pipeline moved to {device}")
             except Exception as e:
                 logger.warning(f"Could not move VAD to {device}: {e}")
@@ -151,7 +151,10 @@ def preload_and_warmup(**kwargs):
     # Warm-up FS-EEND
     if settings.USE_FS_EEND and settings.FS_EEND_MODEL_PATH:
         try:
-            get_eend_model().diarize(str(sample))
+            try:
+                get_eend_model().diarize(str(sample))
+            except Exception as e:
+                logger.warning(f"Skipping FS-EEND warm-up (will load on first real job): {e}")
             logger.info("✅ Warm-up FS-EEND complete")
         except Exception as e:
             logger.warning(f"Warm-up FS-EEND failed: {e}")
