@@ -22,3 +22,4 @@ slowapi>=0.1.5         # FastAPI-compatible rate limiting
 limits>=2.8.0
 yamlargparse>=0.27.0
 chainer>=7.8.0
+numpy<2.0

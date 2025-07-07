@@ -21,7 +21,7 @@ RUN pip install --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
 #  — FS-EEND dependencies —
-RUN pip install --no-cache-dir yamlargparse chainer
+RUN pip install --no-cache-dir yamlargparse chainer numpy<2.0
 
 # Vendored FS-EEND
 COPY eend/ /app/eend/
