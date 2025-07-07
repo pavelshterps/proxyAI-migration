@@ -18,6 +18,9 @@ COPY requirements.txt ./
 RUN pip3 install --upgrade pip && \
     pip3 install --no-cache-dir -r requirements.txt
 
+#  — FS-EEND dependencies —
+RUN pip install --no-cache-dir yamlargparse chainer
+
 # CTranslate2/Faster-Whisper
 RUN pip3 install --no-cache-dir --no-deps \
       ctranslate2[cuda12]==4.4.0 \
