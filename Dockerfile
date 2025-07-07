@@ -20,9 +20,10 @@ RUN pip install --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
 # 3) Клонируем Hitachi-speech/EEND и настраиваем PYTHONPATH
-RUN git clone https://github.com/hitachi-speech/EEND.git /opt/eend && \
-    rm -rf /opt/eend/.git
-ENV PYTHONPATH="/opt/eend:${PYTHONPATH}"
+RUN git clone https://github.com/hitachi-speech/EEND.git /tmp/eend \
+ && cp -r /tmp/eend/eend /app/ \
+ && rm -rf /tmp/eend
+ENV PYTHONPATH="/tmp/eend:${PYTHONPATH}"
 
 # 4) Копируем ваш код
 COPY . .
