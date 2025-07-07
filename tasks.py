@@ -13,12 +13,6 @@ from utils.audio import convert_to_wav
 from pydub import AudioSegment
 from redis import Redis
 
-# Попытка импортировать FS-EEND, если установлен
-try:
-    from eend.inference import Inference as EENDInference
-except ImportError:
-    EENDInference = None
-
 from config.settings import settings
 
 # Инициализация Celery
@@ -48,12 +42,18 @@ def get_whisper_model():
                 f"Compute type '{compute}' not supported on CPU; falling back to int8"
             )
             compute = "int8"
-        logger.info(f"Loading WhisperModel (path={model_path}, device={device}, compute={compute})")
+        logger.info(
+            f"Loading WhisperModel (path={model_path}, device={device}, compute={compute})"
+        )
         try:
             _whisper_model = WhisperModel(model_path, device=device, compute_type=compute)
         except Exception as e:
-            logger.warning(f"Failed to load WhisperModel with compute={compute}: {e}; retrying int8")
-            _whisper_model = WhisperModel(model_path, device=device, compute_type="int8")
+            logger.warning(
+                f"Failed to load WhisperModel with compute={compute}: {e}; retrying int8"
+            )
+            _whisper_model = WhisperModel(
+                model_path, device=device, compute_type="int8"
+            )
         logger.info("WhisperModel loaded")
     return _whisper_model
 
@@ -61,11 +61,17 @@ def get_whisper_model():
 def get_vad():
     global _vad
     if _vad is None:
-        model_id = getattr(settings, "VAD_MODEL_PATH", "pyannote/voice-activity-detection")
+        model_id = getattr(
+            settings, "VAD_MODEL_PATH", "pyannote/voice-activity-detection"
+        )
         _vad = VoiceActivityDetection.from_pretrained(
             model_id, use_auth_token=settings.HUGGINGFACE_TOKEN
         )
-        device = settings.FS_EEND_DEVICE.lower() if settings.USE_FS_EEND else settings.WHISPER_DEVICE.lower()
+        device = (
+            settings.FS_EEND_DEVICE.lower()
+            if settings.USE_FS_EEND
+            else settings.WHISPER_DEVICE.lower()
+        )
         if device != "cpu":
             try:
                 _vad.to(torch.device(device))
@@ -81,6 +87,7 @@ def get_clustering_diarizer():
     if _diarizer is None:
         cache_dir = settings.DIARIZER_CACHE_DIR
         os.makedirs(cache_dir, exist_ok=True)
+        logger.info(f"Loading clustering SpeakerDiarization into cache '{cache_dir}'")
         _diarizer = SpeakerDiarization.from_pretrained(
             settings.PYANNOTE_PIPELINE,
             cache_dir=cache_dir,
@@ -99,22 +106,28 @@ def get_clustering_diarizer():
 
 def get_eend_model():
     global _eend_model
+
     if not settings.USE_FS_EEND or not settings.FS_EEND_MODEL_PATH:
-        raise RuntimeError("FS-EEND отключён или settings.FS_EEND_MODEL_PATH не задан")
+        raise RuntimeError("FS-EEND is not enabled or model path is not set")
+
     if _eend_model is None:
+        # импортим EENDInference только здесь
         try:
             from eend.inference import Inference as EENDInference
         except ImportError as e:
-            raise ImportError(
-                "FS-EEND модуль не найден. "
-                "Установите его (git clone https://github.com/hitachi-speech/EEND && pip install .) "
-                "или отключите USE_FS_EEND в настройках"
-            ) from e
+            logger.error(
+                "FS-EEND module not found; "
+                "скачайте и положите пакет EEND в каталог eend/ или отключите USE_FS_EEND",
+                exc_info=e,
+            )
+            raise
+
         _eend_model = EENDInference(
-            model=settings.FS_EEND_MODEL_PATH,
-            device=settings.FS_EEND_DEVICE
+            model=settings.FS_EEND_MODEL_PATH, device=settings.FS_EEND_DEVICE
         )
-        logger.info(f"FS-EEND model loaded (path={settings.FS_EEND_MODEL_PATH}, device={settings.FS_EEND_DEVICE})")
+        logger.info(
+            f"FS-EEND model loaded (path={settings.FS_EEND_MODEL_PATH}, device={settings.FS_EEND_DEVICE})"
+        )
     return _eend_model
 
 
@@ -127,12 +140,14 @@ def preload_and_warmup(**kwargs):
         logger.info("✅ Warm-up VAD complete")
     except Exception as e:
         logger.warning(f"Warm-up VAD failed: {e}")
+
     # Warm-up clustering diarizer
     try:
         get_clustering_diarizer().apply({"audio": str(sample)})
         logger.info("✅ Warm-up clustering diarizer complete")
     except Exception as e:
         logger.warning(f"Warm-up clustering diarizer failed: {e}")
+
     # Warm-up FS-EEND
     if settings.USE_FS_EEND and settings.FS_EEND_MODEL_PATH:
         try:
@@ -140,6 +155,7 @@ def preload_and_warmup(**kwargs):
             logger.info("✅ Warm-up FS-EEND complete")
         except Exception as e:
             logger.warning(f"Warm-up FS-EEND failed: {e}")
+
     # Warm-up Whisper
     try:
         opts = {}
@@ -149,6 +165,9 @@ def preload_and_warmup(**kwargs):
         logger.info("✅ Warm-up WhisperModel complete")
     except Exception as e:
         logger.warning(f"Warm-up WhisperModel failed: {e}")
+
+
+# … остальной код тасков без изменений …
 
 
 @shared_task(bind=True, name="tasks.transcribe_segments", queue="preprocess_gpu")
