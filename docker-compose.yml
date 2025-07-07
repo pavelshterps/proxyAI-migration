@@ -66,6 +66,9 @@ services:
       - results-data:/data/results
       - /path/to/hf_cache_host:/data/diarizer_cache:ro
       - /path/to/hf_cache_host:/hf_cache:rw
+      - /tasks.py:/app/tasks.py
+      - ./config:/app/config
+      - ./utils:/app/utils
     depends_on:
       - db
       - redis
