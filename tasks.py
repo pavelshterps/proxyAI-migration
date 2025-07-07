@@ -98,33 +98,23 @@ def get_clustering_diarizer():
 
 
 def get_eend_model():
-    """
-    Возвращает загруженный FS-EEND.
-    Требует, чтобы settings.USE_FS_EEND==True и settings.FS_EEND_MODEL_PATH были заданы.
-    """
     global _eend_model
-
     if not settings.USE_FS_EEND or not settings.FS_EEND_MODEL_PATH:
-        raise RuntimeError("FS-EEND не включён или путь к модели не задан")
-
+        raise RuntimeError("FS-EEND отключён или settings.FS_EEND_MODEL_PATH не задан")
     if _eend_model is None:
         try:
-            # Теперь импорт найдётся, т.к. в Dockerfile мы скопировали папку eend/
             from eend.inference import Inference as EENDInference
         except ImportError as e:
-            logger.error(
-                "FS-EEND модуль не найден; клонируйте репозиторий и скопируйте папку eend/ в проект"
-            )
-            raise
-
+            raise ImportError(
+                "FS-EEND модуль не найден. "
+                "Установите его (git clone https://github.com/hitachi-speech/EEND && pip install .) "
+                "или отключите USE_FS_EEND в настройках"
+            ) from e
         _eend_model = EENDInference(
             model=settings.FS_EEND_MODEL_PATH,
-            device=settings.FS_EEND_DEVICE.lower()
+            device=settings.FS_EEND_DEVICE
         )
-        logger.info(
-            f"FS-EEND модель загружена (path={settings.FS_EEND_MODEL_PATH}, device={settings.FS_EEND_DEVICE})"
-        )
-
+        logger.info(f"FS-EEND model loaded (path={settings.FS_EEND_MODEL_PATH}, device={settings.FS_EEND_DEVICE})")
     return _eend_model
 
 
