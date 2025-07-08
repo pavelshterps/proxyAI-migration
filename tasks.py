@@ -23,12 +23,17 @@ app = Celery(
 )
 app.conf.task_default_queue = "preprocess_cpu"
 
+# Route tasks to appropriate queues
+app.conf.task_routes = {
+    "tasks.transcribe_segments": {"queue": "preprocess_gpu"},
+    "tasks.diarize_full":       {"queue": "preprocess_cpu"},
+}
+
 logger = logging.getLogger(__name__)
 
 _whisper_model = None
 _vad = None
 _clustering_diarizer = None
-
 
 def get_whisper_model():
     global _whisper_model
@@ -56,7 +61,6 @@ def get_whisper_model():
         logger.info("WhisperModel loaded")
     return _whisper_model
 
-
 def get_vad():
     global _vad
     if _vad is None:
@@ -66,6 +70,7 @@ def get_vad():
         _vad = VoiceActivityDetection.from_pretrained(
             model_id, use_auth_token=settings.HUGGINGFACE_TOKEN
         )
+        # Попытка переместить пайплайн на GPU (не затираем _vad)
         device = (
             settings.FS_EEND_DEVICE.lower()
             if settings.USE_FS_EEND
@@ -73,13 +78,12 @@ def get_vad():
         )
         if device != "cpu":
             try:
-                _vad = _vad.to(torch.device(device))
+                _vad.to(torch.device(device))
                 logger.info(f"VAD pipeline moved to {device}")
             except Exception as e:
                 logger.warning(f"Could not move VAD to {device}: {e}")
         logger.info("VAD pipeline loaded")
     return _vad
-
 
 def get_clustering_diarizer():
     global _clustering_diarizer
@@ -102,7 +106,6 @@ def get_clustering_diarizer():
         logger.info("Clustering-based diarizer loaded")
     return _clustering_diarizer
 
-
 def get_fs_eend_pipeline():
     """
     Официальный end-to-end diarization pipeline из pyannote-audio.
@@ -114,7 +117,6 @@ def get_fs_eend_pipeline():
         pipeline_id,
         use_auth_token=settings.HUGGINGFACE_TOKEN
     )
-
 
 @worker_process_init.connect
 def preload_and_warmup(**kwargs):
@@ -151,7 +153,6 @@ def preload_and_warmup(**kwargs):
         logger.info("✅ Warm-up WhisperModel complete")
     except Exception as e:
         logger.warning(f"Warm-up WhisperModel failed: {e}")
-
 
 @shared_task(bind=True, name="tasks.transcribe_segments", queue="preprocess_gpu")
 def transcribe_segments(self, upload_id: str, correlation_id: str):
@@ -220,8 +221,7 @@ def transcribe_segments(self, upload_id: str, correlation_id: str):
     redis.publish(f"progress:{upload_id}", "50%")
     redis.set(f"progress:{upload_id}", "50%")
 
-
-@shared_task(bind=True, name="tasks.diarize_full", queue="preprocess_gpu")
+@shared_task(bind=True, name="tasks.diarize_full", queue="preprocess_cpu")
 def diarize_full(self, upload_id: str, correlation_id: str):
     adapter = logging.LoggerAdapter(logger, {"correlation_id": correlation_id})
     start_time = time.time()
@@ -262,7 +262,6 @@ def diarize_full(self, upload_id: str, correlation_id: str):
     redis = Redis.from_url(settings.CELERY_BROKER_URL)
     redis.publish(f"progress:{upload_id}", "100%")
     redis.set(f"progress:{upload_id}", "100%")
-
 
 def split_audio_fixed_windows(audio_path: Path, window_s: int):
     audio = AudioSegment.from_file(str(audio_path))
