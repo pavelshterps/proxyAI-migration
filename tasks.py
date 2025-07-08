@@ -15,7 +15,7 @@ from redis import Redis
 
 from config.settings import settings
 
-# Инициализация Celery
+# ─── Инициализация Celery ───────────────────────────────────────────────────────
 app = Celery(
     "proxyai",
     broker=settings.CELERY_BROKER_URL,
@@ -34,6 +34,7 @@ logger = logging.getLogger(__name__)
 _whisper_model = None
 _vad = None
 _clustering_diarizer = None
+
 
 def get_whisper_model():
     global _whisper_model
@@ -61,6 +62,7 @@ def get_whisper_model():
         logger.info("WhisperModel loaded")
     return _whisper_model
 
+
 def get_vad():
     global _vad
     if _vad is None:
@@ -72,6 +74,7 @@ def get_vad():
         )
         logger.info("VAD pipeline loaded")
     return _vad
+
 
 def get_clustering_diarizer():
     global _clustering_diarizer
@@ -87,6 +90,7 @@ def get_clustering_diarizer():
         logger.info("Clustering-based diarizer loaded")
     return _clustering_diarizer
 
+
 def get_fs_eend_pipeline():
     """
     Официальный end-to-end diarization pipeline из pyannote-audio.
@@ -99,11 +103,12 @@ def get_fs_eend_pipeline():
         use_auth_token=settings.HUGGINGFACE_TOKEN
     )
 
+
 @worker_process_init.connect
 def preload_and_warmup(**kwargs):
     """
     Для CPU-воркера (WHISPER_DEVICE=cpu) — прогреваем только Whisper.
-    Для GPU-воркера (WHISPER_DEVICE=cuda) — прогреваем только VAD + diarization.
+    Для GPU-воркера (WHISPER_DEVICE=cuda) — прогреваем VAD + clustering (+ FS-EEND).
     """
     sample = Path(__file__).resolve().parent / "tests" / "fixtures" / "sample.wav"
     device = settings.WHISPER_DEVICE.lower()
@@ -119,31 +124,34 @@ def preload_and_warmup(**kwargs):
         except Exception as e:
             logger.warning(f"Warm-up WhisperModel failed: {e}")
     else:
-        # Warm-up VAD + clustering diarizer + (опционально FS-EEND)
+        # Warm-up VAD
         try:
             get_vad().apply({"audio": str(sample)})
             logger.info("✅ Warm-up VAD complete (GPU worker)")
         except Exception as e:
             logger.warning(f"Warm-up VAD failed: {e}")
+        # Warm-up clustering diarizer
         try:
             get_clustering_diarizer().apply({"audio": str(sample)})
             logger.info("✅ Warm-up clustering diarizer complete (GPU worker)")
         except Exception as e:
             logger.warning(f"Warm-up clustering diarizer failed: {e}")
+        # Warm-up FS-EEND (если включён)
         if settings.USE_FS_EEND:
             try:
-                pipeline = get_fs_eend_pipeline()
-                pipeline({"audio": str(sample)})
+                pipe = get_fs_eend_pipeline()
+                pipe({"audio": str(sample)})
                 logger.info("✅ Warm-up FS-EEND complete (GPU worker)")
             except Exception as e:
                 logger.warning(f"Warm-up FS-EEND failed: {e}")
+
 
 @shared_task(bind=True, name="tasks.transcribe_segments", queue="preprocess_cpu")
 def transcribe_segments(self, upload_id: str, correlation_id: str):
     adapter = logging.LoggerAdapter(logger, {"correlation_id": correlation_id})
     whisper = get_whisper_model()
 
-    # очередь задержки
+    # измеряем задержку в очереди
     headers = getattr(self.request, "headers", {}) or {}
     enqueue_ts = headers.get("enqueue_time")
     if enqueue_ts:
@@ -158,7 +166,7 @@ def transcribe_segments(self, upload_id: str, correlation_id: str):
     wav_name = Path(upload_id).stem + ".wav"
     wav_path = Path(settings.UPLOAD_FOLDER) / wav_name
 
-    # конвертация в WAV
+    # конвертация в WAV, если нужно
     if upload_path.suffix.lower() != ".wav":
         convert_to_wav(upload_path, wav_path, sample_rate=16000, channels=1)
         src = wav_path
@@ -206,6 +214,7 @@ def transcribe_segments(self, upload_id: str, correlation_id: str):
     redis.publish(f"progress:{upload_id}", "50%")
     redis.set(f"progress:{upload_id}", "50%")
 
+
 @shared_task(bind=True, name="tasks.diarize_full", queue="preprocess_gpu")
 def diarize_full(self, upload_id: str, correlation_id: str):
     adapter = logging.LoggerAdapter(logger, {"correlation_id": correlation_id})
@@ -214,7 +223,7 @@ def diarize_full(self, upload_id: str, correlation_id: str):
     wav_name = Path(upload_id).stem + ".wav"
     src = Path(settings.UPLOAD_FOLDER) / wav_name
 
-    # VAD (для подстраховки)
+    # VAD (резервно)
     speech = get_vad().apply({"audio": str(src)})
 
     speakers = []
@@ -239,6 +248,7 @@ def diarize_full(self, upload_id: str, correlation_id: str):
     redis = Redis.from_url(settings.CELERY_BROKER_URL)
     redis.publish(f"progress:{upload_id}", "100%")
     redis.set(f"progress:{upload_id}", "100%")
+
 
 def split_audio_fixed_windows(audio_path: Path, window_s: int):
     audio = AudioSegment.from_file(str(audio_path))
