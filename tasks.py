@@ -21,12 +21,12 @@ app = Celery(
     broker=settings.CELERY_BROKER_URL,
     backend=settings.CELERY_RESULT_BACKEND,
 )
+# По умолчанию — CPU-очередь
 app.conf.task_default_queue = "preprocess_cpu"
-
-# Route tasks to appropriate queues
+# Маршрутизация: транскрипция→CPU, диаризация→GPU
 app.conf.task_routes = {
-    "tasks.transcribe_segments": {"queue": "preprocess_gpu"},
-    "tasks.diarize_full":       {"queue": "preprocess_cpu"},
+    "tasks.transcribe_segments": {"queue": "preprocess_cpu"},
+    "tasks.diarize_full":       {"queue": "preprocess_gpu"},
 }
 
 logger = logging.getLogger(__name__)
@@ -70,18 +70,6 @@ def get_vad():
         _vad = VoiceActivityDetection.from_pretrained(
             model_id, use_auth_token=settings.HUGGINGFACE_TOKEN
         )
-        # Попытка переместить пайплайн на GPU (не затираем _vad)
-        device = (
-            settings.FS_EEND_DEVICE.lower()
-            if settings.USE_FS_EEND
-            else settings.WHISPER_DEVICE.lower()
-        )
-        if device != "cpu":
-            try:
-                _vad.to(torch.device(device))
-                logger.info(f"VAD pipeline moved to {device}")
-            except Exception as e:
-                logger.warning(f"Could not move VAD to {device}: {e}")
         logger.info("VAD pipeline loaded")
     return _vad
 
@@ -96,13 +84,6 @@ def get_clustering_diarizer():
             cache_dir=cache_dir,
             use_auth_token=settings.HUGGINGFACE_TOKEN,
         )
-        device = getattr(settings, "PYANNOTE_DEVICE", settings.WHISPER_DEVICE).lower()
-        if device != "cpu":
-            try:
-                _clustering_diarizer.to(torch.device(device))
-                logger.info(f"Clustering diarizer moved to {device}")
-            except Exception as e:
-                logger.warning(f"Could not move clustering diarizer to {device}: {e}")
         logger.info("Clustering-based diarizer loaded")
     return _clustering_diarizer
 
@@ -120,45 +101,49 @@ def get_fs_eend_pipeline():
 
 @worker_process_init.connect
 def preload_and_warmup(**kwargs):
+    """
+    Для CPU-воркера (WHISPER_DEVICE=cpu) — прогреваем только Whisper.
+    Для GPU-воркера (WHISPER_DEVICE=cuda) — прогреваем только VAD + diarization.
+    """
     sample = Path(__file__).resolve().parent / "tests" / "fixtures" / "sample.wav"
-    # Warm-up VAD
-    try:
-        get_vad().apply({"audio": str(sample)})
-        logger.info("✅ Warm-up VAD complete")
-    except Exception as e:
-        logger.warning(f"Warm-up VAD failed: {e}")
+    device = settings.WHISPER_DEVICE.lower()
 
-    # Warm-up clustering diarizer
-    try:
-        get_clustering_diarizer().apply({"audio": str(sample)})
-        logger.info("✅ Warm-up clustering diarizer complete")
-    except Exception as e:
-        logger.warning(f"Warm-up clustering diarizer failed: {e}")
-
-    # Warm-up FS-EEND (pyannote)
-    if settings.USE_FS_EEND:
+    if device == "cpu":
+        # Warm-up Whisper
         try:
-            pipeline = get_fs_eend_pipeline()
-            pipeline({"audio": str(sample)})
-            logger.info("✅ Warm-up FS-EEND complete")
+            opts = {}
+            if settings.WHISPER_LANGUAGE:
+                opts["language"] = settings.WHISPER_LANGUAGE
+            get_whisper_model().transcribe(str(sample), **opts)
+            logger.info("✅ Warm-up WhisperModel complete (CPU worker)")
         except Exception as e:
-            logger.warning(f"Warm-up FS-EEND failed: {e}")
+            logger.warning(f"Warm-up WhisperModel failed: {e}")
+    else:
+        # Warm-up VAD + clustering diarizer + (опционально FS-EEND)
+        try:
+            get_vad().apply({"audio": str(sample)})
+            logger.info("✅ Warm-up VAD complete (GPU worker)")
+        except Exception as e:
+            logger.warning(f"Warm-up VAD failed: {e}")
+        try:
+            get_clustering_diarizer().apply({"audio": str(sample)})
+            logger.info("✅ Warm-up clustering diarizer complete (GPU worker)")
+        except Exception as e:
+            logger.warning(f"Warm-up clustering diarizer failed: {e}")
+        if settings.USE_FS_EEND:
+            try:
+                pipeline = get_fs_eend_pipeline()
+                pipeline({"audio": str(sample)})
+                logger.info("✅ Warm-up FS-EEND complete (GPU worker)")
+            except Exception as e:
+                logger.warning(f"Warm-up FS-EEND failed: {e}")
 
-    # Warm-up Whisper
-    try:
-        opts = {}
-        if settings.WHISPER_LANGUAGE:
-            opts["language"] = settings.WHISPER_LANGUAGE
-        get_whisper_model().transcribe(str(sample), **opts)
-        logger.info("✅ Warm-up WhisperModel complete")
-    except Exception as e:
-        logger.warning(f"Warm-up WhisperModel failed: {e}")
-
-@shared_task(bind=True, name="tasks.transcribe_segments", queue="preprocess_gpu")
+@shared_task(bind=True, name="tasks.transcribe_segments", queue="preprocess_cpu")
 def transcribe_segments(self, upload_id: str, correlation_id: str):
     adapter = logging.LoggerAdapter(logger, {"correlation_id": correlation_id})
     whisper = get_whisper_model()
 
+    # очередь задержки
     headers = getattr(self.request, "headers", {}) or {}
     enqueue_ts = headers.get("enqueue_time")
     if enqueue_ts:
@@ -173,7 +158,7 @@ def transcribe_segments(self, upload_id: str, correlation_id: str):
     wav_name = Path(upload_id).stem + ".wav"
     wav_path = Path(settings.UPLOAD_FOLDER) / wav_name
 
-    # Преобразуем в WAV, если нужно
+    # конвертация в WAV
     if upload_path.suffix.lower() != ".wav":
         convert_to_wav(upload_path, wav_path, sample_rate=16000, channels=1)
         src = wav_path
@@ -221,7 +206,7 @@ def transcribe_segments(self, upload_id: str, correlation_id: str):
     redis.publish(f"progress:{upload_id}", "50%")
     redis.set(f"progress:{upload_id}", "50%")
 
-@shared_task(bind=True, name="tasks.diarize_full", queue="preprocess_cpu")
+@shared_task(bind=True, name="tasks.diarize_full", queue="preprocess_gpu")
 def diarize_full(self, upload_id: str, correlation_id: str):
     adapter = logging.LoggerAdapter(logger, {"correlation_id": correlation_id})
     start_time = time.time()
@@ -229,7 +214,7 @@ def diarize_full(self, upload_id: str, correlation_id: str):
     wav_name = Path(upload_id).stem + ".wav"
     src = Path(settings.UPLOAD_FOLDER) / wav_name
 
-    # Сегментация VAD — всегда сначала
+    # VAD (для подстраховки)
     speech = get_vad().apply({"audio": str(src)})
 
     speakers = []
@@ -238,20 +223,12 @@ def diarize_full(self, upload_id: str, correlation_id: str):
         pipeline = get_fs_eend_pipeline()
         diarization = pipeline({"audio": str(src)})
         for segment, _, spk in diarization.itertracks(yield_label=True):
-            speakers.append({
-                "start": segment.start,
-                "end": segment.end,
-                "speaker": spk
-            })
+            speakers.append({"start": segment.start, "end": segment.end, "speaker": spk})
     else:
         adapter.info("Using clustering-based diarization")
         ann = get_clustering_diarizer().apply({"audio": str(src)})
         for turn, _, spk in ann.itertracks(yield_label=True):
-            speakers.append({
-                "start": turn.start,
-                "end": turn.end,
-                "speaker": spk
-            })
+            speakers.append({"start": turn.start, "end": turn.end, "speaker": spk})
 
     dst_dir = Path(settings.RESULTS_FOLDER) / upload_id
     dst_dir.mkdir(parents=True, exist_ok=True)
