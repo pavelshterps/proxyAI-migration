@@ -1,5 +1,4 @@
 # Dockerfile.gpu
-
 FROM nvidia/cuda:12.2.2-cudnn8-runtime-ubuntu22.04
 WORKDIR /app
 
@@ -7,10 +6,11 @@ WORKDIR /app
 RUN sed -i 's|http://archive.ubuntu.com/ubuntu/|http://ru.archive.ubuntu.com/ubuntu/|g' /etc/apt/sources.list && \
     sed -i 's|http://security.ubuntu.com/ubuntu|http://ru.archive.ubuntu.com/ubuntu/|g' /etc/apt/sources.list
 
-# Системные зависимости + git
+# Системные зависимости + git + libs for librosa
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-      python3-pip python3-dev build-essential ffmpeg libsndfile1 git && \
+      python3-pip python3-dev build-essential ffmpeg libsndfile1 git \
+      libavformat-dev libavcodec-dev libavutil-dev libswscale-dev libportaudio2 && \
     rm -rf /var/lib/apt/lists/*
 
 # Python-библиотеки
@@ -18,8 +18,8 @@ COPY requirements.txt ./
 RUN pip3 install --upgrade pip && \
     pip3 install --no-cache-dir -r requirements.txt
 
-#  — FS-EEND dependencies —
-RUN pip install --no-cache-dir yamlargparse chainer "numpy<2.0" cupy-cuda12x h5py
+# — FS-EEND dependencies —
+RUN pip3 install --no-cache-dir yamlargparse chainer "numpy<2.0" cupy-cuda12x h5py
 
 # CTranslate2/Faster-Whisper
 RUN pip3 install --no-cache-dir --no-deps \
