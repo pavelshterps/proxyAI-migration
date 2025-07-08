@@ -21,7 +21,7 @@ RUN pip install --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
 # — FS-EEND dependencies —
-RUN pip install --no-cache-dir yamlargparse chainer "numpy<2.0" cupy-cuda12x h5py
+RUN pip install --no-cache-dir yamlargparse chainer "numpy<2.0" cupy-cuda12x h5py "librosa>=0.10.0" "soundfile>=0.12.1"
 
 # Vendored FS-EEND
 COPY eend/ /app/eend/

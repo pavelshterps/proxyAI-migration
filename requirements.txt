@@ -26,3 +26,4 @@ numpy<2.0
 cupy-cuda12x
 h5py>=3.0.0
 librosa>=0.10.0
+soundfile>=0.12.1
