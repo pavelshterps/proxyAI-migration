@@ -58,7 +58,7 @@ class Settings(BaseSettings):
     # segmentation/VAD
     SEGMENT_LENGTH_S: int = Field(30, env="SEGMENT_LENGTH_S")
     VAD_LEVEL: int = Field(2, env="VAD_LEVEL")
-    VAD_MODEL_PATH = Field(..., env="VAD_MODEL_PATH")  # path to ONNX model
+    VAD_MODEL_PATH: str = Field(..., env="VAD_MODEL_PATH")  # path to ONNX model
 
     # limits & retention
     MAX_FILE_SIZE: int = Field(1_073_741_824, env="MAX_FILE_SIZE")
