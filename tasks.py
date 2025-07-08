@@ -27,9 +27,7 @@ logger = logging.getLogger(__name__)
 
 _whisper_model = None
 _vad = None
-_diarizer = None
-_eend_model = None
-
+_clustering_diarizer = None
 
 def get_whisper_model():
     global _whisper_model
@@ -57,7 +55,6 @@ def get_whisper_model():
         logger.info("WhisperModel loaded")
     return _whisper_model
 
-
 def get_vad():
     global _vad
     if _vad is None:
@@ -81,14 +78,13 @@ def get_vad():
         logger.info("VAD pipeline loaded")
     return _vad
 
-
 def get_clustering_diarizer():
-    global _diarizer
-    if _diarizer is None:
+    global _clustering_diarizer
+    if _clustering_diarizer is None:
         cache_dir = settings.DIARIZER_CACHE_DIR
         os.makedirs(cache_dir, exist_ok=True)
         logger.info(f"Loading clustering SpeakerDiarization into cache '{cache_dir}'")
-        _diarizer = SpeakerDiarization.from_pretrained(
+        _clustering_diarizer = SpeakerDiarization.from_pretrained(
             settings.PYANNOTE_PIPELINE,
             cache_dir=cache_dir,
             use_auth_token=settings.HUGGINGFACE_TOKEN,
@@ -96,40 +92,24 @@ def get_clustering_diarizer():
         device = getattr(settings, "PYANNOTE_DEVICE", settings.WHISPER_DEVICE).lower()
         if device != "cpu":
             try:
-                _diarizer.to(torch.device(device))
+                _clustering_diarizer.to(torch.device(device))
                 logger.info(f"Clustering diarizer moved to {device}")
             except Exception as e:
                 logger.warning(f"Could not move clustering diarizer to {device}: {e}")
         logger.info("Clustering-based diarizer loaded")
-    return _diarizer
+    return _clustering_diarizer
 
-
-def get_eend_model():
-    global _eend_model
-
-    if not settings.USE_FS_EEND or not settings.FS_EEND_MODEL_PATH:
-        raise RuntimeError("FS-EEND is not enabled or model path is not set")
-
-    if _eend_model is None:
-        # импортим EENDInference только здесь
-        try:
-            from eend.inference import Inference as EENDInference
-        except ImportError as e:
-            logger.error(
-                "FS-EEND module not found; "
-                "скачайте и положите пакет EEND в каталог eend/ или отключите USE_FS_EEND",
-                exc_info=e,
-            )
-            raise
-
-        _eend_model = EENDInference(
-            model=settings.FS_EEND_MODEL_PATH, device=settings.FS_EEND_DEVICE
-        )
-        logger.info(
-            f"FS-EEND model loaded (path={settings.FS_EEND_MODEL_PATH}, device={settings.FS_EEND_DEVICE})"
-        )
-    return _eend_model
-
+def get_fs_eend_pipeline():
+    """
+    Официальный FS-EEND (neural diarization) из Pyannote.
+    Идентификатор можно задать в settings.FS_EEND_PIPELINE,
+    иначе берём 'pyannote/speaker-diarization'.
+    """
+    pipeline_id = getattr(settings, "FS_EEND_PIPELINE", "pyannote/speaker-diarization")
+    return SpeakerDiarization.from_pretrained(
+        pipeline_id,
+        use_auth_token=settings.HUGGINGFACE_TOKEN
+    )
 
 @worker_process_init.connect
 def preload_and_warmup(**kwargs):
@@ -148,13 +128,11 @@ def preload_and_warmup(**kwargs):
     except Exception as e:
         logger.warning(f"Warm-up clustering diarizer failed: {e}")
 
-    # Warm-up FS-EEND
-    if settings.USE_FS_EEND and settings.FS_EEND_MODEL_PATH:
+    # Warm-up FS-EEND (pyannote)
+    if settings.USE_FS_EEND:
         try:
-            try:
-                get_eend_model().diarize(str(sample))
-            except Exception as e:
-                logger.warning(f"Skipping FS-EEND warm-up (will load on first real job): {e}")
+            pipeline = get_fs_eend_pipeline()
+            pipeline({"audio": str(sample)})
             logger.info("✅ Warm-up FS-EEND complete")
         except Exception as e:
             logger.warning(f"Warm-up FS-EEND failed: {e}")
@@ -168,10 +146,6 @@ def preload_and_warmup(**kwargs):
         logger.info("✅ Warm-up WhisperModel complete")
     except Exception as e:
         logger.warning(f"Warm-up WhisperModel failed: {e}")
-
-
-# … остальной код тасков без изменений …
-
 
 @shared_task(bind=True, name="tasks.transcribe_segments", queue="preprocess_gpu")
 def transcribe_segments(self, upload_id: str, correlation_id: str):
@@ -237,7 +211,6 @@ def transcribe_segments(self, upload_id: str, correlation_id: str):
     redis.publish(f"progress:{upload_id}", "50%")
     redis.set(f"progress:{upload_id}", "50%")
 
-
 @shared_task(bind=True, name="tasks.diarize_full", queue="preprocess_gpu")
 def diarize_full(self, upload_id: str, correlation_id: str):
     adapter = logging.LoggerAdapter(logger, {"correlation_id": correlation_id})
@@ -246,27 +219,29 @@ def diarize_full(self, upload_id: str, correlation_id: str):
     wav_name = Path(upload_id).stem + ".wav"
     src = Path(settings.UPLOAD_FOLDER) / wav_name
 
-    vad = get_vad()
-    speech = vad.apply({"audio": str(src)})
-    regions = speech.get_timeline().support()
+    # Сегментация VAD — используем всегда
+    speech = get_vad().apply({"audio": str(src)})
 
     speakers = []
-    if settings.USE_FS_EEND and settings.FS_EEND_MODEL_PATH:
-        adapter.info("Using FS-EEND diarization")
-        eend = get_eend_model()
-        labels = eend.diarize(str(src))
-        fs = settings.FRAME_SHIFT
-        for i, row in enumerate(labels):
-            t0 = i * fs
-            for spk_idx, active in enumerate(row):
-                if active:
-                    speakers.append({"start": t0, "end": t0 + fs, "speaker": spk_idx})
+    if settings.USE_FS_EEND:
+        adapter.info("Using FS-EEND (pyannote) diarization")
+        pipeline = get_fs_eend_pipeline()
+        diarization = pipeline({"audio": str(src)})
+        for segment, _, spk in diarization.itertracks(yield_label=True):
+            speakers.append({
+                "start": segment.start,
+                "end": segment.end,
+                "speaker": spk
+            })
     else:
         adapter.info("Using clustering-based diarization")
-        diar = get_clustering_diarizer()
-        ann = diar.apply({"audio": str(src)})
+        ann = get_clustering_diarizer().apply({"audio": str(src)})
         for turn, _, spk in ann.itertracks(yield_label=True):
-            speakers.append({"start": turn.start, "end": turn.end, "speaker": spk})
+            speakers.append({
+                "start": turn.start,
+                "end": turn.end,
+                "speaker": spk
+            })
 
     dst_dir = Path(settings.RESULTS_FOLDER) / upload_id
     dst_dir.mkdir(parents=True, exist_ok=True)
@@ -277,7 +252,6 @@ def diarize_full(self, upload_id: str, correlation_id: str):
     redis = Redis.from_url(settings.CELERY_BROKER_URL)
     redis.publish(f"progress:{upload_id}", "100%")
     redis.set(f"progress:{upload_id}", "100%")
-
 
 def split_audio_fixed_windows(audio_path: Path, window_s: int):
     audio = AudioSegment.from_file(str(audio_path))

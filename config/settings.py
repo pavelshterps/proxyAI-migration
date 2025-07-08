@@ -59,6 +59,7 @@ class Settings(BaseSettings):
     SEGMENT_LENGTH_S: int = Field(30, env="SEGMENT_LENGTH_S")
     VAD_LEVEL: int = Field(2, env="VAD_LEVEL")
     VAD_MODEL_PATH: str = Field(..., env="VAD_MODEL_PATH")  # path to ONNX model
+    FS_EEND_PIPELINE: str = Field(..., env="FS_EEND_PIPELINE")
 
     # limits & retention
     MAX_FILE_SIZE: int = Field(1_073_741_824, env="MAX_FILE_SIZE")
