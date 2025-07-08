@@ -234,6 +234,15 @@ def diarize_full(self, upload_id: str, correlation_id: str):
     wav_name = Path(upload_id).stem + ".wav"
     src = Path(settings.UPLOAD_FOLDER) / wav_name
 
+    # ─── Fallback: если WAV ещё нет, конвертируем оригинал ─────────────────────────
+    if not src.exists():
+        orig = Path(settings.UPLOAD_FOLDER) / upload_id
+        if orig.exists():
+            adapter.info(f"Converting '{orig}' to WAV for diarization")
+            convert_to_wav(orig, src, sample_rate=16000, channels=1)
+        else:
+            raise ValueError(f"Neither {src} nor {orig} exist for upload_id={upload_id}")
+
     # ─── VAD (резервно) ────────────────────────────────────────────────────────────
     speech = get_vad().apply({"audio": str(src)})
 
