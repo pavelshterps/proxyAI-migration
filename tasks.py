@@ -151,7 +151,7 @@ def transcribe_segments(self, upload_id: str, correlation_id: str):
     adapter = logging.LoggerAdapter(logger, {"correlation_id": correlation_id})
     whisper = get_whisper_model()
 
-    # измеряем задержку в очереди
+    # ─── измеряем задержку в очереди ───────────────────────────────────────────────
     headers = getattr(self.request, "headers", {}) or {}
     enqueue_ts = headers.get("enqueue_time")
     if enqueue_ts:
@@ -166,7 +166,7 @@ def transcribe_segments(self, upload_id: str, correlation_id: str):
     wav_name = Path(upload_id).stem + ".wav"
     wav_path = Path(settings.UPLOAD_FOLDER) / wav_name
 
-    # конвертация в WAV, если нужно
+    # ─── конвертация в WAV, если нужно ─────────────────────────────────────────────
     if upload_path.suffix.lower() != ".wav":
         convert_to_wav(upload_path, wav_path, sample_rate=16000, channels=1)
         src = wav_path
@@ -208,7 +208,8 @@ def transcribe_segments(self, upload_id: str, correlation_id: str):
 
     out_file = dst_dir / "transcript.json"
     out_file.write_text(json.dumps(transcript, ensure_ascii=False, indent=2))
-    adapter.info(f"Transcription saved to {out_file} in {time.time() - start_time:.2f}s")
+    elapsed = time.time() - start_time
+    adapter.info(f"✅ Transcription saved to {out_file} in {elapsed:.2f}s")
 
     redis = Redis.from_url(settings.CELERY_BROKER_URL)
     redis.publish(f"progress:{upload_id}", "50%")
@@ -218,12 +219,22 @@ def transcribe_segments(self, upload_id: str, correlation_id: str):
 @shared_task(bind=True, name="tasks.diarize_full", queue="preprocess_gpu")
 def diarize_full(self, upload_id: str, correlation_id: str):
     adapter = logging.LoggerAdapter(logger, {"correlation_id": correlation_id})
-    start_time = time.time()
 
+    # ─── измеряем задержку в очереди ───────────────────────────────────────────────
+    headers = getattr(self.request, "headers", {}) or {}
+    enqueue_ts = headers.get("enqueue_time")
+    if enqueue_ts:
+        try:
+            delay = time.time() - float(enqueue_ts)
+            adapter.info(f"⏳ Queue delay: {delay:.2f}s")
+        except ValueError:
+            adapter.warning(f"Invalid enqueue_time header: {enqueue_ts}")
+
+    start_time = time.time()
     wav_name = Path(upload_id).stem + ".wav"
     src = Path(settings.UPLOAD_FOLDER) / wav_name
 
-    # VAD (резервно)
+    # ─── VAD (резервно) ────────────────────────────────────────────────────────────
     speech = get_vad().apply({"audio": str(src)})
 
     speakers = []
@@ -243,7 +254,8 @@ def diarize_full(self, upload_id: str, correlation_id: str):
     dst_dir.mkdir(parents=True, exist_ok=True)
     out_file = dst_dir / "diarization.json"
     out_file.write_text(json.dumps(speakers, ensure_ascii=False, indent=2))
-    adapter.info(f"Diarization saved to {out_file} in {time.time() - start_time:.2f}s")
+    elapsed = time.time() - start_time
+    adapter.info(f"✅ Diarization saved to {out_file} in {elapsed:.2f}s")
 
     redis = Redis.from_url(settings.CELERY_BROKER_URL)
     redis.publish(f"progress:{upload_id}", "100%")
