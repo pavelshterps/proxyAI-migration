@@ -240,8 +240,9 @@ async def upload(
 
     # выбор внутренней/внешней транскрипции
     mode = settings.DEFAULT_TRANSCRIBE_MODE.lower()
-    if mode == "external":
-        external_transcribe.delay(upload_id, cid)
+    if mode == "external" and settings.EXTERNAL_API_URL:
+        transcribe_segments.delay(upload_id, cid)
+        diarize_full.delay(upload_id, cid)
     else:
         transcribe_segments.delay(upload_id, cid)
         diarize_full.delay(upload_id, cid)
