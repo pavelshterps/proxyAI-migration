@@ -1,3 +1,4 @@
+# docker-compose.yml
 services:
   db:
     image: postgres:15
@@ -66,8 +67,7 @@ services:
       - results-data:/data/results
       - diarizer-cache:/data/diarizer_cache:ro
       - /path/to/hf_cache_host:/hf_cache:rw
-    command: ["celery", "-A", "tasks", "worker", "--loglevel=info",
-              "--concurrency=${CPU_CONCURRENCY}", "--queues=preprocess_cpu"]
+    command: ["celery", "-A", "tasks", "worker", "--loglevel=info", "--concurrency=${CPU_CONCURRENCY}", "--queues=preprocess_cpu"]
     depends_on:
       - db
       - redis
