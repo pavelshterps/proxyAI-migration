@@ -217,13 +217,12 @@ async def upload(
 
     # 3) Обычная загрузка файла
     elif file:
-        ct = file.content_type or ""
-        if not (ct.startswith("audio/") or ct.startswith("video/")):
-            raise HTTPException(status_code=415, detail="Unsupported file type")
         data = await file.read()
+        if len(data) == 0:
+            raise HTTPException(status_code=400, detail="File is empty")
         if len(data) > settings.MAX_FILE_SIZE:
             raise HTTPException(status_code=413, detail="File too large")
-        ext = Path(file.filename).suffix
+        ext = Path(file.filename).suffix or ""
         upload_id = f"{uuid.uuid4().hex}{ext}"
         dest = Path(settings.UPLOAD_FOLDER) / upload_id
         dest.write_bytes(data)
