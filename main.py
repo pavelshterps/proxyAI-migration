@@ -1,13 +1,18 @@
+# main.py
+
 import time
 import uuid
 from pathlib import Path
 import structlog
 import redis.asyncio as redis_async
+import httpx
+from urllib.parse import urlparse
 
 from fastapi import (
     FastAPI,
     UploadFile,
     File,
+    Form,
     HTTPException,
     Header,
     Depends,
@@ -153,11 +158,7 @@ async def get_status(
     base = Path(settings.RESULTS_FOLDER) / upload_id
     done = (base / "transcript.json").exists() and (base / "diarization.json").exists()
 
-    if done:
-        status_str = "done"
-    else:
-        status_str = "processing"
-
+    status_str = "done" if done else "processing"
     progress = await redis.get(f"progress:{upload_id}") or "0%"
     return {"status": status_str, "progress": progress}
 
@@ -170,24 +171,44 @@ async def get_status(
 @limiter.limit("10/minute")
 async def upload(
     request: Request,
-    file: UploadFile = File(...),
+    file: UploadFile | None = File(None),
+    s3_url: str | None = Form(None),
     x_correlation_id: str | None = Header(None),
     current_user=Depends(get_current_user),
     db=Depends(get_db),
 ):
     cid = x_correlation_id or str(uuid.uuid4())
-    ct = file.content_type or ""
-    if not (ct.startswith("audio/") or ct.startswith("video/")):
-        raise HTTPException(status_code=415, detail="Unsupported file type")
-    data = await file.read()
-    if len(data) > settings.MAX_FILE_SIZE:
-        raise HTTPException(status_code=413, detail="File too large")
 
-    ext = Path(file.filename).suffix
-    upload_id = f"{uuid.uuid4().hex}{ext}"
-    dest = Path(settings.UPLOAD_FOLDER) / upload_id
-    dest.write_bytes(data)
+    # either file upload or S3 URL
+    if s3_url:
+        # download from S3-presigned URL
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(s3_url)
+                resp.raise_for_status()
+                data = resp.content
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Failed to fetch from s3_url: {e}")
+        ext = Path(urlparse(s3_url).path).suffix or ""
+        upload_id = f"{uuid.uuid4().hex}{ext}"
+        dest = Path(settings.UPLOAD_FOLDER) / upload_id
+        dest.write_bytes(data)
+    elif file:
+        # direct upload
+        ct = file.content_type or ""
+        if not (ct.startswith("audio/") or ct.startswith("video/")):
+            raise HTTPException(status_code=415, detail="Unsupported file type")
+        data = await file.read()
+        if len(data) > settings.MAX_FILE_SIZE:
+            raise HTTPException(status_code=413, detail="File too large")
+        ext = Path(file.filename).suffix
+        upload_id = f"{uuid.uuid4().hex}{ext}"
+        dest = Path(settings.UPLOAD_FOLDER) / upload_id
+        dest.write_bytes(data)
+    else:
+        raise HTTPException(status_code=400, detail="Must provide either file or s3_url")
 
+    # record & log
     await create_upload_record(db, current_user.id, upload_id)
     log.bind(
         correlation_id=cid,
@@ -203,6 +224,7 @@ async def upload(
         transcribe_segments.delay(upload_id, cid)
         diarize_full.delay(upload_id, cid)
 
+    # init progress
     await redis.publish(f"progress:{upload_id}", "0%")
     await redis.set(f"progress:{upload_id}", "0%")
 
