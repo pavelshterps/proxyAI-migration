@@ -80,7 +80,7 @@ class Settings(BaseSettings):
     EXTERNAL_POLL_INTERVAL_S: int = Field(5, env="EXTERNAL_POLL_INTERVAL_S")
 
     # --- Новое: переключение на внешний сервис ---
-    USE_EXTERNAL_TRANSCRIBE: bool = Field(False, env="USE_EXTERNAL_TRANSCRIBE")
+    DEFAULT_TRANSCRIBE_MODE: str = Field("local", env="DEFAULT_TRANSCRIBE_MODE")
 
     @property
     def ALLOWED_ORIGINS_LIST(self) -> List[str]:

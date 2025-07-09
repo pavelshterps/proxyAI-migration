@@ -1,5 +1,3 @@
-# main.py
-
 import time
 import uuid
 from pathlib import Path
@@ -198,7 +196,8 @@ async def upload(
     ).info("upload accepted")
 
     # выбор между внутренней и внешней транскрипцией
-    if settings.USE_EXTERNAL_TRANSCRIBE:
+    mode = settings.DEFAULT_TRANSCRIBE_MODE.lower()
+    if mode == "external":
         external_transcribe.delay(upload_id, cid)
     else:
         transcribe_segments.delay(upload_id, cid)
