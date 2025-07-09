@@ -5,6 +5,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field
 from typing import List, Optional
 
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 
@@ -58,7 +59,7 @@ class Settings(BaseSettings):
     # segmentation/VAD
     SEGMENT_LENGTH_S: int = Field(30, env="SEGMENT_LENGTH_S")
     VAD_LEVEL: int = Field(2, env="VAD_LEVEL")
-    VAD_MODEL_PATH: str = Field(..., env="VAD_MODEL_PATH")  # path to ONNX model
+    VAD_MODEL_PATH: str = Field(..., env="VAD_MODEL_PATH")
     FS_EEND_PIPELINE: str = Field(..., env="FS_EEND_PIPELINE")
 
     # limits & retention
@@ -73,6 +74,12 @@ class Settings(BaseSettings):
     FLOWER_USER: Optional[str] = Field(None, env="FLOWER_USER")
     FLOWER_PASS: Optional[str] = Field(None, env="FLOWER_PASS")
 
+    # --- Новые поля для внешней транскрипции ---
+    EXTERNAL_API_URL: str = Field(..., env="EXTERNAL_API_URL")
+    EXTERNAL_API_KEY: str = Field(..., env="EXTERNAL_API_KEY")
+    PUBLIC_BASE_URL: str = Field(..., env="PUBLIC_BASE_URL")
+    EXTERNAL_POLL_INTERVAL_S: int = Field(5, env="EXTERNAL_POLL_INTERVAL_S")
+
     @property
     def ALLOWED_ORIGINS_LIST(self) -> List[str]:
         import json
@@ -80,5 +87,6 @@ class Settings(BaseSettings):
             return json.loads(self.ALLOWED_ORIGINS)
         except Exception:
             return [o.strip() for o in self.ALLOWED_ORIGINS.split(",") if o.strip()]
+
 
 settings = Settings()

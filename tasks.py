@@ -1,3 +1,5 @@
+# tasks.py
+
 import os
 import json
 import logging
@@ -5,6 +7,7 @@ import time
 from pathlib import Path
 
 import torch
+import requests
 from celery import Celery, shared_task
 from celery.signals import worker_process_init
 from faster_whisper import WhisperModel
@@ -23,10 +26,11 @@ app = Celery(
 )
 # По умолчанию — CPU-очередь
 app.conf.task_default_queue = "preprocess_cpu"
-# Маршрутизация: транскрипция→CPU, диаризация→GPU
+# Маршрутизация: транскрипция→CPU, диаризация→GPU, внешняя транскрипция→external
 app.conf.task_routes = {
-    "tasks.transcribe_segments": {"queue": "preprocess_cpu"},
-    "tasks.diarize_full":       {"queue": "preprocess_gpu"},
+    "tasks.transcribe_segments":    {"queue": "preprocess_cpu"},
+    "tasks.diarize_full":            {"queue": "preprocess_gpu"},
+    "tasks.external_transcribe":     {"queue": "preprocess_external"},
 }
 
 logger = logging.getLogger(__name__)
@@ -94,8 +98,7 @@ def get_clustering_diarizer():
 def get_fs_eend_pipeline():
     """
     Официальный end-to-end diarization pipeline из pyannote-audio.
-    Идентификатор задаётся в settings.FS_EEND_PIPELINE,
-    по умолчанию 'pyannote/speaker-diarization'.
+    Идентификатор задаётся в settings.FS_EEND_PIPELINE.
     """
     pipeline_id = getattr(settings, "FS_EEND_PIPELINE", "pyannote/speaker-diarization")
     return SpeakerDiarization.from_pretrained(
@@ -114,7 +117,6 @@ def preload_and_warmup(**kwargs):
     device = settings.WHISPER_DEVICE.lower()
 
     if device == "cpu":
-        # Warm-up Whisper
         try:
             opts = {}
             if settings.WHISPER_LANGUAGE:
@@ -124,19 +126,18 @@ def preload_and_warmup(**kwargs):
         except Exception as e:
             logger.warning(f"Warm-up WhisperModel failed: {e}")
     else:
-        # Warm-up VAD
         try:
             get_vad().apply({"audio": str(sample)})
             logger.info("✅ Warm-up VAD complete (GPU worker)")
         except Exception as e:
             logger.warning(f"Warm-up VAD failed: {e}")
-        # Warm-up clustering diarizer
+
         try:
             get_clustering_diarizer().apply({"audio": str(sample)})
             logger.info("✅ Warm-up clustering diarizer complete (GPU worker)")
         except Exception as e:
             logger.warning(f"Warm-up clustering diarizer failed: {e}")
-        # Warm-up FS-EEND (если включён)
+
         if settings.USE_FS_EEND:
             try:
                 pipe = get_fs_eend_pipeline()
@@ -220,7 +221,6 @@ def transcribe_segments(self, upload_id: str, correlation_id: str):
 def diarize_full(self, upload_id: str, correlation_id: str):
     adapter = logging.LoggerAdapter(logger, {"correlation_id": correlation_id})
 
-    # ─── измеряем задержку в очереди ───────────────────────────────────────────────
     headers = getattr(self.request, "headers", {}) or {}
     enqueue_ts = headers.get("enqueue_time")
     if enqueue_ts:
@@ -234,7 +234,6 @@ def diarize_full(self, upload_id: str, correlation_id: str):
     wav_name = Path(upload_id).stem + ".wav"
     src = Path(settings.UPLOAD_FOLDER) / wav_name
 
-    # ─── Fallback: если WAV ещё нет, конвертируем оригинал ─────────────────────────
     if not src.exists():
         orig = Path(settings.UPLOAD_FOLDER) / upload_id
         if orig.exists():
@@ -243,7 +242,6 @@ def diarize_full(self, upload_id: str, correlation_id: str):
         else:
             raise ValueError(f"Neither {src} nor {orig} exist for upload_id={upload_id}")
 
-    # ─── VAD (резервно) ────────────────────────────────────────────────────────────
     speech = get_vad().apply({"audio": str(src)})
 
     speakers = []
@@ -265,6 +263,64 @@ def diarize_full(self, upload_id: str, correlation_id: str):
     out_file.write_text(json.dumps(speakers, ensure_ascii=False, indent=2))
     elapsed = time.time() - start_time
     adapter.info(f"✅ Diarization saved to {out_file} in {elapsed:.2f}s")
+
+    redis = Redis.from_url(settings.CELERY_BROKER_URL)
+    redis.publish(f"progress:{upload_id}", "100%")
+    redis.set(f"progress:{upload_id}", "100%")
+
+
+@shared_task(bind=True, name="tasks.external_transcribe", queue="preprocess_external")
+def external_transcribe(self, upload_id: str, correlation_id: str):
+    adapter = logging.LoggerAdapter(logger, {"correlation_id": correlation_id})
+    file_url = f"{settings.PUBLIC_BASE_URL}/uploads/{upload_id}"
+    headers = {"API-KEY": settings.EXTERNAL_API_KEY}
+    payload = {"upload": file_url}
+
+    try:
+        response = requests.post(f"{settings.EXTERNAL_API_URL}/upload", json=payload, headers=headers)
+        response.raise_for_status()
+        data = response.json()
+        ext_id = data.get("id")
+        if not ext_id:
+            raise ValueError("No 'id' returned by external API")
+        adapter.info(f"Started external transcription, id={ext_id}")
+    except Exception as e:
+        adapter.error(f"Failed to start external transcription: {e}", exc_info=True)
+        return
+
+    # Poll until completion
+    status_url = f"{settings.EXTERNAL_API_URL}/status/{ext_id}"
+    while True:
+        try:
+            status_resp = requests.get(status_url, headers=headers)
+            status_resp.raise_for_status()
+            status_data = status_resp.json()
+            status = status_data.get("status")
+            adapter.info(f"External status: {status}")
+            if status == "completed":
+                result_url = status_data.get("result_url")
+                break
+            if status == "error":
+                adapter.error(f"External transcription error: {status_data}")
+                return
+        except Exception as e:
+            adapter.warning(f"Polling error: {e}", exc_info=True)
+        time.sleep(settings.EXTERNAL_POLL_INTERVAL_S)
+
+    # Fetch and save result
+    try:
+        result_resp = requests.get(result_url)
+        result_resp.raise_for_status()
+        transcript = result_resp.json()
+    except Exception as e:
+        adapter.error(f"Failed to fetch external transcript: {e}", exc_info=True)
+        return
+
+    dst_dir = Path(settings.RESULTS_FOLDER) / upload_id
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    out_file = dst_dir / "transcript.json"
+    out_file.write_text(json.dumps(transcript, ensure_ascii=False, indent=2))
+    adapter.info(f"Saved external transcript to {out_file}")
 
     redis = Redis.from_url(settings.CELERY_BROKER_URL)
     redis.publish(f"progress:{upload_id}", "100%")
