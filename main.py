@@ -1,5 +1,3 @@
-# main.py
-
 import time
 import uuid
 from pathlib import Path
@@ -13,6 +11,7 @@ from fastapi import (
     UploadFile,
     File,
     Form,
+    Body,                  # ⟵ NEW
     HTTPException,
     Header,
     Depends,
@@ -37,7 +36,7 @@ from dependencies import get_current_user
 from routes import router as api_router
 from admin_routes import router as admin_router
 
-from tasks import transcribe_segments, diarize_full, external_transcribe  # Added external_transcribe
+from tasks import transcribe_segments, diarize_full, external_transcribe
 
 # —————————————————————————————————————————————
 # async‐contextmanager для старта/остановки приложения
@@ -74,7 +73,10 @@ app.add_middleware(SlowAPIMiddleware)
 # CORS и TrustedHost
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.ALLOWED_ORIGINS_LIST,
+    allow_origins=[
+        *settings.ALLOWED_ORIGINS_LIST,
+        "https://transcriber-next.vercel.app",    # ⟵ NEW
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -171,17 +173,36 @@ async def get_status(
 @limiter.limit("10/minute")
 async def upload(
     request: Request,
+    # — multipart/form-data (как раньше) —
     file: UploadFile | None = File(None),
     s3_url: str | None = Form(None),
+    # — JSON-режим для внешнего фронта —
+    id: str | None = Body(None),
+    upload: str | None = Body(None),
     x_correlation_id: str | None = Header(None),
     current_user=Depends(get_current_user),
     db=Depends(get_db),
 ):
     cid = x_correlation_id or str(uuid.uuid4())
 
-    # either file upload or S3 URL
-    if s3_url:
-        # download from S3-presigned URL
+    # 1) JSON-поход
+    if upload is not None:
+        if not id:
+            raise HTTPException(status_code=400, detail="JSON must include 'id'")
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(upload)
+                resp.raise_for_status()
+                data = resp.content
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Failed to fetch '{upload}': {e}")
+        ext = Path(urlparse(upload).path).suffix or ""
+        upload_id = id
+        dest = Path(settings.UPLOAD_FOLDER) / upload_id
+        dest.write_bytes(data)
+
+    # 2) S3-URL из формы
+    elif s3_url:
         try:
             async with httpx.AsyncClient() as client:
                 resp = await client.get(s3_url)
@@ -193,8 +214,9 @@ async def upload(
         upload_id = f"{uuid.uuid4().hex}{ext}"
         dest = Path(settings.UPLOAD_FOLDER) / upload_id
         dest.write_bytes(data)
+
+    # 3) Обычная загрузка файла
     elif file:
-        # direct upload
         ct = file.content_type or ""
         if not (ct.startswith("audio/") or ct.startswith("video/")):
             raise HTTPException(status_code=415, detail="Unsupported file type")
@@ -205,10 +227,11 @@ async def upload(
         upload_id = f"{uuid.uuid4().hex}{ext}"
         dest = Path(settings.UPLOAD_FOLDER) / upload_id
         dest.write_bytes(data)
-    else:
-        raise HTTPException(status_code=400, detail="Must provide either file or s3_url")
 
-    # record & log
+    else:
+        raise HTTPException(status_code=400, detail="Must provide file, s3_url or JSON {'id','upload'}")
+
+    # запись в БД и лог
     await create_upload_record(db, current_user.id, upload_id)
     log.bind(
         correlation_id=cid,
@@ -216,7 +239,7 @@ async def upload(
         user_id=current_user.id,
     ).info("upload accepted")
 
-    # выбор между внутренней и внешней транскрипцией
+    # выбор внутренней/внешней транскрипции
     mode = settings.DEFAULT_TRANSCRIBE_MODE.lower()
     if mode == "external":
         external_transcribe.delay(upload_id, cid)
@@ -224,7 +247,7 @@ async def upload(
         transcribe_segments.delay(upload_id, cid)
         diarize_full.delay(upload_id, cid)
 
-    # init progress
+    # инициализация прогресса
     await redis.publish(f"progress:{upload_id}", "0%")
     await redis.set(f"progress:{upload_id}", "0%")
 
