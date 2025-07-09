@@ -1,4 +1,4 @@
-# docker-compose.yml
+version: "3.8"
 
 services:
   db:
@@ -69,7 +69,13 @@ services:
       - results-data:/data/results
       - diarizer-cache:/data/diarizer_cache:ro
       - /path/to/hf_cache_host:/hf_cache:rw
-    command: ["celery", "-A", "tasks", "worker", "--loglevel=info", "--concurrency=${CPU_CONCURRENCY}", "--queues=preprocess_cpu"]
+    command:
+      [
+        "celery", "-A", "tasks", "worker",
+        "--loglevel=info",
+        "--concurrency=${CPU_CONCURRENCY}",
+        "--queues=preprocess_cpu"
+      ]
     depends_on:
       - db
       - redis
@@ -111,12 +117,35 @@ services:
     networks:
       - proxyai_net
 
+  external-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file: .env
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+    volumes:
+      - ./:/app:delegated
+    command:
+      [
+        "celery", "-A", "tasks", "worker",
+        "--loglevel=info",
+        "--concurrency=${CPU_CONCURRENCY}",
+        "--queues=preprocess_external"
+      ]
+    depends_on:
+      - redis
+    restart: unless-stopped
+    networks:
+      - proxyai_net
+
   beat:
     build:
       context: .
       dockerfile: Dockerfile
     env_file: .env
-    command: ["celery", "-A", "tasks", "beat", "--loglevel=info"]
+    command:
+      ["celery", "-A", "tasks", "beat", "--loglevel=info"]
     depends_on:
       - redis
     restart: unless-stopped
