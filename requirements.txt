@@ -28,3 +28,4 @@ h5py>=3.0.0
 librosa>=0.10.0
 soundfile>=0.12.1
 pyannote.audio>=2.4.0
+httpx>=0.24.0
