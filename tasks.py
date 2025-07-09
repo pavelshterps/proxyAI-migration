@@ -30,7 +30,7 @@ app.conf.task_default_queue = "preprocess_cpu"
 app.conf.task_routes = {
     "tasks.transcribe_segments":    {"queue": "preprocess_cpu"},
     "tasks.diarize_full":            {"queue": "preprocess_gpu"},
-    "tasks.external_transcribe":     {"queue": "preprocess_external"},
+  #  "tasks.external_transcribe":     {"queue": "preprocess_external"},
 }
 
 logger = logging.getLogger(__name__)
