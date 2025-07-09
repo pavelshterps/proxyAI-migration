@@ -32,7 +32,6 @@ services:
       dockerfile: Dockerfile
     env_file: .env
     environment:
-      # теперь берём пользователя и БД из тех же переменных, что создаются в сервисе db
       - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
       - API_WORKERS
     volumes:
@@ -68,11 +67,10 @@ services:
       - results-data:/data/results
       - /path/to/hf_cache_host:/data/diarizer_cache:ro
       - /path/to/hf_cache_host:/hf_cache:rw
+    command: ["celery", "-A", "tasks", "worker", "--loglevel=info", "--concurrency=${CPU_CONCURRENCY}", "--queues=preprocess_cpu"]
     depends_on:
       - db
       - redis
-    command:
-      ["celery", "-A", "tasks", "worker", "--loglevel=info", "--concurrency=${CPU_CONCURRENCY}", "--queues=preprocess_cpu"]
     restart: unless-stopped
     networks:
       - proxyai_net
@@ -96,17 +94,17 @@ services:
       - diarizer-cache:/data/diarizer_cache
       - ctranslate2-cache:/root/.cache/ctranslate2
       - /path/to/hf_cache_host:/hf_cache:rw
-    depends_on:
-      - db
-      - redis
     command:
       [
         "celery", "-A", "tasks", "worker",
         "--loglevel=info",
         "--concurrency=${GPU_CONCURRENCY}",
-        "--pool=solo",          # <--- однопроцессный пул, чтобы избежать fork+CUDA
+        "--pool=solo",
         "--queues=preprocess_gpu"
       ]
+    depends_on:
+      - db
+      - redis
     restart: unless-stopped
     networks:
       - proxyai_net
@@ -116,10 +114,9 @@ services:
       context: .
       dockerfile: Dockerfile
     env_file: .env
+    command: ["celery", "-A", "tasks", "beat", "--loglevel=info"]
     depends_on:
       - redis
-    command:
-      ["celery", "-A", "tasks", "beat", "--loglevel=info"]
     restart: unless-stopped
     networks:
       - proxyai_net
@@ -134,11 +131,25 @@ services:
       - "--broker=${CELERY_BROKER_URL}"
       - "--basic_auth=${FLOWER_USER}:${FLOWER_PASS}"
       - "--port=5555"
-    restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:5555"]
       interval: 30s
       retries: 3
+    restart: unless-stopped
+    networks:
+      - proxyai_net
+
+  nginx:
+    image: nginx:stable-alpine
+    container_name: proxyai_nginx
+    depends_on:
+      - api
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/certs:/etc/nginx/certs:ro
     networks:
       - proxyai_net
 
