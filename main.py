@@ -1,3 +1,5 @@
+# main.py
+
 import time
 import uuid
 from pathlib import Path
@@ -31,6 +33,8 @@ from crud import create_upload_record, get_upload_for_user
 from dependencies import get_current_user
 from routes import router as api_router
 from admin_routes import router as admin_router
+
+from tasks import transcribe_segments, diarize_full, external_transcribe  # Added external_transcribe
 
 # —————————————————————————————————————————————
 # async‐contextmanager для старта/остановки приложения
@@ -149,10 +153,8 @@ async def get_status(
         raise HTTPException(status_code=404, detail="upload_id not found")
 
     base = Path(settings.RESULTS_FOLDER) / upload_id
-    # проверяем, есть ли оба файла — транскрипт и диаризация
     done = (base / "transcript.json").exists() and (base / "diarization.json").exists()
 
-    # ОЧЕНЬ ВАЖНО: отступы должны быть ровно такие
     if done:
         status_str = "done"
     else:
@@ -176,7 +178,6 @@ async def upload(
     db=Depends(get_db),
 ):
     cid = x_correlation_id or str(uuid.uuid4())
-    # accept all audio/* and video/* formats
     ct = file.content_type or ""
     if not (ct.startswith("audio/") or ct.startswith("video/")):
         raise HTTPException(status_code=415, detail="Unsupported file type")
@@ -196,10 +197,12 @@ async def upload(
         user_id=current_user.id,
     ).info("upload accepted")
 
-    from tasks import transcribe_segments, diarize_full
-    # правильно передаём два позиционных аргумента
-    transcribe_segments.delay(upload_id, cid)
-    diarize_full.delay(upload_id, cid)
+    # выбор между внутренней и внешней транскрипцией
+    if settings.USE_EXTERNAL_TRANSCRIBE:
+        external_transcribe.delay(upload_id, cid)
+    else:
+        transcribe_segments.delay(upload_id, cid)
+        diarize_full.delay(upload_id, cid)
 
     await redis.publish(f"progress:{upload_id}", "0%")
     await redis.set(f"progress:{upload_id}", "0%")

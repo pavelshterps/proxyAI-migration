@@ -5,7 +5,6 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field
 from typing import List, Optional
 
-
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 
@@ -80,6 +79,9 @@ class Settings(BaseSettings):
     PUBLIC_BASE_URL: str = Field(..., env="PUBLIC_BASE_URL")
     EXTERNAL_POLL_INTERVAL_S: int = Field(5, env="EXTERNAL_POLL_INTERVAL_S")
 
+    # --- Новое: переключение на внешний сервис ---
+    USE_EXTERNAL_TRANSCRIBE: bool = Field(False, env="USE_EXTERNAL_TRANSCRIBE")
+
     @property
     def ALLOWED_ORIGINS_LIST(self) -> List[str]:
         import json
@@ -87,6 +89,5 @@ class Settings(BaseSettings):
             return json.loads(self.ALLOWED_ORIGINS)
         except Exception:
             return [o.strip() for o in self.ALLOWED_ORIGINS.split(",") if o.strip()]
-
 
 settings = Settings()
