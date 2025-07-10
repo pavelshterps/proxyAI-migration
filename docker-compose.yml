@@ -73,14 +73,12 @@ services:
       - results-data:/data/results
       - diarizer-cache:/data/diarizer_cache:ro
       - /data/whisper-models:/hf_cache:ro
-    command:
-      - celery
-      - -A
-      - tasks
-      - worker
-      - --loglevel=info
-      - --concurrency=${CPU_CONCURRENCY}
-      - --queues=preprocess_cpu
+    command:>
+    celery -A config.celery:app
+    worker
+    --queues preprocess_cpu
+    --concurrency ${CPU_CONCURRENCY}
+    --loglevel info
     depends_on:
       - db
       - redis
@@ -104,15 +102,12 @@ services:
       - results-data:/data/results
       - diarizer-cache:/data/diarizer_cache
       - /data/whisper-models:/hf_cache:ro
-    command:
-      - celery
-      - -A
-      - tasks
-      - worker
-      - --loglevel=info
-      - --concurrency=${GPU_CONCURRENCY}
-      - --pool=solo
-      - --queues=preprocess_gpu
+    command: >
+      celery -A config.celery:app
+      worker
+      --queues preprocess_gpu
+      --loglevel info
+      --pool solo
     depends_on:
       - db
       - redis
@@ -126,12 +121,12 @@ services:
       context: .
       dockerfile: Dockerfile
     env_file: .env
-    command:
-      - celery
-      - -A
-      - tasks
-      - beat
-      - --loglevel=info
+    command: >
+    celery -A config.celery:app
+    worker
+    --queues preprocess_gpu
+    --loglevel info
+    --pool solo
     depends_on:
       - redis
     restart: unless-stopped

@@ -4,37 +4,16 @@ import logging
 import time
 from pathlib import Path
 
-import torch
-import requests
-from celery import Celery, shared_task
+from celery import shared_task
 from celery.signals import worker_process_init
 from faster_whisper import WhisperModel
 from pyannote.audio.pipelines import VoiceActivityDetection, SpeakerDiarization
-from utils.audio import convert_to_wav
 from pydub import AudioSegment
 from redis import Redis
 
 from config.settings import settings
-
-# ─── Инициализация Celery ───────────────────────────────────────────────────────
-app = Celery(
-    "proxyai",
-    broker=settings.CELERY_BROKER_URL,
-    backend=settings.CELERY_RESULT_BACKEND,
-)
-# Перенаправляем ВСЁ на GPU-воркер
-app.conf.task_default_queue = "preprocess_gpu"
-app.conf.task_routes = {
-    "tasks.transcribe_segments": {"queue": "preprocess_gpu"},
-    "tasks.diarize_full":       {"queue": "preprocess_gpu"},
-}
-# Планировщик для очистки старых файлов
-app.conf.beat_schedule = {
-    "cleanup_old_uploads": {
-        "task": "tasks.cleanup_old_uploads",
-        "schedule": 3600.0,  # ежечасно
-    },
-}
+from config.celery import app           # ← single Celery instance
+from utils.audio import convert_to_wav
 
 logger = logging.getLogger(__name__)
 
@@ -47,8 +26,8 @@ def get_whisper_model():
     global _whisper_model
     if _whisper_model is None:
         model_path = settings.WHISPER_MODEL_PATH
-        device = settings.WHISPER_DEVICE.lower()
-        compute = settings.WHISPER_COMPUTE_TYPE.lower()
+        device     = settings.WHISPER_DEVICE.lower()
+        compute    = settings.WHISPER_COMPUTE_TYPE.lower()
         if device == "cpu" and compute in ("float16", "fp16"):
             logger.warning(
                 f"Compute type '{compute}' not supported on CPU; falling back to int8"
@@ -99,7 +78,7 @@ def get_clustering_diarizer():
 @worker_process_init.connect
 def preload_and_warmup(**kwargs):
     """
-    Прогрев моделей при старте воркера.
+    Warm up models on worker start.
     """
     sample = Path(__file__).resolve().parent / "tests" / "fixtures" / "sample.wav"
     device = settings.WHISPER_DEVICE.lower()
@@ -129,17 +108,17 @@ def preload_and_warmup(**kwargs):
 @shared_task(bind=True, name="tasks.transcribe_segments", queue="preprocess_gpu")
 def transcribe_segments(self, upload_id: str, correlation_id: str):
     """
-    Транскрипция на GPU (Faster-Whisper).
+    Whisper transcription (int8) on GPU.
     """
-    redis = Redis.from_url(settings.CELERY_BROKER_URL)
+    redis   = Redis.from_url(settings.CELERY_BROKER_URL)
     adapter = logging.LoggerAdapter(logger, {"correlation_id": correlation_id})
-    start_time = time.time()
+    start   = time.time()
 
-    # 1) Найти исходный файл
+    # locate source file (any extension)
     upload_dir = Path(settings.UPLOAD_FOLDER)
     candidates = list(upload_dir.glob(f"{upload_id}.*"))
     if not candidates:
-        adapter.error(f"No source file found for upload_id={upload_id}")
+        adapter.error(f"No source file for upload_id={upload_id}")
         redis.publish(f"progress:{upload_id}", "error")
         redis.set(f"progress:{upload_id}", "error")
         return
@@ -148,8 +127,9 @@ def transcribe_segments(self, upload_id: str, correlation_id: str):
     whisper = get_whisper_model()
     try:
         adapter.info(f"Starting transcription for '{upload_path.name}'")
-        # 2) Конвертация в WAV, если нужно
         wav_path = upload_dir / f"{upload_id}.wav"
+
+        # convert if needed
         if upload_path.suffix.lower() != ".wav":
             try:
                 convert_to_wav(upload_path, wav_path, sample_rate=16000, channels=1)
@@ -160,17 +140,16 @@ def transcribe_segments(self, upload_id: str, correlation_id: str):
         else:
             src = upload_path
 
-        # 3) Сегментация и транскрипция
-        dst_dir = Path(settings.RESULTS_FOLDER) / upload_id
+        dst_dir   = Path(settings.RESULTS_FOLDER) / upload_id
         dst_dir.mkdir(parents=True, exist_ok=True)
 
-        audio = AudioSegment.from_file(str(src))
+        audio     = AudioSegment.from_file(str(src))
         transcript = []
-        windows = split_audio_fixed_windows(src, settings.SEGMENT_LENGTH_S)
+        windows   = split_audio_fixed_windows(src, settings.SEGMENT_LENGTH_S)
 
         for idx, (start, end) in enumerate(windows):
             adapter.debug(f"Segment {idx}: {start:.1f}-{end:.1f}s")
-            chunk = audio[int(start * 1000) : int(end * 1000)]
+            chunk   = audio[int(start*1000):int(end*1000)]
             tmp_wav = dst_dir / f"{upload_id}_{idx}.wav"
             chunk.export(tmp_wav, format="wav")
 
@@ -185,23 +164,22 @@ def transcribe_segments(self, upload_id: str, correlation_id: str):
                 continue
 
             for seg in segments:
-                transcript.append(
-                    {
-                        "segment": idx,
-                        "start": start + seg.start,
-                        "end": start + seg.end,
-                        "text": seg.text,
-                    }
-                )
+                transcript.append({
+                    "segment": idx,
+                    "start":   start + seg.start,
+                    "end":     start + seg.end,
+                    "text":    seg.text,
+                })
             tmp_wav.unlink(missing_ok=True)
 
-        # 4) Сохранить результат
         out_file = dst_dir / "transcript.json"
-        out_file.write_text(json.dumps(transcript, ensure_ascii=False, indent=2), encoding="utf-8")
-        elapsed = time.time() - start_time
+        out_file.write_text(
+            json.dumps(transcript, ensure_ascii=False, indent=2),
+            encoding="utf-8"
+        )
+        elapsed = time.time() - start
         adapter.info(f"✅ Transcription saved in {elapsed:.2f}s")
 
-        # 5) Обновить прогресс
         redis.publish(f"progress:{upload_id}", "50%")
         redis.set(f"progress:{upload_id}", "50%")
 
@@ -215,31 +193,31 @@ def transcribe_segments(self, upload_id: str, correlation_id: str):
 @shared_task(bind=True, name="tasks.diarize_full", queue="preprocess_gpu")
 def diarize_full(self, upload_id: str, correlation_id: str):
     """
-    Диаризация на GPU (pyannote).
+    Pyannote diarization on GPU.
     """
-    redis = Redis.from_url(settings.CELERY_BROKER_URL)
+    redis   = Redis.from_url(settings.CELERY_BROKER_URL)
     adapter = logging.LoggerAdapter(logger, {"correlation_id": correlation_id})
-    start_time = time.time()
+    start   = time.time()
 
     try:
         adapter.info(f"Starting diarization for upload_id={upload_id}")
         src_wav = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
+
         if not src_wav.exists():
             candidates = list(Path(settings.UPLOAD_FOLDER).glob(f"{upload_id}.*"))
-            if candidates:
-                orig = candidates[0]
-                try:
-                    convert_to_wav(orig, src_wav, sample_rate=16000, channels=1)
-                    src = src_wav
-                except Exception as e:
-                    adapter.error(f"❌ convert_to_wav failed for diarization: {e}", exc_info=True)
-                    src = orig
-            else:
-                raise FileNotFoundError(f"No source file found for {upload_id}")
+            if not candidates:
+                raise FileNotFoundError(f"No source file for {upload_id}")
+            orig = candidates[0]
+            try:
+                convert_to_wav(orig, src_wav, sample_rate=16000, channels=1)
+                src = src_wav
+            except Exception as e:
+                adapter.error(f"❌ convert_to_wav for diarization failed: {e}", exc_info=True)
+                src = orig
         else:
             src = src_wav
 
-        speech = get_vad().apply({"audio": str(src)})
+        speech  = get_vad().apply({"audio": str(src)})
         speakers = []
 
         if settings.USE_FS_EEND:
@@ -259,9 +237,11 @@ def diarize_full(self, upload_id: str, correlation_id: str):
         dst_dir = Path(settings.RESULTS_FOLDER) / upload_id
         dst_dir.mkdir(parents=True, exist_ok=True)
         out_file = dst_dir / "diarization.json"
-        out_file.write_text(json.dumps(speakers, ensure_ascii=False, indent=2), encoding="utf-8")
-
-        elapsed = time.time() - start_time
+        out_file.write_text(
+            json.dumps(speakers, ensure_ascii=False, indent=2),
+            encoding="utf-8"
+        )
+        elapsed = time.time() - start
         adapter.info(f"✅ Diarization saved in {elapsed:.2f}s")
 
         redis.publish(f"progress:{upload_id}", "100%")
@@ -277,10 +257,10 @@ def diarize_full(self, upload_id: str, correlation_id: str):
 @shared_task(name="tasks.cleanup_old_uploads")
 def cleanup_old_uploads():
     """
-    Удаляет из папки uploads все файлы старше 24 часов.
-    Запускается автоматически через Celery Beat.
+    Deletes upload files older than 24 hours.
+    Scheduled via Celery Beat.
     """
-    cutoff = time.time() - 24 * 3600
+    cutoff     = time.time() - 24 * 3600
     upload_dir = Path(settings.UPLOAD_FOLDER)
     for file_path in upload_dir.iterdir():
         try:
@@ -292,7 +272,7 @@ def cleanup_old_uploads():
 
 
 def split_audio_fixed_windows(audio_path: Path, window_s: int):
-    audio = AudioSegment.from_file(str(audio_path))
+    audio     = AudioSegment.from_file(str(audio_path))
     length_ms = len(audio)
     window_ms = window_s * 1000
     return [
