@@ -1,9 +1,7 @@
-# config/settings.py
-
-import os
-from pydantic_settings import BaseSettings, SettingsConfigDict
-from pydantic import Field
+import json
 from typing import List, Optional
+from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
@@ -46,7 +44,7 @@ class Settings(BaseSettings):
     USE_FS_EEND: bool = Field(False, env="USE_FS_EEND")
     FS_EEND_MODEL_PATH: Optional[str] = Field(None, env="FS_EEND_MODEL_PATH")
     FS_EEND_DEVICE: str = Field("cuda", env="FS_EEND_DEVICE")
-    FRAME_SHIFT: float = Field(0.01, env="FRAME_SHIFT")  # 10 ms
+    FRAME_SHIFT: float = Field(0.01, env="FRAME_SHIFT")
 
     # HF cache & token
     HUGGINGFACE_CACHE_DIR: Optional[str] = Field(None, env="HUGGINGFACE_CACHE_DIR")
@@ -73,18 +71,16 @@ class Settings(BaseSettings):
     FLOWER_USER: Optional[str] = Field(None, env="FLOWER_USER")
     FLOWER_PASS: Optional[str] = Field(None, env="FLOWER_PASS")
 
-    # --- Новые поля для внешней транскрипции ---
+    # экстернальная транскрипция
     EXTERNAL_API_URL: str = Field(..., env="EXTERNAL_API_URL")
     EXTERNAL_API_KEY: str = Field(..., env="EXTERNAL_API_KEY")
-    PUBLIC_BASE_URL: str = Field(..., env="PUBLIC_BASE_URL")
     EXTERNAL_POLL_INTERVAL_S: int = Field(5, env="EXTERNAL_POLL_INTERVAL_S")
 
-    # --- Новое: переключение на внешний сервис ---
+    # переключение на внешний сервис
     DEFAULT_TRANSCRIBE_MODE: str = Field("local", env="DEFAULT_TRANSCRIBE_MODE")
 
     @property
     def ALLOWED_ORIGINS_LIST(self) -> List[str]:
-        import json
         try:
             return json.loads(self.ALLOWED_ORIGINS)
         except Exception:
