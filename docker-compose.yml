@@ -73,7 +73,7 @@ services:
       - results-data:/data/results
       - diarizer-cache:/data/diarizer_cache:ro
       - /data/whisper-models:/hf_cache:ro
-    command:>
+    command: >
     celery -A config.celery:app
     worker
     --queues preprocess_cpu
