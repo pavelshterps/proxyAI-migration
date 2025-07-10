@@ -1,7 +1,8 @@
-FROM nvidia/cuda:12.9.0-cudnn8-runtime-ubuntu22.04
+FROM nvidia/cuda:12.9.1-cudnn-runtime-ubuntu22.04
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
       python3-pip python3-dev build-essential ffmpeg libsndfile1 git \
       libavformat-dev libavcodec-dev libavutil-dev libswscale-dev libportaudio2 && \
     rm -rf /var/lib/apt/lists/*
@@ -12,9 +13,7 @@ RUN pip3 install --upgrade pip && \
 
 RUN pip3 install --no-cache-dir \
     ctranslate2[cuda12]==4.6.* \
-    faster-whisper[cuda12] \
-    nvidia-cudnn-cu12==9.* \
-    nvidia-cublas-cu12==12.*
+    faster-whisper[cuda12]
 
 COPY . .
 ENV HUGGINGFACE_CACHE_DIR=/hf_cache \
