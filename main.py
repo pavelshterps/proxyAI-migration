@@ -1,4 +1,5 @@
 # main.py
+
 import time
 import uuid
 from pathlib import Path
@@ -41,6 +42,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="proxyAI", version=settings.APP_VERSION, lifespan=lifespan)
 
+# structlog
 structlog.configure(
     processors=[
         structlog.processors.add_log_level,
@@ -50,10 +52,12 @@ structlog.configure(
 )
 log = structlog.get_logger()
 
+# rate limiter
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 app.add_middleware(SlowAPIMiddleware)
 
+# CORS & TrustedHost
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[*settings.ALLOWED_ORIGINS_LIST, "https://transcriber-next.vercel.app"],
@@ -66,12 +70,17 @@ app.add_middleware(
     allowed_hosts=["127.0.0.1", "localhost"] + settings.ALLOWED_ORIGINS_LIST
 )
 
+# Redis Pub/Sub
 redis = redis_async.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
+
+# API-Key header
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
+# ensure dirs exist
 for d in (settings.UPLOAD_FOLDER, settings.RESULTS_FOLDER, settings.DIARIZER_CACHE_DIR):
     Path(d).mkdir(parents=True, exist_ok=True)
 
+# Prometheus metrics
 HTTP_REQ_COUNT = Counter("http_requests_total", "Total HTTP requests", ["method", "path"])
 HTTP_REQ_LATENCY = Histogram("http_request_duration_seconds", "HTTP request latency", ["path"])
 
@@ -102,18 +111,21 @@ async def metrics(request: Request):
 async def root():
     return FileResponse("static/index.html")
 
-@app.get("/status/{upload_id}", summary="Check processing status",
+@app.get("/status/{upload_id}",
+         summary="Check processing status",
          responses={401: {"description": "Invalid X-API-Key"}, 404: {"description": "Not found"}})
 async def get_status(upload_id: str, current_user=Depends(get_current_user), db=Depends(get_db)):
     rec = await get_upload_for_user(db, current_user.id, upload_id)
     if not rec:
-        raise HTTPException(status_code=404, detail="upload_id not found")
+        raise HTTPException(404, "upload_id not found")
+
     base = Path(settings.RESULTS_FOLDER) / upload_id
     done = (base / "transcript.json").exists() and (base / "diarization.json").exists()
     progress = await redis.get(f"progress:{upload_id}") or "0%"
     return {"status": "done" if done else "processing", "progress": progress}
 
-@app.post("/upload/", dependencies=[Depends(get_current_user)],
+@app.post("/upload/",
+          dependencies=[Depends(get_current_user)],
           responses={401: {"description": "Invalid X-API-Key"}})
 @limiter.limit("10/minute")
 async def upload(
@@ -128,61 +140,68 @@ async def upload(
 ):
     cid = x_correlation_id or str(uuid.uuid4().hex)
 
-    # JSON mode
+    # 1) JSON mode
     if upload is not None:
         if not id:
-            raise HTTPException(status_code=400, detail="JSON must include 'id'")
+            raise HTTPException(400, "JSON must include 'id'")
         try:
             async with httpx.AsyncClient() as client:
                 resp = await client.get(upload); resp.raise_for_status()
                 data = resp.content
         except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Failed to fetch '{upload}': {e}")
+            raise HTTPException(400, f"Failed to fetch '{upload}': {e}")
         ext = Path(urlparse(upload).path).suffix or ""
         upload_id = id
         dest = Path(settings.UPLOAD_FOLDER) / f"{upload_id}{ext}"
         dest.write_bytes(data)
 
-    # S3 form mode
+    # 2) S3 form mode
     elif s3_url:
         try:
             async with httpx.AsyncClient() as client:
                 resp = await client.get(s3_url); resp.raise_for_status()
                 data = resp.content
         except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Failed to fetch from s3_url: {e}")
+            raise HTTPException(400, f"Failed to fetch from s3_url: {e}")
         ext = Path(urlparse(s3_url).path).suffix or ""
         upload_id = uuid.uuid4().hex
         dest = Path(settings.UPLOAD_FOLDER) / f"{upload_id}{ext}"
         dest.write_bytes(data)
 
-    # File upload
+    # 3) File upload
     elif file:
         data = await file.read()
         if not data:
-            raise HTTPException(status_code=400, detail="File is empty")
+            raise HTTPException(400, "File is empty")
         if len(data) > settings.MAX_FILE_SIZE:
-            raise HTTPException(status_code=413, detail="File too large")
+            raise HTTPException(413, "File too large")
         ext = Path(file.filename).suffix or ""
         upload_id = uuid.uuid4().hex
         dest = Path(settings.UPLOAD_FOLDER) / f"{upload_id}{ext}"
         dest.write_bytes(data)
 
     else:
-        raise HTTPException(status_code=400, detail="Must provide file, s3_url or JSON {'id','upload'}")
+        raise HTTPException(400, "Must provide file, s3_url or JSON {'id','upload'}")
 
+    # запись и лог
     await create_upload_record(db, current_user.id, upload_id)
-    log.bind(correlation_id=cid, upload_id=upload_id, user_id=current_user.id).info("upload accepted")
+    log.bind(
+        correlation_id=cid,
+        upload_id=upload_id,
+        user_id=current_user.id,
+    ).info("upload accepted")
 
-    # dispatch both tasks to GPU queue
+    # шлём на транскрипцию и диаризацию
     transcribe_segments.delay(upload_id, cid)
     diarize_full.delay(upload_id, cid)
 
+    # старт прогресса
     await redis.publish(f"progress:{upload_id}", "0%")
     await redis.set(f"progress:{upload_id}", "0%")
 
-    return JSONResponse(content={"upload_id": upload_id}, headers={"X-Correlation-ID": cid})
+    return JSONResponse({"upload_id": upload_id}, headers={"X-Correlation-ID": cid})
 
-app.include_router(api_router, tags=["proxyAI"], dependencies=[Depends(get_current_user)])
+# регистрация роутеров
+app.include_router(api_router, tags=["proxyAI"])
 app.include_router(admin_router)
 app.mount("/static", StaticFiles(directory="static"), name="static")

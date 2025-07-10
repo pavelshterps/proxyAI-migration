@@ -1,5 +1,3 @@
-# tasks.py
-
 import os
 import json
 import logging
@@ -18,6 +16,7 @@ from redis import Redis
 
 from config.settings import settings
 
+# ─── Инициализация Celery ───────────────────────────────────────────────────────
 app = Celery(
     "proxyai",
     broker=settings.CELERY_BROKER_URL,
@@ -29,11 +28,20 @@ app.conf.task_routes = {
     "tasks.diarize_full":       {"queue": "preprocess_gpu"},
 }
 
+# Периодический планировщик очистки старых файлов
+app.conf.beat_schedule = {
+    "cleanup_old_uploads": {
+        "task": "tasks.cleanup_old_uploads",
+        "schedule": 3600.0,  # запускать ежечасно
+    },
+}
+
 logger = logging.getLogger(__name__)
 
 _whisper_model = None
 _vad = None
 _clustering_diarizer = None
+
 
 def get_whisper_model():
     global _whisper_model
@@ -53,6 +61,7 @@ def get_whisper_model():
         logger.info("WhisperModel loaded")
     return _whisper_model
 
+
 def get_vad():
     global _vad
     if _vad is None:
@@ -60,6 +69,7 @@ def get_vad():
         _vad = VoiceActivityDetection.from_pretrained(model_id, use_auth_token=settings.HUGGINGFACE_TOKEN)
         logger.info("VAD pipeline loaded")
     return _vad
+
 
 def get_clustering_diarizer():
     global _clustering_diarizer
@@ -74,6 +84,7 @@ def get_clustering_diarizer():
         )
         logger.info("Clustering-based diarizer loaded")
     return _clustering_diarizer
+
 
 @worker_process_init.connect
 def preload_and_warmup(**kwargs):
@@ -100,6 +111,7 @@ def preload_and_warmup(**kwargs):
             logger.info("✅ Warm-up clustering diarizer complete (GPU worker)")
         except Exception as e:
             logger.warning(f"Warm-up clustering diarizer failed: {e}")
+
 
 @shared_task(bind=True, name="tasks.transcribe_segments", queue="preprocess_cpu")
 def transcribe_segments(self, upload_id: str, correlation_id: str):
@@ -129,7 +141,7 @@ def transcribe_segments(self, upload_id: str, correlation_id: str):
 
         for idx, (start, end) in enumerate(windows):
             adapter.debug(f"Segment {idx}: {start:.1f}-{end:.1f}s")
-            chunk = audio[int(start*1000):int(end*1000)]
+            chunk = audio[int(start * 1000):int(end * 1000)]
             tmp_wav = dst_dir / f"{upload_id}_{idx}.wav"
             chunk.export(tmp_wav, format="wav")
 
@@ -165,6 +177,7 @@ def transcribe_segments(self, upload_id: str, correlation_id: str):
         redis.publish(f"progress:{upload_id}", "error")
         redis.set(f"progress:{upload_id}", "error")
         raise
+
 
 @shared_task(bind=True, name="tasks.diarize_full", queue="preprocess_gpu")
 def diarize_full(self, upload_id: str, correlation_id: str):
@@ -218,11 +231,29 @@ def diarize_full(self, upload_id: str, correlation_id: str):
         redis.set(f"progress:{upload_id}", "error")
         raise
 
+
+@shared_task(name="tasks.cleanup_old_uploads")
+def cleanup_old_uploads():
+    """
+    Удаляет из папки uploads все файлы старше 24 часов.
+    Запускается автоматически через Celery Beat.
+    """
+    cutoff = time.time() - 24 * 3600
+    upload_dir = Path(settings.UPLOAD_FOLDER)
+    for file_path in upload_dir.iterdir():
+        try:
+            if file_path.stat().st_mtime < cutoff:
+                file_path.unlink()
+                logger.info(f"Deleted old upload file: {file_path}")
+        except Exception as e:
+            logger.warning(f"Failed to delete {file_path}: {e}")
+
+
 def split_audio_fixed_windows(audio_path: Path, window_s: int):
     audio = AudioSegment.from_file(str(audio_path))
     length_ms = len(audio)
     window_ms = window_s * 1000
     return [
-        (start/1000.0, min(start + window_ms, length_ms)/1000.0)
+        (start / 1000.0, min(start + window_ms, length_ms) / 1000.0)
         for start in range(0, length_ms, window_ms)
     ]
