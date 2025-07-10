@@ -5,14 +5,14 @@ import time
 from pathlib import Path
 
 from celery.signals import worker_process_init
-from pydub import AudioSegment
-from redis import Redis
 from faster_whisper import WhisperModel
 from pyannote.audio.pipelines import VoiceActivityDetection, SpeakerDiarization
+from pydub import AudioSegment
+from redis import Redis
 
-from utils.audio import convert_to_wav
 from config.settings import settings
-from config.celery import app  # единый Celery instance
+from config.celery import app          # используем единый Celery instance
+from utils.audio import convert_to_wav
 
 logger = logging.getLogger(__name__)
 
@@ -49,9 +49,7 @@ def get_whisper_model():
 def get_vad():
     global _vad
     if _vad is None:
-        model_id = getattr(
-            settings, "VAD_MODEL_PATH", "pyannote/voice-activity-detection"
-        )
+        model_id = getattr(settings, "VAD_MODEL_PATH", "pyannote/voice-activity-detection")
         _vad = VoiceActivityDetection.from_pretrained(
             model_id, use_auth_token=settings.HUGGINGFACE_TOKEN
         )
@@ -104,16 +102,16 @@ def preload_and_warmup(**kwargs):
             logger.warning(f"Warm-up clustering diarizer failed: {e}")
 
 
-@app.task(bind=True, name="tasks.transcribe_segments")
+@app.task(bind=True, name="tasks.transcribe_segments", queue="preprocess_gpu")
 def transcribe_segments(self, upload_id: str, correlation_id: str):
     """
-    Whisper transcription (int8) on GPU.
+    Транскрипция на GPU (Faster-Whisper).
     """
     redis   = Redis.from_url(settings.CELERY_BROKER_URL)
     adapter = logging.LoggerAdapter(logger, {"correlation_id": correlation_id})
     start   = time.time()
 
-    # locate source file (any extension)
+    # Найти исходный файл
     upload_dir = Path(settings.UPLOAD_FOLDER)
     candidates = list(upload_dir.glob(f"{upload_id}.*"))
     if not candidates:
@@ -128,7 +126,7 @@ def transcribe_segments(self, upload_id: str, correlation_id: str):
         adapter.info(f"Starting transcription for '{upload_path.name}'")
         wav_path = upload_dir / f"{upload_id}.wav"
 
-        # convert if needed
+        # Конвертация, если не WAV
         if upload_path.suffix.lower() != ".wav":
             try:
                 convert_to_wav(upload_path, wav_path, sample_rate=16000, channels=1)
@@ -139,16 +137,16 @@ def transcribe_segments(self, upload_id: str, correlation_id: str):
         else:
             src = upload_path
 
+        # Сегментация
         dst_dir   = Path(settings.RESULTS_FOLDER) / upload_id
         dst_dir.mkdir(parents=True, exist_ok=True)
-
         audio     = AudioSegment.from_file(str(src))
         transcript = []
         windows   = split_audio_fixed_windows(src, settings.SEGMENT_LENGTH_S)
 
-        for idx, (start_t, end_t) in enumerate(windows):
-            adapter.debug(f"Segment {idx}: {start_t:.1f}-{end_t:.1f}s")
-            chunk   = audio[int(start_t*1000):int(end_t*1000)]
+        for idx, (start, end) in enumerate(windows):
+            adapter.debug(f"Segment {idx}: {start:.1f}-{end:.1f}s")
+            chunk   = audio[int(start * 1000) : int(end * 1000)]
             tmp_wav = dst_dir / f"{upload_id}_{idx}.wav"
             chunk.export(tmp_wav, format="wav")
 
@@ -165,13 +163,13 @@ def transcribe_segments(self, upload_id: str, correlation_id: str):
             for seg in segments:
                 transcript.append({
                     "segment": idx,
-                    "start":   start_t + seg.start,
-                    "end":     start_t + seg.end,
+                    "start":   start + seg.start,
+                    "end":     start + seg.end,
                     "text":    seg.text,
                 })
             tmp_wav.unlink(missing_ok=True)
 
-        # save result
+        # Сохранить результат
         out_file = dst_dir / "transcript.json"
         out_file.write_text(
             json.dumps(transcript, ensure_ascii=False, indent=2),
@@ -180,7 +178,7 @@ def transcribe_segments(self, upload_id: str, correlation_id: str):
         elapsed = time.time() - start
         adapter.info(f"✅ Transcription saved in {elapsed:.2f}s")
 
-        # update progress
+        # Апдейт прогресса
         redis.publish(f"progress:{upload_id}", "50%")
         redis.set(f"progress:{upload_id}", "50%")
 
@@ -191,10 +189,10 @@ def transcribe_segments(self, upload_id: str, correlation_id: str):
         raise
 
 
-@app.task(bind=True, name="tasks.diarize_full")
+@app.task(bind=True, name="tasks.diarize_full", queue="preprocess_gpu")
 def diarize_full(self, upload_id: str, correlation_id: str):
     """
-    Pyannote diarization on GPU.
+    Диаризация на GPU (pyannote).
     """
     redis   = Redis.from_url(settings.CELERY_BROKER_URL)
     adapter = logging.LoggerAdapter(logger, {"correlation_id": correlation_id})
@@ -205,7 +203,6 @@ def diarize_full(self, upload_id: str, correlation_id: str):
         src_wav = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
 
         if not src_wav.exists():
-            # find original
             candidates = list(Path(settings.UPLOAD_FOLDER).glob(f"{upload_id}.*"))
             if not candidates:
                 raise FileNotFoundError(f"No source file for {upload_id}")
@@ -246,7 +243,6 @@ def diarize_full(self, upload_id: str, correlation_id: str):
         elapsed = time.time() - start
         adapter.info(f"✅ Diarization saved in {elapsed:.2f}s")
 
-        # update progress
         redis.publish(f"progress:{upload_id}", "100%")
         redis.set(f"progress:{upload_id}", "100%")
 
@@ -260,8 +256,7 @@ def diarize_full(self, upload_id: str, correlation_id: str):
 @app.task(name="tasks.cleanup_old_uploads")
 def cleanup_old_uploads():
     """
-    Deletes upload files older than 24 hours.
-    Scheduled via Celery Beat.
+    Удаляет старые файлы (24ч).
     """
     cutoff     = time.time() - 24 * 3600
     upload_dir = Path(settings.UPLOAD_FOLDER)
