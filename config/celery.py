@@ -1,28 +1,29 @@
 from config.settings import settings
 from kombu import Queue, Exchange
+from celery import Celery
 
-# Broker and result backend
+# Broker и бэкенд
 broker_url = settings.CELERY_BROKER_URL
 result_backend = settings.CELERY_RESULT_BACKEND
 
-# Serialization
+# Сериализация
 task_serializer = "json"
 accept_content = ["json"]
 
-# Timezone settings
+# Таймзона
 timezone = settings.CELERY_TIMEZONE
 enable_utc = True
 
-# Queues
+# Очереди
 task_queues = (
     Queue("preprocess_cpu", Exchange("preprocess_cpu"), routing_key="preprocess_cpu"),
     Queue("preprocess_gpu", Exchange("preprocess_gpu"), routing_key="preprocess_gpu"),
 )
 
-# Route both tasks onto the GPU queue for now
+# Маршрутизация задач
 task_routes = {
     "tasks.transcribe_segments": {
-        "queue": "preprocess_gpu",
+        "queue": "preprocess_gpu",      # транскрипция теперь на GPU
         "routing_key": "preprocess_gpu",
     },
     "tasks.diarize_full": {
@@ -31,20 +32,40 @@ task_routes = {
     },
 }
 
-# Reliability / resource control
-task_acks_late = True
-task_reject_on_worker_lost = True
-worker_prefetch_multiplier = 1
-task_time_limit = 600        # hard limit (10 min)
-task_soft_time_limit = 550   # soft limit
+# Рекомендованные опции для надёжности и контроля ресурсов
+task_acks_late = True                       # подтверждать при окончании задачи
+task_reject_on_worker_lost = True           # автозабалансировка при падении воркера
+worker_prefetch_multiplier = 1              # минимальный prefetch
+task_time_limit = 600                       # жёсткий таймаут (10 минут)
+task_soft_time_limit = 550                  # мягкий таймаут, за 50с до жёсткого
 
-# Periodic tasks
+# Периодические задачи
 beat_schedule = {
     "cleanup_old_uploads": {
         "task": "tasks.cleanup_old_uploads",
-        "schedule": 3600.0,  # run hourly
+        "schedule": 3600.0,  # ежечасно
     },
 }
 
-# Ensure Beat imports your task definitions
-imports = ("tasks",)
+# ─── Единый экземпляр Celery ────────────────────────────────────────────────────
+app = Celery(
+    "proxyai",
+    broker=broker_url,
+    backend=result_backend,
+)
+
+# Применяем сконфигурированные параметры
+app.conf.update(
+    task_serializer=task_serializer,
+    accept_content=accept_content,
+    timezone=timezone,
+    enable_utc=enable_utc,
+    task_queues=task_queues,
+    task_routes=task_routes,
+    task_acks_late=task_acks_late,
+    task_reject_on_worker_lost=task_reject_on_worker_lost,
+    worker_prefetch_multiplier=worker_prefetch_multiplier,
+    task_time_limit=task_time_limit,
+    task_soft_time_limit=task_soft_time_limit,
+    beat_schedule=beat_schedule,
+)
