@@ -1,3 +1,5 @@
+version: "3.8"
+
 services:
   db:
     image: postgres:15
@@ -15,12 +17,15 @@ services:
     image: redis:7-alpine
     volumes:
       - redis-data:/data
-    ports: ["6379:6379"]
+    ports:
+      - "6379:6379"
     networks:
       - proxyai_net
 
   api:
-    build: { context: ., dockerfile: Dockerfile }
+    build:
+      context: .
+      dockerfile: Dockerfile
     env_file: .env
     environment:
       - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
@@ -32,12 +37,17 @@ services:
       - results-data:/data/results
       - diarizer-cache:/data/diarizer_cache
       - hf-cache:/hf_cache:rw
-    ports: ["8000:8000"]
-    depends_on: [db, redis]
+    ports:
+      - "8000:8000"
+    depends_on:
+      - db
+      - redis
     restart: unless-stopped
 
   cpu-worker:
-    build: { context: ., dockerfile: Dockerfile }
+    build:
+      context: .
+      dockerfile: Dockerfile
     env_file: .env
     environment:
       - WHISPER_DEVICE=cpu
@@ -47,12 +57,23 @@ services:
       - results-data:/data/results
       - diarizer-cache:/data/diarizer_cache:ro
       - hf-cache:/hf_cache:rw
-    command: ["celery","-A","tasks","worker","--loglevel=info","--concurrency=${CPU_CONCURRENCY}","--queues=preprocess_cpu"]
-    depends_on: [db, redis]
+    command:
+      - celery
+      - -A
+      - tasks
+      - worker
+      - --loglevel=info
+      - --concurrency=${CPU_CONCURRENCY}
+      - --queues=preprocess_cpu
+    depends_on:
+      - db
+      - redis
     restart: unless-stopped
 
   gpu-worker:
-    build: { context: ., dockerfile: Dockerfile.gpu }
+    build:
+      context: .
+      dockerfile: Dockerfile.gpu
     env_file: .env
     environment:
       - WHISPER_DEVICE=cuda
@@ -64,17 +85,63 @@ services:
       - results-data:/data/results
       - diarizer-cache:/data/diarizer_cache
       - hf-cache:/hf_cache:rw
-    command: ["celery","-A","tasks","worker","--loglevel=info","--concurrency=${GPU_CONCURRENCY}","--pool=solo","--queues=preprocess_gpu"]
-    depends_on: [db, redis]
+    command:
+      - celery
+      - -A
+      - tasks
+      - worker
+      - --loglevel=info
+      - --concurrency=${GPU_CONCURRENCY}
+      - --pool=solo
+      - --queues=preprocess_gpu
+    depends_on:
+      - db
+      - redis
     restart: unless-stopped
 
-  beat: ...
-  flower: ...
+  beat:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file: .env
+    command:
+      - celery
+      - -A
+      - tasks
+      - beat
+      - --loglevel=info
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+  flower:
+    image: mher/flower:0.9.7
+    env_file: .env
+    ports:
+      - "5555:5555"
+    command:
+      - flower
+      - "--broker=${CELERY_BROKER_URL}"
+      - "--basic_auth=${FLOWER_USER}:${FLOWER_PASS}"
+      - "--port=5555"
+    depends_on:
+      - redis
+    restart: unless-stopped
+
   nginx:
+    image: nginx:stable-alpine
+    container_name: proxyai_nginx
+    depends_on:
+      - api
+    ports:
+      - "80:80"
+      - "443:443"
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
       - /etc/letsencrypt/live/tonage.io/fullchain.pem:/etc/nginx/certs/fullchain.pem:ro
       - /etc/letsencrypt/live/tonage.io/privkey.pem:/etc/nginx/certs/privkey.pem:ro
+    networks:
+      - proxyai_net
 
 volumes:
   postgres_data:
