@@ -12,7 +12,7 @@ from pydub import AudioSegment
 from redis import Redis
 
 from config.settings import settings
-from config.celery import app           # ← single Celery instance
+from config.celery import app                # ← единый экземпляр
 from utils.audio import convert_to_wav
 
 logger = logging.getLogger(__name__)
@@ -20,7 +20,6 @@ logger = logging.getLogger(__name__)
 _whisper_model = None
 _vad = None
 _clustering_diarizer = None
-
 
 def get_whisper_model():
     global _whisper_model
@@ -46,7 +45,6 @@ def get_whisper_model():
         logger.info("WhisperModel loaded")
     return _whisper_model
 
-
 def get_vad():
     global _vad
     if _vad is None:
@@ -58,7 +56,6 @@ def get_vad():
         )
         logger.info("VAD pipeline loaded")
     return _vad
-
 
 def get_clustering_diarizer():
     global _clustering_diarizer
@@ -73,7 +70,6 @@ def get_clustering_diarizer():
         )
         logger.info("Clustering-based diarizer loaded")
     return _clustering_diarizer
-
 
 @worker_process_init.connect
 def preload_and_warmup(**kwargs):
@@ -104,11 +100,10 @@ def preload_and_warmup(**kwargs):
         except Exception as e:
             logger.warning(f"Warm-up clustering diarizer failed: {e}")
 
-
-@shared_task(bind=True, name="tasks.transcribe_segments", queue="preprocess_gpu")
+@shared_task(bind=True, name="tasks.transcribe_segments", queue="preprocess_cpu")
 def transcribe_segments(self, upload_id: str, correlation_id: str):
     """
-    Whisper transcription (int8) on GPU.
+    Whisper transcription (int8) on CPU.
     """
     redis   = Redis.from_url(settings.CELERY_BROKER_URL)
     adapter = logging.LoggerAdapter(logger, {"correlation_id": correlation_id})
@@ -189,7 +184,6 @@ def transcribe_segments(self, upload_id: str, correlation_id: str):
         redis.set(f"progress:{upload_id}", "error")
         raise
 
-
 @shared_task(bind=True, name="tasks.diarize_full", queue="preprocess_gpu")
 def diarize_full(self, upload_id: str, correlation_id: str):
     """
@@ -217,7 +211,7 @@ def diarize_full(self, upload_id: str, correlation_id: str):
         else:
             src = src_wav
 
-        speech  = get_vad().apply({"audio": str(src)})
+        speech   = get_vad().apply({"audio": str(src)})
         speakers = []
 
         if settings.USE_FS_EEND:
@@ -253,7 +247,6 @@ def diarize_full(self, upload_id: str, correlation_id: str):
         redis.set(f"progress:{upload_id}", "error")
         raise
 
-
 @shared_task(name="tasks.cleanup_old_uploads")
 def cleanup_old_uploads():
     """
@@ -269,7 +262,6 @@ def cleanup_old_uploads():
                 logger.info(f"Deleted old upload file: {file_path}")
         except Exception as e:
             logger.warning(f"Failed to delete {file_path}: {e}")
-
 
 def split_audio_fixed_windows(audio_path: Path, window_s: int):
     audio     = AudioSegment.from_file(str(audio_path))
