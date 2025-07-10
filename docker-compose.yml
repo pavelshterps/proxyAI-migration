@@ -1,5 +1,4 @@
-version: '3.8'
-
+# docker-compose.yml
 services:
   db:
     image: postgres:15
@@ -48,10 +47,6 @@ services:
       - db
       - redis
     restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
-      interval: 30s
-      retries: 3
     networks:
       - proxyai_net
 
@@ -91,8 +86,15 @@ services:
     environment:
       - WHISPER_DEVICE=cuda
       - NVIDIA_VISIBLE_DEVICES=all
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: ["gpu"]
     gpus:
-      - all
+      count: 1
     volumes:
       - ./:/app:delegated
       - upload-data:/data/uploads
