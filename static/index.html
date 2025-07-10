@@ -25,10 +25,10 @@
     Аудио/видео-файл:
     <input type="file" id="audioFile" accept="audio/*,video/*" />
   </label>
-  <button id="uploadBtn">Загрузить и начать</button>
+  <button id="uploadBtn" type="button">Загрузить и начать</button>
 
   <div id="status" style="margin-top:1rem;"></div>
-  <button id="fetchResultsBtn" disabled>Получить результаты</button>
+  <button id="fetchResultsBtn" type="button" disabled>Получить результаты</button>
 
   <h2>Плеер</h2>
   <audio id="audio" controls style="width:100%"></audio>
@@ -36,7 +36,7 @@
   <h2>Транскрипция / Диаризация</h2>
   <div id="transcriptContainer"></div>
 
-  <button id="saveLabelsBtn" disabled>Сохранить метки спикеров</button>
+  <button id="saveLabelsBtn" type="button" disabled>Сохранить метки спикеров</button>
 
   <script>
   (async function(){
@@ -76,7 +76,7 @@
           headers:{ "X-API-Key": key }
         })).json();
         statusEl.textContent = `Статус: ${st.status}, прогресс: ${st.progress}`;
-        if (st.status === "done" || st.progress === "100%")) {
+        if (st.status === "done" || st.progress === "100%") {
           clearInterval(interval);
           fetchBtn.disabled = false;
         }

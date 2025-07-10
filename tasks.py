@@ -22,9 +22,10 @@ app = Celery(
     broker=settings.CELERY_BROKER_URL,
     backend=settings.CELERY_RESULT_BACKEND,
 )
-app.conf.task_default_queue = "preprocess_cpu"
+# Перенаправляем ВСЁ на GPU-воркер
+app.conf.task_default_queue = "preprocess_gpu"
 app.conf.task_routes = {
-    "tasks.transcribe_segments": {"queue": "preprocess_cpu"},
+    "tasks.transcribe_segments": {"queue": "preprocess_gpu"},
     "tasks.diarize_full":       {"queue": "preprocess_gpu"},
 }
 # Планировщик для очистки старых файлов
@@ -125,17 +126,16 @@ def preload_and_warmup(**kwargs):
             logger.warning(f"Warm-up clustering diarizer failed: {e}")
 
 
-@shared_task(bind=True, name="tasks.transcribe_segments", queue="preprocess_cpu")
+@shared_task(bind=True, name="tasks.transcribe_segments", queue="preprocess_gpu")
 def transcribe_segments(self, upload_id: str, correlation_id: str):
     """
-    Транскрипция на CPU (Faster-Whisper int8).
-    Автоматически находит исходный файл по upload_id с любым расширением.
+    Транскрипция на GPU (Faster-Whisper).
     """
     redis = Redis.from_url(settings.CELERY_BROKER_URL)
     adapter = logging.LoggerAdapter(logger, {"correlation_id": correlation_id})
     start_time = time.time()
 
-    # 1) Найти реальный файл в папке uploads/*
+    # 1) Найти исходный файл
     upload_dir = Path(settings.UPLOAD_FOLDER)
     candidates = list(upload_dir.glob(f"{upload_id}.*"))
     if not candidates:
@@ -153,16 +153,14 @@ def transcribe_segments(self, upload_id: str, correlation_id: str):
         if upload_path.suffix.lower() != ".wav":
             try:
                 convert_to_wav(upload_path, wav_path, sample_rate=16000, channels=1)
+                src = wav_path
             except Exception as e:
                 adapter.error(f"❌ convert_to_wav failed: {e}", exc_info=True)
-                # если конвертация упала, пробуем читать оригинал
                 src = upload_path
-            else:
-                src = wav_path
         else:
             src = upload_path
 
-        # 3) Сегментация и сам Whisper
+        # 3) Сегментация и транскрипция
         dst_dir = Path(settings.RESULTS_FOLDER) / upload_id
         dst_dir.mkdir(parents=True, exist_ok=True)
 
@@ -217,8 +215,7 @@ def transcribe_segments(self, upload_id: str, correlation_id: str):
 @shared_task(bind=True, name="tasks.diarize_full", queue="preprocess_gpu")
 def diarize_full(self, upload_id: str, correlation_id: str):
     """
-    Диаризация на GPU (pyannote). Ищет WAV с именем upload_id.wav,
-    при отсутствии — конвертирует исходник.
+    Диаризация на GPU (pyannote).
     """
     redis = Redis.from_url(settings.CELERY_BROKER_URL)
     adapter = logging.LoggerAdapter(logger, {"correlation_id": correlation_id})
@@ -228,25 +225,23 @@ def diarize_full(self, upload_id: str, correlation_id: str):
         adapter.info(f"Starting diarization for upload_id={upload_id}")
         src_wav = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
         if not src_wav.exists():
-            # найти исходник
             candidates = list(Path(settings.UPLOAD_FOLDER).glob(f"{upload_id}.*"))
             if candidates:
                 orig = candidates[0]
                 try:
                     convert_to_wav(orig, src_wav, sample_rate=16000, channels=1)
+                    src = src_wav
                 except Exception as e:
                     adapter.error(f"❌ convert_to_wav failed for diarization: {e}", exc_info=True)
                     src = orig
-                else:
-                    src = src_wav
             else:
                 raise FileNotFoundError(f"No source file found for {upload_id}")
         else:
             src = src_wav
 
-        # pyannote VAD + SpeakerDiarization
         speech = get_vad().apply({"audio": str(src)})
         speakers = []
+
         if settings.USE_FS_EEND:
             adapter.info("Using FS-EEND diarization")
             pipeline = SpeakerDiarization.from_pretrained(
