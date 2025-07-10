@@ -1,3 +1,4 @@
+# docker-compose.yml
 version: '3.8'
 
 services:
@@ -5,8 +6,8 @@ services:
     image: postgres:15
     restart: always
     environment:
-      POSTGRES_DB:       ${POSTGRES_DB}
-      POSTGRES_USER:     ${POSTGRES_USER}
+      POSTGRES_DB:   ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
     volumes:
       - postgres_data:/var/lib/postgresql/data
@@ -27,12 +28,13 @@ services:
     networks:
       - proxyai_net
 
+  # ==== API (FastAPI) ====
   api:
     build:
       context: .
       dockerfile: Dockerfile
     env_file: .env
-    # Запускаем FastAPI сервер, а не Celery:
+    # вместо celery, запускаем Uvicorn
     command: >
       uvicorn main:app
       --host 0.0.0.0
@@ -40,14 +42,13 @@ services:
       --workers ${API_WORKERS}
     environment:
       - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
-      - API_WORKERS
       - USE_EXTERNAL_TRANSCRIBE
     volumes:
       - ./:/app:delegated
       - upload-data:/data/uploads
       - results-data:/data/results
       - diarizer-cache:/data/diarizer_cache
-      # Монтируем папку с локальными моделями Whisper:
+      # монтируем модели Whisper из /data/whisper-models
       - /data/whisper-models:/hf_cache:ro
     ports:
       - "8000:8000"
@@ -58,6 +59,7 @@ services:
     networks:
       - proxyai_net
 
+  # ==== CPU-воркер ====
   cpu-worker:
     build:
       context: .
@@ -86,6 +88,7 @@ services:
     networks:
       - proxyai_net
 
+  # ==== GPU-воркер ====
   gpu-worker:
     build:
       context: .
@@ -94,11 +97,7 @@ services:
     environment:
       - WHISPER_DEVICE=cuda
       - NVIDIA_VISIBLE_DEVICES=all
-    # Прокидываем GPU через device_requests — работает и в `docker compose`, и в старом `docker-compose`
-    device_requests:
-      - driver: nvidia
-        count: 1
-        capabilities: ["gpu"]
+    gpus: all
     volumes:
       - ./:/app:delegated
       - upload-data:/data/uploads
@@ -121,6 +120,7 @@ services:
     networks:
       - proxyai_net
 
+  # ==== Celery Beat ====
   beat:
     build:
       context: .
@@ -138,6 +138,7 @@ services:
     networks:
       - proxyai_net
 
+  # ==== Flower UI ====
   flower:
     image: mher/flower:0.9.7
     env_file: .env
@@ -154,6 +155,7 @@ services:
     networks:
       - proxyai_net
 
+  # ==== Nginx (reverse proxy + SSL) ====
   nginx:
     image: nginx:stable-alpine
     container_name: proxyai_nginx
@@ -176,7 +178,7 @@ volumes:
   upload-data:
   results-data:
   diarizer-cache:
-  hf-cache:   # оставляем ради совместимости, но уже не монтируется
+  hf-cache:  # оставляем (для локального кэша), но теперь не монтируется напрямую
 
 networks:
   proxyai_net:
