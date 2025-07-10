@@ -27,12 +27,11 @@ app.conf.task_routes = {
     "tasks.transcribe_segments": {"queue": "preprocess_cpu"},
     "tasks.diarize_full":       {"queue": "preprocess_gpu"},
 }
-
-# Периодический планировщик очистки старых файлов
+# Планировщик для очистки старых файлов
 app.conf.beat_schedule = {
     "cleanup_old_uploads": {
         "task": "tasks.cleanup_old_uploads",
-        "schedule": 3600.0,  # запускать ежечасно
+        "schedule": 3600.0,  # ежечасно
     },
 }
 
@@ -50,13 +49,19 @@ def get_whisper_model():
         device = settings.WHISPER_DEVICE.lower()
         compute = settings.WHISPER_COMPUTE_TYPE.lower()
         if device == "cpu" and compute in ("float16", "fp16"):
-            logger.warning(f"Compute type '{compute}' not supported on CPU; falling back to int8")
+            logger.warning(
+                f"Compute type '{compute}' not supported on CPU; falling back to int8"
+            )
             compute = "int8"
-        logger.info(f"Loading WhisperModel (path={model_path}, device={device}, compute={compute})")
+        logger.info(
+            f"Loading WhisperModel (path={model_path}, device={device}, compute={compute})"
+        )
         try:
             _whisper_model = WhisperModel(model_path, device=device, compute_type=compute)
         except Exception as e:
-            logger.warning(f"Failed to load WhisperModel with compute={compute}: {e}; retrying int8")
+            logger.warning(
+                f"Failed to load WhisperModel with compute={compute}: {e}; retrying int8"
+            )
             _whisper_model = WhisperModel(model_path, device=device, compute_type="int8")
         logger.info("WhisperModel loaded")
     return _whisper_model
@@ -65,8 +70,12 @@ def get_whisper_model():
 def get_vad():
     global _vad
     if _vad is None:
-        model_id = getattr(settings, "VAD_MODEL_PATH", "pyannote/voice-activity-detection")
-        _vad = VoiceActivityDetection.from_pretrained(model_id, use_auth_token=settings.HUGGINGFACE_TOKEN)
+        model_id = getattr(
+            settings, "VAD_MODEL_PATH", "pyannote/voice-activity-detection"
+        )
+        _vad = VoiceActivityDetection.from_pretrained(
+            model_id, use_auth_token=settings.HUGGINGFACE_TOKEN
+        )
         logger.info("VAD pipeline loaded")
     return _vad
 
@@ -88,6 +97,9 @@ def get_clustering_diarizer():
 
 @worker_process_init.connect
 def preload_and_warmup(**kwargs):
+    """
+    Прогрев моделей при старте воркера.
+    """
     sample = Path(__file__).resolve().parent / "tests" / "fixtures" / "sample.wav"
     device = settings.WHISPER_DEVICE.lower()
 
@@ -115,23 +127,42 @@ def preload_and_warmup(**kwargs):
 
 @shared_task(bind=True, name="tasks.transcribe_segments", queue="preprocess_cpu")
 def transcribe_segments(self, upload_id: str, correlation_id: str):
+    """
+    Транскрипция на CPU (Faster-Whisper int8).
+    Автоматически находит исходный файл по upload_id с любым расширением.
+    """
     redis = Redis.from_url(settings.CELERY_BROKER_URL)
     adapter = logging.LoggerAdapter(logger, {"correlation_id": correlation_id})
     start_time = time.time()
 
+    # 1) Найти реальный файл в папке uploads/*
+    upload_dir = Path(settings.UPLOAD_FOLDER)
+    candidates = list(upload_dir.glob(f"{upload_id}.*"))
+    if not candidates:
+        adapter.error(f"No source file found for upload_id={upload_id}")
+        redis.publish(f"progress:{upload_id}", "error")
+        redis.set(f"progress:{upload_id}", "error")
+        return
+    upload_path = candidates[0]
+
     whisper = get_whisper_model()
     try:
-        adapter.info(f"Starting transcription for upload_id={upload_id}")
-        upload_path = Path(settings.UPLOAD_FOLDER) / upload_id
-        wav_name = Path(upload_id).stem + ".wav"
-        wav_path = Path(settings.UPLOAD_FOLDER) / wav_name
-
+        adapter.info(f"Starting transcription for '{upload_path.name}'")
+        # 2) Конвертация в WAV, если нужно
+        wav_path = upload_dir / f"{upload_id}.wav"
         if upload_path.suffix.lower() != ".wav":
-            convert_to_wav(upload_path, wav_path, sample_rate=16000, channels=1)
-            src = wav_path
+            try:
+                convert_to_wav(upload_path, wav_path, sample_rate=16000, channels=1)
+            except Exception as e:
+                adapter.error(f"❌ convert_to_wav failed: {e}", exc_info=True)
+                # если конвертация упала, пробуем читать оригинал
+                src = upload_path
+            else:
+                src = wav_path
         else:
             src = upload_path
 
+        # 3) Сегментация и сам Whisper
         dst_dir = Path(settings.RESULTS_FOLDER) / upload_id
         dst_dir.mkdir(parents=True, exist_ok=True)
 
@@ -141,7 +172,7 @@ def transcribe_segments(self, upload_id: str, correlation_id: str):
 
         for idx, (start, end) in enumerate(windows):
             adapter.debug(f"Segment {idx}: {start:.1f}-{end:.1f}s")
-            chunk = audio[int(start * 1000):int(end * 1000)]
+            chunk = audio[int(start * 1000) : int(end * 1000)]
             tmp_wav = dst_dir / f"{upload_id}_{idx}.wav"
             chunk.export(tmp_wav, format="wav")
 
@@ -152,23 +183,27 @@ def transcribe_segments(self, upload_id: str, correlation_id: str):
                 segments, _ = whisper.transcribe(str(tmp_wav), **opts)
             except Exception as e:
                 adapter.error(f"❌ Transcription failed on segment {idx}: {e}", exc_info=True)
-                tmp_wav.unlink()
+                tmp_wav.unlink(missing_ok=True)
                 continue
 
             for seg in segments:
-                transcript.append({
-                    "segment": idx,
-                    "start": start + seg.start,
-                    "end":   start + seg.end,
-                    "text":  seg.text,
-                })
-            tmp_wav.unlink()
+                transcript.append(
+                    {
+                        "segment": idx,
+                        "start": start + seg.start,
+                        "end": start + seg.end,
+                        "text": seg.text,
+                    }
+                )
+            tmp_wav.unlink(missing_ok=True)
 
+        # 4) Сохранить результат
         out_file = dst_dir / "transcript.json"
-        out_file.write_text(json.dumps(transcript, ensure_ascii=False, indent=2))
+        out_file.write_text(json.dumps(transcript, ensure_ascii=False, indent=2), encoding="utf-8")
         elapsed = time.time() - start_time
         adapter.info(f"✅ Transcription saved in {elapsed:.2f}s")
 
+        # 5) Обновить прогресс
         redis.publish(f"progress:{upload_id}", "50%")
         redis.set(f"progress:{upload_id}", "50%")
 
@@ -181,32 +216,44 @@ def transcribe_segments(self, upload_id: str, correlation_id: str):
 
 @shared_task(bind=True, name="tasks.diarize_full", queue="preprocess_gpu")
 def diarize_full(self, upload_id: str, correlation_id: str):
+    """
+    Диаризация на GPU (pyannote). Ищет WAV с именем upload_id.wav,
+    при отсутствии — конвертирует исходник.
+    """
     redis = Redis.from_url(settings.CELERY_BROKER_URL)
     adapter = logging.LoggerAdapter(logger, {"correlation_id": correlation_id})
     start_time = time.time()
 
     try:
         adapter.info(f"Starting diarization for upload_id={upload_id}")
-        wav_name = Path(upload_id).stem + ".wav"
-        src = Path(settings.UPLOAD_FOLDER) / wav_name
-
-        if not src.exists():
-            orig = Path(settings.UPLOAD_FOLDER) / upload_id
-            if orig.exists():
-                convert_to_wav(orig, src, sample_rate=16000, channels=1)
+        src_wav = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
+        if not src_wav.exists():
+            # найти исходник
+            candidates = list(Path(settings.UPLOAD_FOLDER).glob(f"{upload_id}.*"))
+            if candidates:
+                orig = candidates[0]
+                try:
+                    convert_to_wav(orig, src_wav, sample_rate=16000, channels=1)
+                except Exception as e:
+                    adapter.error(f"❌ convert_to_wav failed for diarization: {e}", exc_info=True)
+                    src = orig
+                else:
+                    src = src_wav
             else:
-                raise ValueError(f"File not found for {upload_id}")
+                raise FileNotFoundError(f"No source file found for {upload_id}")
+        else:
+            src = src_wav
 
+        # pyannote VAD + SpeakerDiarization
         speech = get_vad().apply({"audio": str(src)})
         speakers = []
-
         if settings.USE_FS_EEND:
             adapter.info("Using FS-EEND diarization")
             pipeline = SpeakerDiarization.from_pretrained(
                 settings.FS_EEND_PIPELINE, use_auth_token=settings.HUGGINGFACE_TOKEN
             )
-            diarization = pipeline({"audio": str(src)})
-            for segment, _, spk in diarization.itertracks(yield_label=True):
+            diar = pipeline({"audio": str(src)})
+            for segment, _, spk in diar.itertracks(yield_label=True):
                 speakers.append({"start": segment.start, "end": segment.end, "speaker": spk})
         else:
             adapter.info("Using clustering-based diarization")
@@ -217,7 +264,7 @@ def diarize_full(self, upload_id: str, correlation_id: str):
         dst_dir = Path(settings.RESULTS_FOLDER) / upload_id
         dst_dir.mkdir(parents=True, exist_ok=True)
         out_file = dst_dir / "diarization.json"
-        out_file.write_text(json.dumps(speakers, ensure_ascii=False, indent=2))
+        out_file.write_text(json.dumps(speakers, ensure_ascii=False, indent=2), encoding="utf-8")
 
         elapsed = time.time() - start_time
         adapter.info(f"✅ Diarization saved in {elapsed:.2f}s")
