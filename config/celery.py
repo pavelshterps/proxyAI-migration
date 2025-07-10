@@ -6,15 +6,17 @@ from config.settings import settings
 broker_url = settings.CELERY_BROKER_URL
 result_backend = settings.CELERY_RESULT_BACKEND
 
-# Инициализируем единый экземпляр Celery
+# Инициализируем единый экземпляр Celery,
+# явно включая модуль tasks
 app = Celery(
     "proxyai",
     broker=broker_url,
     backend=result_backend,
+    include=["tasks"],               # ← вот это добавили
 )
 
-# Общие настройки
 app.conf.update(
+    # Сериализация и часовой пояс
     task_serializer="json",
     accept_content=["json"],
     timezone=settings.CELERY_TIMEZONE,
@@ -26,30 +28,27 @@ app.conf.update(
         Queue("preprocess_gpu", Exchange("preprocess_gpu"), routing_key="preprocess_gpu"),
     ),
 
-    # Все задачи по умолчанию в GPU-очередь
+    # По умолчанию — GPU
     task_default_queue="preprocess_gpu",
 
-    # Маршрутизация: отправляем обе задачи в preprocess_gpu
+    # Маршрутизация: и транскрипция, и диаризация — в GPU
     task_routes={
         "tasks.transcribe_segments": {"queue": "preprocess_gpu", "routing_key": "preprocess_gpu"},
         "tasks.diarize_full":       {"queue": "preprocess_gpu", "routing_key": "preprocess_gpu"},
     },
 
-    # Надёжность и контроль ресурсов
+    # Надёжность и таймауты
     task_acks_late=True,
     task_reject_on_worker_lost=True,
     worker_prefetch_multiplier=1,
     task_time_limit=600,
     task_soft_time_limit=550,
 
-    # Периодические задачи
+    # Планировщик очистки
     beat_schedule={
         "cleanup_old_uploads": {
             "task": "tasks.cleanup_old_uploads",
-            "schedule": 3600.0,  # раз в час
+            "schedule": 3600.0,
         },
     },
 )
-
-# Автоматически подхватываем задачи из модуля tasks.py
-app.autodiscover_tasks(["tasks"])
