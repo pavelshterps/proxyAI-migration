@@ -138,11 +138,11 @@ def transcribe_segments(self, upload_id: str, correlation_id: str):
             src = upload_path
 
         # Сегментация
-        dst_dir   = Path(settings.RESULTS_FOLDER) / upload_id
+        dst_dir    = Path(settings.RESULTS_FOLDER) / upload_id
         dst_dir.mkdir(parents=True, exist_ok=True)
-        audio     = AudioSegment.from_file(str(src))
+        audio      = AudioSegment.from_file(str(src))
         transcript = []
-        windows   = split_audio_fixed_windows(src, settings.SEGMENT_LENGTH_S)
+        windows    = split_audio_fixed_windows(src, settings.SEGMENT_LENGTH_S)
 
         for idx, (start, end) in enumerate(windows):
             adapter.debug(f"Segment {idx}: {start:.1f}-{end:.1f}s")
@@ -233,7 +233,7 @@ def diarize_full(self, upload_id: str, correlation_id: str):
             for turn, _, spk in ann.itertracks(yield_label=True):
                 speakers.append({"start": turn.start, "end": turn.end, "speaker": spk})
 
-        dst_dir = Path(settings.RESULTS_FOLDER) / upload_id
+        dst_dir  = Path(settings.RESULTS_FOLDER) / upload_id
         dst_dir.mkdir(parents=True, exist_ok=True)
         out_file = dst_dir / "diarization.json"
         out_file.write_text(
