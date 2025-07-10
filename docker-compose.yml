@@ -97,7 +97,7 @@ services:
     environment:
       - WHISPER_DEVICE=cuda
       - NVIDIA_VISIBLE_DEVICES=all
-    gpus: all
+    runtime: nvidia
     volumes:
       - ./:/app:delegated
       - upload-data:/data/uploads
