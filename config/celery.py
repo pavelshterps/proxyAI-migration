@@ -1,50 +1,55 @@
-from config.settings import settings
-from kombu import Queue, Exchange
 from celery import Celery
+from kombu import Queue, Exchange
+from config.settings import settings
 
-# Брокер и бэкенд
-broker_url = settings.CELERY_BROKER_URL
-result_backend = settings.CELERY_RESULT_BACKEND
-
-# Создаём единый экземпляр Celery и подключаем модуль tasks
+# Создаём единственный экземпляр Celery приложения
 app = Celery(
     "proxyai",
-    broker=broker_url,
-    backend=result_backend,
-    include=["tasks"],
+    broker=settings.CELERY_BROKER_URL,
+    backend=settings.CELERY_RESULT_BACKEND,
 )
 
-# Сериализация
-app.conf.task_serializer = "json"
-app.conf.accept_content = ["json"]
+# Общие настройки Celery
+app.conf.update(
+    # Сериализация
+    task_serializer="json",
+    accept_content=["json"],
 
-# Таймзона
-app.conf.timezone = settings.CELERY_TIMEZONE
-app.conf.enable_utc = True
+    # Часовой пояс
+    timezone=settings.CELERY_TIMEZONE,
+    enable_utc=True,
 
-# Определение очередей
-app.conf.task_queues = (
-    Queue("preprocess_cpu", Exchange("preprocess_cpu"), routing_key="preprocess_cpu"),
-    Queue("preprocess_gpu", Exchange("preprocess_gpu"), routing_key="preprocess_gpu"),
-)
+    # Очередь по умолчанию — GPU
+    task_default_queue="preprocess_gpu",
 
-# Маршрутизация задач
-app.conf.task_routes = {
-    "tasks.transcribe_segments": {"queue": "preprocess_cpu", "routing_key": "preprocess_cpu"},
-    "tasks.diarize_full":       {"queue": "preprocess_gpu", "routing_key": "preprocess_gpu"},
-}
+    # Определяем единственную очередь preprocess_gpu
+    task_queues=(
+        Queue("preprocess_gpu", Exchange("preprocess_gpu"), routing_key="preprocess_gpu"),
+    ),
 
-# Надёжность и контроль ресурсов
-app.conf.task_acks_late               = True
-app.conf.task_reject_on_worker_lost   = True
-app.conf.worker_prefetch_multiplier   = 1
-app.conf.task_time_limit              = 600
-app.conf.task_soft_time_limit         = 550
-
-# Периодические задачи
-app.conf.beat_schedule = {
-    "cleanup_old_uploads": {
-        "task":    "tasks.cleanup_old_uploads",
-        "schedule": 3600.0,  # ежечасно
+    # Все задачи шлём в preprocess_gpu
+    task_routes={
+        "tasks.transcribe_segments": {"queue": "preprocess_gpu", "routing_key": "preprocess_gpu"},
+        "tasks.diarize_full":       {"queue": "preprocess_gpu", "routing_key": "preprocess_gpu"},
+        "tasks.cleanup_old_uploads": {"queue": "preprocess_gpu", "routing_key": "preprocess_gpu"},
     },
-}
+
+    # Подтверждение задач после выполнения
+    task_acks_late=True,
+    task_reject_on_worker_lost=True,
+
+    # Минимальный prefetch
+    worker_prefetch_multiplier=1,
+
+    # Тайм-ауты
+    task_time_limit=600,
+    task_soft_time_limit=550,
+
+    # Планировщик периодических задач (Beat)
+    beat_schedule={
+        "cleanup_old_uploads": {
+            "task": "tasks.cleanup_old_uploads",
+            "schedule": 3600.0,  # каждую секунду
+        },
+    },
+)
