@@ -10,22 +10,20 @@ transformers>=4.28.1
 faster-whisper==1.1.1
 ctranslate2>=4.6.0
 pydub>=0.25.1
-pyannote.audio>=2.1.1
-webrtcvad>=2.0.10           # VAD segmentation
-structlog>=23.3.0           # structured logging
-# database & auth
+pyannote.audio>=2.4.0
+webrtcvad>=2.0.10
+structlog>=23.3.0
 sqlalchemy[asyncio]
 asyncpg
 aiosqlite
 prometheus-client>=0.14.1
-slowapi>=0.1.5         # FastAPI-compatible rate limiting
+slowapi>=0.1.5
 limits>=2.8.0
 yamlargparse>=0.27.0
 chainer>=7.8.0
 numpy<2.0
-cupy-cuda12x
+cupy-cuda12x  # для GPU
 h5py>=3.0.0
 librosa>=0.10.0
 soundfile>=0.12.1
-pyannote.audio>=2.4.0
 httpx>=0.24.0
