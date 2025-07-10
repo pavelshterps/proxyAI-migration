@@ -1,11 +1,12 @@
-# docker‐compose.yml
+version: '3.8'
+
 services:
   db:
     image: postgres:15
     restart: always
     environment:
-      POSTGRES_DB:   ${POSTGRES_DB}
-      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_DB:       ${POSTGRES_DB}
+      POSTGRES_USER:     ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
     volumes:
       - postgres_data:/var/lib/postgresql/data
@@ -31,7 +32,7 @@ services:
       context: .
       dockerfile: Dockerfile
     env_file: .env
-    # Запускаем FastAPI, а не Celery:
+    # Запускаем FastAPI сервер, а не Celery:
     command: >
       uvicorn main:app
       --host 0.0.0.0
@@ -46,7 +47,7 @@ services:
       - upload-data:/data/uploads
       - results-data:/data/results
       - diarizer-cache:/data/diarizer_cache
-      # Привязываем нашу директорию с моделями Whisper на хосте:
+      # Монтируем папку с локальными моделями Whisper:
       - /data/whisper-models:/hf_cache:ro
     ports:
       - "8000:8000"
@@ -93,8 +94,11 @@ services:
     environment:
       - WHISPER_DEVICE=cuda
       - NVIDIA_VISIBLE_DEVICES=all
-    # В Docker Compose v3+: просто "gpus: all"
-    gpus: all
+    # Прокидываем GPU через device_requests — работает и в `docker compose`, и в старом `docker-compose`
+    device_requests:
+      - driver: nvidia
+        count: 1
+        capabilities: ["gpu"]
     volumes:
       - ./:/app:delegated
       - upload-data:/data/uploads
@@ -172,7 +176,8 @@ volumes:
   upload-data:
   results-data:
   diarizer-cache:
-  hf-cache:   # оставляем, но теперь не монтируется
+  hf-cache:   # оставляем ради совместимости, но уже не монтируется
+
 networks:
   proxyai_net:
     driver: bridge
