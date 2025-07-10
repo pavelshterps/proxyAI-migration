@@ -33,7 +33,6 @@ services:
       context: .
       dockerfile: Dockerfile
     env_file: .env
-    # вместо celery, запускаем Uvicorn
     command: >
       uvicorn main:app
       --host 0.0.0.0
@@ -47,7 +46,6 @@ services:
       - upload-data:/data/uploads
       - results-data:/data/results
       - diarizer-cache:/data/diarizer_cache
-      # монтируем модели Whisper из /data/whisper-models
       - /data/whisper-models:/hf_cache:ro
     ports:
       - "8000:8000"
@@ -162,7 +160,9 @@ services:
       - /etc/letsencrypt/live/tonage.io/privkey.pem:/etc/nginx/certs/privkey.pem:ro
     restart: unless-stopped
     networks:
-      - proxyai_net
+      proxyai_net:
+        aliases:
+          - api
 
 volumes:
   postgres_data:
@@ -170,7 +170,7 @@ volumes:
   upload-data:
   results-data:
   diarizer-cache:
-  hf-cache:  # оставляем (для локального кэша), но теперь не монтируется напрямую
+  hf-cache:
 
 networks:
   proxyai_net:
