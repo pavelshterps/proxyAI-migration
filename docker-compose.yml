@@ -1,5 +1,3 @@
-version: "3.8"
-
 services:
   db:
     image: postgres:15
@@ -78,7 +76,14 @@ services:
     environment:
       - WHISPER_DEVICE=cuda
       - NVIDIA_VISIBLE_DEVICES=all
-    runtime: nvidia
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: ["gpu"]
+    gpus: all
     volumes:
       - ./:/app:delegated
       - upload-data:/data/uploads
