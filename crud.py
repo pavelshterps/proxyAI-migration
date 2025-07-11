@@ -6,7 +6,7 @@ from typing import List, Optional
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 
-from models import Base, Upload, User
+from models import Upload, User
 
 # -----------------------
 # Upload-CRUD
@@ -72,12 +72,15 @@ async def get_label_mapping(
 
 async def create_user(
     db: AsyncSession,
-    name: str
+    name: str,
+    api_key: Optional[str] = None
 ) -> User:
     """
-    Создаёт нового пользователя с уникальным api_key.
+    Создаёт нового пользователя.
+    Если api_key не передан, генерирует случайный.
     """
-    api_key = uuid.uuid4().hex
+    if api_key is None:
+        api_key = uuid.uuid4().hex
     user = User(name=name, api_key=api_key)
     db.add(user)
     await db.commit()
