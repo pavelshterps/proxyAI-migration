@@ -10,9 +10,12 @@ from faster_whisper import WhisperModel
 from pyannote.audio.pipelines import VoiceActivityDetection, SpeakerDiarization
 from pydub import AudioSegment
 from redis import Redis
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
 
 from config.settings import settings
 from config.celery import app          # единый Celery instance
+from models import Upload
 from utils.audio import convert_to_wav
 
 logger = logging.getLogger(__name__)
@@ -91,36 +94,63 @@ def preload_and_warmup(**kwargs):
 
 @app.task(bind=True, name="tasks.download_audio", queue="preprocess_gpu")
 def download_audio(self, upload_id: str, correlation_id: str):
-    # noop if already local
     logger.info(f"[{correlation_id}] download_audio noop for {upload_id}")
 
 @app.task(bind=True, name="tasks.preview_transcribe", queue="preprocess_gpu")
 def preview_transcribe(self, upload_id: str, correlation_id: str):
     """Preview: первые settings.PREVIEW_LENGTH_S секунд."""
-    redis = Redis.from_url(settings.CELERY_BROKER_URL)
-    # … (конвертация + сегментация как было) …
-    # результат пушим в Redis:
-    #   redis.set(f"preview_result:{upload_id}", json.dumps(preview))
-    #   redis.publish(f"progress:{upload_id}", "preview_done")
-    # callbacks:
-    for url in json.loads(redis.get(f"callbacks:{upload_id}") or "[]"):
+    redis_client = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
+
+    # конвертация и сегментация аудио
+    source = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
+    wav_path = convert_to_wav(source)
+    segments = split_audio_fixed_windows(wav_path, settings.PREVIEW_LENGTH_S)
+
+    # транскрибируем первые segments
+    preview = {"text": "", "timestamps": []}
+    model = get_whisper_model()
+    for start, end in segments:
+        result, _ = model.transcribe(str(wav_path), timestamp=True, start=start, end=end)
+        preview["text"] += result["text"]
+        preview["timestamps"].extend(result["segments"])
+
+    # сохраняем preview в Redis
+    redis_client.set(f"preview_result:{upload_id}", json.dumps(preview, ensure_ascii=False))
+
+    # обновляем прогресс
+    redis_client.set(f"progress:{upload_id}", "preview_done")
+    redis_client.publish(f"progress:{upload_id}", "preview_done")
+
+    # callbacks preview_complete
+    for url in json.loads(redis_client.get(f"callbacks:{upload_id}") or "[]"):
         try:
             requests.post(url, json={
-                "external_id": upload_id,
-                "event":       "preview_complete"
+                "external_id":   upload_id,
+                "event":         "preview_complete",
+                "url_to_result": None
             }, timeout=5)
         except:
             pass
-    # запускаем полную транскрипцию
+
+    # запуск полной транскрипции
     transcribe_segments.delay(upload_id, correlation_id)
 
 @app.task(bind=True, name="tasks.transcribe_segments", queue="preprocess_gpu")
 def transcribe_segments(self, upload_id: str, correlation_id: str):
     """Полная транскрипция."""
-    redis = Redis.from_url(settings.CELERY_BROKER_URL)
-    # … (как было: полная транскрипция, сохранение в RESULTS) …
-    # callbacks для full transcript
-    for url in json.loads(redis.get(f"callbacks:{upload_id}") or "[]"):
+    redis_client = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
+
+    # полная транскрипция всего файла
+    source = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
+    wav_path = convert_to_wav(source)
+    model = get_whisper_model()
+    result, _ = model.transcribe(str(wav_path), timestamp=True)
+    out_file = Path(settings.RESULTS_FOLDER) / upload_id / "transcript.json"
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+    out_file.write_text(json.dumps(result["segments"], ensure_ascii=False, indent=2), encoding="utf-8")
+
+    # callbacks transcript_complete
+    for url in json.loads(redis_client.get(f"callbacks:{upload_id}") or "[]"):
         try:
             requests.post(url, json={
                 "external_id": upload_id,
@@ -129,17 +159,46 @@ def transcribe_segments(self, upload_id: str, correlation_id: str):
         except:
             pass
 
-    # **Условный** запуск диаризации
-    if redis.get(f"diarize_requested:{upload_id}") == "1":
+    # условный запуск диаризации
+    if redis_client.get(f"diarize_requested:{upload_id}") == "1":
         diarize_full.delay(upload_id, correlation_id)
 
 @app.task(bind=True, name="tasks.diarize_full", queue="preprocess_gpu")
 def diarize_full(self, upload_id: str, correlation_id: str):
     """Полная диаризация."""
-    redis = Redis.from_url(settings.CELERY_BROKER_URL)
-    # … (как было: diarization.json) …
-    # callbacks для diarization
-    for url in json.loads(redis.get(f"callbacks:{upload_id}") or "[]"):
+    redis_client = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
+
+    # генерация diarization.json
+    audio = {"audio": str(Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav")}
+    vad = get_vad().apply(audio)
+    diar = get_clustering_diarizer().apply(audio, vad=vad)
+    segments = [
+        {"start": float(s.start), "end": float(s.end), "speaker": int(s.label)}
+        for s in diar
+    ]
+    out_file = Path(settings.RESULTS_FOLDER) / upload_id / "diarization.json"
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+    out_file.write_text(json.dumps(segments, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    # автоматически применяем пользовательский mapping
+    try:
+        engine = create_engine(settings.DATABASE_URL)
+        SessionLocal = sessionmaker(bind=engine)
+        session = SessionLocal()
+        upload = session.query(Upload).filter_by(upload_id=upload_id).first()
+        mapping = upload.label_mapping or {}
+        if mapping:
+            for seg in segments:
+                key = str(seg["speaker"])
+                if key in mapping:
+                    seg["speaker"] = mapping[key]
+            out_file.write_text(json.dumps(segments, ensure_ascii=False, indent=2), encoding="utf-8")
+        session.close()
+    except Exception as e:
+        logger.error(f"[{correlation_id}] Error applying label mapping: {e}")
+
+    # callbacks diarization_complete
+    for url in json.loads(redis_client.get(f"callbacks:{upload_id}") or "[]"):
         try:
             requests.post(url, json={
                 "external_id": upload_id,

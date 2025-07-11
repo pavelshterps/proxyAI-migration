@@ -1,3 +1,5 @@
+# crud.py
+
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from typing import List, Optional
@@ -33,3 +35,24 @@ async def get_upload_for_user(
         stmt = stmt.where(Upload.external_id == external_id)
     res = await db.execute(stmt)
     return res.scalars().first()
+
+async def update_label_mapping(
+    db: AsyncSession,
+    user_id: int,
+    upload_id: str,
+    mapping: dict
+):
+    rec = await get_upload_for_user(db, user_id, upload_id=upload_id)
+    if not rec:
+        return None
+    rec.label_mapping = mapping
+    await db.commit()
+    return rec
+
+async def get_label_mapping(
+    db: AsyncSession,
+    user_id: int,
+    upload_id: str
+) -> dict:
+    rec = await get_upload_for_user(db, user_id, upload_id=upload_id)
+    return rec.label_mapping or {}

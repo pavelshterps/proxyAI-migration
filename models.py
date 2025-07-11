@@ -1,3 +1,5 @@
+# models.py
+
 import datetime
 from sqlalchemy import Column, Integer, String, ForeignKey, DateTime, JSON, Boolean
 from sqlalchemy.orm import relationship, declarative_base
@@ -22,9 +24,7 @@ class Upload(Base):
     preview_result        = Column(JSON, nullable=True)
     callback_urls         = Column(JSON, nullable=True)
     diarization_requested = Column(Boolean, default=False, index=True)
-    # (опционально) можно хранить статус/результат диаризации в БД, но мы используем Redis:
-    # diarization_status   = Column(String, default="queued", index=True)
-    # diarization_result   = Column(JSON, nullable=True)
+    label_mapping         = Column(JSON, nullable=True)   # новое поле
     created_at            = Column(
                               DateTime,
                               default=datetime.datetime.utcnow
