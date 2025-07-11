@@ -1,5 +1,3 @@
-# routes.py
-
 import json
 from pathlib import Path
 from fastapi import APIRouter, Depends, HTTPException
@@ -18,33 +16,23 @@ def _read_json(path: Path):
 
 @router.get("/transcription/{upload_id}")
 async def get_transcription(upload_id: str):
-    """
-    Вернёт только транскрипцию, как она лежит в transcript.json
-    """
-    base = Path(settings.RESULTS_FOLDER) / upload_id
-    t_file = base / "transcript.json"
-    transcript = _read_json(t_file)
-    return {"transcript": transcript}
+    t = Path(settings.RESULTS_FOLDER) / upload_id / "transcript.json"
+    return {"transcript": _read_json(t)}
 
 @router.get("/diarization/{upload_id}")
 async def get_diarization(upload_id: str):
-    """
-    Вернёт только диаризацию, как она лежит в diarization.json
-    """
-    base = Path(settings.RESULTS_FOLDER) / upload_id
-    d_file = base / "diarization.json"
-    diarization = _read_json(d_file)
-    return {"diarization": diarization}
+    d = Path(settings.RESULTS_FOLDER) / upload_id / "diarization.json"
+    return {"diarization": _read_json(d)}
+
+@router.get("/transcription/{upload_id}/preview")
+async def get_preview(upload_id: str):
+    p = Path(settings.RESULTS_FOLDER) / upload_id / "preview_transcript.json"
+    return {"preview": _read_json(p)}
 
 @router.get("/results/{upload_id}")
 async def get_results(upload_id: str):
-    """
-    Скомбинированный вид для UI: транскрипция + подстановка спикера
-    """
-    base = Path(settings.RESULTS_FOLDER) / upload_id
-    transcript = _read_json(base / "transcript.json")
-    diarization = _read_json(base / "diarization.json")
-
+    transcript = _read_json(Path(settings.RESULTS_FOLDER)/upload_id/"transcript.json")
+    diarization = _read_json(Path(settings.RESULTS_FOLDER)/upload_id/"diarization.json")
     results = []
     for seg in transcript:
         spk = next(
@@ -66,16 +54,14 @@ async def get_results(upload_id: str):
 
 @router.post("/labels/{upload_id}")
 async def save_labels(upload_id: str, mapping: dict, current=Depends(get_current_user)):
-    """
-    Перезаписать имена спикеров в diarization.json по словарю mapping.
-    """
     base = Path(settings.RESULTS_FOLDER) / upload_id
     d_file = base / "diarization.json"
     diarization = _read_json(d_file)
-
     for d in diarization:
         if d["speaker"] in mapping:
             d["speaker"] = mapping[d["speaker"]]
-
-    d_file.write_text(json.dumps(diarization, ensure_ascii=False, indent=2), encoding="utf-8")
+    d_file.write_text(
+        json.dumps(diarization, ensure_ascii=False, indent=2),
+        encoding="utf-8"
+    )
     return {"detail": "Labels updated"}

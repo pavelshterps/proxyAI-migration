@@ -54,6 +54,7 @@ class Settings(BaseSettings):
     PYANNOTE_PIPELINE: str = Field(..., env="PYANNOTE_PIPELINE")
 
     # segmentation/VAD
+    PREVIEW_LENGTH_S: int = Field(60, env="PREVIEW_LENGTH_S")
     SEGMENT_LENGTH_S: int = Field(30, env="SEGMENT_LENGTH_S")
     VAD_LEVEL: int = Field(2, env="VAD_LEVEL")
     VAD_MODEL_PATH: str = Field(..., env="VAD_MODEL_PATH")
