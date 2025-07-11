@@ -108,7 +108,6 @@ def preview_transcribe(self, upload_id: str, correlation_id: str):
     redis_client = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
 
     # 1) Конвертация в WAV (если нужно)
-    # Locate the uploaded source file with any extension
     upload_folder = Path(settings.UPLOAD_FOLDER)
     candidates = list(upload_folder.glob(f"{upload_id}.*"))
     if not candidates:
@@ -127,7 +126,6 @@ def preview_transcribe(self, upload_id: str, correlation_id: str):
     opts = {}
     if settings.WHISPER_LANGUAGE:
         opts["language"] = settings.WHISPER_LANGUAGE
-    # включаем таймштампы
     segments, _ = model.transcribe(str(wav_path), word_timestamps=True, **opts)
 
     preview = {"text": "", "timestamps": []}
@@ -176,7 +174,6 @@ def transcribe_segments(self, upload_id: str, correlation_id: str):
     redis_client = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
 
     # 1) Конвертация в WAV (если нужно)
-    # Locate the uploaded source file with any extension
     upload_folder = Path(settings.UPLOAD_FOLDER)
     candidates = list(upload_folder.glob(f"{upload_id}.*"))
     if not candidates:
