@@ -67,6 +67,16 @@ def get_clustering_diarizer():
         )
     return _clustering_diarizer
 
+def find_source_file(upload_id: str) -> Path:
+    """
+    Находит исходный файл по upload_id с любым расширением.
+    """
+    folder = Path(settings.UPLOAD_FOLDER)
+    matches = list(folder.glob(f"{upload_id}.*"))
+    if not matches:
+        raise FileNotFoundError(f"No source file found for upload_id={upload_id}")
+    return matches[0]
+
 @worker_process_init.connect
 def preload_and_warmup(**kwargs):
     """
@@ -101,10 +111,14 @@ def preview_transcribe(self, upload_id: str, correlation_id: str):
     """Preview: первые settings.PREVIEW_LENGTH_S секунд."""
     redis_client = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
 
-    # исходный файл и целевой WAV
-    src = Path(settings.UPLOAD_FOLDER) / f"{upload_id}"
-    wav_dst = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
-    wav_path = convert_to_wav(src, wav_dst)
+    try:
+        # находим исходный файл и конвертируем в WAV
+        src_file = find_source_file(upload_id)
+        wav_dst = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
+        wav_path = convert_to_wav(src_file, wav_dst)
+    except Exception as e:
+        logger.error(f"[{correlation_id}] Ошибка конвертации: {e}")
+        return
 
     # разбиваем на отрезки для превью
     segments = split_audio_fixed_windows(wav_path, settings.PREVIEW_LENGTH_S)
@@ -125,8 +139,6 @@ def preview_transcribe(self, upload_id: str, correlation_id: str):
 
     # сохраняем preview в Redis
     redis_client.set(f"preview_result:{upload_id}", json.dumps(preview, ensure_ascii=False))
-
-    # публикуем прогресс
     redis_client.set(f"progress:{upload_id}", "preview_done")
     redis_client.publish(f"progress:{upload_id}", "preview_done")
 
@@ -149,10 +161,13 @@ def transcribe_segments(self, upload_id: str, correlation_id: str):
     """Полная транскрипция."""
     redis_client = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
 
-    # полная транскрипция всего файла
-    src = Path(settings.UPLOAD_FOLDER) / f"{upload_id}"
-    wav_dst = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
-    wav_path = convert_to_wav(src, wav_dst)
+    try:
+        src_file = find_source_file(upload_id)
+        wav_dst = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
+        wav_path = convert_to_wav(src_file, wav_dst)
+    except Exception as e:
+        logger.error(f"[{correlation_id}] Ошибка конвертации: {e}")
+        return
 
     model = get_whisper_model()
     result, _ = model.transcribe(
@@ -160,7 +175,7 @@ def transcribe_segments(self, upload_id: str, correlation_id: str):
         timestamp=True,
         **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {})
     )
-    # сохраняем результат
+
     out_dir = Path(settings.RESULTS_FOLDER) / upload_id
     out_dir.mkdir(parents=True, exist_ok=True)
     transcript_file = out_dir / "transcript.json"
@@ -179,7 +194,7 @@ def transcribe_segments(self, upload_id: str, correlation_id: str):
         except:
             pass
 
-    # если нужно, запускаем диаризацию
+    # условный запуск диаризации
     if redis_client.get(f"diarize_requested:{upload_id}") == "1":
         diarize_full.delay(upload_id, correlation_id)
 
@@ -188,12 +203,10 @@ def diarize_full(self, upload_id: str, correlation_id: str):
     """Полная диаризация."""
     redis_client = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
 
-    # подготовка и VAD
-    audio_kwargs = {"audio": str(Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav")}
-    vad = get_vad().apply(audio_kwargs)
-    diar = get_clustering_diarizer().apply(audio_kwargs, vad=vad)
+    audio_args = {"audio": str((Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"))}
+    vad = get_vad().apply(audio_args)
+    diar = get_clustering_diarizer().apply(audio_args, vad=vad)
 
-    # формируем сегменты
     segments = [
         {"start": float(s.start), "end": float(s.end), "speaker": int(s.label)}
         for s in diar
@@ -206,7 +219,7 @@ def diarize_full(self, upload_id: str, correlation_id: str):
         encoding="utf-8"
     )
 
-    # применяем пользовательский mapping, если есть
+    # применяем пользовательский mapping
     try:
         engine = create_engine(settings.DATABASE_URL)
         SessionLocal = sessionmaker(bind=engine)
