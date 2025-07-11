@@ -74,7 +74,7 @@ def get_clustering_diarizer():
 @worker_process_init.connect
 def preload_and_warmup(**kwargs):
     """
-    Warm up: Whisper (CPU) or VAD+diarizer (GPU).
+    Warm up: Whisper (CPU) или VAD+diarizer (GPU).
     """
     sample = Path(__file__).resolve().parent / "tests" / "fixtures" / "sample.wav"
     device = settings.WHISPER_DEVICE.lower()
@@ -107,7 +107,7 @@ def preview_transcribe(self, upload_id: str, correlation_id: str):
     """Preview: первые settings.PREVIEW_LENGTH_S секунд."""
     redis_client = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
 
-    # 1) Конвертация в WAV (если нужно)
+    # 1) Найти исходный файл (любое расширение) и конвертировать в WAV
     upload_folder = Path(settings.UPLOAD_FOLDER)
     candidates = list(upload_folder.glob(f"{upload_id}.*"))
     if not candidates:
@@ -121,11 +121,12 @@ def preview_transcribe(self, upload_id: str, correlation_id: str):
         logger.error(f"[{correlation_id}] Ошибка конвертации: {e}")
         return
 
-    # 2) Транскрибируем первые settings.PREVIEW_LENGTH_S секунд
+    # 2) Транскрибировать первые settings.PREVIEW_LENGTH_S секунд
     model = get_whisper_model()
     opts = {}
     if settings.WHISPER_LANGUAGE:
         opts["language"] = settings.WHISPER_LANGUAGE
+    # включаем разметку по словам для таймштампов
     segments, _ = model.transcribe(str(wav_path), word_timestamps=True, **opts)
 
     preview = {"text": "", "timestamps": []}
@@ -135,17 +136,17 @@ def preview_transcribe(self, upload_id: str, correlation_id: str):
         preview["text"] += seg.text
         preview["timestamps"].append({
             "start": seg.start,
-            "end": seg.end,
-            "text": seg.text
+            "end":   seg.end,
+            "text":  seg.text
         })
 
-    # 3) Сохраняем preview в Redis
+    # 3) Сохранить preview в Redis
     redis_client.set(
         f"preview_result:{upload_id}",
         json.dumps(preview, ensure_ascii=False)
     )
 
-    # 4) Обновляем прогресс
+    # 4) Обновить прогресс
     redis_client.set(f"progress:{upload_id}", "preview_done")
     redis_client.publish(f"progress:{upload_id}", "preview_done")
 
@@ -155,8 +156,8 @@ def preview_transcribe(self, upload_id: str, correlation_id: str):
             requests.post(
                 url,
                 json={
-                    "external_id": upload_id,
-                    "event":       "preview_complete",
+                    "external_id":   upload_id,
+                    "event":         "preview_complete",
                     "url_to_result": None
                 },
                 timeout=5
@@ -164,7 +165,7 @@ def preview_transcribe(self, upload_id: str, correlation_id: str):
         except:
             pass
 
-    # 6) Запуск полной транскрипции
+    # 6) Запустить полную транскрипцию
     transcribe_segments.delay(upload_id, correlation_id)
 
 
@@ -173,7 +174,7 @@ def transcribe_segments(self, upload_id: str, correlation_id: str):
     """Полная транскрипция."""
     redis_client = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
 
-    # 1) Конвертация в WAV (если нужно)
+    # 1) Конвертация в WAV
     upload_folder = Path(settings.UPLOAD_FOLDER)
     candidates = list(upload_folder.glob(f"{upload_id}.*"))
     if not candidates:
@@ -187,7 +188,7 @@ def transcribe_segments(self, upload_id: str, correlation_id: str):
         logger.error(f"[{correlation_id}] Ошибка конвертации полного файла: {e}")
         return
 
-    # 2) Транскрипция всего файла
+    # 2) Полная транскрипция
     model = get_whisper_model()
     opts = {}
     if settings.WHISPER_LANGUAGE:
@@ -249,7 +250,7 @@ def diarize_full(self, upload_id: str, correlation_id: str):
         encoding="utf-8"
     )
 
-    # 2) Автоматически применяем пользовательский mapping
+    # 2) Автоматически применить пользовательский mapping
     try:
         engine = create_engine(settings.DATABASE_URL)
         SessionLocal = sessionmaker(bind=engine)
@@ -261,6 +262,7 @@ def diarize_full(self, upload_id: str, correlation_id: str):
                 key = str(seg["speaker"])
                 if key in mapping:
                     seg["speaker"] = mapping[key]
+            # перезаписать с новыми метками
             out_file.write_text(
                 json.dumps(segments, ensure_ascii=False, indent=2),
                 encoding="utf-8"
@@ -286,7 +288,7 @@ def diarize_full(self, upload_id: str, correlation_id: str):
 
 @app.task(name="tasks.cleanup_old_uploads")
 def cleanup_old_uploads():
-    """Удаление старых."""
+    """Удаление старых файлов из папки upload."""
     cutoff = time.time() - 24 * 3600
     for f in Path(settings.UPLOAD_FOLDER).iterdir():
         if f.stat().st_mtime < cutoff:
@@ -294,7 +296,7 @@ def cleanup_old_uploads():
 
 
 def split_audio_fixed_windows(audio_path: Path, window_s: int):
-    """Утилита: нарезка файлов на фиксированные окна (не используется в новых задачах)."""
+    """Утилита: нарезка файла на окна – пока не используется."""
     audio = AudioSegment.from_file(str(audio_path))
     length_ms = len(audio)
     window_ms = window_s * 1000
