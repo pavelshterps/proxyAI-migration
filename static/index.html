@@ -43,24 +43,24 @@
 
   <script>
   (async function(){
-    const apiKeyEl = document.getElementById('apiKey');
-    const fileEl   = document.getElementById('audioFile');
-    const uploadBtn= document.getElementById('uploadBtn');
-    const statusEl = document.getElementById('status');
-    const previewBtn = document.getElementById('fetchPreviewBtn');
-    const transcriptBtn = document.getElementById('fetchTranscriptBtn');
-    const diarizeBtn = document.getElementById('requestDiarizeBtn');
-    const audioEl  = document.getElementById('audio');
-    const container= document.getElementById('transcriptContainer');
-    const saveBtn  = document.getElementById('saveLabelsBtn');
+    const apiKeyEl       = document.getElementById('apiKey');
+    const fileEl         = document.getElementById('audioFile');
+    const uploadBtn      = document.getElementById('uploadBtn');
+    const statusEl       = document.getElementById('status');
+    const previewBtn     = document.getElementById('fetchPreviewBtn');
+    const transcriptBtn  = document.getElementById('fetchTranscriptBtn');
+    const diarizeBtn     = document.getElementById('requestDiarizeBtn');
+    const audioEl        = document.getElementById('audio');
+    const container      = document.getElementById('transcriptContainer');
+    const saveBtn        = document.getElementById('saveLabelsBtn');
 
     let uploadId, fileBlob, mapping = {};
 
     uploadBtn.onclick = async () => {
       const key = apiKeyEl.value.trim();
-      if(!key){ alert("Введите API-Key"); return; }
+      if (!key) { alert("Введите API-Key"); return; }
       const file = fileEl.files[0];
-      if(!file){ alert("Выберите файл"); return; }
+      if (!file) { alert("Выберите файл"); return; }
       fileBlob = file;
       statusEl.textContent = "Загружаем...";
       const fd = new FormData();
@@ -68,32 +68,39 @@
 
       const res = await fetch("/upload/", {
         method: "POST",
-        headers:{ "X-API-Key": key },
+        headers: { "X-API-Key": key },
         body: fd
       });
-      if(!res.ok){ alert("Upload error: "+res.status); return; }
+      if (!res.ok) { alert("Upload error: " + res.status); return; }
       const { upload_id } = await res.json();
       uploadId = upload_id;
       statusEl.textContent = `upload_id=${uploadId}. Ожидаем...`;
 
-      const interval = setInterval(async ()=>{
+      previewBtn.disabled    = true;
+      transcriptBtn.disabled = true;
+      diarizeBtn.disabled    = true;
+      saveBtn.disabled       = true;
+
+      const interval = setInterval(async () => {
         const st = await (await fetch(`/status/${uploadId}`, {
-          headers:{ "X-API-Key": key }
+          headers: { "X-API-Key": key }
         })).json();
         statusEl.textContent = `Статус: ${st.status}, прогресс: ${st.progress}`;
+
         if (st.progress === "preview_done") {
-          previewBtn.disabled = false;
+          previewBtn.disabled    = false;
           transcriptBtn.disabled = true;
-          diarizeBtn.disabled = true;
+          diarizeBtn.disabled    = true;
         }
         if (st.progress === "transcript_done") {
           transcriptBtn.disabled = false;
-          diarizeBtn.disabled = false;
+          diarizeBtn.disabled    = false;
         }
         if (st.progress === "diarization_done") {
-          transcriptBtn.disabled = false;
+          // после полной диаризации уже можно менять лейблы
+          saveBtn.disabled = false;
         }
-        if (st.status === "done" || st.progress === "100%") {
+        if (st.status === "done") {
           clearInterval(interval);
         }
       }, 2000);
@@ -103,9 +110,9 @@
       const key = apiKeyEl.value.trim();
       statusEl.textContent = "Получаем превью...";
       const res = await fetch(`/results/${uploadId}`, {
-        headers:{ "X-API-Key": key }
+        headers: { "X-API-Key": key }
       });
-      if(!res.ok){ alert("Ошибка: "+res.status); return; }
+      if (!res.ok) { alert("Ошибка: " + res.status); return; }
       const payload = await res.json();
       audioEl.src = URL.createObjectURL(fileBlob);
       renderTranscript(payload.results);
@@ -116,9 +123,9 @@
       const key = apiKeyEl.value.trim();
       statusEl.textContent = "Получаем транскрипцию...";
       const res = await fetch(`/results/${uploadId}`, {
-        headers:{ "X-API-Key": key }
+        headers: { "X-API-Key": key }
       });
-      if(!res.ok){ alert("Ошибка: "+res.status); return; }
+      if (!res.ok) { alert("Ошибка: " + res.status); return; }
       const payload = await res.json();
       audioEl.src = URL.createObjectURL(fileBlob);
       renderTranscript(payload.results);
@@ -130,19 +137,19 @@
       statusEl.textContent = "Запрашиваем диаризацию...";
       const res = await fetch(`/diarize/${uploadId}`, {
         method: "POST",
-        headers:{ "X-API-Key": key }
+        headers: { "X-API-Key": key }
       });
-      if(!res.ok){ alert("Ошибка: "+res.status); return; }
+      if (!res.ok) { alert("Ошибка: " + res.status); return; }
       statusEl.textContent = "Диаризация запрошена. Ожидаем...";
     };
 
     saveBtn.onclick = async () => {
       const key = apiKeyEl.value.trim();
       const payload = {};
-      Object.entries(mapping).forEach(([o,n]) => {
-        if(o !== n) payload[o] = n;
+      Object.entries(mapping).forEach(([o, n]) => {
+        if (o !== n) payload[o] = n;
       });
-      if(!Object.keys(payload).length){ alert("Нет изменений"); return; }
+      if (!Object.keys(payload).length) { alert("Нет изменений"); return; }
       const res = await fetch(`/labels/${uploadId}`, {
         method: "POST",
         headers: {
@@ -151,51 +158,55 @@
         },
         body: JSON.stringify(payload)
       });
-      if(!res.ok){
+      if (!res.ok) {
         const err = await res.json();
-        alert("Ошибка: "+ err.detail || res.status);
+        alert("Ошибка: " + (err.detail || res.status));
         return;
       }
       alert("Метки сохранены");
     };
 
-    function renderTranscript(list){
+    function renderTranscript(list) {
       container.innerHTML = "";
       mapping = {};
       list.forEach(s => mapping[s.speaker] = s.speaker);
       list.forEach(seg => {
         const div = document.createElement("div");
         div.className = "segment";
+
         const t = document.createElement("span");
         t.className = "time";
         t.textContent = seg.time || "--:--:--";
+
         const btn = document.createElement("button");
         btn.textContent = "▶️";
         btn.onclick = () => {
           audioEl.currentTime = seg.start;
           audioEl.play();
-          setTimeout(()=>audioEl.pause(), (seg.end - seg.start)*1000 + 200);
+          setTimeout(() => audioEl.pause(), (seg.end - seg.start) * 1000 + 200);
         };
+
         const inp = document.createElement("input");
         inp.value = seg.speaker;
         inp.onchange = () => {
           const old = seg.speaker, neu = inp.value.trim();
-          if(neu && neu.length<=50){
+          if (neu && neu.length <= 50) {
             mapping[old] = neu;
-            document.querySelectorAll('.segment input').forEach(i=>{
-              if(i.value===old) i.value = neu;
+            document.querySelectorAll('.segment input').forEach(i => {
+              if (i.value === old) i.value = neu;
             });
           } else {
             alert("Имя 1–50 символов");
             inp.value = mapping[old];
           }
         };
+
         const txt = document.createElement("span");
         txt.textContent = seg.text;
+
         div.append(t, btn, inp, txt);
         container.append(div);
       });
-      saveBtn.disabled = false;
     }
   })();
   </script>
