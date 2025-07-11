@@ -108,8 +108,14 @@ def preview_transcribe(self, upload_id: str, correlation_id: str):
     redis_client = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
 
     # 1) Конвертация в WAV (если нужно)
-    src_file = Path(settings.UPLOAD_FOLDER) / upload_id
-    dst_file = src_file.with_suffix(".wav")
+    # Locate the uploaded source file with any extension
+    upload_folder = Path(settings.UPLOAD_FOLDER)
+    candidates = list(upload_folder.glob(f"{upload_id}.*"))
+    if not candidates:
+        logger.error(f"[{correlation_id}] Source file for upload_id {upload_id} not found")
+        return
+    src_file = candidates[0]
+    dst_file = upload_folder / f"{upload_id}.wav"
     try:
         wav_path = convert_to_wav(src_file, dst_file)
     except Exception as e:
@@ -170,8 +176,14 @@ def transcribe_segments(self, upload_id: str, correlation_id: str):
     redis_client = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
 
     # 1) Конвертация в WAV (если нужно)
-    src_file = Path(settings.UPLOAD_FOLDER) / upload_id
-    dst_file = src_file.with_suffix(".wav")
+    # Locate the uploaded source file with any extension
+    upload_folder = Path(settings.UPLOAD_FOLDER)
+    candidates = list(upload_folder.glob(f"{upload_id}.*"))
+    if not candidates:
+        logger.error(f"[{correlation_id}] Source file for upload_id {upload_id} not found")
+        return
+    src_file = candidates[0]
+    dst_file = upload_folder / f"{upload_id}.wav"
     try:
         wav_path = convert_to_wav(src_file, dst_file)
     except Exception as e:
