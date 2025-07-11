@@ -126,6 +126,37 @@ async def get_status(upload_id: str, current_user=Depends(get_current_user), db=
     progress = await redis.get(f"progress:{upload_id}") or "0%"
     return {"status": "done" if done else "processing", "progress": progress}
 
+# === единый endpoint для выдачи preview / transcript / diarization ===
+@app.get("/results/{upload_id}", summary="Get preview, full transcript or diarization")
+async def get_results(upload_id: str, current_user=Depends(get_current_user)):
+    # 1) Preview из Redis
+    preview_data = await redis.get(f"preview_result:{upload_id}")
+    if preview_data:
+        preview = json.loads(preview_data)
+        # preview["timestamps"] — список {"start","end","text"}
+        return JSONResponse(status_code=200, content={"results": preview["timestamps"]})
+
+    # 2) Полная транскрипция из файла
+    transcript_path = Path(settings.RESULTS_FOLDER) / upload_id / "transcript.json"
+    if transcript_path.exists():
+        data = json.loads(transcript_path.read_text(encoding="utf-8"))
+        # приводим к единому формату
+        results = [
+            {"start": seg["start"], "end": seg["end"], "text": seg["text"]}
+            for seg in data
+        ]
+        return JSONResponse(status_code=200, content={"results": results})
+
+    # 3) Диаризация из файла
+    diar_path = Path(settings.RESULTS_FOLDER) / upload_id / "diarization.json"
+    if diar_path.exists():
+        data = json.loads(diar_path.read_text(encoding="utf-8"))
+        # data уже список {"start","end","speaker"}
+        return JSONResponse(status_code=200, content={"results": data})
+
+    # 4) Результатов нет — 404
+    raise HTTPException(404, "Results not ready")
+
 # === upload с external_id и callbacks ===
 @app.post("/upload/", dependencies=[Depends(get_current_user)])
 @limiter.limit("10/minute")
