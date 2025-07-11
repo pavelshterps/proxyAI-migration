@@ -28,7 +28,10 @@
   <button id="uploadBtn" type="button">Загрузить и начать</button>
 
   <div id="status" style="margin-top:1rem;"></div>
-  <button id="fetchResultsBtn" type="button" disabled>Получить результаты</button>
+
+  <button id="fetchPreviewBtn" type="button" disabled>Получить превью</button>
+  <button id="fetchTranscriptBtn" type="button" disabled>Получить транскрипцию</button>
+  <button id="requestDiarizeBtn" type="button" disabled>Запросить диаризацию</button>
 
   <h2>Плеер</h2>
   <audio id="audio" controls style="width:100%"></audio>
@@ -44,7 +47,9 @@
     const fileEl   = document.getElementById('audioFile');
     const uploadBtn= document.getElementById('uploadBtn');
     const statusEl = document.getElementById('status');
-    const fetchBtn = document.getElementById('fetchResultsBtn');
+    const previewBtn = document.getElementById('fetchPreviewBtn');
+    const transcriptBtn = document.getElementById('fetchTranscriptBtn');
+    const diarizeBtn = document.getElementById('requestDiarizeBtn');
     const audioEl  = document.getElementById('audio');
     const container= document.getElementById('transcriptContainer');
     const saveBtn  = document.getElementById('saveLabelsBtn');
@@ -76,26 +81,82 @@
           headers:{ "X-API-Key": key }
         })).json();
         statusEl.textContent = `Статус: ${st.status}, прогресс: ${st.progress}`;
+        if (st.progress === "preview_done") {
+          previewBtn.disabled = false;
+          transcriptBtn.disabled = true;
+          diarizeBtn.disabled = true;
+        }
+        if (st.progress === "transcript_done") {
+          transcriptBtn.disabled = false;
+          diarizeBtn.disabled = false;
+        }
+        if (st.progress === "diarization_done") {
+          transcriptBtn.disabled = false;
+        }
         if (st.status === "done" || st.progress === "100%") {
           clearInterval(interval);
-          fetchBtn.disabled = false;
         }
       }, 2000);
     };
 
-    fetchBtn.onclick = async () => {
+    previewBtn.onclick = async () => {
       const key = apiKeyEl.value.trim();
-      statusEl.textContent = "Получаем результаты...";
+      statusEl.textContent = "Получаем превью...";
       const res = await fetch(`/results/${uploadId}`, {
         headers:{ "X-API-Key": key }
       });
-      if(!res.ok){ alert("Error fetching results"); return; }
+      if(!res.ok){ alert("Ошибка: "+res.status); return; }
       const payload = await res.json();
-      const list = payload.results;
-      statusEl.textContent = "Результаты получены";
       audioEl.src = URL.createObjectURL(fileBlob);
-      renderTranscript(list);
-      saveBtn.disabled = false;
+      renderTranscript(payload.results);
+      saveBtn.disabled = true;
+    };
+
+    transcriptBtn.onclick = async () => {
+      const key = apiKeyEl.value.trim();
+      statusEl.textContent = "Получаем транскрипцию...";
+      const res = await fetch(`/results/${uploadId}`, {
+        headers:{ "X-API-Key": key }
+      });
+      if(!res.ok){ alert("Ошибка: "+res.status); return; }
+      const payload = await res.json();
+      audioEl.src = URL.createObjectURL(fileBlob);
+      renderTranscript(payload.results);
+      saveBtn.disabled = true;
+    };
+
+    diarizeBtn.onclick = async () => {
+      const key = apiKeyEl.value.trim();
+      statusEl.textContent = "Запрашиваем диаризацию...";
+      const res = await fetch(`/diarize/${uploadId}`, {
+        method: "POST",
+        headers:{ "X-API-Key": key }
+      });
+      if(!res.ok){ alert("Ошибка: "+res.status); return; }
+      statusEl.textContent = "Диаризация запрошена. Ожидаем...";
+    };
+
+    saveBtn.onclick = async () => {
+      const key = apiKeyEl.value.trim();
+      const payload = {};
+      Object.entries(mapping).forEach(([o,n]) => {
+        if(o !== n) payload[o] = n;
+      });
+      if(!Object.keys(payload).length){ alert("Нет изменений"); return; }
+      const res = await fetch(`/labels/${uploadId}`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-API-Key": key
+        },
+        body: JSON.stringify(payload)
+      });
+      if(!res.ok){
+        const err = await res.json();
+        alert("Ошибка: "+ err.detail || res.status);
+        return;
+      }
+      alert("Метки сохранены");
     };
 
     function renderTranscript(list){
@@ -134,29 +195,8 @@
         div.append(t, btn, inp, txt);
         container.append(div);
       });
+      saveBtn.disabled = false;
     }
-
-    saveBtn.onclick = async () => {
-      const key = apiKeyEl.value.trim();
-      const payload = {};
-      Object.entries(mapping).forEach(([o,n]) => {
-        if(o !== n) payload[o] = n;
-      });
-      if(!Object.keys(payload).length){ alert("Нет изменений"); return; }
-      const res = await fetch(`/labels/${uploadId}`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "X-API-Key": key
-        },
-        body: JSON.stringify(payload)
-      });
-      if(!res.ok){
-        alert("Ошибка: "+(await res.json()).detail);
-        return;
-      }
-      alert("Метки сохранены");
-    };
   })();
   </script>
 </body>
