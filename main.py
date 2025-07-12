@@ -1,3 +1,6 @@
+import logging
+logging.basicConfig(level=logging.DEBUG)
+
 import time
 import uuid
 import json
@@ -111,46 +114,59 @@ async def root():
 # === Unified progress endpoint ===
 @app.get("/status/{upload_id}", summary="Check processing status")
 async def get_status(upload_id: str, current_user=Depends(get_current_user)):
+    log.debug("GET /status", upload_id=upload_id)
     base = Path(settings.RESULTS_FOLDER) / upload_id
+
     # полностью готово (транскрипт + диаризация)
     if (base / "transcript.json").exists() and (base / "diarization.json").exists():
-        return {
+        preview = json.loads(await redis.get(f"preview_result:{upload_id}") or "null")
+        resp = {
             "status": "diarization_done",
-            "preview": json.loads(await redis.get(f"preview_result:{upload_id}") or "null"),
+            "preview": preview,
             "chunks_total": None,
             "chunks_done": None,
             "diarize_requested": True
         }
+        log.debug("STATUS -> diarization_done", **resp)
+        return resp
 
     raw = await redis.get(f"progress:{upload_id}")
     if raw:
-        return json.loads(raw)
+        data = json.loads(raw)
+        log.debug("STATUS -> from redis", **data)
+        return data
 
     # ещё не стартовали
-    return {
+    init = {
         "status": "processing",
         "preview": None,
         "chunks_total": 0,
         "chunks_done": 0,
         "diarize_requested": False
     }
+    log.debug("STATUS -> initial", **init)
+    return init
 
 
 # === Unified results endpoint ===
 @app.get("/results/{upload_id}", summary="Get preview, transcript or diarization")
 async def get_results(upload_id: str, current_user=Depends(get_current_user), db=Depends(get_db)):
+    log.debug("GET /results", upload_id=upload_id)
     base = Path(settings.RESULTS_FOLDER) / upload_id
 
     # 1) Preview first
     pd = await redis.get(f"preview_result:{upload_id}")
     if pd:
         pl = json.loads(pd)
+        log.debug("RESULTS -> preview", count=len(pl["timestamps"]))
         return JSONResponse(content={"results": pl["timestamps"]})
 
     # 2) Full transcript
     tp = base / "transcript.json"
     if tp.exists():
-        return JSONResponse(content={"results": json.loads(tp.read_text(encoding="utf-8"))})
+        data = json.loads(tp.read_text(encoding="utf-8"))
+        log.debug("RESULTS -> full transcript", count=len(data))
+        return JSONResponse(content={"results": data})
 
     # 3) Diarization + mapping
     dp = base / "diarization.json"
@@ -163,9 +179,10 @@ async def get_results(upload_id: str, current_user=Depends(get_current_user), db
             mapping = {}
         for s in segs:
             s["speaker"] = mapping.get(str(s["speaker"]), s["speaker"])
+        log.debug("RESULTS -> diarization", count=len(segs))
         return JSONResponse(content={"results": segs})
 
-    # ещё нет даже превью
+    log.debug("RESULTS -> not ready", upload_id=upload_id)
     raise HTTPException(404, "Results not ready")
 
 
@@ -210,6 +227,7 @@ async def upload(
     await redis.set(f"progress:{upload_id}", json.dumps(init, ensure_ascii=False))
     await redis.publish(f"progress:{upload_id}", json.dumps(init, ensure_ascii=False))
 
+    log.debug("POST /upload -> queued preview_transcribe", upload_id=upload_id)
     return JSONResponse(
         {"upload_id": upload_id, "external_id": upload_id},
         headers={"X-Correlation-ID": cid}
@@ -219,6 +237,7 @@ async def upload(
 # === Manual diarization trigger ===
 @app.post("/diarize/{upload_id}", summary="Request diarization")
 async def request_diarization(upload_id: str, current_user=Depends(get_current_user)):
+    log.debug("POST /diarize", upload_id=upload_id)
     await redis.set(f"diarize_requested:{upload_id}", "1")
     diarize_full.delay(upload_id, None)
     return JSONResponse({"message": "diarization started"})
@@ -232,6 +251,7 @@ async def save_labels(
     current_user=Depends(get_current_user),
     db=Depends(get_db),
 ):
+    log.debug("POST /labels", upload_id=upload_id, mapping=mapping)
     try:
         rec = await get_upload_for_user(db, current_user.id, upload_id)
     except:
@@ -254,6 +274,7 @@ async def save_labels(
         ]
         out.write_text(json.dumps(updated, ensure_ascii=False, indent=2), encoding="utf-8")
 
+    log.debug("POST /labels -> saved", count=len(updated))
     return JSONResponse({"message": "labels saved", "results": updated})
 
 
