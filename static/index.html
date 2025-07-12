@@ -101,14 +101,14 @@
       }).then(r => r.json());
       const now = Date.now();
 
-      // 1) Превью готово, как только есть st.preview
+      // ПРЕВЬЮ: смотрим на наличие поля preview
       if (st.preview && !previewDoneTime) {
         previewDoneTime = now;
         previewBtn.disabled = false;
         await loadPreview();
       }
 
-      // 2) Транскрипция готова
+      // ТРАНСКРИПТ
       if ((st.status === "transcript_done" || st.status === "diarization_done") && !transcriptDoneTime) {
         transcriptDoneTime = now;
         transcriptBtn.disabled = false;
@@ -116,11 +116,11 @@
         await loadTranscript();
       }
 
-      // 3) Диаризация готова
+      // ДИАРИЗАЦИЯ
       if (st.status === "diarization_done" && !diarizeDoneTime) {
         diarizeDoneTime = now;
         saveBtn.disabled = false;
-        await loadTranscript();  // отдаёт теперь уже сегменты с спикерами
+        await loadTranscript();
         clearInterval(pollInterval);
       }
 
