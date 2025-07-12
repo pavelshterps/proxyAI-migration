@@ -1,8 +1,6 @@
-# tasks.py
 import os
 import json
 import logging
-import time
 import math
 import subprocess
 from pathlib import Path
@@ -15,7 +13,6 @@ from redis import Redis
 
 from config.settings import settings
 from config.celery import app
-
 from utils.audio import convert_to_wav
 
 logger = logging.getLogger(__name__)
@@ -27,7 +24,7 @@ _clustering_diarizer = None
 def get_whisper_model():
     global _whisper_model
     if _whisper_model is None:
-        device  = settings.WHISPER_DEVICE.lower()
+        device = settings.WHISPER_DEVICE.lower()
         compute = settings.WHISPER_COMPUTE_TYPE.lower()
         if device == "cpu" and compute in ("float16", "fp16"):
             logger.warning(f"Compute '{compute}' unsupported on CPU; falling back to int8")
@@ -84,7 +81,7 @@ def preload_and_warmup(**kwargs):
 
 @app.task(bind=True, name="tasks.preview_transcribe", queue="transcribe_gpu")
 def preview_transcribe(self, upload_id: str, correlation_id: str):
-    r   = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
+    r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
     upl = Path(settings.UPLOAD_FOLDER)
     src = next(upl.glob(f"{upload_id}.*"), None)
     if not src:
@@ -114,24 +111,17 @@ def preview_transcribe(self, upload_id: str, correlation_id: str):
         "-of", "default=noprint_wrappers=1:nokey=1",
         wav_path
     ]).strip()
-    full_len_s   = float(duration_str)
+    full_len_s = float(duration_str)
     total_chunks = max(1, math.ceil(full_len_s / settings.CHUNK_LENGTH_S))
 
     # 4) Transcribe preview
     model = get_whisper_model()
-    opts  = {"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {}
-    segs, _ = model.transcribe(
-        str(preview_wav),
-        word_timestamps=False,
-        **opts
-    )
+    opts = {"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {}
+    segs, _ = model.transcribe(str(preview_wav), word_timestamps=False, **opts)
 
     preview = {
         "text": "".join(s.text for s in segs),
-        "timestamps": [
-            {"start": s.start, "end": s.end, "text": s.text}
-            for s in segs
-        ]
+        "timestamps": [{"start": s.start, "end": s.end, "text": s.text} for s in segs]
     }
     state = {
         "status": "preview_done",
@@ -141,8 +131,8 @@ def preview_transcribe(self, upload_id: str, correlation_id: str):
         "diarize_requested": False
     }
     r.set(f"preview_result:{upload_id}", json.dumps(preview, ensure_ascii=False))
-    r.set(f"progress:{upload_id}",    json.dumps(state,   ensure_ascii=False))
-    r.publish(f"progress:{upload_id}", json.dumps(state,   ensure_ascii=False))
+    r.set(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
+    r.publish(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
 
     # 5) Split remainder
     split_audio.delay(upload_id, correlation_id)
@@ -163,16 +153,11 @@ def split_audio(self, upload_id: str, correlation_id: str):
 
 @app.task(bind=True, name="tasks.dispatch_transcription", queue="dispatch_cpu")
 def dispatch_transcription(self, upload_id: str, idx: int, wav_path: str, correlation_id: str):
-    app.send_task(
-        "tasks.transcribe_chunk",
-        args=(upload_id, idx, wav_path, correlation_id),
-        queue="transcribe_gpu"
-    )
+    app.send_task("tasks.transcribe_chunk", args=(upload_id, idx, wav_path, correlation_id), queue="transcribe_gpu")
 
 @app.task(bind=True, name="tasks.transcribe_chunk", queue="transcribe_gpu")
 def transcribe_chunk(self, upload_id: str, idx: int, wav_path: str, correlation_id: str):
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
-
     duration_str = subprocess.check_output([
         "ffprobe", "-v", "error",
         "-show_entries", "format=duration",
@@ -182,32 +167,25 @@ def transcribe_chunk(self, upload_id: str, idx: int, wav_path: str, correlation_
     total_chunks = max(1, math.ceil(float(duration_str) / settings.CHUNK_LENGTH_S))
 
     model = get_whisper_model()
-    opts  = {"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {}
+    opts = {"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {}
     segs, _ = model.transcribe(wav_path, word_timestamps=True, **opts)
 
     offset = idx * settings.CHUNK_LENGTH_S
-    out = [
-        {"start": s.start + offset, "end": s.end + offset, "text": s.text}
-        for s in segs
-    ]
+    out = [{"start": s.start + offset, "end": s.end + offset, "text": s.text} for s in segs]
 
     d = Path(settings.RESULTS_FOLDER) / upload_id
     d.mkdir(parents=True, exist_ok=True)
-    (d / f"chunk_{idx}.json").write_text(
-        json.dumps(out, ensure_ascii=False, indent=2),
-        encoding="utf-8"
-    )
+    (d / f"chunk_{idx}.json").write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
 
     collect_transcription.delay(upload_id, correlation_id)
 
 @app.task(bind=True, name="tasks.collect_transcription", queue="collect_cpu")
 def collect_transcription(self, upload_id: str, correlation_id: str):
-    r  = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
-    d  = Path(settings.RESULTS_FOLDER) / upload_id
+    r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
+    d = Path(settings.RESULTS_FOLDER) / upload_id
     js = sorted(d.glob("chunk_*.json"), key=lambda p: int(p.stem.split("_")[1]))
     st = json.loads(r.get(f"progress:{upload_id}") or "{}")
     tot = st.get("chunks_total", 0)
-
     if len(js) < tot:
         st["chunks_done"] = len(js)
         r.set(f"progress:{upload_id}", json.dumps(st, ensure_ascii=False))
@@ -217,48 +195,33 @@ def collect_transcription(self, upload_id: str, correlation_id: str):
     merged = []
     for f in js:
         merged.extend(json.loads(f.read_text(encoding="utf-8")))
-    (d / "transcript.json").write_text(
-        json.dumps(merged, ensure_ascii=False, indent=2),
-        encoding="utf-8"
-    )
+    (d / "transcript.json").write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    st["status"]      = "transcript_done"
+    st["status"] = "transcript_done"
     st["chunks_done"] = tot
     r.set(f"progress:{upload_id}", json.dumps(st, ensure_ascii=False))
     r.publish(f"progress:{upload_id}", json.dumps(st, ensure_ascii=False))
 
     if st.get("diarize_requested"):
-        app.send_task(
-            "tasks.diarize_full",
-            args=(upload_id, correlation_id),
-            queue="diarize_gpu"
-        )
+        app.send_task("tasks.diarize_full", args=(upload_id, correlation_id), queue="diarize_gpu")
 
 @app.task(bind=True, name="tasks.diarize_full", queue="diarize_gpu")
 def diarize_full(self, upload_id: str, correlation_id: str):
-    r   = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
+    r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
     wav = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
     if not wav.exists():
         return
 
     ann = get_clustering_diarizer().apply({"audio": str(wav)})
-    segs = []
-    for seg, _, spk in ann.itertracks(yield_label=True):
-        segs.append({
-            "start": float(seg.start),
-            "end":   float(seg.end),
-            "speaker": spk
-        })
+    segs = [{"start": float(seg.start), "end": float(seg.end), "speaker": spk}
+            for seg, _, spk in ann.itertracks(yield_label=True)]
 
     d = Path(settings.RESULTS_FOLDER) / upload_id
     d.mkdir(parents=True, exist_ok=True)
-    (d / "diarization.json").write_text(
-        json.dumps(segs, ensure_ascii=False, indent=2),
-        encoding="utf-8"
-    )
+    (d / "diarization.json").write_text(json.dumps(segs, ensure_ascii=False, indent=2), encoding="utf-8")
 
     st = json.loads(r.get(f"progress:{upload_id}") or "{}")
-    st["status"]            = "diarization_done"
+    st["status"] = "diarization_done"
     st["diarize_requested"] = True
     r.set(f"progress:{upload_id}", json.dumps(st, ensure_ascii=False))
     r.publish(f"progress:{upload_id}", json.dumps(st, ensure_ascii=False))

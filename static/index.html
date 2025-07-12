@@ -15,48 +15,38 @@
 </head>
 <body>
   <h1>proxyAI Demo UI</h1>
-
-  <label>
-    Ваш API-Key:
+  <label>Ваш API-Key:
     <input type="text" id="apiKey" placeholder="X-API-Key" />
   </label>
-
-  <label>
-    Аудио/видео-файл:
+  <label>Аудио/видео-файл:
     <input type="file" id="audioFile" accept="audio/*,video/*" />
   </label>
-  <button id="uploadBtn" type="button">Загрузить и начать</button>
-
+  <button id="uploadBtn">Загрузить и начать</button>
   <div id="status" style="margin-top:1rem;">Готово к загрузке</div>
-
-  <button id="fetchPreviewBtn" type="button" disabled>Получить превью</button>
-  <button id="fetchTranscriptBtn" type="button" disabled>Получить транскрипцию</button>
-  <button id="requestDiarizeBtn" type="button" disabled>Запросить диаризацию</button>
+  <button id="fetchPreviewBtn" disabled>Получить превью</button>
+  <button id="fetchTranscriptBtn" disabled>Получить транскрипцию</button>
+  <button id="requestDiarizeBtn" disabled>Запросить диаризацию</button>
 
   <h2>Плеер</h2>
   <audio id="audio" controls style="width:100%"></audio>
 
   <h2>Транскрипция / Диаризация</h2>
   <div id="transcriptContainer"></div>
-
-  <button id="saveLabelsBtn" type="button" disabled>Сохранить метки спикеров</button>
+  <button id="saveLabelsBtn" disabled>Сохранить метки спикеров</button>
 
   <script>
   (async function(){
-    // базовый URL API (тот же протокол, хост и порт, что и у текущей страницы)
-    const API_BASE = `${window.location.protocol}//${window.location.hostname}:${window.location.port}`;
-    console.log("→ API_BASE:", API_BASE);
-
-    const apiKeyEl      = document.getElementById('apiKey');
-    const fileEl        = document.getElementById('audioFile');
-    const uploadBtn     = document.getElementById('uploadBtn');
-    const statusEl      = document.getElementById('status');
-    const previewBtn    = document.getElementById('fetchPreviewBtn');
+    const API_BASE = window.location.origin;
+    const apiKeyEl = document.getElementById('apiKey');
+    const fileEl = document.getElementById('audioFile');
+    const uploadBtn = document.getElementById('uploadBtn');
+    const statusEl = document.getElementById('status');
+    const previewBtn = document.getElementById('fetchPreviewBtn');
     const transcriptBtn = document.getElementById('fetchTranscriptBtn');
-    const diarizeBtn    = document.getElementById('requestDiarizeBtn');
-    const audioEl       = document.getElementById('audio');
-    const container     = document.getElementById('transcriptContainer');
-    const saveBtn       = document.getElementById('saveLabelsBtn');
+    const diarizeBtn = document.getElementById('requestDiarizeBtn');
+    const audioEl = document.getElementById('audio');
+    const container = document.getElementById('transcriptContainer');
+    const saveBtn = document.getElementById('saveLabelsBtn');
 
     let uploadId, fileBlob;
     let startTime, previewDoneTime, transcriptDoneTime, diarizeDoneTime;
@@ -78,26 +68,22 @@
 
       fileBlob = file;
       statusEl.textContent = "Загружаем…";
-
-      console.log("→ POST", `${API_BASE}/upload/`);
       const fd = new FormData();
       fd.append("file", file, file.name);
+
       const res = await fetch(`${API_BASE}/upload/`, {
         method: "POST",
         headers: { "X-API-Key": key },
         body: fd
       });
-      if (!res.ok) {
-        alert("Upload error: " + res.status);
-        return;
-      }
-      uploadId = (await res.json()).upload_id;
-      console.log("← upload_id =", uploadId);
+      if (!res.ok) { alert("Upload error: " + res.status); return; }
+      const json = await res.json();
+      uploadId = json.upload_id;
 
       startTime = Date.now();
       previewDoneTime = transcriptDoneTime = diarizeDoneTime = null;
       clearInterval(pollInterval);
-      previewBtn.disabled = transcriptBtn.disabled = diarizeBtn.disabled = saveBtn.disabled = true;
+      [previewBtn, transcriptBtn, diarizeBtn, saveBtn].forEach(b => b.disabled = true);
       container.innerHTML = "";
       audioEl.src = "";
 
@@ -107,26 +93,24 @@
 
     async function updateStatus() {
       const key = apiKeyEl.value.trim();
-      const url = `${API_BASE}/status/${uploadId}`;
-      console.log("→ GET", url);
-      const st  = await fetch(url, { headers: { "X-API-Key": key } }).then(r => r.json());
-      console.log("← status", st);
+      const res = await fetch(`${API_BASE}/status/${uploadId}`, {
+        headers: { "X-API-Key": key }
+      });
+      const st = await res.json();
       const now = Date.now();
 
-      // ПРЕВЬЮ
       if (st.preview && !previewDoneTime) {
         previewDoneTime = now;
         previewBtn.disabled = false;
         await loadPreview();
       }
-      // ТРАНСКРИПТ
-      if ((st.status === "transcript_done" || st.status === "diarization_done") && !transcriptDoneTime) {
+      if ((st.status === "transcript_done" || st.status === "diarization_done") &&
+          !transcriptDoneTime) {
         transcriptDoneTime = now;
         transcriptBtn.disabled = false;
         diarizeBtn.disabled = false;
         await loadTranscript();
       }
-      // ДИАРИЗАЦИЯ
       if (st.status === "diarization_done" && !diarizeDoneTime) {
         diarizeDoneTime = now;
         saveBtn.disabled = false;
@@ -134,26 +118,25 @@
         clearInterval(pollInterval);
       }
 
-      const totalDisp      = formatElapsed(now - startTime);
-      const previewDisp    = previewDoneTime    ? formatElapsed(previewDoneTime - startTime)    : "--:--";
-      const transcriptDisp = transcriptDoneTime ? formatElapsed(transcriptDoneTime - startTime) : "--:--";
-      const diarizeDisp    = diarizeDoneTime    ? formatElapsed(diarizeDoneTime - startTime)    : "--:--";
+      const total = formatElapsed(now - startTime);
+      const prev = previewDoneTime ? formatElapsed(previewDoneTime - startTime) : "--:--";
+      const tran = transcriptDoneTime ? formatElapsed(transcriptDoneTime - startTime) : "--:--";
+      const diar = diarizeDoneTime ? formatElapsed(diarizeDoneTime - startTime) : "--:--";
 
-      statusEl.textContent = `Статус: ${st.status}, от загрузки: ${totalDisp}` +
-                             `, превью: ${previewDisp}` +
-                             `, транскр.: ${transcriptDisp}` +
-                             `, диар.: ${diarizeDisp}`;
+      statusEl.textContent = `Статус: ${st.status}, от загрузки: ${total}` +
+                             `, превью: ${prev}` +
+                             `, транскр.: ${tran}` +
+                             `, диар.: ${diar}`;
     }
 
     async function loadPreview() {
       statusEl.textContent = "Загружаю превью…";
       const key = apiKeyEl.value.trim();
-      const url = `${API_BASE}/results/${uploadId}`;
-      console.log("→ GET preview results", url);
-      const res = await fetch(url, { headers: { "X-API-Key": key } });
-      if (!res.ok) { console.warn("preview fetch failed", res.status); return; }
+      const res = await fetch(`${API_BASE}/results/${uploadId}`, {
+        headers: { "X-API-Key": key }
+      });
+      if (!res.ok) return;
       const { results } = await res.json();
-      console.log("← preview results count =", results.length);
       audioEl.src = URL.createObjectURL(fileBlob);
       renderTranscript(results);
     }
@@ -161,12 +144,11 @@
     async function loadTranscript() {
       statusEl.textContent = "Загружаю транскрипцию/диаризацию…";
       const key = apiKeyEl.value.trim();
-      const url = `${API_BASE}/results/${uploadId}`;
-      console.log("→ GET transcript/diarization", url);
-      const res = await fetch(url, { headers: { "X-API-Key": key } });
-      if (!res.ok) { console.warn("transcript fetch failed", res.status); return; }
+      const res = await fetch(`${API_BASE}/results/${uploadId}`, {
+        headers: { "X-API-Key": key }
+      });
+      if (!res.ok) return;
       const { results } = await res.json();
-      console.log("← transcript/diarization count =", results.length);
       audioEl.src = URL.createObjectURL(fileBlob);
       renderTranscript(results);
     }
@@ -175,11 +157,9 @@
     transcriptBtn.onclick = loadTranscript;
 
     diarizeBtn.onclick = async () => {
-      const key = apiKeyEl.value.trim();
       statusEl.textContent = "Запрашиваем диаризацию…";
-      const url = `${API_BASE}/diarize/${uploadId}`;
-      console.log("→ POST diarize", url);
-      await fetch(url, {
+      const key = apiKeyEl.value.trim();
+      await fetch(`${API_BASE}/diarize/${uploadId}`, {
         method: "POST",
         headers: { "X-API-Key": key }
       });
@@ -191,11 +171,9 @@
       const payload = {};
       Object.entries(mapping).forEach(([o,n]) => { if (o!==n) payload[o]=n; });
       if (!Object.keys(payload).length) { alert("Нет изменений"); return; }
-      const url = `${API_BASE}/labels/${uploadId}`;
-      console.log("→ POST labels", url, payload);
-      const res = await fetch(url, {
+      const res = await fetch(`${API_BASE}/labels/${uploadId}`, {
         method: "POST",
-        headers: { "Content-Type":"application/json","X-API-Key":key },
+        headers: { "Content-Type":"application/json", "X-API-Key": key },
         body: JSON.stringify(payload)
       });
       if (!res.ok) {
@@ -204,7 +182,6 @@
         return;
       }
       const { results } = await res.json();
-      console.log("← labels saved, count =", results.length);
       renderTranscript(results);
       saveBtn.disabled = true;
       alert("Метки сохранены");
@@ -215,22 +192,22 @@
       mapping = {};
       list.forEach(s => mapping[s.speaker||""] = s.speaker||"");
       list.forEach(seg => {
-        const div = document.createElement("div"); div.className="segment";
-        const t = document.createElement("span"); t.className="time";
-        t.textContent = seg.time || formatElapsed(seg.start*1000) || "--:--";
-        const btn = document.createElement("button"); btn.textContent="▶️";
-        btn.onclick = ()=>{
-          audioEl.currentTime = seg.start;
-          audioEl.play();
-          setTimeout(()=>audioEl.pause(), (seg.end-seg.start)*1000+200);
+        const div = document.createElement("div"); div.className = "segment";
+        const t = document.createElement("span"); t.className = "time";
+        t.textContent = seg.time || formatElapsed(seg.start*1000);
+        const btn = document.createElement("button"); btn.textContent = "▶️";
+        btn.onclick = () => {
+          audioEl.currentTime = seg.start; audioEl.play();
+          setTimeout(()=>audioEl.pause(), (seg.end - seg.start)*1000 + 200);
         };
         const inp = document.createElement("input"); inp.value = seg.speaker||"";
-        inp.onchange = ()=>{
+        inp.onchange = () => {
           const old = seg.speaker||"", neu = inp.value.trim();
-          if(neu && neu.length<=50){
+          if (neu && neu.length <= 50) {
             mapping[old] = neu;
-            document.querySelectorAll('.segment input')
-                    .forEach(i=>{ if(i.value === old) i.value = neu });
+            document.querySelectorAll('.segment input').forEach(i => {
+              if (i.value === old) i.value = neu;
+            });
           } else {
             alert("Имя 1–50 символов");
             inp.value = mapping[old];
