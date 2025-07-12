@@ -1,6 +1,5 @@
+import asyncio
 import logging
-logging.basicConfig(level=logging.DEBUG)
-
 import time
 import uuid
 import json
@@ -11,10 +10,8 @@ import structlog
 import redis.asyncio as redis_async
 from fastapi import (
     FastAPI, UploadFile, File, HTTPException,
-    Header, Depends, Request, Response, Body,
-    WebSocket, WebSocketDisconnect
+    Header, Depends, Request, Response, Body
 )
-import asyncio
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
@@ -25,6 +22,8 @@ from slowapi import Limiter
 from slowapi.middleware import SlowAPIMiddleware
 from slowapi.util import get_remote_address
 
+from sse_starlette.sse import EventSourceResponse  # <— добавлено для SSE
+
 from config.settings import settings
 from database import get_db, engine, init_models
 from crud import create_upload_record, get_upload_for_user
@@ -33,6 +32,7 @@ from routes import router as api_router
 from admin_routes import router as admin_router
 from tasks import preview_transcribe, diarize_full
 
+# === Lifespan & Инициализация ===
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     try:
@@ -41,7 +41,11 @@ async def lifespan(app: FastAPI):
         structlog.get_logger().warning(f"init_models failed: {e}")
     yield
 
-app = FastAPI(title="proxyAI", version=settings.APP_VERSION, lifespan=lifespan)
+app = FastAPI(
+    title="proxyAI",
+    version=settings.APP_VERSION,
+    lifespan=lifespan
+)
 
 # structlog
 structlog.configure(
@@ -93,6 +97,7 @@ async def metrics_middleware(request: Request, call_next):
     HTTP_REQ_LATENCY.labels(request.url.path).observe(time.time() - start)
     return resp
 
+# === Health, Ready, Metrics ===
 @app.get("/health")
 @limiter.limit("30/minute")
 async def health(request: Request):
@@ -112,11 +117,35 @@ async def metrics_endpoint(request: Request):
 async def root():
     return FileResponse("static/index.html")
 
+# === SSE: шина прогресса ===
+@app.get("/events/{upload_id}")
+async def progress_events(
+    upload_id: str,
+    current_user=Depends(get_current_user)
+):
+    """Server-Sent Events — отдаем все изменения прогресса из Redis PubSub."""
+    async def event_generator():
+        pubsub = redis.pubsub()
+        await pubsub.subscribe(f"progress:{upload_id}")
+        try:
+            while True:
+                msg = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
+                if msg and msg["type"] == "message":
+                    # отдаем уже сериализованное JSON-сообщение
+                    yield f"data: {msg['data']}\n\n"
+                await asyncio.sleep(0.1)
+        finally:
+            await pubsub.unsubscribe(f"progress:{upload_id}")
+
+    return EventSourceResponse(event_generator())
+
+# === Статус загрузки/обработки ===
 @app.get("/status/{upload_id}", summary="Check processing status")
 async def get_status(upload_id: str, current_user=Depends(get_current_user)):
     log.debug("GET /status", upload_id=upload_id)
     base = Path(settings.RESULTS_FOLDER) / upload_id
 
+    # если всё готово (текст + диаризация)
     if (base / "transcript.json").exists() and (base / "diarization.json").exists():
         preview = json.loads(await redis.get(f"preview_result:{upload_id}") or "null")
         resp = {
@@ -145,23 +174,27 @@ async def get_status(upload_id: str, current_user=Depends(get_current_user)):
     log.debug("STATUS -> initial", **init)
     return init
 
+# === Результаты (timestamps, full transcript, diarization) ===
 @app.get("/results/{upload_id}", summary="Get preview, transcript or diarization")
 async def get_results(upload_id: str, current_user=Depends(get_current_user), db=Depends(get_db)):
     log.debug("GET /results", upload_id=upload_id)
     base = Path(settings.RESULTS_FOLDER) / upload_id
 
+    # превью-таймстемпы
     pd = await redis.get(f"preview_result:{upload_id}")
     if pd:
         pl = json.loads(pd)
         log.debug("RESULTS -> preview", count=len(pl["timestamps"]))
         return JSONResponse(content={"results": pl["timestamps"]})
 
+    # полный транскрипт
     tp = base / "transcript.json"
     if tp.exists():
         data = json.loads(tp.read_text(encoding="utf-8"))
         log.debug("RESULTS -> full transcript", count=len(data))
         return JSONResponse(content={"results": data})
 
+    # диаризация
     dp = base / "diarization.json"
     if dp.exists():
         segs = json.loads(dp.read_text(encoding="utf-8"))
@@ -178,6 +211,7 @@ async def get_results(upload_id: str, current_user=Depends(get_current_user), db
     log.debug("RESULTS -> not ready", upload_id=upload_id)
     raise HTTPException(404, "Results not ready")
 
+# === Загрузка файла ===
 @app.post("/upload/", dependencies=[Depends(get_current_user)])
 @limiter.limit("10/minute")
 async def upload(
@@ -205,8 +239,10 @@ async def upload(
     log.bind(correlation_id=cid, upload_id=upload_id, user_id=current_user.id).info("upload accepted")
     await redis.set(f"external:{upload_id}", upload_id)
 
+    # стартуем preview → split → транскрипцию
     preview_transcribe.delay(upload_id, cid)
 
+    # сразу инициализируем прогресс
     init = {
         "status": "processing",
         "preview": None,
@@ -223,20 +259,22 @@ async def upload(
         headers={"X-Correlation-ID": cid}
     )
 
+# === Триггер диаризации ===
 @app.post("/diarize/{upload_id}", summary="Request diarization")
 async def request_diarization(upload_id: str, current_user=Depends(get_current_user)):
     log.debug("POST /diarize", upload_id=upload_id)
+    # пометим запрос и сразу же запустим
     await redis.set(f"diarize_requested:{upload_id}", "1")
-    # Обновляем и публикуем progress, чтобы фронтенд тут же увидел флаг
-    raw = await redis.get(f"progress:{upload_id}")
-    if raw:
-        st = json.loads(raw)
-        st["diarize_requested"] = True
-        await redis.set(f"progress:{upload_id}", json.dumps(st, ensure_ascii=False))
-        await redis.publish(f"progress:{upload_id}", json.dumps(st, ensure_ascii=False))
+    # обновляем прогресс-флаг
+    state = json.loads(await redis.get(f"progress:{upload_id}") or "{}")
+    state["diarize_requested"] = True
+    await redis.set(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
+    await redis.publish(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
+
     diarize_full.delay(upload_id, None)
     return JSONResponse({"message": "diarization started"})
 
+# === Сохранение меток спикеров ===
 @app.post("/labels/{upload_id}", summary="Save speaker labels")
 async def save_labels(
     upload_id: str,
@@ -266,8 +304,7 @@ async def save_labels(
     log.debug("POST /labels -> saved", count=len(updated))
     return JSONResponse({"message": "labels saved", "results": updated})
 
-# WebSocket-эндпоинт для прогресса (вставлен выше)
-
+# === Подключаем дополнительные роуты и статику ===
 app.include_router(api_router, tags=["proxyAI"])
 app.include_router(admin_router)
 app.mount("/static", StaticFiles(directory="static"), name="static")

@@ -138,11 +138,12 @@ def preview_transcribe(self, upload_id: str, correlation_id: str):
         "chunks_done": 0,
         "diarize_requested": False
     }
+    # сохраняем и шлём прогресс сразу же
     r.set(f"preview_result:{upload_id}", json.dumps(preview, ensure_ascii=False))
     r.set(f"progress:{upload_id}",    json.dumps(state,   ensure_ascii=False))
     r.publish(f"progress:{upload_id}", json.dumps(state,   ensure_ascii=False))
 
-    # 5) Split remainder
+    # 5) Split remainder и запустить транскрипцию чанков
     split_audio.delay(upload_id, correlation_id)
 
 @app.task(bind=True, name="tasks.split_audio", queue="split_cpu")
@@ -196,6 +197,7 @@ def transcribe_chunk(self, upload_id: str, idx: int, wav_path: str, correlation_
         encoding="utf-8"
     )
 
+    # сообщаем о прогрессе
     collect_transcription.delay(upload_id, correlation_id)
 
 @app.task(bind=True, name="tasks.collect_transcription", queue="collect_cpu")
@@ -206,12 +208,14 @@ def collect_transcription(self, upload_id: str, correlation_id: str):
     st = json.loads(r.get(f"progress:{upload_id}") or "{}")
     tot = st.get("chunks_total", 0)
 
+    # если ещё не все чанки, просто обновляем chunks_done
     if len(js) < tot:
         st["chunks_done"] = len(js)
         r.set(f"progress:{upload_id}", json.dumps(st, ensure_ascii=False))
         r.publish(f"progress:{upload_id}", json.dumps(st, ensure_ascii=False))
         return
 
+    # сливаем и финализируем
     merged = []
     for f in js:
         merged.extend(json.loads(f.read_text(encoding="utf-8")))
@@ -225,6 +229,7 @@ def collect_transcription(self, upload_id: str, correlation_id: str):
     r.set(f"progress:{upload_id}", json.dumps(st, ensure_ascii=False))
     r.publish(f"progress:{upload_id}", json.dumps(st, ensure_ascii=False))
 
+    # если уже запросили диаризацию, запустить
     if st.get("diarize_requested"):
         app.send_task(
             "tasks.diarize_full",

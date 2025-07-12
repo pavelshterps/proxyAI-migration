@@ -55,8 +55,7 @@
     const saveBtn       = document.getElementById('saveLabelsBtn');
 
     let uploadId, fileBlob;
-    let startTime, previewDoneTime, transcriptDoneTime, diarizeDoneTime;
-    let pollInterval;
+    let previewDone=false, transcriptDone=false, diarizeDone=false;
     let mapping = {};
 
     function formatElapsed(ms) {
@@ -85,52 +84,41 @@
       if (!res.ok) { alert("Upload error: " + res.status); return; }
       uploadId = (await res.json()).upload_id;
 
-      startTime = Date.now();
-      previewDoneTime = transcriptDoneTime = diarizeDoneTime = null;
-      clearInterval(pollInterval);
+      // сброс флагов UI
+      previewDone = transcriptDone = diarizeDone = false;
       previewBtn.disabled = transcriptBtn.disabled = diarizeBtn.disabled = saveBtn.disabled = true;
       container.innerHTML = "";
       audioEl.src = "";
 
-      pollInterval = setInterval(updateStatus, 1000);
+      // открываем SSE
+      const evtSource = new EventSource(`/events/${uploadId}`, { withCredentials: true });
+      evtSource.onmessage = async e => {
+        const st = JSON.parse(e.data);
+        statusEl.textContent = `Статус: ${st.status}`;
+        // превью
+        if (st.status === "preview_done" && !previewDone) {
+          previewDone = true;
+          previewBtn.disabled = false;
+          await loadPreview();
+        }
+        // транскрипция
+        if (st.status === "transcript_done" && !transcriptDone) {
+          transcriptDone = true;
+          transcriptBtn.disabled = false;
+          diarizeBtn.disabled = false;
+          await loadTranscript();
+        }
+        // диаризация
+        if (st.status === "diarization_done" && !diarizeDone) {
+          diarizeDone = true;
+          saveBtn.disabled = false;
+          await loadTranscript();
+          evtSource.close();
+        }
+      };
+
       statusEl.textContent = "Файл загружен, ждём результатов…";
     };
-
-    async function updateStatus() {
-      const key = apiKeyEl.value.trim();
-      const st  = await fetch(`/status/${uploadId}`, { headers: { "X-API-Key": key } })
-                         .then(r => r.json());
-      const now = Date.now();
-
-      if (st.preview && !previewDoneTime) {
-        previewDoneTime = now;
-        previewBtn.disabled = false;
-        await loadPreview();
-      }
-      if ((st.status === "transcript_done" || st.status === "diarization_done") && !transcriptDoneTime) {
-        transcriptDoneTime = now;
-        transcriptBtn.disabled = false;
-        diarizeBtn.disabled = false;
-        await loadTranscript();
-      }
-      if (st.status === "diarization_done" && !diarizeDoneTime) {
-        diarizeDoneTime = now;
-        saveBtn.disabled = false;
-        await loadTranscript();
-        clearInterval(pollInterval);
-      }
-
-      const totalDisp      = formatElapsed(now - startTime);
-      const previewDisp    = previewDoneTime    ? formatElapsed(previewDoneTime - startTime)    : "--:--";
-      const transcriptDisp = transcriptDoneTime ? formatElapsed(transcriptDoneTime - startTime) : "--:--";
-      const diarizeDisp    = diarizeDoneTime    ? formatElapsed(diarizeDoneTime - startTime)    : "--:--";
-
-      statusEl.textContent =
-        `Статус: ${st.status}, от загрузки: ${totalDisp}` +
-        `, превью: ${previewDisp}` +
-        `, транскр.: ${transcriptDisp}` +
-        `, диар.: ${diarizeDisp}`;
-    }
 
     async function loadPreview() {
       statusEl.textContent = "Загружаю превью…";
@@ -140,6 +128,7 @@
       const { results } = await res.json();
       audioEl.src = URL.createObjectURL(fileBlob);
       renderTranscript(results);
+      statusEl.textContent = "Превью готово";
     }
 
     async function loadTranscript() {
@@ -150,6 +139,7 @@
       const { results } = await res.json();
       audioEl.src = URL.createObjectURL(fileBlob);
       renderTranscript(results);
+      statusEl.textContent = "Результаты загружены";
     }
 
     previewBtn.onclick    = loadPreview;
