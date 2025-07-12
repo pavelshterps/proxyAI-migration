@@ -89,8 +89,6 @@
 
         if (st.progress === "preview_done") {
           previewBtn.disabled    = false;
-          transcriptBtn.disabled = true;
-          diarizeBtn.disabled    = true;
         }
         if (st.progress === "transcript_done") {
           transcriptBtn.disabled = false;
@@ -153,7 +151,7 @@
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "X-API-Key": key
+          "X-API-Key":     key
         },
         body: JSON.stringify(payload)
       });
