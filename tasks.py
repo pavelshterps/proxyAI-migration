@@ -1,3 +1,5 @@
+# tasks.py
+
 import os
 import json
 import logging
@@ -8,7 +10,6 @@ from pathlib import Path
 from celery.signals import worker_process_init
 from faster_whisper import WhisperModel
 from pyannote.audio.pipelines import VoiceActivityDetection, SpeakerDiarization
-from pydub import AudioSegment
 from redis import Redis
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -71,6 +72,7 @@ def get_clustering_diarizer():
 def preload_and_warmup(**kwargs):
     """
     Warm up: Whisper (CPU) или VAD+diarizer (GPU).
+    Это выполняется один раз при старте воркера.
     """
     sample = Path(__file__).resolve().parent / "tests" / "fixtures" / "sample.wav"
     device = settings.WHISPER_DEVICE.lower()
@@ -101,21 +103,21 @@ def preview_transcribe(self, upload_id: str, correlation_id: str):
     """Preview: первые settings.PREVIEW_LENGTH_S секунд."""
     redis_client = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
 
-    # Найти исходный файл и конвертировать в WAV
+    # 1) Конвертация исходника в WAV
     upload_folder = Path(settings.UPLOAD_FOLDER)
     candidates = list(upload_folder.glob(f"{upload_id}.*"))
     if not candidates:
         logger.error(f"[{correlation_id}] Source file for upload_id {upload_id} not found")
         return
-    src_file = candidates[0]
-    dst_file = upload_folder / f"{upload_id}.wav"
+    src = candidates[0]
+    dst = upload_folder / f"{upload_id}.wav"
     try:
-        wav_path = convert_to_wav(src_file, dst_file)
+        wav_path = convert_to_wav(src, dst)
     except Exception as e:
         logger.error(f"[{correlation_id}] Ошибка конвертации: {e}")
         return
 
-    # Транскрипция первых PREVIEW_LENGTH_S секунд
+    # 2) Транскрипция первых N секунд
     model = get_whisper_model()
     opts = {}
     if settings.WHISPER_LANGUAGE:
@@ -133,12 +135,12 @@ def preview_transcribe(self, upload_id: str, correlation_id: str):
             "text":  seg.text
         })
 
-    # Сохраняем preview в Redis и обновляем прогресс
+    # 3) Сохраняем в Redis и обновляем прогресс
     redis_client.set(f"preview_result:{upload_id}", json.dumps(preview, ensure_ascii=False))
     redis_client.set(f"progress:{upload_id}", "preview_done")
     redis_client.publish(f"progress:{upload_id}", "preview_done")
 
-    # callbacks preview_complete
+    # 4) callbacks preview_complete
     for url in json.loads(redis_client.get(f"callbacks:{upload_id}") or "[]"):
         try:
             requests.post(
@@ -153,7 +155,7 @@ def preview_transcribe(self, upload_id: str, correlation_id: str):
         except:
             pass
 
-    # Запуск полной транскрипции
+    # 5) Запуск полной транскрипции
     transcribe_segments.delay(upload_id, correlation_id)
 
 @app.task(bind=True, name="tasks.transcribe_segments", queue="preprocess_gpu")
@@ -161,21 +163,21 @@ def transcribe_segments(self, upload_id: str, correlation_id: str):
     """Полная транскрипция."""
     redis_client = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
 
-    # Конвертация в WAV
+    # 1) Конвертация
     upload_folder = Path(settings.UPLOAD_FOLDER)
     candidates = list(upload_folder.glob(f"{upload_id}.*"))
     if not candidates:
         logger.error(f"[{correlation_id}] Source file for upload_id {upload_id} not found")
         return
-    src_file = candidates[0]
-    dst_file = upload_folder / f"{upload_id}.wav"
+    src = candidates[0]
+    dst = upload_folder / f"{upload_id}.wav"
     try:
-        wav_path = convert_to_wav(src_file, dst_file)
+        wav_path = convert_to_wav(src, dst)
     except Exception as e:
         logger.error(f"[{correlation_id}] Ошибка конвертации полного файла: {e}")
         return
 
-    # Полная транскрипция
+    # 2) Транскрипция всего
     model = get_whisper_model()
     opts = {}
     if settings.WHISPER_LANGUAGE:
@@ -184,28 +186,29 @@ def transcribe_segments(self, upload_id: str, correlation_id: str):
 
     out_dir = Path(settings.RESULTS_FOLDER) / upload_id
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_file = out_dir / "transcript.json"
-    transcript_data = [
+    transcript = [
         {"start": seg.start, "end": seg.end, "text": seg.text}
         for seg in segments
     ]
-    out_file.write_text(json.dumps(transcript_data, ensure_ascii=False, indent=2), encoding="utf-8")
+    (out_dir / "transcript.json").write_text(
+        json.dumps(transcript, ensure_ascii=False, indent=2),
+        encoding="utf-8"
+    )
 
-    # callbacks transcript_complete
+    # Обновляем прогресс и callbacks
+    redis_client.set(f"progress:{upload_id}", "transcript_done")
+    redis_client.publish(f"progress:{upload_id}", "transcript_done")
     for url in json.loads(redis_client.get(f"callbacks:{upload_id}") or "[]"):
         try:
             requests.post(
                 url,
-                json={
-                    "external_id": upload_id,
-                    "event":       "transcript_complete"
-                },
+                json={"external_id": upload_id, "event": "transcript_complete"},
                 timeout=5
             )
         except:
             pass
 
-    # По запросу — полная диаризация
+    # Если нужно—запустить диаризацию
     if redis_client.get(f"diarize_requested:{upload_id}") == "1":
         diarize_full.delay(upload_id, correlation_id)
 
@@ -214,17 +217,15 @@ def diarize_full(self, upload_id: str, correlation_id: str):
     """Полная диаризация."""
     redis_client = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
 
-    # 1) Вычисление пути к WAV
     wav_file = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
     if not wav_file.exists():
         logger.error(f"[{correlation_id}] WAV file for upload_id {upload_id} not found")
         return
 
-    # 2) Диаризация через пайплайн (он сам выполнит VAD)
-    audio = {"audio": str(wav_file)}
-    annotation = get_clustering_diarizer().apply(audio)
+    # 1) Самая диаризация (VAD внутри)
+    annotation = get_clustering_diarizer().apply({"audio": str(wav_file)})
 
-    # 3) Извлечение сегментов
+    # 2) Проходим по всем трекам и лейблам
     segments = []
     for segment, track, label in annotation.itertracks(yield_label=True):
         segments.append({
@@ -233,13 +234,18 @@ def diarize_full(self, upload_id: str, correlation_id: str):
             "speaker": label
         })
 
-    # 4) Сохранение результатов
     out_dir = Path(settings.RESULTS_FOLDER) / upload_id
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_file = out_dir / "diarization.json"
-    out_file.write_text(json.dumps(segments, ensure_ascii=False, indent=2), encoding="utf-8")
+    (out_dir / "diarization.json").write_text(
+        json.dumps(segments, ensure_ascii=False, indent=2),
+        encoding="utf-8"
+    )
 
-    # 5) Применение пользовательского маппинга, если он есть
+    # 3) Обновляем прогресс
+    redis_client.set(f"progress:{upload_id}", "diarization_done")
+    redis_client.publish(f"progress:{upload_id}", "diarization_done")
+
+    # 4) Применяем label_mapping из БД (если есть)
     try:
         engine = create_engine(settings.DATABASE_URL)
         SessionLocal = sessionmaker(bind=engine)
@@ -254,20 +260,20 @@ def diarize_full(self, upload_id: str, correlation_id: str):
                     "end":   seg["end"],
                     "speaker": mapping.get(str(seg["speaker"]), seg["speaker"])
                 })
-            out_file.write_text(json.dumps(mapped, ensure_ascii=False, indent=2), encoding="utf-8")
+            (out_dir / "diarization.json").write_text(
+                json.dumps(mapped, ensure_ascii=False, indent=2),
+                encoding="utf-8"
+            )
         session.close()
     except Exception as e:
         logger.error(f"[{correlation_id}] Error applying label mapping: {e}")
 
-    # 6) callbacks diarization_complete
+    # 5) callbacks
     for url in json.loads(redis_client.get(f"callbacks:{upload_id}") or "[]"):
         try:
             requests.post(
                 url,
-                json={
-                    "external_id": upload_id,
-                    "event":       "diarization_complete"
-                },
+                json={"external_id": upload_id, "event": "diarization_complete"},
                 timeout=5
             )
         except:
@@ -282,7 +288,7 @@ def cleanup_old_uploads():
             f.unlink(missing_ok=True)
 
 def split_audio_fixed_windows(audio_path: Path, window_s: int):
-    """Утилита: нарезка файла на окна – пока не используется."""
+    """Нарезка на окна — пока не используется."""
     audio = AudioSegment.from_file(str(audio_path))
     length_ms = len(audio)
     window_ms = window_s * 1000
