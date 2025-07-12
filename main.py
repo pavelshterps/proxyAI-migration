@@ -11,8 +11,10 @@ import structlog
 import redis.asyncio as redis_async
 from fastapi import (
     FastAPI, UploadFile, File, HTTPException,
-    Header, Depends, Request, Response, Body
+    Header, Depends, Request, Response, Body,
+    WebSocket, WebSocketDisconnect
 )
+import asyncio
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
@@ -110,13 +112,11 @@ async def metrics_endpoint(request: Request):
 async def root():
     return FileResponse("static/index.html")
 
-# === Status endpoint ===
 @app.get("/status/{upload_id}", summary="Check processing status")
 async def get_status(upload_id: str, current_user=Depends(get_current_user)):
     log.debug("GET /status", upload_id=upload_id)
     base = Path(settings.RESULTS_FOLDER) / upload_id
 
-    # both transcript + diarization done
     if (base / "transcript.json").exists() and (base / "diarization.json").exists():
         preview = json.loads(await redis.get(f"preview_result:{upload_id}") or "null")
         resp = {
@@ -145,7 +145,6 @@ async def get_status(upload_id: str, current_user=Depends(get_current_user)):
     log.debug("STATUS -> initial", **init)
     return init
 
-# === Results endpoint ===
 @app.get("/results/{upload_id}", summary="Get preview, transcript or diarization")
 async def get_results(upload_id: str, current_user=Depends(get_current_user), db=Depends(get_db)):
     log.debug("GET /results", upload_id=upload_id)
@@ -179,7 +178,6 @@ async def get_results(upload_id: str, current_user=Depends(get_current_user), db
     log.debug("RESULTS -> not ready", upload_id=upload_id)
     raise HTTPException(404, "Results not ready")
 
-# === Upload endpoint ===
 @app.post("/upload/", dependencies=[Depends(get_current_user)])
 @limiter.limit("10/minute")
 async def upload(
@@ -225,15 +223,20 @@ async def upload(
         headers={"X-Correlation-ID": cid}
     )
 
-# === Diarization trigger ===
 @app.post("/diarize/{upload_id}", summary="Request diarization")
 async def request_diarization(upload_id: str, current_user=Depends(get_current_user)):
     log.debug("POST /diarize", upload_id=upload_id)
     await redis.set(f"diarize_requested:{upload_id}", "1")
+    # Обновляем и публикуем progress, чтобы фронтенд тут же увидел флаг
+    raw = await redis.get(f"progress:{upload_id}")
+    if raw:
+        st = json.loads(raw)
+        st["diarize_requested"] = True
+        await redis.set(f"progress:{upload_id}", json.dumps(st, ensure_ascii=False))
+        await redis.publish(f"progress:{upload_id}", json.dumps(st, ensure_ascii=False))
     diarize_full.delay(upload_id, None)
     return JSONResponse({"message": "diarization started"})
 
-# === Save speaker labels ===
 @app.post("/labels/{upload_id}", summary="Save speaker labels")
 async def save_labels(
     upload_id: str,
@@ -263,7 +266,8 @@ async def save_labels(
     log.debug("POST /labels -> saved", count=len(updated))
     return JSONResponse({"message": "labels saved", "results": updated})
 
-# === Routers & Static files ===
+# WebSocket-эндпоинт для прогресса (вставлен выше)
+
 app.include_router(api_router, tags=["proxyAI"])
 app.include_router(admin_router)
 app.mount("/static", StaticFiles(directory="static"), name="static")
