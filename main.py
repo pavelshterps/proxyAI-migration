@@ -1,3 +1,4 @@
+# main.py
 import logging
 logging.basicConfig(level=logging.DEBUG)
 
@@ -136,7 +137,6 @@ async def get_status(upload_id: str, current_user=Depends(get_current_user)):
         log.debug("STATUS -> from redis", **data)
         return data
 
-    # ещё не стартовали
     init = {
         "status": "processing",
         "preview": None,
