@@ -1,188 +1,75 @@
 version: '3.8'
-
 services:
-  db:
-    image: postgres:14
-    restart: always
-    environment:
-      POSTGRES_DB:   ${POSTGRES_DB}
-      POSTGRES_USER: ${POSTGRES_USER}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-    ports:
-      - "5432:5432"
-    networks:
-      - proxyai_net
-
-  redis:
-    image: redis:7-alpine
-    restart: unless-stopped
-    volumes:
-      - redis-data:/data
-    ports:
-      - "6379:6379"
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 30s
-      retries: 3
-    networks:
-      - proxyai_net
-
-  # ==== API (FastAPI) ====
   api:
     build:
       context: .
       dockerfile: Dockerfile
-    env_file: .env
-    command: >
-      uvicorn main:app
-      --host 0.0.0.0
-      --port 8000
-      --workers ${API_WORKERS}
-    environment:
-      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
-      - USE_EXTERNAL_TRANSCRIBE
-    volumes:
-      - ./:/app:delegated
-      - upload-data:/data/uploads
-      - results-data:/data/results
-      - diarizer-cache:/data/diarizer_cache
-      - /data/whisper-models:/hf_cache:ro
+    container_name: proxyai_api
     ports:
       - "8000:8000"
-    depends_on:
-      - db
-      - redis
-    restart: unless-stopped
-    networks:
-      - proxyai_net
+    volumes:
+      - ./:/app
+    environment:
+      - DATABASE_URL=${DATABASE_URL}
+      - CELERY_BROKER_URL=${CELERY_BROKER_URL}
+      - RESULTS_FOLDER=/app/results
+      - UPLOAD_FOLDER=/app/uploads
 
-  # ==== CPU-worker ====
-  cpu-worker:
+  worker_cpu:
     build:
       context: .
       dockerfile: Dockerfile
-    env_file: .env
-    environment:
-      - WHISPER_DEVICE=cpu
-      - OMP_NUM_THREADS=${CPU_CONCURRENCY}
-      - MKL_NUM_THREADS=${CPU_CONCURRENCY}
-      - CHUNK_LENGTH_S=${CHUNK_LENGTH_S}
-      - OMP_NUM_THREADS=4       # или число ядер вашего CPU
-      - OPENBLAS_NUM_THREADS=4
-      - MKL_NUM_THREADS=4
-      - TORCH_NUM_THREADS=4      # для PyTorch
-    volumes:
-      - ./:/app:delegated
-      - upload-data:/data/uploads
-      - results-data:/data/results
-      - diarizer-cache:/data/diarizer_cache:ro
-      - /data/whisper-models:/hf_cache:ro
+    container_name: proxyai_worker_cpu
     command: >
-      celery -A config.celery:app worker
-      --queues preview_cpu,split_cpu,dispatch_cpu,collect_cpu
-      --concurrency=${CPU_CONCURRENCY}
-      --prefetch-multiplier=1
-      --loglevel info
+      celery -A tasks worker
+      --loglevel=info
+      --concurrency=1
+      --queues=split_cpu,dispatch_cpu,collect_cpu
+    volumes:
+      - ./:/app
     depends_on:
-      - db
-      - redis
-    restart: unless-stopped
-    networks:
-      - proxyai_net
+      - api
+    environment:
+      - CELERY_BROKER_URL=${CELERY_BROKER_URL}
+      - UPLOAD_FOLDER=/app/uploads
+      - RESULTS_FOLDER=/app/results
 
-  # ==== GPU-worker ====
-  gpu-worker:
+  worker_gpu:
     build:
       context: .
       dockerfile: Dockerfile.gpu
-    env_file: .env
-    environment:
-      - WHISPER_DEVICE=cuda
-      - WHISPER_COMPUTE_TYPE=${WHISPER_COMPUTE_TYPE}   # e.g. "float16"
-      - NVIDIA_VISIBLE_DEVICES=all
+    container_name: proxyai_worker_gpu
     runtime: nvidia
+    environment:
+      - CELERY_BROKER_URL=${CELERY_BROKER_URL}
+      - UPLOAD_FOLDER=/app/uploads
+      - RESULTS_FOLDER=/app/results
+      - NVIDIA_VISIBLE_DEVICES=all
+    command: >
+      celery -A tasks worker
+      --loglevel=info
+      --concurrency=1
+      --queues=transcribe_gpu,diarize_gpu
     volumes:
-      - ./:/app:delegated
-      - upload-data:/data/uploads
-      - results-data:/data/results
-      - diarizer-cache:/data/diarizer_cache
-      - /data/whisper-models:/hf_cache:ro
-    command: >
-      celery -A config.celery:app worker
-      --queues transcribe_gpu,diarize_gpu
-      --concurrency ${GPU_CONCURRENCY}
-      --prefetch-multiplier=1
-      --pool solo
-      --loglevel info
-    depends_on:
-      - db
-      - redis
-    restart: unless-stopped
-    networks:
-      - proxyai_net
-
-  # ==== Celery Beat ====
-  beat:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    env_file: .env
-    command: >
-      celery -A config.celery:app
-      beat
-      --loglevel info
-    depends_on:
-      - redis
-    restart: unless-stopped
-    networks:
-      - proxyai_net
-
-  # ==== Flower UI ====
-  flower:
-    image: mher/flower:0.9.7
-    env_file: .env
-    ports:
-      - "5555:5555"
-    command:
-      - flower
-      - "--broker=${CELERY_BROKER_URL}"
-      - "--basic_auth=${FLOWER_USER}:${FLOWER_PASS}"
-      - "--port=5555"
-    depends_on:
-      - redis
-    restart: unless-stopped
-    networks:
-      - proxyai_net
-
-  # ==== Nginx (reverse proxy + SSL) ====
-  nginx:
-    image: nginx:stable-alpine
-    container_name: proxyai_nginx
+      - ./:/app
     depends_on:
       - api
+
+  redis:
+    image: redis:7-alpine
+    container_name: proxyai_redis
     ports:
-      - "80:80"
-      - "443:443"
+      - "6379:6379"
+
+  db:
+    image: postgres:15-alpine
+    container_name: proxyai_db
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
     volumes:
-      - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
-      - /etc/letsencrypt/live/tonage.io/fullchain.pem:/etc/nginx/certs/fullchain.pem:ro
-      - /etc/letsencrypt/live/tonage.io/privkey.pem:/etc/nginx/certs/privkey.pem:ro
-    restart: unless-stopped
-    networks:
-      proxyai_net:
-        aliases:
-          - api
+      - pgdata:/var/lib/postgresql/data
 
 volumes:
-  postgres_data:
-  redis-data:
-  upload-data:
-  results-data:
-  diarizer-cache:
-  hf-cache:
-
-networks:
-  proxyai_net:
-    driver: bridge
+  pgdata:
