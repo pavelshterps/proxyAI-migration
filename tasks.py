@@ -1,4 +1,3 @@
-# tasks.py
 import os
 import json
 import logging
@@ -15,7 +14,6 @@ from redis import Redis
 
 from config.settings import settings
 from config.celery import app
-
 from utils.audio import convert_to_wav
 
 logger = logging.getLogger(__name__)
