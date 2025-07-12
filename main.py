@@ -9,8 +9,15 @@ from contextlib import asynccontextmanager
 import structlog
 import redis.asyncio as redis_async
 from fastapi import (
-    FastAPI, UploadFile, File, HTTPException,
-    Header, Request, Response, Body, Depends
+    FastAPI,
+    UploadFile,
+    File,
+    HTTPException,
+    Header,
+    Request,                # <-- добавлен
+    Depends,
+    Body,
+    Response
 )
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -22,7 +29,7 @@ from slowapi import Limiter
 from slowapi.middleware import SlowAPIMiddleware
 from slowapi.util import get_remote_address
 
-from sse_starlette.sse import EventSourceResponse  # <— SSE
+from sse_starlette.sse import EventSourceResponse  # <-- SSE
 
 from config.settings import settings
 from database import get_db, engine, init_models
@@ -97,19 +104,19 @@ async def metrics_middleware(request: Request, call_next):
     HTTP_REQ_LATENCY.labels(request.url.path).observe(time.time() - start)
     return resp
 
-# Health, ready, metrics
-@limiter.limit("30/minute")
+# === Health, ready, metrics ===
 @app.get("/health")
-async def health(request: Request):
+@limiter.limit("30/minute")
+async def health(request: Request):  # <-- теперь принимаем request
     return {"status": "ok", "version": app.version}
 
 @app.get("/ready")
 async def ready():
     return {"status": "ready", "version": app.version}
 
-@limiter.limit("10/minute")
 @app.get("/metrics")
-async def metrics(request: Request):
+@limiter.limit("10/minute")
+async def metrics(request: Request):  # <-- теперь принимаем request
     data = generate_latest()
     return Response(content=data, media_type=CONTENT_TYPE_LATEST)
 
@@ -134,7 +141,7 @@ async def progress_events(upload_id: str):
 
     return EventSourceResponse(event_generator())
 
-# === Статус (для ручных запросов, если нужно) ===
+# === Статус (для ручных запросов) ===
 @app.get("/status/{upload_id}", summary="Check processing status")
 async def get_status(upload_id: str, current_user=Depends(get_current_user)):
     log.debug("GET /status", upload_id=upload_id)
@@ -152,8 +159,7 @@ async def get_status(upload_id: str, current_user=Depends(get_current_user)):
 
     raw = await redis.get(f"progress:{upload_id}")
     if raw:
-        data = json.loads(raw)
-        return data
+        return json.loads(raw)
 
     return {
         "status": "processing",
@@ -165,7 +171,11 @@ async def get_status(upload_id: str, current_user=Depends(get_current_user)):
 
 # === Результаты ===
 @app.get("/results/{upload_id}", summary="Get preview, transcript or diarization")
-async def get_results(upload_id: str, current_user=Depends(get_current_user), db=Depends(get_db)):
+async def get_results(
+    upload_id: str,
+    current_user=Depends(get_current_user),
+    db=Depends(get_db)
+):
     base = Path(settings.RESULTS_FOLDER) / upload_id
 
     # превью
@@ -213,8 +223,8 @@ async def upload(
 
     try:
         await create_upload_record(db, current_user.id, upload_id)
-    except Exception as e:
-        log.warning("Failed to create upload record", error=str(e))
+    except Exception:
+        log.warning("Failed to create upload record")
 
     await redis.set(f"external:{upload_id}", upload_id)
     preview_transcribe.delay(upload_id, cid)
@@ -252,6 +262,7 @@ async def save_labels(
     rec = await get_upload_for_user(db, current_user.id, upload_id)
     rec.label_mapping = mapping
     await db.commit()
+
     out = Path(settings.RESULTS_FOLDER) / upload_id / "diarization.json"
     updated = []
     if out.exists():
@@ -261,6 +272,7 @@ async def save_labels(
             for seg in segs
         ]
         out.write_text(json.dumps(updated, ensure_ascii=False, indent=2), encoding="utf-8")
+
     return JSONResponse({"results": updated})
 
 # === Подключаем основное API и админ ===
