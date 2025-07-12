@@ -26,7 +26,7 @@ from crud import create_upload_record, get_upload_for_user
 from dependencies import get_current_user
 from routes import router as api_router
 from admin_routes import router as admin_router
-from tasks import download_audio, preview_transcribe, transcribe_segments, diarize_full
+from tasks import download_audio, preview_transcribe, diarize_full
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -107,24 +107,42 @@ async def metrics_endpoint(request: Request):
 async def root():
     return FileResponse("static/index.html")
 
-# === Проверка статуса по upload_id ===
+# === Единый прогресс-эндпоинт ===
 @app.get("/status/{upload_id}", summary="Check processing status")
 async def get_status(upload_id: str, current_user=Depends(get_current_user)):
     base = Path(settings.RESULTS_FOLDER) / upload_id
-    done = (base / "transcript.json").exists() and (base / "diarization.json").exists()
-    progress = await redis.get(f"progress:{upload_id}") or "0%"
-    return {"status": "done" if done else "processing", "progress": progress}
+    # если уже всё сделано на диске — возвращаем финальный статус
+    if (base / "transcript.json").exists() and (base / "diarization.json").exists():
+        return {
+            "status": "diarization_done",
+            "preview": json.loads(await redis.get(f"preview_result:{upload_id}") or "null"),
+            "chunks_total": None,
+            "chunks_done": None,
+            "diarize_requested": True
+        }
+
+    raw = await redis.get(f"progress:{upload_id}")
+    if raw:
+        return json.loads(raw)
+    # если нет прогресса — загрузка
+    return {
+        "status": "processing",
+        "preview": None,
+        "chunks_total": 0,
+        "chunks_done": 0,
+        "diarize_requested": False
+    }
 
 # === Unified results endpoint ===
 @app.get("/results/{upload_id}", summary="Get preview, transcript or diarization")
 async def get_results(upload_id: str, current_user=Depends(get_current_user), db=Depends(get_db)):
-    # 1) Preview from Redis
+    # 1) Preview
     preview_data = await redis.get(f"preview_result:{upload_id}")
     if preview_data:
         payload = json.loads(preview_data)
         return JSONResponse(content={"results": payload["timestamps"]})
 
-    # 2) Full transcript file
+    # 2) Full transcript
     tp = Path(settings.RESULTS_FOLDER) / upload_id / "transcript.json"
     if tp.exists():
         data = json.loads(tp.read_text(encoding="utf-8"))
@@ -145,11 +163,11 @@ async def get_results(upload_id: str, current_user=Depends(get_current_user), db
 
     raise HTTPException(404, "Results not ready")
 
-# === File upload endpoint ===
+# === Загрузка файлов ===
 @app.post("/upload/", dependencies=[Depends(get_current_user)])
 @limiter.limit("10/minute")
 async def upload(
-    request: Request,            # <- обязательный параметр для slowapi
+    request: Request,
     file: UploadFile = File(...),
     x_correlation_id: str | None = Header(None),
     current_user=Depends(get_current_user),
@@ -164,7 +182,6 @@ async def upload(
     dest = Path(settings.UPLOAD_FOLDER) / f"{upload_id}{ext}"
     dest.write_bytes(data)
 
-    # Try to save record but don’t fail if DB is unreachable
     try:
         await create_upload_record(db, current_user.id, upload_id)
     except Exception as e:
@@ -173,27 +190,33 @@ async def upload(
     log.bind(correlation_id=cid, upload_id=upload_id, user_id=current_user.id).info("upload accepted")
     await redis.set(f"external:{upload_id}", upload_id)
 
-    # Kick off tasks
     download_audio.delay(upload_id, cid)
     preview_transcribe.delay(upload_id, cid)
 
-    # Initialize progress
-    await redis.publish(f"progress:{upload_id}", "0%")
-    await redis.set(f"progress:{upload_id}", "0%")
+    # инициализируем «0%»
+    init = {
+        "status": "processing",
+        "preview": None,
+        "chunks_total": 0,
+        "chunks_done": 0,
+        "diarize_requested": False
+    }
+    await redis.set(f"progress:{upload_id}", json.dumps(init, ensure_ascii=False))
+    await redis.publish(f"progress:{upload_id}", json.dumps(init, ensure_ascii=False))
 
     return JSONResponse(
         {"upload_id": upload_id, "external_id": upload_id},
         headers={"X-Correlation-ID": cid}
     )
 
-# === Manual diarization trigger ===
+# === Запрос диаризации ===
 @app.post("/diarize/{upload_id}", summary="Request diarization")
 async def request_diarization(upload_id: str, current_user=Depends(get_current_user)):
     await redis.set(f"diarize_requested:{upload_id}", "1")
     diarize_full.delay(upload_id, None)
     return JSONResponse({"message": "diarization started"})
 
-# === Save speaker-label mapping endpoint ===
+# === Сохранение меток спикеров ===
 @app.post("/labels/{upload_id}", summary="Save speaker labels")
 async def save_labels(
     upload_id: str,
@@ -204,9 +227,6 @@ async def save_labels(
     try:
         rec = await get_upload_for_user(db, current_user.id, upload_id)
     except:
-        rec = None
-
-    if not rec:
         raise HTTPException(404, "upload_id not found")
 
     rec.label_mapping = mapping
@@ -217,21 +237,16 @@ async def save_labels(
     if out_file.exists():
         segments = json.loads(out_file.read_text(encoding="utf-8"))
         updated = [
-            {
-                "start": seg["start"],
-                "end":   seg["end"],
-                "speaker": mapping.get(str(seg["speaker"]), seg["speaker"])
-            }
+            {"start": seg["start"], "end": seg["end"],
+             "speaker": mapping.get(str(seg["speaker"]), seg["speaker"])}
             for seg in segments
         ]
-        out_file.write_text(
-            json.dumps(updated, ensure_ascii=False, indent=2),
-            encoding="utf-8"
-        )
+        out_file.write_text(json.dumps(updated, ensure_ascii=False, indent=2),
+                            encoding="utf-8")
 
     return JSONResponse({"message": "labels saved", "results": updated})
 
-# === Additional routers & static files ===
+# === Роуты и статичные ресурсы ===
 app.include_router(api_router, tags=["proxyAI"])
 app.include_router(admin_router)
 app.mount("/static", StaticFiles(directory="static"), name="static")
