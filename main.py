@@ -10,7 +10,10 @@ from contextlib import asynccontextmanager
 
 import structlog
 import redis.asyncio as redis_async
-from fastapi import FastAPI, UploadFile, File, HTTPException, Header, Depends, Request, Response, Body
+from fastapi import (
+    FastAPI, UploadFile, File, HTTPException,
+    Header, Depends, Request, Response, Body
+)
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
@@ -27,6 +30,8 @@ from crud import create_upload_record, get_upload_for_user
 from dependencies import get_current_user
 from routes import router as api_router
 from admin_routes import router as admin_router
+
+# забираем две celery‐задачи
 from tasks import preview_transcribe, diarize_full
 
 @asynccontextmanager
@@ -57,14 +62,14 @@ app.add_middleware(SlowAPIMiddleware)
 # CORS & TrustedHost
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.ALLOWED_ORIGINS_LIST,
+    allow_origins=[*settings.ALLOWED_ORIGINS_LIST],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 app.add_middleware(
     TrustedHostMiddleware,
-    allowed_hosts=["localhost", "127.0.0.1"] + settings.ALLOWED_ORIGINS_LIST
+    allowed_hosts=["127.0.0.1", "localhost"] + settings.ALLOWED_ORIGINS_LIST
 )
 
 # Ensure directories
@@ -74,11 +79,11 @@ for d in (settings.UPLOAD_FOLDER, settings.RESULTS_FOLDER, settings.DIARIZER_CAC
 # Redis client
 redis = redis_async.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
 
-# API Key
+# APIKey
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 # Metrics
-HTTP_REQ_COUNT   = Counter("http_requests_total", "HTTP requests count", ["method", "path"])
+HTTP_REQ_COUNT   = Counter("http_requests_total", "Total HTTP requests", ["method", "path"])
 HTTP_REQ_LATENCY = Histogram("http_request_duration_seconds", "HTTP request latency", ["path"])
 
 @app.middleware("http")
@@ -109,12 +114,13 @@ async def root():
     return FileResponse("static/index.html")
 
 
-# === Progress ===
+# === Unified progress endpoint ===
 @app.get("/status/{upload_id}", summary="Check processing status")
 async def get_status(upload_id: str, current_user=Depends(get_current_user)):
     log.debug("GET /status", upload_id=upload_id)
     base = Path(settings.RESULTS_FOLDER) / upload_id
 
+    # полностью готово (transcript + diarization)
     if (base / "transcript.json").exists() and (base / "diarization.json").exists():
         preview = json.loads(await redis.get(f"preview_result:{upload_id}") or "null")
         resp = {
@@ -133,32 +139,39 @@ async def get_status(upload_id: str, current_user=Depends(get_current_user)):
         log.debug("STATUS -> from redis", **data)
         return data
 
-    init = {"status":"processing","preview":None,"chunks_total":0,"chunks_done":0,"diarize_requested":False}
+    # ещё не стартовали
+    init = {
+        "status": "processing",
+        "preview": None,
+        "chunks_total": 0,
+        "chunks_done": 0,
+        "diarize_requested": False
+    }
     log.debug("STATUS -> initial", **init)
     return init
 
 
-# === Results ===
+# === Unified results endpoint ===
 @app.get("/results/{upload_id}", summary="Get preview, transcript or diarization")
 async def get_results(upload_id: str, current_user=Depends(get_current_user), db=Depends(get_db)):
     log.debug("GET /results", upload_id=upload_id)
     base = Path(settings.RESULTS_FOLDER) / upload_id
 
-    # preview first
+    # 1) Preview first
     pd = await redis.get(f"preview_result:{upload_id}")
     if pd:
         pl = json.loads(pd)
         log.debug("RESULTS -> preview", count=len(pl["timestamps"]))
         return JSONResponse(content={"results": pl["timestamps"]})
 
-    # then full transcript
+    # 2) Full transcript
     tp = base / "transcript.json"
     if tp.exists():
         data = json.loads(tp.read_text(encoding="utf-8"))
         log.debug("RESULTS -> full transcript", count=len(data))
         return JSONResponse(content={"results": data})
 
-    # and finally diarization
+    # 3) Diarization + mapping
     dp = base / "diarization.json"
     if dp.exists():
         segs = json.loads(dp.read_text(encoding="utf-8"))
@@ -176,11 +189,16 @@ async def get_results(upload_id: str, current_user=Depends(get_current_user), db
     raise HTTPException(404, "Results not ready")
 
 
-# === Upload ===
+# === File upload ===
 @app.post("/upload/", dependencies=[Depends(get_current_user)])
 @limiter.limit("10/minute")
-async def upload(request: Request, file: UploadFile=File(...), x_correlation_id: str|None=Header(None),
-                 current_user=Depends(get_current_user), db=Depends(get_db)):
+async def upload(
+    request: Request,
+    file:   UploadFile = File(...),
+    x_correlation_id: str | None = Header(None),
+    current_user=Depends(get_current_user),
+    db=Depends(get_db),
+):
     cid  = x_correlation_id or str(uuid.uuid4().hex)
     data = await file.read()
     if not data:
@@ -188,7 +206,7 @@ async def upload(request: Request, file: UploadFile=File(...), x_correlation_id:
 
     ext = Path(file.filename).suffix or ""
     upload_id = uuid.uuid4().hex
-    dest = Path(settings.UPLOAD_FOLDER)/f"{upload_id}{ext}"
+    dest = Path(settings.UPLOAD_FOLDER) / f"{upload_id}{ext}"
     dest.write_bytes(data)
 
     try:
@@ -199,43 +217,71 @@ async def upload(request: Request, file: UploadFile=File(...), x_correlation_id:
     log.bind(correlation_id=cid, upload_id=upload_id, user_id=current_user.id).info("upload accepted")
     await redis.set(f"external:{upload_id}", upload_id)
 
+    # запускаем превью → сплит…
     preview_transcribe.delay(upload_id, cid)
 
-    init = {"status":"processing","preview":None,"chunks_total":0,"chunks_done":0,"diarize_requested":False}
+    init = {
+        "status": "processing",
+        "preview": None,
+        "chunks_total": 0,
+        "chunks_done": 0,
+        "diarize_requested": False
+    }
     await redis.set(f"progress:{upload_id}", json.dumps(init, ensure_ascii=False))
     await redis.publish(f"progress:{upload_id}", json.dumps(init, ensure_ascii=False))
+
     log.debug("POST /upload -> queued preview_transcribe", upload_id=upload_id)
-    return JSONResponse({"upload_id":upload_id,"external_id":upload_id}, headers={"X-Correlation-ID":cid})
+    return JSONResponse(
+        {"upload_id": upload_id, "external_id": upload_id},
+        headers={"X-Correlation-ID": cid}
+    )
 
 
-# === Diarize trigger ===
+# === Manual diarization trigger ===
 @app.post("/diarize/{upload_id}", summary="Request diarization")
 async def request_diarization(upload_id: str, current_user=Depends(get_current_user)):
     log.debug("POST /diarize", upload_id=upload_id)
     await redis.set(f"diarize_requested:{upload_id}", "1")
     diarize_full.delay(upload_id, None)
-    return JSONResponse({"message":"diarization started"})
+    return JSONResponse({"message": "diarization started"})
 
-# === Labels ===
+
+# === Save speaker‐label mapping ===
 @app.post("/labels/{upload_id}", summary="Save speaker labels")
-async def save_labels(upload_id: str, mapping: dict=Body(...),
-                      current_user=Depends(get_current_user), db=Depends(get_db)):
+async def save_labels(
+    upload_id: str,
+    mapping: dict = Body(...),
+    current_user=Depends(get_current_user),
+    db=Depends(get_db),
+):
     log.debug("POST /labels", upload_id=upload_id, mapping=mapping)
-    rec = await get_upload_for_user(db, current_user.id, upload_id)
+    try:
+        rec = await get_upload_for_user(db, current_user.id, upload_id)
+    except:
+        raise HTTPException(404, "upload_id not found")
+
     rec.label_mapping = mapping
     await db.commit()
 
-    out = Path(settings.RESULTS_FOLDER)/upload_id/"diarization.json"
+    out = Path(settings.RESULTS_FOLDER) / upload_id / "diarization.json"
     updated = []
     if out.exists():
         segs = json.loads(out.read_text(encoding="utf-8"))
-        updated = [{"start":s["start"],"end":s["end"],"speaker":mapping.get(str(s["speaker"]),s["speaker"])} for s in segs]
+        updated = [
+            {
+                "start": seg["start"],
+                "end":   seg["end"],
+                "speaker": mapping.get(str(seg["speaker"]), seg["speaker"])
+            }
+            for seg in segs
+        ]
         out.write_text(json.dumps(updated, ensure_ascii=False, indent=2), encoding="utf-8")
+
     log.debug("POST /labels -> saved", count=len(updated))
-    return JSONResponse({"message":"labels saved","results":updated})
+    return JSONResponse({"message": "labels saved", "results": updated})
 
 
-# === include routers & static ===
+# === Routers & Static ===
 app.include_router(api_router, tags=["proxyAI"])
 app.include_router(admin_router)
 app.mount("/static", StaticFiles(directory="static"), name="static")
