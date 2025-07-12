@@ -3,7 +3,7 @@ import json
 import logging
 import time
 import math
-import requests
+import subprocess
 from pathlib import Path
 from celery.signals import worker_process_init
 from faster_whisper import WhisperModel
@@ -28,9 +28,7 @@ def get_whisper_model():
         device  = settings.WHISPER_DEVICE.lower()
         compute = settings.WHISPER_COMPUTE_TYPE.lower()
         if device == "cpu" and compute in ("float16", "fp16"):
-            logger.warning(
-                f"Compute '{compute}' unsupported on CPU; falling back to int8"
-            )
+            logger.warning(f"Compute '{compute}' unsupported on CPU; falling back to int8")
             compute = "int8"
         _whisper_model = WhisperModel(
             settings.WHISPER_MODEL_PATH,
@@ -88,54 +86,51 @@ def preload_and_warmup(**kwargs):
 
 # === 1) Preview on CPU ===
 @app.task(bind=True, name="tasks.preview_transcribe", queue="preview_cpu")
-def preview_transcribe(self, upload_id, cid):
-    r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
+def preview_transcribe(self, upload_id: str, correlation_id: str):
+    r   = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
     upl = Path(settings.UPLOAD_FOLDER)
     src = next(upl.glob(f"{upload_id}.*"), None)
     if not src:
-        logger.error(f"[{cid}] no source")
+        logger.error(f"[{correlation_id}] no source for {upload_id}")
         return
 
-    # 1) WAV или конвертация
-    wav_path = str(src) if src.suffix.lower()==".wav" else convert_to_wav(src, upl/f"{upload_id}.wav")
+    # ensure WAV input
+    wav_path = str(src)
+    if src.suffix.lower() != ".wav":
+        wav_path = str(upl / f"{upload_id}.wav")
+        convert_to_wav(src, wav_path)
 
-    # 2) Первые PREVIEW_LENGTH_S секунд
-    preview_ms = int(settings.PREVIEW_LENGTH_S * 1000)
-    audio = AudioSegment.from_file(wav_path, duration=preview_ms)
-    preview_wav = upl/f"{upload_id}_preview.wav"
-    audio.export(str(preview_wav), format="wav")
+    # 1) extract first PREVIEW_LENGTH_S seconds via ffmpeg
+    preview_wav = upl / f"{upload_id}_preview.wav"
+    subprocess.run([
+        "ffmpeg", "-y",
+        "-ss", "0",
+        "-t", str(settings.PREVIEW_LENGTH_S),
+        "-i", wav_path,
+        str(preview_wav)
+    ], check=True)
 
-    # 3) Однопроходная транскрипция без детекции языка и word-timestamps
-    segs, _ = _model.transcribe(
-        str(preview_wav),
-        language=settings.WHISPER_LANGUAGE,
-        word_timestamps=False
+    # 2) compute total chunks for full file via ffprobe
+    duration_str = subprocess.check_output([
+        "ffprobe", "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        wav_path
+    ]).strip()
+    full_len_s    = float(duration_str)
+    total_chunks  = max(1, math.ceil(full_len_s / settings.CHUNK_LENGTH_S))
+
+    # 3) dispatch preview chunk (idx = 0) to GPU
+    app.send_task(
+        "tasks.transcribe_chunk",
+        args=(upload_id, 0, str(preview_wav), correlation_id),
+        queue="transcribe_gpu"
     )
+    # 4) start splitting the rest of the file in background
+    split_audio.delay(upload_id, correlation_id)
 
-    # 4) Сбор результата
-    preview = {
-      "text": "".join(s.text for s in segs),
-      "timestamps": [{"start":s.start,"end":s.end,"text":s.text} for s in segs]
-    }
 
-    # 5) Посчитаем число чанков для полного файла
-    full_len_s = AudioSegment.from_file(wav_path).duration_seconds
-    total_chunks = max(1, math.ceil(full_len_s / settings.CHUNK_LENGTH_S))
-
-    state = {
-      "status": "preview_done",
-      "preview": preview,
-      "chunks_total": total_chunks,
-      "chunks_done": 0,
-      "diarize_requested": False
-    }
-    r.set(f"preview_result:{upload_id}", json.dumps(preview, ensure_ascii=False))
-    r.set(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
-    r.publish(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
-
-    split_audio.delay(upload_id, cid)
-
-# === 2) Split into fixed-length chunks ===
+# === 2) Split into fixed‐length chunks ===
 @app.task(bind=True, name="tasks.split_audio", queue="split_cpu")
 def split_audio(self, upload_id: str, correlation_id: str):
     upl = Path(settings.UPLOAD_FOLDER)
@@ -144,16 +139,12 @@ def split_audio(self, upload_id: str, correlation_id: str):
         return
 
     audio = AudioSegment.from_file(str(wav))
-    # Размер чанка задаётся из settings.CHUNK_LENGTH_S (в секундах), например 600
     chunk_ms = int(settings.CHUNK_LENGTH_S * 1000)
-    paths = []
     for i in range(0, len(audio), chunk_ms):
         out = upl / f"{upload_id}_chunk_{i//chunk_ms}.wav"
         audio[i:i+chunk_ms].export(str(out), format="wav")
-        paths.append(str(out))
-
-    for idx, p in enumerate(paths):
-        dispatch_transcription.delay(upload_id, idx, p, correlation_id)
+        # dispatch each chunk
+        dispatch_transcription.delay(upload_id, i//chunk_ms, str(out), correlation_id)
 
 
 # === 3) Dispatch to GPU ===
@@ -170,12 +161,22 @@ def dispatch_transcription(self, upload_id: str, idx: int, wav_path: str, correl
 @app.task(bind=True, name="tasks.transcribe_chunk", queue="transcribe_gpu")
 def transcribe_chunk(self, upload_id: str, idx: int, wav_path: str, correlation_id: str):
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
+
+    # recompute total_chunks here so preview knows it
+    duration_str = subprocess.check_output([
+        "ffprobe", "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        wav_path
+    ]).strip()
+    total_chunks = max(1, math.ceil(float(duration_str) / settings.CHUNK_LENGTH_S))
+
     model = get_whisper_model()
-    opts = {"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {}
+    opts  = {"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {}
     segs, _ = model.transcribe(wav_path, word_timestamps=True, **opts)
 
     offset = idx * settings.CHUNK_LENGTH_S
-    out = []
+    out    = []
     for s in segs:
         out.append({
             "start": s.start + offset,
@@ -183,6 +184,7 @@ def transcribe_chunk(self, upload_id: str, idx: int, wav_path: str, correlation_
             "text":  s.text
         })
 
+    # save chunk result
     d = Path(settings.RESULTS_FOLDER) / upload_id
     d.mkdir(parents=True, exist_ok=True)
     (d / f"chunk_{idx}.json").write_text(
@@ -190,14 +192,32 @@ def transcribe_chunk(self, upload_id: str, idx: int, wav_path: str, correlation_
         encoding="utf-8"
     )
 
+    # if this is the preview chunk, publish preview result immediately
+    if idx == 0:
+        preview = {
+            "text": "".join(item["text"] for item in out),
+            "timestamps": out
+        }
+        state = {
+            "status": "preview_done",
+            "preview": preview,
+            "chunks_total": total_chunks,
+            "chunks_done": 0,
+            "diarize_requested": False
+        }
+        r.set(f"preview_result:{upload_id}", json.dumps(preview, ensure_ascii=False))
+        r.set(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
+        r.publish(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
+
+    # proceed to collect
     collect_transcription.delay(upload_id, correlation_id)
 
 
 # === 5) CPU: Collect all chunks ===
 @app.task(bind=True, name="tasks.collect_transcription", queue="collect_cpu")
 def collect_transcription(self, upload_id: str, correlation_id: str):
-    r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
-    d = Path(settings.RESULTS_FOLDER) / upload_id
+    r  = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
+    d  = Path(settings.RESULTS_FOLDER) / upload_id
     js = sorted(d.glob("chunk_*.json"), key=lambda p: int(p.stem.split("_")[1]))
     st = json.loads(r.get(f"progress:{upload_id}") or "{}")
     tot = st.get("chunks_total", 0)
@@ -232,7 +252,7 @@ def collect_transcription(self, upload_id: str, correlation_id: str):
 # === 6) GPU: Speaker diarization ===
 @app.task(bind=True, name="tasks.diarize_full", queue="diarize_gpu")
 def diarize_full(self, upload_id: str, correlation_id: str):
-    r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
+    r   = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
     wav = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
     if not wav.exists():
         return

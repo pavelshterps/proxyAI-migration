@@ -66,6 +66,8 @@ services:
     env_file: .env
     environment:
       - WHISPER_DEVICE=cpu
+      - OMP_NUM_THREADS=${CPU_CONCURRENCY}
+      - MKL_NUM_THREADS=${CPU_CONCURRENCY}
       - CHUNK_LENGTH_S=${CHUNK_LENGTH_S}
       - OMP_NUM_THREADS=4       # или число ядер вашего CPU
       - OPENBLAS_NUM_THREADS=4
@@ -80,8 +82,7 @@ services:
     command: >
       celery -A config.celery:app worker
       --queues preview_cpu,split_cpu,dispatch_cpu,collect_cpu
-      --concurrency 1
-      --pool solo
+      --concurrency=${CPU_CONCURRENCY}
       --prefetch-multiplier=1
       --loglevel info
     depends_on:
