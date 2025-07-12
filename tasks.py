@@ -3,6 +3,7 @@ import json
 import logging
 import time
 import requests
+import math
 from pathlib import Path
 from celery.signals import worker_process_init
 from faster_whisper import WhisperModel
@@ -73,10 +74,14 @@ def preload_and_warmup(**kwargs):
         except:
             pass
     else:
-        try: get_vad().apply({"audio": str(sample)})
-        except: pass
-        try: get_clustering_diarizer().apply({"audio": str(sample)})
-        except: pass
+        try:
+            get_vad().apply({"audio": str(sample)})
+        except:
+            pass
+        try:
+            get_clustering_diarizer().apply({"audio": str(sample)})
+        except:
+            pass
 
 
 # === 1) Preview on CPU ===
@@ -109,7 +114,11 @@ def preview_transcribe(self, upload_id: str, correlation_id: str):
             "start": s.start, "end": s.end, "text": s.text
         })
 
-    total_chunks = max(1, int((segs[-1].end // settings.CHUNK_LENGTH_S) + 1))
+    # Compute total number of chunks based on full audio duration
+    full_audio = AudioSegment.from_file(str(wav_path))
+    duration_s = len(full_audio) / 1000.0
+    total_chunks = max(1, math.ceil(duration_s / settings.CHUNK_LENGTH_S))
+
     state = {
         "status": "preview_done",
         "preview": preview,
@@ -130,7 +139,8 @@ def preview_transcribe(self, upload_id: str, correlation_id: str):
 def split_audio(self, upload_id: str, correlation_id: str):
     upl = Path(settings.UPLOAD_FOLDER)
     wav = upl / f"{upload_id}.wav"
-    if not wav.exists(): return
+    if not wav.exists():
+        return
 
     audio = AudioSegment.from_file(str(wav))
     chunk_ms = int(settings.CHUNK_LENGTH_S * 1000)
@@ -184,10 +194,10 @@ def transcribe_chunk(self, upload_id: str, idx: int, wav_path: str, correlation_
 # === 5) CPU: Collect all chunks ===
 @app.task(bind=True, name="tasks.collect_transcription", queue="collect_cpu")
 def collect_transcription(self, upload_id: str, correlation_id: str):
-    r   = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
-    d   = Path(settings.RESULTS_FOLDER) / upload_id
-    js  = sorted(d.glob("chunk_*.json"), key=lambda p: int(p.stem.split("_")[1]))
-    st  = json.loads(r.get(f"progress:{upload_id}") or "{}")
+    r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
+    d = Path(settings.RESULTS_FOLDER) / upload_id
+    js = sorted(d.glob("chunk_*.json"), key=lambda p: int(p.stem.split("_")[1]))
+    st = json.loads(r.get(f"progress:{upload_id}") or "{}")
     tot = st.get("chunks_total", 0)
 
     if len(js) < tot:
@@ -220,9 +230,10 @@ def collect_transcription(self, upload_id: str, correlation_id: str):
 # === 6) GPU: Speaker diarization ===
 @app.task(bind=True, name="tasks.diarize_full", queue="diarize_gpu")
 def diarize_full(self, upload_id: str, correlation_id: str):
-    r   = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
+    r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
     wav = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
-    if not wav.exists(): return
+    if not wav.exists():
+        return
 
     ann = get_clustering_diarizer().apply({"audio": str(wav)})
     segs = []
