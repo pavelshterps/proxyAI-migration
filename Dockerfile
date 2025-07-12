@@ -13,13 +13,7 @@ RUN apt-get update && \
 COPY requirements.txt ./
 
 RUN pip3 install --upgrade pip && \
-    pip3 install --no-cache-dir \
-      fastapi uvicorn[standard] celery redis python-dotenv \
-      python-multipart pydantic pydantic-settings \
-      structlog sqlalchemy[asyncio] asyncpg aiosqlite \
-      prometheus-client slowapi limits yamlargparse chainer numpy<2.0 \
-      webrtcvad pydub librosa soundfile httpx sse-starlette \
-      psycopg2-binary && \
+    pip3 install --no-cache-dir -r requirements.txt psycopg2-binary && \
     rm -rf /root/.cache/pip
 
 # --- Копируем код приложения ---
