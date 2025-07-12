@@ -141,12 +141,18 @@ async def get_status(upload_id: str, current_user=Depends(get_current_user)):
 async def get_results(upload_id: str, current_user=Depends(get_current_user), db=Depends(get_db)):
     base = Path(settings.RESULTS_FOLDER) / upload_id
 
-    # 1) Если готов полный транскрипт — отдаем его
+    # 1) Preview first
+    pd = await redis.get(f"preview_result:{upload_id}")
+    if pd:
+        pl = json.loads(pd)
+        return JSONResponse(content={"results": pl["timestamps"]})
+
+    # 2) Full transcript
     tp = base / "transcript.json"
     if tp.exists():
         return JSONResponse(content={"results": json.loads(tp.read_text(encoding="utf-8"))})
 
-    # 2) Если готова диаризация (после транскрипта) — отдаем её
+    # 3) Diarization + mapping
     dp = base / "diarization.json"
     if dp.exists():
         segs = json.loads(dp.read_text(encoding="utf-8"))
@@ -158,12 +164,6 @@ async def get_results(upload_id: str, current_user=Depends(get_current_user), db
         for s in segs:
             s["speaker"] = mapping.get(str(s["speaker"]), s["speaker"])
         return JSONResponse(content={"results": segs})
-
-    # 3) Иначе — отдаем превью
-    pd = await redis.get(f"preview_result:{upload_id}")
-    if pd:
-        pl = json.loads(pd)
-        return JSONResponse(content={"results": pl["timestamps"]})
 
     # ещё нет даже превью
     raise HTTPException(404, "Results not ready")
