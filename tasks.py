@@ -107,7 +107,7 @@ def preview_transcribe(self, upload_id: str, correlation_id: str):
     """Preview: первые settings.PREVIEW_LENGTH_S секунд."""
     redis_client = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
 
-    # 1) Найти исходный файл (любое расширение) и конвертировать в WAV
+    # 1) Конвертация в WAV
     upload_folder = Path(settings.UPLOAD_FOLDER)
     candidates = list(upload_folder.glob(f"{upload_id}.*"))
     if not candidates:
@@ -221,11 +221,11 @@ def transcribe_segments(self, upload_id: str, correlation_id: str):
         except:
             pass
 
-    # обновить прогресс
+    # Обновить прогресс
     redis_client.set(f"progress:{upload_id}", "transcript_done")
     redis_client.publish(f"progress:{upload_id}", "transcript_done")
 
-    # условный запуск диаризации
+    # 3) условный запуск диаризации
     if redis_client.get(f"diarize_requested:{upload_id}") == "1":
         diarize_full.delay(upload_id, correlation_id)
 
@@ -235,23 +235,29 @@ def diarize_full(self, upload_id: str, correlation_id: str):
     """Полная диаризация."""
     redis_client = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
 
-    # 1) Генерация diarization.json
+    # 1) Конвертация уже есть, используем готовый WAV
     wav_file = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
-    audio   = {"audio": str(wav_file)}
+    audio_dict = {"audio": str(wav_file)}
 
-    # Сначала VAD
-    vad = get_vad().apply(audio)
+    # 2) VAD
+    vad = get_vad().apply(audio_dict)
 
-    # Непосредственно diarization — передаём segmentation внутри словаря
-    diar = get_clustering_diarizer().apply({
-        "audio":        audio["audio"],
+    # 3) Diarization
+    diarization = get_clustering_diarizer().apply({
+        "audio":        audio_dict["audio"],
         "segmentation": vad
     })
 
-    segments = [
-        {"start": float(s.start), "end": float(s.end), "speaker": int(s.label)}
-        for s in diar
-    ]
+    # 4) Собираем список сегментов
+    segments = []
+    for speaker in diarization.labels():
+        timeline = diarization.for_label(speaker)
+        for segment in timeline:
+            segments.append({
+                "start": float(segment.start),
+                "end":   float(segment.end),
+                "speaker": speaker
+            })
 
     out_dir = Path(settings.RESULTS_FOLDER) / upload_id
     out_file = out_dir / "diarization.json"
@@ -261,7 +267,7 @@ def diarize_full(self, upload_id: str, correlation_id: str):
         encoding="utf-8"
     )
 
-    # 2) Автоматически применяем пользовательский mapping
+    # 5) Автоматически применить пользовательский mapping
     try:
         engine = create_engine(settings.DATABASE_URL)
         SessionLocal = sessionmaker(bind=engine)
@@ -295,7 +301,7 @@ def diarize_full(self, upload_id: str, correlation_id: str):
         except:
             pass
 
-    # обновить прогресс
+    # 6) Обновить прогресс
     redis_client.set(f"progress:{upload_id}", "diarization_done")
     redis_client.publish(f"progress:{upload_id}", "diarization_done")
 
