@@ -1,8 +1,10 @@
+# tasks.py
+
 import os
 import json
 import logging
-import time
 import requests
+import time
 from pathlib import Path
 
 from celery.signals import worker_process_init
@@ -11,7 +13,7 @@ from pyannote.audio.pipelines import VoiceActivityDetection, SpeakerDiarization
 from redis import Redis
 
 from config.settings import settings
-from config.celery import app          # единый Celery instance
+from config.celery import app        # единый Celery instance
 from utils.audio import convert_to_wav
 
 logger = logging.getLogger(__name__)
@@ -19,6 +21,7 @@ logger = logging.getLogger(__name__)
 _whisper_model = None
 _vad = None
 _clustering_diarizer = None
+
 
 def get_whisper_model():
     global _whisper_model
@@ -38,6 +41,7 @@ def get_whisper_model():
         )
     return _whisper_model
 
+
 def get_vad():
     global _vad
     if _vad is None:
@@ -51,6 +55,7 @@ def get_vad():
         )
     return _vad
 
+
 def get_clustering_diarizer():
     global _clustering_diarizer
     if _clustering_diarizer is None:
@@ -62,6 +67,7 @@ def get_clustering_diarizer():
             use_auth_token=settings.HUGGINGFACE_TOKEN
         )
     return _clustering_diarizer
+
 
 @worker_process_init.connect
 def preload_and_warmup(**kwargs):
@@ -88,16 +94,18 @@ def preload_and_warmup(**kwargs):
         except:
             pass
 
+
 @app.task(bind=True, name="tasks.download_audio", queue="preprocess_gpu")
 def download_audio(self, upload_id: str, correlation_id: str):
     logger.info(f"[{correlation_id}] download_audio noop for {upload_id}")
+
 
 @app.task(bind=True, name="tasks.preview_transcribe", queue="preprocess_gpu")
 def preview_transcribe(self, upload_id: str, correlation_id: str):
     """Preview: первые settings.PREVIEW_LENGTH_S секунд."""
     redis_client = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
 
-    # 1) Конвертация исходного файла в WAV
+    # находим исходник с любым расширением и конвертим в .wav
     upload_folder = Path(settings.UPLOAD_FOLDER)
     candidates = list(upload_folder.glob(f"{upload_id}.*"))
     if not candidates:
@@ -111,7 +119,7 @@ def preview_transcribe(self, upload_id: str, correlation_id: str):
         logger.error(f"[{correlation_id}] Conversion error: {e}")
         return
 
-    # 2) Транскрипция первых N секунд
+    # делаем транскрипцию первых N секунд
     model = get_whisper_model()
     opts = {}
     if settings.WHISPER_LANGUAGE:
@@ -129,12 +137,12 @@ def preview_transcribe(self, upload_id: str, correlation_id: str):
             "text":  seg.text
         })
 
-    # 3) Сохраняем preview и обновляем прогресс
+    # сохраняем в Redis и обновляем прогресс
     redis_client.set(f"preview_result:{upload_id}", json.dumps(preview, ensure_ascii=False))
     redis_client.set(f"progress:{upload_id}", "preview_done")
     redis_client.publish(f"progress:{upload_id}", "preview_done")
 
-    # 4) callbacks preview_complete
+    # callbacks
     for url in json.loads(redis_client.get(f"callbacks:{upload_id}") or "[]"):
         try:
             requests.post(
@@ -149,15 +157,16 @@ def preview_transcribe(self, upload_id: str, correlation_id: str):
         except:
             pass
 
-    # 5) Запускаем полный транскрипт
+    # запускаем полную транскрипцию
     transcribe_segments.delay(upload_id, correlation_id)
+
 
 @app.task(bind=True, name="tasks.transcribe_segments", queue="preprocess_gpu")
 def transcribe_segments(self, upload_id: str, correlation_id: str):
     """Полная транскрипция."""
     redis_client = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
 
-    # 1) Конвертация в WAV
+    # конвертация в wav
     upload_folder = Path(settings.UPLOAD_FOLDER)
     candidates = list(upload_folder.glob(f"{upload_id}.*"))
     if not candidates:
@@ -171,7 +180,7 @@ def transcribe_segments(self, upload_id: str, correlation_id: str):
         logger.error(f"[{correlation_id}] Conversion error: {e}")
         return
 
-    # 2) Полная транскрипция
+    # транскрипция всего файла
     model = get_whisper_model()
     opts = {}
     if settings.WHISPER_LANGUAGE:
@@ -189,7 +198,7 @@ def transcribe_segments(self, upload_id: str, correlation_id: str):
         encoding="utf-8"
     )
 
-    # 3) Обновляем прогресс и callbacks
+    # обновляем прогресс и callbacks
     redis_client.set(f"progress:{upload_id}", "transcript_done")
     redis_client.publish(f"progress:{upload_id}", "transcript_done")
     for url in json.loads(redis_client.get(f"callbacks:{upload_id}") or "[]"):
@@ -202,9 +211,10 @@ def transcribe_segments(self, upload_id: str, correlation_id: str):
         except:
             pass
 
-    # 4) Если запросили — сразу в очередь на диаризацию
+    # если запросили — сразу в очередь на диаризацию
     if redis_client.get(f"diarize_requested:{upload_id}") == "1":
         diarize_full.delay(upload_id, correlation_id)
+
 
 @app.task(bind=True, name="tasks.diarize_full", queue="preprocess_gpu")
 def diarize_full(self, upload_id: str, correlation_id: str):
@@ -216,16 +226,16 @@ def diarize_full(self, upload_id: str, correlation_id: str):
         logger.error(f"[{correlation_id}] WAV for {upload_id} not found")
         return
 
-    # 1) Диаризация (VAD+clustering внутри пайплайна)
+    # диаризация (VAD+clustering внутри)
     annotation = get_clustering_diarizer().apply({"audio": str(wav_file)})
 
-    # 2) Собираем сегменты
+    # собираем сегменты
     segments = []
-    for segment, track, label in annotation.itertracks(yield_label=True):
+    for segment, track, speaker in annotation.itertracks(yield_label=True):
         segments.append({
             "start": float(segment.start),
             "end":   float(segment.end),
-            "speaker": label
+            "speaker": speaker
         })
 
     out_dir = Path(settings.RESULTS_FOLDER) / upload_id
@@ -235,7 +245,7 @@ def diarize_full(self, upload_id: str, correlation_id: str):
         encoding="utf-8"
     )
 
-    # 3) Обновляем прогресс и callbacks
+    # обновляем прогресс и callbacks
     redis_client.set(f"progress:{upload_id}", "diarization_done")
     redis_client.publish(f"progress:{upload_id}", "diarization_done")
     for url in json.loads(redis_client.get(f"callbacks:{upload_id}") or "[]"):
@@ -247,6 +257,7 @@ def diarize_full(self, upload_id: str, correlation_id: str):
             )
         except:
             pass
+
 
 @app.task(name="tasks.cleanup_old_uploads")
 def cleanup_old_uploads():
