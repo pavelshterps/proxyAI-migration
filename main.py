@@ -112,7 +112,7 @@ async def root():
 @app.get("/status/{upload_id}", summary="Check processing status")
 async def get_status(upload_id: str, current_user=Depends(get_current_user)):
     base = Path(settings.RESULTS_FOLDER) / upload_id
-    # fully done?
+    # полностью готово (транскрипт + диаризация)
     if (base / "transcript.json").exists() and (base / "diarization.json").exists():
         return {
             "status": "diarization_done",
@@ -126,7 +126,7 @@ async def get_status(upload_id: str, current_user=Depends(get_current_user)):
     if raw:
         return json.loads(raw)
 
-    # initial loading
+    # ещё не стартовали
     return {
         "status": "processing",
         "preview": None,
@@ -139,19 +139,15 @@ async def get_status(upload_id: str, current_user=Depends(get_current_user)):
 # === Unified results endpoint ===
 @app.get("/results/{upload_id}", summary="Get preview, transcript or diarization")
 async def get_results(upload_id: str, current_user=Depends(get_current_user), db=Depends(get_db)):
-    # 1) Preview — всегда первым
-    pd = await redis.get(f"preview_result:{upload_id}")
-    if pd:
-        pl = json.loads(pd)
-        return JSONResponse(content={"results": pl["timestamps"]})
+    base = Path(settings.RESULTS_FOLDER) / upload_id
 
-    # 2) Full transcript
-    tp = Path(settings.RESULTS_FOLDER) / upload_id / "transcript.json"
+    # 1) Если готов полный транскрипт — отдаем его
+    tp = base / "transcript.json"
     if tp.exists():
         return JSONResponse(content={"results": json.loads(tp.read_text(encoding="utf-8"))})
 
-    # 3) Diarization + mapping
-    dp = Path(settings.RESULTS_FOLDER) / upload_id / "diarization.json"
+    # 2) Если готова диаризация (после транскрипта) — отдаем её
+    dp = base / "diarization.json"
     if dp.exists():
         segs = json.loads(dp.read_text(encoding="utf-8"))
         try:
@@ -163,6 +159,13 @@ async def get_results(upload_id: str, current_user=Depends(get_current_user), db
             s["speaker"] = mapping.get(str(s["speaker"]), s["speaker"])
         return JSONResponse(content={"results": segs})
 
+    # 3) Иначе — отдаем превью
+    pd = await redis.get(f"preview_result:{upload_id}")
+    if pd:
+        pl = json.loads(pd)
+        return JSONResponse(content={"results": pl["timestamps"]})
+
+    # ещё нет даже превью
     raise HTTPException(404, "Results not ready")
 
 
@@ -194,7 +197,9 @@ async def upload(
     log.bind(correlation_id=cid, upload_id=upload_id, user_id=current_user.id).info("upload accepted")
     await redis.set(f"external:{upload_id}", upload_id)
 
-    # Инициализируем прогресс ДО запуска таски
+    # запускаем превью → сплит…
+    preview_transcribe.delay(upload_id, cid)
+
     init = {
         "status": "processing",
         "preview": None,
@@ -204,9 +209,6 @@ async def upload(
     }
     await redis.set(f"progress:{upload_id}", json.dumps(init, ensure_ascii=False))
     await redis.publish(f"progress:{upload_id}", json.dumps(init, ensure_ascii=False))
-
-    # Запускаем CPU-превью → split…
-    preview_transcribe.delay(upload_id, cid)
 
     return JSONResponse(
         {"upload_id": upload_id, "external_id": upload_id},
