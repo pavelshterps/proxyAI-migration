@@ -55,10 +55,7 @@
     const saveBtn        = document.getElementById('saveLabelsBtn');
 
     let uploadId, fileBlob, mapping = {};
-    let startTime = null;
-    let previewStart = null, previewEnd = null;
-    let transcriptStart = null, transcriptEnd = null;
-    let diarizeStart = null, diarizeEnd = null;
+    let t0, tPreview, tTranscript, tDiarize;
     let pollInterval = null;
 
     function formatElapsed(ms) {
@@ -86,124 +83,87 @@
       const json = await res.json();
       uploadId = json.upload_id;
 
-      // сброс состояний и блокировка кнопок
-      startTime = Date.now();
-      previewStart = previewEnd = null;
-      transcriptStart = transcriptEnd = null;
-      diarizeStart = diarizeEnd = null;
-      previewBtn.disabled    = true;
-      transcriptBtn.disabled = true;
-      diarizeBtn.disabled    = true;
-      saveBtn.disabled       = true;
-      container.innerHTML    = "";
+      // сброс времени и кнопок
+      t0 = Date.now(); tPreview = tTranscript = tDiarize = null;
+      previewBtn.disabled = transcriptBtn.disabled = diarizeBtn.disabled = saveBtn.disabled = true;
+      container.innerHTML = "";
       audioEl.src = "";
+      statusEl.textContent = "Файл загружен, ждём результатов...";
 
-      statusEl.textContent = `Файл загружен, ждём превью…`;
-
-      // старт опроса статуса каждую секунду
       if (pollInterval) clearInterval(pollInterval);
       pollInterval = setInterval(async () => {
-        const st = await fetch(`/status/${uploadId}`, {
-          headers: { "X-API-Key": key }
-        }).then(r => r.json());
-
-        // базовый статус + время от загрузки
-        let info = `Статус: ${st.status}, время от загрузки: ${formatElapsed(Date.now() - startTime)}`;
-
-        // превью готово
-        if (st.status === "preview_done") {
+        const st = await fetch(`/status/${uploadId}`, { headers:{"X-API-Key":key} }).then(r=>r.json());
+        let info = `Статус: ${st.status}`;
+        const now = Date.now();
+        info += `, от загрузки: ${formatElapsed(now - t0)}`;
+        if (st.status === 'preview_done') {
+          if (!tPreview) tPreview = now;
+          info += `, превью: ${formatElapsed(tPreview - t0)}`;
           previewBtn.disabled = false;
-          if (!previewEnd) {
-            previewEnd = Date.now();
-            info += ` → превью за ${formatElapsed(previewEnd - startTime)}`;
-          }
         }
-        // транскрипция готова
-        if (st.status === "transcript_done") {
+        if (st.status === 'transcript_done') {
+          if (!tTranscript) tTranscript = now;
+          info += `, транскр.: ${formatElapsed(tTranscript - (tPreview||t0))}`;
           transcriptBtn.disabled = false;
-          diarizeBtn.disabled    = false;
-          if (!transcriptEnd) {
-            transcriptEnd = Date.now();
-            info += ` → транскрипция за ${formatElapsed(transcriptEnd - startTime)}`;
-          }
+          diarizeBtn.disabled = false;
         }
-        // диаризация готова
-        if (st.status === "diarization_done") {
+        if (st.status === 'diarization_done') {
+          if (!tDiarize) tDiarize = now;
+          info += `, диариз.: ${formatElapsed(tDiarize - (tTranscript||t0))}`;
           saveBtn.disabled = false;
-          if (!diarizeEnd) {
-            diarizeEnd = Date.now();
-            info += ` → диаризация за ${formatElapsed(diarizeEnd - startTime)}`;
-          }
           clearInterval(pollInterval);
         }
-
         statusEl.textContent = info;
       }, 1000);
     };
 
     previewBtn.onclick = async () => {
-      previewStart = Date.now();
+      const start = Date.now();
       const key = apiKeyEl.value.trim();
       statusEl.textContent = "Получаем превью…";
-      const res = await fetch(`/results/${uploadId}`, {
-        headers: { "X-API-Key": key }
-      });
+      const res = await fetch(`/results/${uploadId}`, { headers:{"X-API-Key":key} });
       if (!res.ok) { alert("Ошибка: " + res.status); return; }
       const { results } = await res.json();
       audioEl.src = URL.createObjectURL(fileBlob);
       renderTranscript(results);
-      previewEnd = Date.now();
-      statusEl.textContent += ` → загружено за ${formatElapsed(previewEnd - previewStart)}`;
+      const took = formatElapsed(Date.now() - start);
+      statusEl.textContent += ` (загружено за ${took})`;
     };
 
     transcriptBtn.onclick = async () => {
-      transcriptStart = Date.now();
+      const start = Date.now();
       const key = apiKeyEl.value.trim();
       statusEl.textContent = "Получаем транскрипцию…";
-      const res = await fetch(`/results/${uploadId}`, {
-        headers: { "X-API-Key": key }
-      });
+      const res = await fetch(`/results/${uploadId}`, { headers:{"X-API-Key":key} });
       if (!res.ok) { alert("Ошибка: " + res.status); return; }
       const { results } = await res.json();
       audioEl.src = URL.createObjectURL(fileBlob);
       renderTranscript(results);
-      transcriptEnd = Date.now();
-      statusEl.textContent += ` → загружено за ${formatElapsed(transcriptEnd - transcriptStart)}`;
+      const took = formatElapsed(Date.now() - start);
+      statusEl.textContent += ` (загружено за ${took})`;
     };
 
     diarizeBtn.onclick = async () => {
       diarizeStart = Date.now();
       const key = apiKeyEl.value.trim();
       statusEl.textContent = "Запрашиваем диаризацию…";
-      const res = await fetch(`/diarize/${uploadId}`, {
-        method: "POST",
-        headers: { "X-API-Key": key }
-      });
+      const res = await fetch(`/diarize/${uploadId}`, { method:"POST", headers:{"X-API-Key":key} });
       if (!res.ok) { alert("Ошибка: " + res.status); return; }
-      statusEl.textContent = "Диаризация запрошена…";
+      statusEl.textContent = "Диаризация запрошена";
       diarizeBtn.disabled = true;
     };
 
     saveBtn.onclick = async () => {
       const key = apiKeyEl.value.trim();
       const payload = {};
-      Object.entries(mapping).forEach(([o,n])=>{
-        if(o!==n) payload[o]=n;
-      });
+      Object.entries(mapping).forEach(([o,n])=>{ if(o!==n) payload[o]=n; });
       if (!Object.keys(payload).length) { alert("Нет изменений"); return; }
       const res = await fetch(`/labels/${uploadId}`, {
         method: "POST",
-        headers: {
-          "Content-Type":"application/json",
-          "X-API-Key":key
-        },
+        headers: {"Content-Type":"application/json","X-API-Key":key},
         body: JSON.stringify(payload)
       });
-      if (!res.ok) {
-        const err = await res.json();
-        alert("Ошибка: "+(err.detail||res.status));
-        return;
-      }
+      if (!res.ok) { const err = await res.json(); alert("Ошибка: " + (err.detail||res.status)); return; }
       const { results } = await res.json();
       renderTranscript(results);
       saveBtn.disabled = true;
@@ -213,41 +173,19 @@
     function renderTranscript(list) {
       container.innerHTML = "";
       mapping = {};
-      list.forEach(s => mapping[s.speaker] = s.speaker);
-      list.forEach(seg => {
-        const div = document.createElement("div");
-        div.className = "segment";
-
-        const t = document.createElement("span");
-        t.className = "time";
-        t.textContent = seg.time || "--:--:--";
-
-        const btn = document.createElement("button");
-        btn.textContent = "▶️";
-        btn.onclick = () => {
-          audioEl.currentTime = seg.start;
-          audioEl.play();
-          setTimeout(()=> audioEl.pause(), (seg.end - seg.start)*1000 + 200);
+      list.forEach(s=>mapping[s.speaker]=s.speaker);
+      list.forEach(seg=>{
+        const div = document.createElement("div"); div.className="segment";
+        const t = document.createElement("span"); t.className="time"; t.textContent=seg.time||"--:--:--";
+        const btn = document.createElement("button"); btn.textContent="▶️";
+        btn.onclick = ()=>{ audioEl.currentTime=seg.start; audioEl.play(); setTimeout(()=>audioEl.pause(), (seg.end-seg.start)*1000+200); };
+        const inp = document.createElement("input"); inp.value=seg.speaker;
+        inp.onchange = ()=>{
+          const old=seg.speaker, neu=inp.value.trim();
+          if(neu&&neu.length<=50){ mapping[old]=neu; document.querySelectorAll('.segment input').forEach(i=>{ if(i.value===old) i.value=neu; }); }
+          else { alert("Имя 1–50 символов"); inp.value=mapping[old]; }
         };
-
-        const inp = document.createElement("input");
-        inp.value = seg.speaker;
-        inp.onchange = () => {
-          const old = seg.speaker, neu = inp.value.trim();
-          if (neu && neu.length <= 50) {
-            mapping[old] = neu;
-            document.querySelectorAll('.segment input').forEach(i => {
-              if (i.value === old) i.value = neu;
-            });
-          } else {
-            alert("Имя 1–50 символов");
-            inp.value = mapping[old];
-          }
-        };
-
-        const txt = document.createElement("span");
-        txt.textContent = seg.text;
-
+        const txt = document.createElement("span"); txt.textContent=seg.text;
         div.append(t, btn, inp, txt);
         container.append(div);
       });
