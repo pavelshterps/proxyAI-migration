@@ -83,7 +83,6 @@
       if (!res.ok) { alert("Upload error: " + res.status); return; }
       uploadId = (await res.json()).upload_id;
 
-      // сброс состояний
       startTime = Date.now();
       previewDoneTime = transcriptDoneTime = diarizeDoneTime = null;
       clearInterval(pollInterval);
@@ -92,7 +91,7 @@
       audioEl.src = "";
 
       pollInterval = setInterval(updateStatus, 1000);
-      statusEl.textContent = "Файл загружен, ждём превью…";
+      statusEl.textContent = "Файл загружен, ждём результатов…";
     };
 
     async function updateStatus() {
@@ -102,21 +101,26 @@
       }).then(r => r.json());
       const now = Date.now();
 
-      if (st.status === "preview_done" && !previewDoneTime) {
+      // 1) Превью готово, как только есть st.preview
+      if (st.preview && !previewDoneTime) {
         previewDoneTime = now;
         previewBtn.disabled = false;
         await loadPreview();
       }
-      if (st.status === "transcript_done" && !transcriptDoneTime) {
+
+      // 2) Транскрипция готова
+      if ((st.status === "transcript_done" || st.status === "diarization_done") && !transcriptDoneTime) {
         transcriptDoneTime = now;
         transcriptBtn.disabled = false;
         diarizeBtn.disabled = false;
         await loadTranscript();
       }
+
+      // 3) Диаризация готова
       if (st.status === "diarization_done" && !diarizeDoneTime) {
         diarizeDoneTime = now;
         saveBtn.disabled = false;
-        await loadTranscript();  // уже отдаёт диаризацию
+        await loadTranscript();  // отдаёт теперь уже сегменты с спикерами
         clearInterval(pollInterval);
       }
 

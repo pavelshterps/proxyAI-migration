@@ -214,7 +214,6 @@ async def upload(
     log.bind(correlation_id=cid, upload_id=upload_id, user_id=current_user.id).info("upload accepted")
     await redis.set(f"external:{upload_id}", upload_id)
 
-    # запускаем превью → сплит…
     preview_transcribe.delay(upload_id, cid)
 
     init = {
@@ -278,7 +277,6 @@ async def save_labels(
     return JSONResponse({"message": "labels saved", "results": updated})
 
 
-# === Routers & Static ===
 app.include_router(api_router, tags=["proxyAI"])
 app.include_router(admin_router)
 app.mount("/static", StaticFiles(directory="static"), name="static")
