@@ -66,6 +66,7 @@ services:
     env_file: .env
     environment:
       - WHISPER_DEVICE=cpu
+      - CHUNK_LENGTH_S=${CHUNK_LENGTH_S}
     volumes:
       - ./:/app:delegated
       - upload-data:/data/uploads
@@ -73,10 +74,10 @@ services:
       - diarizer-cache:/data/diarizer_cache:ro
       - /data/whisper-models:/hf_cache:ro
     command: >
-      celery -A config.celery:app
-      worker
-      --queues preprocess_cpu
+      celery -A config.celery:app worker
+      --queues preview_cpu,split_cpu,dispatch_cpu,collect_cpu
       --concurrency ${CPU_CONCURRENCY}
+      --prefetch-multiplier=1
       --loglevel info
     depends_on:
       - db
@@ -93,6 +94,7 @@ services:
     env_file: .env
     environment:
       - WHISPER_DEVICE=cuda
+      - WHISPER_COMPUTE_TYPE=${WHISPER_COMPUTE_TYPE}   # e.g. "float16"
       - NVIDIA_VISIBLE_DEVICES=all
     runtime: nvidia
     volumes:
@@ -102,11 +104,12 @@ services:
       - diarizer-cache:/data/diarizer_cache
       - /data/whisper-models:/hf_cache:ro
     command: >
-      celery -A config.celery:app
-      worker
-      --queues preprocess_gpu
-      --loglevel info
+      celery -A config.celery:app worker
+      --queues transcribe_gpu,diarize_gpu
+      --concurrency ${GPU_CONCURRENCY}
+      --prefetch-multiplier=1
       --pool solo
+      --loglevel info
     depends_on:
       - db
       - redis

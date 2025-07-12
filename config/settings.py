@@ -59,6 +59,7 @@ class Settings(BaseSettings):
     VAD_LEVEL: int = Field(2, env="VAD_LEVEL")
     VAD_MODEL_PATH: str = Field(..., env="VAD_MODEL_PATH")
     FS_EEND_PIPELINE: str = Field(..., env="FS_EEND_PIPELINE")
+    CHUNK_LENGTH_S: int = Field(..., env = "CHUNK_LENGTH_S")
 
     # limits & retention
     MAX_FILE_SIZE: int = Field(1_073_741_824, env="MAX_FILE_SIZE")

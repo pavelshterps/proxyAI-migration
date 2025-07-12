@@ -1,19 +1,18 @@
 from celery import Celery
-
 from config.settings import settings
 
 app = Celery(
-    "proxyai",
+    'proxyai',
     broker=settings.CELERY_BROKER_URL,
     backend=settings.CELERY_RESULT_BACKEND,
+    timezone=settings.CELERY_TIMEZONE,
+    include=['tasks']
 )
 
-# единый JSON-сериализатор, таймзона, и т.п.
 app.conf.update(
-    task_serializer="json",
-    result_serializer="json",
-    accept_content=["json"],
-    result_expires=3600,
-    enable_utc=True,
-    timezone=settings.TIMEZONE,
+    task_serializer='json',
+    accept_content=['json'],
+    result_serializer='json',
+    broker_url=settings.CELERY_BROKER_URL,
+    result_backend=settings.CELERY_RESULT_BACKEND,
 )
