@@ -84,8 +84,8 @@ def preload_and_warmup(**kwargs):
             pass
 
 
-# === 1) Preview on CPU ===
-@app.task(bind=True, name="tasks.preview_transcribe", queue="preview_cpu")
+# === 1) Preview on GPU ===
+@app.task(bind=True, name="tasks.preview_transcribe", queue="transcribe_gpu")
 def preview_transcribe(self, upload_id: str, correlation_id: str):
     r   = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
     upl = Path(settings.UPLOAD_FOLDER)
@@ -94,13 +94,13 @@ def preview_transcribe(self, upload_id: str, correlation_id: str):
         logger.error(f"[{correlation_id}] no source for {upload_id}")
         return
 
-    # ensure WAV input
+    # 1) Ensure WAV input
     wav_path = str(src)
     if src.suffix.lower() != ".wav":
         wav_path = str(upl / f"{upload_id}.wav")
         convert_to_wav(src, wav_path)
 
-    # 1) extract first PREVIEW_LENGTH_S seconds via ffmpeg
+    # 2) Extract first PREVIEW_LENGTH_S seconds via ffmpeg
     preview_wav = upl / f"{upload_id}_preview.wav"
     subprocess.run([
         "ffmpeg", "-y",
@@ -110,23 +110,44 @@ def preview_transcribe(self, upload_id: str, correlation_id: str):
         str(preview_wav)
     ], check=True)
 
-    # 2) compute total chunks for full file via ffprobe
+    # 3) Compute total chunks for full file via ffprobe
     duration_str = subprocess.check_output([
         "ffprobe", "-v", "error",
         "-show_entries", "format=duration",
         "-of", "default=noprint_wrappers=1:nokey=1",
         wav_path
     ]).strip()
-    full_len_s    = float(duration_str)
-    total_chunks  = max(1, math.ceil(full_len_s / settings.CHUNK_LENGTH_S))
+    full_len_s   = float(duration_str)
+    total_chunks = max(1, math.ceil(full_len_s / settings.CHUNK_LENGTH_S))
 
-    # 3) dispatch preview chunk (idx = 0) to GPU
-    app.send_task(
-        "tasks.transcribe_chunk",
-        args=(upload_id, 0, str(preview_wav), correlation_id),
-        queue="transcribe_gpu"
+    # 4) Run preview transcription synchronously on GPU
+    model = get_whisper_model()
+    opts  = {"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {}
+    segs, _ = model.transcribe(
+        str(preview_wav),
+        word_timestamps=False,
+        **opts
     )
-    # 4) start splitting the rest of the file in background
+
+    preview = {
+        "text": "".join(s.text for s in segs),
+        "timestamps": [
+            {"start": s.start, "end": s.end, "text": s.text}
+            for s in segs
+        ]
+    }
+    state = {
+        "status": "preview_done",
+        "preview": preview,
+        "chunks_total": total_chunks,
+        "chunks_done": 0,
+        "diarize_requested": False
+    }
+    r.set(f"preview_result:{upload_id}", json.dumps(preview, ensure_ascii=False))
+    r.set(f"progress:{upload_id}",    json.dumps(state,   ensure_ascii=False))
+    r.publish(f"progress:{upload_id}", json.dumps(state,   ensure_ascii=False))
+
+    # 5) Split remainder in background
     split_audio.delay(upload_id, correlation_id)
 
 
@@ -141,10 +162,9 @@ def split_audio(self, upload_id: str, correlation_id: str):
     audio = AudioSegment.from_file(str(wav))
     chunk_ms = int(settings.CHUNK_LENGTH_S * 1000)
     for i in range(0, len(audio), chunk_ms):
-        out = upl / f"{upload_id}_chunk_{i//chunk_ms}.wav"
-        audio[i:i+chunk_ms].export(str(out), format="wav")
-        # dispatch each chunk
-        dispatch_transcription.delay(upload_id, i//chunk_ms, str(out), correlation_id)
+        out = upl / f"{upload_id}_chunk_{i // chunk_ms}.wav"
+        audio[i:i + chunk_ms].export(str(out), format="wav")
+        dispatch_transcription.delay(upload_id, i // chunk_ms, str(out), correlation_id)
 
 
 # === 3) Dispatch to GPU ===
@@ -176,15 +196,11 @@ def transcribe_chunk(self, upload_id: str, idx: int, wav_path: str, correlation_
     segs, _ = model.transcribe(wav_path, word_timestamps=True, **opts)
 
     offset = idx * settings.CHUNK_LENGTH_S
-    out    = []
-    for s in segs:
-        out.append({
-            "start": s.start + offset,
-            "end":   s.end   + offset,
-            "text":  s.text
-        })
+    out = [
+        {"start": s.start + offset, "end": s.end + offset, "text": s.text}
+        for s in segs
+    ]
 
-    # save chunk result
     d = Path(settings.RESULTS_FOLDER) / upload_id
     d.mkdir(parents=True, exist_ok=True)
     (d / f"chunk_{idx}.json").write_text(
@@ -192,24 +208,6 @@ def transcribe_chunk(self, upload_id: str, idx: int, wav_path: str, correlation_
         encoding="utf-8"
     )
 
-    # if this is the preview chunk, publish preview result immediately
-    if idx == 0:
-        preview = {
-            "text": "".join(item["text"] for item in out),
-            "timestamps": out
-        }
-        state = {
-            "status": "preview_done",
-            "preview": preview,
-            "chunks_total": total_chunks,
-            "chunks_done": 0,
-            "diarize_requested": False
-        }
-        r.set(f"preview_result:{upload_id}", json.dumps(preview, ensure_ascii=False))
-        r.set(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
-        r.publish(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
-
-    # proceed to collect
     collect_transcription.delay(upload_id, correlation_id)
 
 
