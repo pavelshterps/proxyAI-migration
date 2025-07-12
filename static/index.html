@@ -97,7 +97,6 @@
           diarizeBtn.disabled    = false;
         }
         if (st.progress === "diarization_done") {
-          // после полной диаризации уже можно менять лейблы
           saveBtn.disabled = false;
         }
         if (st.status === "done") {
@@ -113,9 +112,9 @@
         headers: { "X-API-Key": key }
       });
       if (!res.ok) { alert("Ошибка: " + res.status); return; }
-      const payload = await res.json();
+      const { results } = await res.json();
       audioEl.src = URL.createObjectURL(fileBlob);
-      renderTranscript(payload.results);
+      renderTranscript(results);
       saveBtn.disabled = true;
     };
 
@@ -126,9 +125,9 @@
         headers: { "X-API-Key": key }
       });
       if (!res.ok) { alert("Ошибка: " + res.status); return; }
-      const payload = await res.json();
+      const { results } = await res.json();
       audioEl.src = URL.createObjectURL(fileBlob);
-      renderTranscript(payload.results);
+      renderTranscript(results);
       saveBtn.disabled = true;
     };
 
@@ -163,6 +162,9 @@
         alert("Ошибка: " + (err.detail || res.status));
         return;
       }
+      const { results } = await res.json();
+      renderTranscript(results);
+      saveBtn.disabled = true;
       alert("Метки сохранены");
     };
 
