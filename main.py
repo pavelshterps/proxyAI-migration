@@ -10,7 +10,7 @@ import structlog
 import redis.asyncio as redis_async
 from fastapi import (
     FastAPI, UploadFile, File, HTTPException,
-    Header, Request, Response, Body
+    Header, Request, Response, Body, Depends
 )
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -98,18 +98,18 @@ async def metrics_middleware(request: Request, call_next):
     return resp
 
 # Health, ready, metrics
-@app.get("/health")
 @limiter.limit("30/minute")
-async def health():
+@app.get("/health")
+async def health(request: Request):
     return {"status": "ok", "version": app.version}
 
 @app.get("/ready")
 async def ready():
     return {"status": "ready", "version": app.version}
 
-@app.get("/metrics")
 @limiter.limit("10/minute")
-async def metrics():
+@app.get("/metrics")
+async def metrics(request: Request):
     data = generate_latest()
     return Response(content=data, media_type=CONTENT_TYPE_LATEST)
 
@@ -253,6 +253,7 @@ async def save_labels(
     rec.label_mapping = mapping
     await db.commit()
     out = Path(settings.RESULTS_FOLDER) / upload_id / "diarization.json"
+    updated = []
     if out.exists():
         segs = json.loads(out.read_text(encoding="utf-8"))
         updated = [
