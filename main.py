@@ -1,5 +1,3 @@
-# main.py
-
 import time
 import uuid
 import json
@@ -47,6 +45,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="proxyAI", version=settings.APP_VERSION, lifespan=lifespan)
 
+# structlog
 structlog.configure(
     processors=[
         structlog.processors.add_log_level,
@@ -56,10 +55,12 @@ structlog.configure(
 )
 log = structlog.get_logger()
 
+# Rate limiter
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 app.add_middleware(SlowAPIMiddleware)
 
+# CORS & TrustedHost
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[*settings.ALLOWED_ORIGINS_LIST, "https://transcriber-next.vercel.app"],
@@ -72,12 +73,17 @@ app.add_middleware(
     allowed_hosts=["127.0.0.1", "localhost"] + settings.ALLOWED_ORIGINS_LIST
 )
 
+# Создаём директории
 for d in (settings.UPLOAD_FOLDER, settings.RESULTS_FOLDER, settings.DIARIZER_CACHE_DIR):
     Path(d).mkdir(parents=True, exist_ok=True)
 
+# Redis
 redis = redis_async.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
+
+# API-Key header
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
+# Prometheus
 HTTP_REQ_COUNT = Counter("http_requests_total", "Total HTTP requests", ["method", "path"])
 HTTP_REQ_LATENCY = Histogram("http_request_duration_seconds", "HTTP request latency", ["path"])
 
@@ -108,6 +114,7 @@ async def metrics_endpoint(request: Request):
 async def root():
     return FileResponse("static/index.html")
 
+# === Check internal upload_id status ===
 @app.get("/status/{upload_id}", summary="Check processing status")
 async def get_status(upload_id: str, current_user=Depends(get_current_user), db=Depends(get_db)):
     rec = await get_upload_for_user(db, current_user.id, upload_id)
@@ -118,105 +125,107 @@ async def get_status(upload_id: str, current_user=Depends(get_current_user), db=
     progress = await redis.get(f"progress:{upload_id}") or "0%"
     return {"status": "done" if done else "processing", "progress": progress}
 
+# === Unified results endpoint ===
 @app.get("/results/{upload_id}", summary="Get preview / transcript / diarization")
-async def get_results(upload_id: str, current_user=Depends(get_current_user)):
-    # 1) preview из Redis
+async def get_results(
+    upload_id: str,
+    current_user=Depends(get_current_user),
+    db=Depends(get_db),
+):
+    # 1) Preview
     preview_data = await redis.get(f"preview_result:{upload_id}")
     if preview_data:
-        preview = json.loads(preview_data)
-        return JSONResponse(status_code=200, content={"results": preview["timestamps"]})
+        payload = json.loads(preview_data)
+        return JSONResponse(status_code=200, content={"results": payload["timestamps"]})
 
-    # 2) полный транскрипт из файла
+    # 2) Full transcript
     tp = Path(settings.RESULTS_FOLDER) / upload_id / "transcript.json"
     if tp.exists():
         data = json.loads(tp.read_text(encoding="utf-8"))
         return JSONResponse(status_code=200, content={"results": data})
 
-    # 3) диаризация из файла
+    # 3) Diarization + apply label_mapping
     dp = Path(settings.RESULTS_FOLDER) / upload_id / "diarization.json"
     if dp.exists():
-        data = json.loads(dp.read_text(encoding="utf-8"))
-        return JSONResponse(status_code=200, content={"results": data})
+        segments = json.loads(dp.read_text(encoding="utf-8"))
+        rec      = await get_upload_for_user(db, current_user.id, upload_id)
+        mapping  = rec.label_mapping or {}
+        for seg in segments:
+            seg["speaker"] = mapping.get(str(seg["speaker"]), seg["speaker"])
+        return JSONResponse(status_code=200, content={"results": segments})
 
+    # not ready yet
     raise HTTPException(404, "Results not ready")
 
+# === Upload endpoint ===
 @app.post("/upload/", dependencies=[Depends(get_current_user)])
 @limiter.limit("10/minute")
 async def upload(
     request: Request,
-    file: UploadFile | None = File(None),
-    s3_url: str | None = Form(None),
-    id: str | None = Body(None),
-    upload: str | None = Body(None),
+    file: UploadFile | None     = File(None),
+    s3_url: str | None          = Form(None),
+    id: str | None              = Body(None),
+    upload: str | None          = Body(None),
     callbacks: list[str] | None = Body(None),
-    x_correlation_id: str | None = Header(None),
+    x_correlation_id: str | None= Header(None),
     current_user=Depends(get_current_user),
     db=Depends(get_db),
 ):
     cid = x_correlation_id or str(uuid.uuid4().hex)
 
-    # выбираем режим загрузки
+    # 1) JSON mode
     if upload is not None:
-        # JSON mode
         if not id:
             raise HTTPException(400, "JSON must include 'id' and 'upload'")
-        try:
-            async with httpx.AsyncClient() as client:
-                resp = await client.get(upload)
-                resp.raise_for_status()
-                data = resp.content
-        except Exception as e:
-            raise HTTPException(400, f"Failed to fetch '{upload}': {e}")
-        ext = Path(urlparse(upload).path).suffix or ""
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(upload); resp.raise_for_status()
+            data = resp.content
+        ext         = Path(urlparse(upload).path).suffix or ""
         upload_id   = uuid.uuid4().hex
         external_id = id
-        dest = Path(settings.UPLOAD_FOLDER) / f"{upload_id}{ext}"
+        dest        = Path(settings.UPLOAD_FOLDER) / f"{upload_id}{ext}"
         dest.write_bytes(data)
 
+    # 2) S3 mode
     elif s3_url:
-        # S3 form mode
-        try:
-            async with httpx.AsyncClient() as client:
-                resp = await client.get(s3_url)
-                resp.raise_for_status()
-                data = resp.content
-        except Exception as e:
-            raise HTTPException(400, f"Failed to fetch from s3_url: {e}")
-        ext = Path(urlparse(s3_url).path).suffix or ""
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(s3_url); resp.raise_for_status()
+            data = resp.content
+        ext         = Path(urlparse(s3_url).path).suffix or ""
         upload_id   = uuid.uuid4().hex
         external_id = upload_id
-        dest = Path(settings.UPLOAD_FOLDER) / f"{upload_id}{ext}"
+        dest        = Path(settings.UPLOAD_FOLDER) / f"{upload_id}{ext}"
         dest.write_bytes(data)
 
+    # 3) File upload
     elif file:
-        # File upload
         data = await file.read()
         if not data:
             raise HTTPException(400, "File is empty")
         if len(data) > settings.MAX_FILE_SIZE:
             raise HTTPException(413, "File too large")
-        ext = Path(file.filename).suffix or ""
+        ext         = Path(file.filename).suffix or ""
         upload_id   = uuid.uuid4().hex
         external_id = upload_id
-        dest = Path(settings.UPLOAD_FOLDER) / f"{upload_id}{ext}"
+        dest        = Path(settings.UPLOAD_FOLDER) / f"{upload_id}{ext}"
         dest.write_bytes(data)
 
     else:
         raise HTTPException(400, "Must provide file, s3_url or JSON {'id','upload'}")
 
-    # сохраняем в БД
+    # Record in DB
     await create_upload_record(db, current_user.id, upload_id)
     log.bind(correlation_id=cid, upload_id=upload_id, user_id=current_user.id).info("upload accepted")
 
-    # callbacks и external→internal
+    # Store callbacks & external→internal mapping
     await redis.set(f"callbacks:{upload_id}", json.dumps(callbacks or []))
     await redis.set(f"external:{external_id}", upload_id)
 
-    # старт задач
+    # Launch tasks
     download_audio.delay(upload_id, cid)
     preview_transcribe.delay(upload_id, cid)
 
-    # инициализация прогресса
+    # Initialize progress
     await redis.publish(f"progress:{upload_id}", "0%")
     await redis.set(f"progress:{upload_id}", "0%")
 
@@ -225,13 +234,15 @@ async def upload(
         headers={"X-Correlation-ID": cid}
     )
 
+# === Explicit diarization request endpoint ===
 @app.post("/diarize/{upload_id}", summary="Request diarization")
 async def request_diarization(upload_id: str, current_user=Depends(get_current_user)):
-    # проверка прав пользователя опущена, но get_upload_for_user можно вызвать
+    # ensure user owns upload_id (via get_upload_for_user in Depends)
     await redis.set(f"diarize_requested:{upload_id}", "1")
     diarize_full.delay(upload_id, None)
     return JSONResponse(status_code=200, content={"message": "diarization started"})
 
+# Routers & static
 app.include_router(api_router, tags=["proxyAI"])
 app.include_router(admin_router)
 app.mount("/static", StaticFiles(directory="static"), name="static")
