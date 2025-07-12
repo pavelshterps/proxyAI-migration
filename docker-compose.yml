@@ -67,6 +67,10 @@ services:
     environment:
       - WHISPER_DEVICE=cpu
       - CHUNK_LENGTH_S=${CHUNK_LENGTH_S}
+      - OMP_NUM_THREADS=4       # или число ядер вашего CPU
+      - OPENBLAS_NUM_THREADS=4
+      - MKL_NUM_THREADS=4
+      - TORCH_NUM_THREADS=4      # для PyTorch
     volumes:
       - ./:/app:delegated
       - upload-data:/data/uploads
@@ -76,7 +80,8 @@ services:
     command: >
       celery -A config.celery:app worker
       --queues preview_cpu,split_cpu,dispatch_cpu,collect_cpu
-      --concurrency ${CPU_CONCURRENCY}
+      --concurrency 1
+      --pool solo
       --prefetch-multiplier=1
       --loglevel info
     depends_on:

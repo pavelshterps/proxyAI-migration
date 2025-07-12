@@ -88,63 +88,52 @@ def preload_and_warmup(**kwargs):
 
 # === 1) Preview on CPU ===
 @app.task(bind=True, name="tasks.preview_transcribe", queue="preview_cpu")
-def preview_transcribe(self, upload_id: str, correlation_id: str):
+def preview_transcribe(self, upload_id, cid):
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
     upl = Path(settings.UPLOAD_FOLDER)
-    cands = list(upl.glob(f"{upload_id}.*"))
-    if not cands:
-        logger.error(f"[{correlation_id}] no source for {upload_id}")
+    src = next(upl.glob(f"{upload_id}.*"), None)
+    if not src:
+        logger.error(f"[{cid}] no source")
         return
 
-    # 1. Конвертируем в WAV
-    wav = upl / f"{upload_id}.wav"
-    try:
-        wav_path = convert_to_wav(cands[0], wav)
-    except Exception as e:
-        logger.error(f"[{correlation_id}] conversion error: {e}")
-        return
+    # 1) WAV или конвертация
+    wav_path = str(src) if src.suffix.lower()==".wav" else convert_to_wav(src, upl/f"{upload_id}.wav")
 
-    # 2. Запускаем нарезку на основные чанки сразу, параллельно с превью
-    split_audio.delay(upload_id, correlation_id)
-
-    # 3. Загружаем полное аудио для вычислений превью
-    audio = AudioSegment.from_file(str(wav_path))
-
-    # 4. Вычисляем общее число чанков по длине всего файла
-    duration_s = len(audio) / 1000.0
-    total_chunks = max(1, math.ceil(duration_s / settings.CHUNK_LENGTH_S))
-
-    # 5. Делаем превью-файл: первые PREVIEW_LENGTH_S секунд
+    # 2) Первые PREVIEW_LENGTH_S секунд
     preview_ms = int(settings.PREVIEW_LENGTH_S * 1000)
-    preview_audio = audio[:preview_ms]
-    preview_path = upl / f"{upload_id}_preview.wav"
-    preview_audio.export(str(preview_path), format="wav")
+    audio = AudioSegment.from_file(wav_path, duration=preview_ms)
+    preview_wav = upl/f"{upload_id}_preview.wav"
+    audio.export(str(preview_wav), format="wav")
 
-    # 6. Транскрибируем только превью-файл
-    model = get_whisper_model()
-    opts = {"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {}
-    segs, _ = model.transcribe(str(preview_path), word_timestamps=True, **opts)
+    # 3) Однопроходная транскрипция без детекции языка и word-timestamps
+    segs, _ = _model.transcribe(
+        str(preview_wav),
+        language=settings.WHISPER_LANGUAGE,
+        word_timestamps=False
+    )
 
-    # 7. Составляем результат превью
-    preview = {"text": "", "timestamps": []}
-    for s in segs:
-        preview["text"] += s.text
-        preview["timestamps"].append({
-            "start": s.start, "end": s.end, "text": s.text
-        })
+    # 4) Сбор результата
+    preview = {
+      "text": "".join(s.text for s in segs),
+      "timestamps": [{"start":s.start,"end":s.end,"text":s.text} for s in segs]
+    }
 
-    # 8. Публикуем прогресс
+    # 5) Посчитаем число чанков для полного файла
+    full_len_s = AudioSegment.from_file(wav_path).duration_seconds
+    total_chunks = max(1, math.ceil(full_len_s / settings.CHUNK_LENGTH_S))
+
     state = {
-        "status": "preview_done",
-        "preview": preview,
-        "chunks_total": total_chunks,
-        "chunks_done": 0,
-        "diarize_requested": False
+      "status": "preview_done",
+      "preview": preview,
+      "chunks_total": total_chunks,
+      "chunks_done": 0,
+      "diarize_requested": False
     }
     r.set(f"preview_result:{upload_id}", json.dumps(preview, ensure_ascii=False))
     r.set(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
     r.publish(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
 
+    split_audio.delay(upload_id, cid)
 
 # === 2) Split into fixed-length chunks ===
 @app.task(bind=True, name="tasks.split_audio", queue="split_cpu")
