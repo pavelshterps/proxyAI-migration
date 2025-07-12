@@ -117,7 +117,11 @@ async def root():
 
 # === статус по внутреннему upload_id ===
 @app.get("/status/{upload_id}", summary="Check processing status")
-async def get_status(upload_id: str, current_user=Depends(get_current_user), db=Depends(get_db)):
+async def get_status(
+    upload_id: str,
+    current_user=Depends(get_current_user),
+    db=Depends(get_db)
+):
     rec = await get_upload_for_user(db, current_user.id, upload_id)
     if not rec:
         raise HTTPException(404, "upload_id not found")
@@ -128,19 +132,20 @@ async def get_status(upload_id: str, current_user=Depends(get_current_user), db=
 
 # === единый endpoint для выдачи preview / transcript / diarization ===
 @app.get("/results/{upload_id}", summary="Get preview, full transcript or diarization")
-async def get_results(upload_id: str, current_user=Depends(get_current_user)):
+async def get_results(
+    upload_id: str,
+    current_user=Depends(get_current_user)
+):
     # 1) Preview из Redis
     preview_data = await redis.get(f"preview_result:{upload_id}")
     if preview_data:
         preview = json.loads(preview_data)
-        # preview["timestamps"] — список {"start","end","text"}
         return JSONResponse(status_code=200, content={"results": preview["timestamps"]})
 
     # 2) Полная транскрипция из файла
     transcript_path = Path(settings.RESULTS_FOLDER) / upload_id / "transcript.json"
     if transcript_path.exists():
         data = json.loads(transcript_path.read_text(encoding="utf-8"))
-        # приводим к единому формату
         results = [
             {"start": seg["start"], "end": seg["end"], "text": seg["text"]}
             for seg in data
@@ -151,11 +156,27 @@ async def get_results(upload_id: str, current_user=Depends(get_current_user)):
     diar_path = Path(settings.RESULTS_FOLDER) / upload_id / "diarization.json"
     if diar_path.exists():
         data = json.loads(diar_path.read_text(encoding="utf-8"))
-        # data уже список {"start","end","speaker"}
         return JSONResponse(status_code=200, content={"results": data})
 
     # 4) Результатов нет — 404
     raise HTTPException(404, "Results not ready")
+
+# === запрос диаризации ===
+@app.post("/diarize/{upload_id}", summary="Request diarization")
+async def request_diarization(
+    upload_id: str,
+    current_user=Depends(get_current_user),
+    db=Depends(get_db)
+):
+    rec = await get_upload_for_user(db, current_user.id, upload_id)
+    if not rec:
+        raise HTTPException(404, "upload_id not found")
+    await redis.set(f"diarize_requested:{upload_id}", "1")
+    # сразу публикуем событие и прогресс
+    await redis.set(f"progress:{upload_id}", "diarization_requested")
+    await redis.publish(f"progress:{upload_id}", "diarization_requested")
+    diarize_full.delay(upload_id, str(uuid.uuid4().hex))
+    return {"status": "diarization requested"}
 
 # === upload с external_id и callbacks ===
 @app.post("/upload/", dependencies=[Depends(get_current_user)])
@@ -173,138 +194,62 @@ async def upload(
 ):
     cid = x_correlation_id or str(uuid.uuid4().hex)
 
-    # Выбираем режим загрузки
     if upload is not None:
-        # JSON mode
         if not id:
             raise HTTPException(400, "JSON must include 'id' and 'upload'")
         try:
             async with httpx.AsyncClient() as client:
-                resp = await client.get(upload)
-                resp.raise_for_status()
+                resp = await client.get(upload); resp.raise_for_status()
                 data = resp.content
         except Exception as e:
             raise HTTPException(400, f"Failed to fetch '{upload}': {e}")
         ext = Path(urlparse(upload).path).suffix or ""
-        upload_id = uuid.uuid4().hex  # уникальный внутренний ID
-        external_id = id
+        upload_id, external_id = uuid.uuid4().hex, id
         dest = Path(settings.UPLOAD_FOLDER) / f"{upload_id}{ext}"
         dest.write_bytes(data)
 
     elif s3_url:
-        # S3 form mode
         try:
             async with httpx.AsyncClient() as client:
-                resp = await client.get(s3_url)
-                resp.raise_for_status()
+                resp = await client.get(s3_url); resp.raise_for_status()
                 data = resp.content
         except Exception as e:
             raise HTTPException(400, f"Failed to fetch from s3_url: {e}")
         ext = Path(urlparse(s3_url).path).suffix or ""
-        upload_id = uuid.uuid4().hex
-        external_id = upload_id
+        upload_id, external_id = uuid.uuid4().hex, uuid.uuid4().hex
         dest = Path(settings.UPLOAD_FOLDER) / f"{upload_id}{ext}"
         dest.write_bytes(data)
 
     elif file:
-        # File upload
         data = await file.read()
         if not data:
             raise HTTPException(400, "File is empty")
         if len(data) > settings.MAX_FILE_SIZE:
             raise HTTPException(413, "File too large")
         ext = Path(file.filename).suffix or ""
-        upload_id = uuid.uuid4().hex
-        external_id = upload_id
+        upload_id, external_id = uuid.uuid4().hex, uuid.uuid4().hex
         dest = Path(settings.UPLOAD_FOLDER) / f"{upload_id}{ext}"
         dest.write_bytes(data)
 
     else:
         raise HTTPException(400, "Must provide file, s3_url or JSON {'id','upload'}")
 
-    # Запись в БД
     await create_upload_record(db, current_user.id, upload_id)
     log.bind(correlation_id=cid, upload_id=upload_id, user_id=current_user.id).info("upload accepted")
 
-    # Сохраняем callbacks и mapping external_id → upload_id
     await redis.set(f"callbacks:{upload_id}", json.dumps(callbacks or []))
     await redis.set(f"external:{external_id}", upload_id)
 
-    # Запуск цепочки задач: download → preview → full → diarize
     download_audio.delay(upload_id, cid)
     preview_transcribe.delay(upload_id, cid)
 
-    # Инициализация прогресса
-    await redis.publish(f"progress:{upload_id}", "0%")
     await redis.set(f"progress:{upload_id}", "0%")
+    await redis.publish(f"progress:{upload_id}", "0%")
 
     return JSONResponse(
         {"upload_id": upload_id, "external_id": external_id},
         headers={"X-Correlation-ID": cid}
     )
-
-# === новые endpoints для внешнего клиента ===
-@app.get("/tasks/{external_id}/status", summary="Get preview/full status")
-async def get_task_status(
-    external_id: str,
-    current_user=Depends(get_current_user),
-    db=Depends(get_db)
-):
-    upload_id = await redis.get(f"external:{external_id}")
-    if not upload_id:
-        raise HTTPException(404, "external_id not found")
-
-    preview_done = bool(await redis.exists(f"preview_result:{upload_id}"))
-    progress = await redis.get(f"progress:{upload_id}") or "0%"
-    full_done = progress == "100%" or (Path(settings.RESULTS_FOLDER)/upload_id/"transcript.json").exists()
-
-    return {
-        "preview_status": "done" if preview_done else "processing",
-        "status":         "done" if full_done else "processing",
-        "progress":       progress
-    }
-
-@app.get("/tasks/{external_id}/transcript/preview", summary="Get preview transcript")
-async def get_preview_transcript(
-    external_id: str,
-    current_user=Depends(get_current_user),
-    db=Depends(get_db)
-):
-    upload_id = await redis.get(f"external:{external_id}")
-    if not upload_id:
-        raise HTTPException(404, "external_id not found")
-    data = await redis.get(f"preview_result:{upload_id}")
-    if not data:
-        raise HTTPException(404, "preview not ready")
-    return JSONResponse(status_code=200, content=json.loads(data))
-
-@app.get("/tasks/{external_id}/transcript", summary="Get full transcript JSON")
-async def get_full_transcript(
-    external_id: str,
-    current_user=Depends(get_current_user),
-    db=Depends(get_db)
-):
-    upload_id = await redis.get(f"external:{external_id}")
-    if not upload_id:
-        raise HTTPException(404, "external_id not found")
-    path = Path(settings.RESULTS_FOLDER) / upload_id / "transcript.json"
-    if not path.exists():
-        raise HTTPException(404, "full transcript not found")
-    return JSONResponse(status_code=200, content=json.loads(path.read_text(encoding="utf-8")))
-
-@app.get("/tasks/{external_id}/diarization", summary="Get full diarization JSON")
-async def get_full_diarization(
-    external_id: str,
-    current_user=Depends(get_current_user),
-    db=Depends(get_db)
-):
-    upload_id = await redis.get(f"external:{external_id}")
-    if not upload_id:
-        raise HTTPException(404, "external_id not found")
-    path = Path(settings.RESULTS_FOLDER) / upload_id / "diarization.json"
-    if not path.exists():
-        raise HTTPException(404, "diarization not found")
-    return JSONResponse(status_code=200, content=json.loads(path.read_text(encoding="utf-8")))
 
 # Подключение роутеров и статики
 app.include_router(api_router, tags=["proxyAI"])
