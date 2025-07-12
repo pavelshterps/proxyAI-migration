@@ -5,135 +5,163 @@
   <title>proxyAI Demo UI</title>
   <style>
     body { font-family: sans-serif; margin: 2rem; }
+    label, button { margin: .5rem 0; display: block; }
+    #transcriptContainer { margin-top: 1rem; }
     .segment { border-bottom: 1px solid #ccc; padding: .5rem 0; }
-    .time { color: #666; margin-right: .5rem; }
     .segment input { width: 180px; margin-left: .5rem; }
     .segment button { margin-left: .5rem; }
+    .time { color: #666; margin-right: .5rem; }
   </style>
 </head>
 <body>
   <h1>proxyAI Demo UI</h1>
-  <label>Ваш API-Key:<input id="apiKey" /></label>
-  <label>Файл:<input type="file" id="audioFile" accept="audio/*,video/*" /></label>
+
+  <label>
+    Ваш API-Key:
+    <input type="text" id="apiKey" placeholder="X-API-Key" />
+  </label>
+
+  <label>
+    Аудио/видео-файл:
+    <input type="file" id="audioFile" accept="audio/*,video/*" />
+  </label>
   <button id="uploadBtn">Загрузить и начать</button>
-  <div id="status">Готово</div>
+
+  <div id="status" style="margin-top:1rem;">Готово к загрузке</div>
+
+  <button id="fetchPreviewBtn" disabled>Получить превью</button>
+  <button id="fetchTranscriptBtn" disabled>Получить транскрипцию</button>
+  <button id="requestDiarizeBtn" disabled>Запросить диаризацию</button>
+
   <h2>Плеер</h2>
   <audio id="audio" controls style="width:100%"></audio>
-  <h2>Результаты</h2>
+
+  <h2>Транскрипция / Диаризация</h2>
   <div id="transcriptContainer"></div>
-  <button id="saveLabelsBtn" disabled>Сохранить метки</button>
+  <button id="saveLabelsBtn" disabled>Сохранить метки спикеров</button>
 
   <script>
   (async function(){
-    const apiKeyEl = document.getElementById('apiKey');
-    const fileEl   = document.getElementById('audioFile');
-    const uploadBtn= document.getElementById('uploadBtn');
-    const statusEl = document.getElementById('status');
-    const audioEl  = document.getElementById('audio');
-    const container= document.getElementById('transcriptContainer');
-    const saveBtn  = document.getElementById('saveLabelsBtn');
+    const apiKeyEl      = document.getElementById('apiKey');
+    const fileEl        = document.getElementById('audioFile');
+    const uploadBtn     = document.getElementById('uploadBtn');
+    const statusEl      = document.getElementById('status');
+    const previewBtn    = document.getElementById('fetchPreviewBtn');
+    const transcriptBtn = document.getElementById('fetchTranscriptBtn');
+    const diarizeBtn    = document.getElementById('requestDiarizeBtn');
+    const audioEl       = document.getElementById('audio');
+    const container     = document.getElementById('transcriptContainer');
+    const saveBtn       = document.getElementById('saveLabelsBtn');
 
     let uploadId, fileBlob;
     let previewDone=false, transcriptDone=false, diarizeDone=false;
     let mapping = {};
 
-    function formatTime(ms){
-      const s = Math.floor(ms/1000), m = Math.floor(s/60);
-      return `${String(m).padStart(2,'0')}:${String(s%60).padStart(2,'0')}`;
-    }
+    const fmt = ms => {
+      const sec = Math.floor(ms/1000), m = String(Math.floor(sec/60)).padStart(2,'0'), s = String(sec%60).padStart(2,'0');
+      return `${m}:${s}`;
+    };
 
     uploadBtn.onclick = async () => {
-      const key = apiKeyEl.value.trim();
-      if(!key){ alert("Введите API-Key"); return; }
-      const file = fileEl.files[0];
-      if(!file){ alert("Выберите файл"); return; }
+      const key = apiKeyEl.value.trim(); if(!key){alert("Введите API-Key");return;}
+      const file = fileEl.files[0]; if(!file){alert("Выберите файл");return;}
 
       fileBlob = file;
       statusEl.textContent = "Загружаем…";
-
-      const fd = new FormData();
-      fd.append("file", file);
+      const form = new FormData(); form.append("file", file, file.name);
       const res = await fetch("/upload/", {
-        method:"POST",
-        headers:{"X-API-Key":key},
-        body: fd
+        method: "POST",
+        headers: { "X-API-Key": key },
+        body: form
       });
-      if(!res.ok){ alert("Ошибка при загрузке"); return; }
+      if(!res.ok){alert("Upload error: "+res.status);return;}
       uploadId = (await res.json()).upload_id;
 
-      // сброс
+      // reset UI
       previewDone = transcriptDone = diarizeDone = false;
-      container.innerHTML = "";
-      saveBtn.disabled = true;
+      [previewBtn, transcriptBtn, diarizeBtn, saveBtn].forEach(b=>b.disabled=true);
+      container.innerHTML = ""; audioEl.src = "";
 
-      // старт SSE
-      const evt = new EventSource(`/events/${uploadId}`);
-      evt.onmessage = async e => {
+      // SSE
+      const es = new EventSource(`/events/${uploadId}`);
+      es.onmessage = async e => {
         const st = JSON.parse(e.data);
         statusEl.textContent = `Статус: ${st.status}`;
         if(st.status==="preview_done" && !previewDone){
-          previewDone=true; await loadResults(); }
+          previewDone=true; previewBtn.disabled=false; await loadPreview();
+        }
         if(st.status==="transcript_done" && !transcriptDone){
-          transcriptDone=true; await loadResults(); }
+          transcriptDone=true; transcriptBtn.disabled=false; diarizeBtn.disabled=false; await loadTranscript();
+        }
         if(st.status==="diarization_done" && !diarizeDone){
-          diarizeDone=true; await loadResults(); evt.close(); saveBtn.disabled=false; }
+          diarizeDone=true; saveBtn.disabled=false; await loadTranscript(); es.close();
+        }
       };
 
-      statusEl.textContent = "Ожидаем…";
+      statusEl.textContent = "Файл загружен, ждём прогресса…";
     };
 
-    async function loadResults(){
-      statusEl.textContent = "Загрузка результатов…";
+    async function loadPreview(){
+      statusEl.textContent="Загружаю превью…";
       const key = apiKeyEl.value.trim();
-      const res = await fetch(`/results/${uploadId}`, {
-        headers:{"X-API-Key":key}
-      });
-      if(!res.ok) return;
-      const {results} = await res.json();
+      const res = await fetch(`/results/${uploadId}`, { headers:{ "X-API-Key":key }});
+      const { results } = await res.json();
       audioEl.src = URL.createObjectURL(fileBlob);
-      container.innerHTML = "";
-      mapping = {};
-      results.forEach(s=>mapping[s.speaker||""]=s.speaker||"");
-      results.forEach(seg=>{
-        const div = document.createElement("div"); div.className="segment";
-        const time = document.createElement("span"); time.className="time";
-        time.textContent = formatTime(seg.start*1000);
-        const play = document.createElement("button"); play.textContent="▶️";
-        play.onclick = ()=>{
-          audioEl.currentTime = seg.start;
-          audioEl.play();
-          setTimeout(()=>audioEl.pause(), (seg.end-seg.start)*1000+200);
-        };
-        const inp = document.createElement("input"); inp.value=seg.speaker||"";
-        inp.onchange = ()=>{
-          const old=seg.speaker||"", neu=inp.value.trim();
-          if(neu && neu.length<=50){
-            mapping[old]=neu;
-            container.querySelectorAll('input')
-                     .forEach(i=>{ if(i.value===old) i.value=neu; });
-          } else { alert("1–50 символов"); inp.value=mapping[old]; }
-        };
-        const txt = document.createElement("span"); txt.textContent=seg.text;
-        div.append(time,play,inp,txt);
-        container.append(div);
-      });
-      statusEl.textContent = "Готово";
+      render(results);
+      statusEl.textContent="Превью готово";
     }
 
-    saveBtn.onclick = async ()=>{
+    async function loadTranscript(){
+      statusEl.textContent="Загружаю результат…";
       const key = apiKeyEl.value.trim();
-      const payload = {};
-      for(const [o,n] of Object.entries(mapping)) if(o!==n) payload[o]=n;
-      if(!Object.keys(payload).length) return alert("Нет изменений");
+      const res = await fetch(`/results/${uploadId}`, { headers:{ "X-API-Key":key }});
+      const { results } = await res.json();
+      audioEl.src = URL.createObjectURL(fileBlob);
+      render(results);
+      statusEl.textContent="Готово";
+    }
+
+    previewBtn.onclick = loadPreview;
+    transcriptBtn.onclick = loadTranscript;
+    diarizeBtn.onclick = async () => {
+      statusEl.textContent="Запрашиваем диаризацию…";
+      await fetch(`/diarize/${uploadId}`, { method:"POST", headers:{"X-API-Key":apiKeyEl.value.trim()}});
+      diarizeBtn.disabled=true;
+    };
+    saveBtn.onclick = async () => {
+      const key = apiKeyEl.value.trim(), payload={};
+      Object.entries(mapping).forEach(([o,n])=>o!==n&&(payload[o]=n));
+      if(!Object.keys(payload).length){alert("Нет изменений");return;}
       const res = await fetch(`/labels/${uploadId}`, {
         method:"POST",
-        headers:{"Content-Type":"application/json","X-API-Key":key},
+        headers:{ "Content-Type":"application/json","X-API-Key":key },
         body: JSON.stringify(payload)
       });
-      if(!res.ok) return alert("Ошибка");
+      const { results } = await res.json();
+      render(results);
+      saveBtn.disabled=true;
       alert("Метки сохранены");
     };
 
+    function render(list){
+      container.innerHTML=""; mapping={};
+      list.forEach(s=>mapping[s.speaker||""]=s.speaker||"");
+      list.forEach(seg=>{
+        const div=document.createElement("div"); div.className="segment";
+        const t=document.createElement("span"); t.className="time"; t.textContent=fmt(seg.start*1000);
+        const btn=document.createElement("button"); btn.textContent="▶️";
+        btn.onclick=()=>{ audioEl.currentTime=seg.start; audioEl.play(); setTimeout(()=>audioEl.pause(),(seg.end-seg.start)*1000); };
+        const inp=document.createElement("input"); inp.value=seg.speaker||"";
+        inp.onchange=()=>{
+          const old=seg.speaker||"", neu=inp.value.trim();
+          if(neu&&neu.length<=50){ mapping[old]=neu; document.querySelectorAll('.segment input').forEach(i=>i.value===old&&(i.value=neu)); }
+          else{ alert("Имя 1–50 символов"); inp.value=mapping[old]; }
+        };
+        const txt=document.createElement("span"); txt.textContent=seg.text;
+        div.append(t,btn,inp,txt);
+        container.append(div);
+      });
+    }
   })();
   </script>
 </body>
