@@ -139,7 +139,7 @@ async def get_status(upload_id: str, current_user=Depends(get_current_user)):
 # === Unified results endpoint ===
 @app.get("/results/{upload_id}", summary="Get preview, transcript or diarization")
 async def get_results(upload_id: str, current_user=Depends(get_current_user), db=Depends(get_db)):
-    # 1) Preview
+    # 1) Preview — всегда первым
     pd = await redis.get(f"preview_result:{upload_id}")
     if pd:
         pl = json.loads(pd)
@@ -194,9 +194,7 @@ async def upload(
     log.bind(correlation_id=cid, upload_id=upload_id, user_id=current_user.id).info("upload accepted")
     await redis.set(f"external:{upload_id}", upload_id)
 
-    # start CPU preview → split…
-    preview_transcribe.delay(upload_id, cid)
-
+    # Инициализируем прогресс ДО запуска таски
     init = {
         "status": "processing",
         "preview": None,
@@ -206,6 +204,9 @@ async def upload(
     }
     await redis.set(f"progress:{upload_id}", json.dumps(init, ensure_ascii=False))
     await redis.publish(f"progress:{upload_id}", json.dumps(init, ensure_ascii=False))
+
+    # Запускаем CPU-превью → split…
+    preview_transcribe.delay(upload_id, cid)
 
     return JSONResponse(
         {"upload_id": upload_id, "external_id": upload_id},
