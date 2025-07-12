@@ -27,7 +27,7 @@
   </label>
   <button id="uploadBtn" type="button">Загрузить и начать</button>
 
-  <div id="status" style="margin-top:1rem;"></div>
+  <div id="status" style="margin-top:1rem;">Готово к загрузке</div>
 
   <button id="fetchPreviewBtn" type="button" disabled>Получить превью</button>
   <button id="fetchTranscriptBtn" type="button" disabled>Получить транскрипцию</button>
@@ -54,58 +54,80 @@
     const container      = document.getElementById('transcriptContainer');
     const saveBtn        = document.getElementById('saveLabelsBtn');
 
-    let uploadId, fileBlob, mapping = {};
+    let uploadId, fileBlob, mapping = {}, startTime = null, pollInterval = null;
+
+    function formatElapsed(ms) {
+      const totalSec = Math.floor(ms / 1000);
+      const m = String(Math.floor(totalSec / 60)).padStart(2,'0');
+      const s = String(totalSec % 60).padStart(2,'0');
+      return `${m}:${s}`;
+    }
 
     uploadBtn.onclick = async () => {
       const key = apiKeyEl.value.trim();
       if (!key) { alert("Введите API-Key"); return; }
       const file = fileEl.files[0];
       if (!file) { alert("Выберите файл"); return; }
-      fileBlob = file;
-      statusEl.textContent = "Загружаем...";
-      const fd = new FormData();
-      fd.append("file", file, file.name);
 
+      fileBlob = file;
+      statusEl.textContent = "Загружаем…";
+      const fd = new FormData(); fd.append("file", file, file.name);
       const res = await fetch("/upload/", {
         method: "POST",
         headers: { "X-API-Key": key },
         body: fd
       });
       if (!res.ok) { alert("Upload error: " + res.status); return; }
-      const { upload_id } = await res.json();
-      uploadId = upload_id;
-      statusEl.textContent = `upload_id=${uploadId}. Ожидаем...`;
+      const json = await res.json();
+      uploadId = json.upload_id;
+      startTime = Date.now();
 
+      // сброс кнопок
       previewBtn.disabled    = true;
       transcriptBtn.disabled = true;
       diarizeBtn.disabled    = true;
       saveBtn.disabled       = true;
+      container.innerHTML    = "";
+      audioEl.src = "";
 
-      const interval = setInterval(async () => {
-        const st = await (await fetch(`/status/${uploadId}`, {
+      statusEl.textContent = `upload_id=${uploadId}. Ожидаем…`;
+
+      // старт опроса
+      if (pollInterval) clearInterval(pollInterval);
+      pollInterval = setInterval(async () => {
+        const st = await fetch(`/status/${uploadId}`, {
           headers: { "X-API-Key": key }
-        })).json();
-        statusEl.textContent = `Статус: ${st.status}, прогресс: ${st.progress}`;
+        }).then(r => r.json());
 
-        if (st.progress === "preview_done") {
-          previewBtn.disabled    = false;
+        const elapsed = formatElapsed(Date.now() - startTime);
+        let info = `Статус: ${st.status}`;
+        if (st.chunks_total > 0) {
+          info += `, чанков: ${st.chunks_done}/${st.chunks_total}`;
         }
-        if (st.progress === "transcript_done") {
+        if (st.diarize_requested) {
+          info += `, диаризация запрошена`;
+        }
+        info += `, время: ${elapsed}`;
+        statusEl.textContent = info;
+
+        // управление кнопками по новому статусу
+        if (st.status === "preview_done") {
+          previewBtn.disabled = false;
+        }
+        if (st.status === "transcript_done") {
           transcriptBtn.disabled = false;
           diarizeBtn.disabled    = false;
         }
-        if (st.progress === "diarization_done") {
+        if (st.status === "diarization_done") {
           saveBtn.disabled = false;
-        }
-        if (st.status === "done") {
-          clearInterval(interval);
+          clearInterval(pollInterval);
         }
       }, 2000);
     };
 
     previewBtn.onclick = async () => {
       const key = apiKeyEl.value.trim();
-      statusEl.textContent = "Получаем превью...";
+      statusEl.textContent = "Получаем превью…";
       const res = await fetch(`/results/${uploadId}`, {
         headers: { "X-API-Key": key }
       });
@@ -118,7 +140,7 @@
 
     transcriptBtn.onclick = async () => {
       const key = apiKeyEl.value.trim();
-      statusEl.textContent = "Получаем транскрипцию...";
+      statusEl.textContent = "Получаем транскрипцию…";
       const res = await fetch(`/results/${uploadId}`, {
         headers: { "X-API-Key": key }
       });
@@ -131,21 +153,20 @@
 
     diarizeBtn.onclick = async () => {
       const key = apiKeyEl.value.trim();
-      statusEl.textContent = "Запрашиваем диаризацию...";
+      statusEl.textContent = "Запрашиваем диаризацию…";
       const res = await fetch(`/diarize/${uploadId}`, {
         method: "POST",
         headers: { "X-API-Key": key }
       });
       if (!res.ok) { alert("Ошибка: " + res.status); return; }
-      statusEl.textContent = "Диаризация запрошена. Ожидаем...";
+      statusEl.textContent = "Диаризация запрошена. Ожидаем…";
+      diarizeBtn.disabled = true;
     };
 
     saveBtn.onclick = async () => {
       const key = apiKeyEl.value.trim();
       const payload = {};
-      Object.entries(mapping).forEach(([o, n]) => {
-        if (o !== n) payload[o] = n;
-      });
+      Object.entries(mapping).forEach(([o, n]) => { if (o !== n) payload[o] = n; });
       if (!Object.keys(payload).length) { alert("Нет изменений"); return; }
       const res = await fetch(`/labels/${uploadId}`, {
         method: "POST",
@@ -183,7 +204,7 @@
         btn.onclick = () => {
           audioEl.currentTime = seg.start;
           audioEl.play();
-          setTimeout(() => audioEl.pause(), (seg.end - seg.start) * 1000 + 200);
+          setTimeout(() => audioEl.pause(), (seg.end - seg.start)*1000 + 200);
         };
 
         const inp = document.createElement("input");
