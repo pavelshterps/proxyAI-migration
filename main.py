@@ -111,7 +111,7 @@ async def metrics_middleware(request: Request, call_next):
     HTTP_REQ_LATENCY.labels(request.url.path).observe(time.time() - start)
     return resp
 
-# === Health & readiness & metrics & root ===
+# === Health, readiness, metrics, root ===
 
 @app.get("/health")
 @limiter.limit("30/minute")
@@ -201,7 +201,7 @@ async def upload(
         headers={"X-Correlation-ID":cid}
     )
 
-# === Server-Sent Events for progress ===
+# === SSE for progress ===
 
 @app.get("/events/{upload_id}")
 async def progress_events(
@@ -215,16 +215,13 @@ async def progress_events(
         pubsub = redis.pubsub()
         await pubsub.subscribe(f"progress:{upload_id}")
         last_hb = time.time()
-
         try:
             while True:
                 if await request.is_disconnected():
-                    log.info("Client disconnected before completion", upload_id=upload_id)
+                    log.info("Client disconnected", upload_id=upload_id)
                     break
-
                 msg = await pubsub.get_message(ignore_subscribe_messages=True, timeout=0.5)
                 now = time.time()
-
                 if msg and msg["type"] == "message":
                     payload = msg["data"]
                     log.debug("SSE ▶ sending JSON", upload_id=upload_id, data=payload)
@@ -232,14 +229,13 @@ async def progress_events(
                 elif now - last_hb > 1.0:
                     yield ":\n\n"
                     last_hb = now
-
                 await asyncio.sleep(0.1)
         except Exception as e:
             log.error("Error in SSE generator", upload_id=upload_id, error=str(e))
             yield f"data: {{\"status\":\"error\",\"message\":\"{str(e)}\"}}\n\n"
         finally:
             await pubsub.unsubscribe(f"progress:{upload_id}")
-            log.info("Client unsubscribed from SSE", upload_id=upload_id)
+            log.info("Client unsubscribed", upload_id=upload_id)
 
     return EventSourceResponse(generator())
 
@@ -260,15 +256,14 @@ async def get_results(
         pl = json.loads(preview_file.read_text(encoding="utf-8"))
         return JSONResponse(content={"results": pl["timestamps"], "text": pl["text"]})
 
-    # 2) full transcript
+    # 2) transcript
     tp = base / "transcript.json"
     if not tp.exists():
         log.warning("Results not ready", upload_id=upload_id)
         raise HTTPException(404, "Results not ready")
-
     transcript = json.loads(tp.read_text(encoding="utf-8"))
 
-    # 3) merge with diarization if exists
+    # 3) merge diarization if exists
     dp = base / "diarization.json"
     if dp.exists():
         diar = json.loads(dp.read_text(encoding="utf-8"))
@@ -276,12 +271,10 @@ async def get_results(
         label_map = rec.label_mapping or {}
         for seg in diar:
             seg["speaker"] = label_map.get(str(seg["speaker"]), seg["speaker"])
-
         merged = []
         for seg in transcript:
             spk = next(
-                (d["speaker"] for d in diar
-                 if d["start"] <= seg["start"] < d["end"]),
+                (d["speaker"] for d in diar if d["start"] <= seg["start"] < d["end"]),
                 None
             )
             merged.append({
@@ -290,15 +283,14 @@ async def get_results(
                 "text":    seg["text"],
                 "speaker": spk
             })
-
-        log.info("Returning merged transcript + speakers", upload_id=upload_id, segments=len(merged))
+        log.info("Returning merged transcript+speakers", upload_id=upload_id, segments=len(merged))
         return JSONResponse(content={"results": merged})
 
-    # 4) no diarization -> transcript only
+    # 4) only transcript
     log.info("Returning transcript only", upload_id=upload_id, segments=len(transcript))
     return JSONResponse(content={"results": transcript})
 
-# === Trigger diarization manually ===
+# === Manual diarization trigger ===
 
 @app.post("/diarize/{upload_id}", summary="Request diarization")
 async def request_diarization(
@@ -312,8 +304,6 @@ async def request_diarization(
         state["diarize_requested"] = True
         await redis.set(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
         await redis.publish(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
-        log.debug("Published diarize_requested flag", upload_id=upload_id, state=state)
-
         diarize_full.delay(upload_id, None)
         log.info("Launched diarize_full task", upload_id=upload_id)
         return JSONResponse({"message": "diarization started"})
@@ -321,7 +311,7 @@ async def request_diarization(
         log.error("Failed to launch diarization", upload_id=upload_id, error=str(e))
         raise HTTPException(500, f"Diarize launch failed: {e}")
 
-# === Save speaker labels ===
+# === Save speaker labels & return merged ===
 
 @app.post("/labels/{upload_id}", summary="Save speaker labels")
 async def save_labels(
@@ -332,34 +322,30 @@ async def save_labels(
 ):
     log.info("Save labels called", upload_id=upload_id, user_id=current_user.id, mapping=mapping)
 
-    # 1) Сохраняем в базу
+    # 1) сохранить в БД
     rec = await get_upload_for_user(db, current_user.id, upload_id)
     if not rec:
-        log.error("Upload not found for saving labels", upload_id=upload_id, user_id=current_user.id)
+        log.error("Upload not found for saving labels", upload_id=upload_id)
         raise HTTPException(404, "upload_id not found")
     rec.label_mapping = mapping
     await db.commit()
     log.debug("Updated label_mapping in DB", upload_id=upload_id)
 
-    # 2) Обновляем локальный файл diarization.json
+    # 2) обновить файл diarization.json
     base = Path(settings.RESULTS_FOLDER) / upload_id
     dfile = base / "diarization.json"
     if dfile.exists():
-        raw_diar = json.loads(dfile.read_text(encoding="utf-8"))
-        updated_diar = []
-        for seg in raw_diar:
+        raw = json.loads(dfile.read_text(encoding="utf-8"))
+        updated = []
+        for seg in raw:
             new_spk = mapping.get(str(seg["speaker"]), seg["speaker"])
-            updated_diar.append({
-                "start":   seg["start"],
-                "end":     seg["end"],
-                "speaker": new_spk
-            })
-        dfile.write_text(json.dumps(updated_diar, ensure_ascii=False, indent=2), encoding="utf-8")
-        log.info("Rewrote diarization.json with new labels", path=str(dfile), segments=len(updated_diar))
+            updated.append({"start": seg["start"], "end": seg["end"], "speaker": new_spk})
+        dfile.write_text(json.dumps(updated, ensure_ascii=False, indent=2), encoding="utf-8")
+        log.info("Rewrote diarization.json with new labels", upload_id=upload_id)
     else:
-        log.warning("Diarization file not found for updating labels", path=str(dfile))
+        log.warning("Diarization file not found for updating labels", upload_id=upload_id)
 
-    # 3) Вариант B: сразу возвращаем merged transcript + speakers
+    # 3) сразу собрать merged transcript+speakers и вернуть
     tfile = base / "transcript.json"
     if not tfile.exists():
         log.error("Transcript not found when merging after labels", upload_id=upload_id)
@@ -369,11 +355,7 @@ async def save_labels(
 
     merged = []
     for seg in transcript:
-        spk = next(
-            (d["speaker"] for d in diar
-             if d["start"] <= seg["start"] < d["end"]),
-            None
-        )
+        spk = next((d["speaker"] for d in diar if d["start"] <= seg["start"] < d["end"]), None)
         merged.append({
             "start":   seg["start"],
             "end":     seg["end"],
@@ -381,11 +363,10 @@ async def save_labels(
             "speaker": spk
         })
 
-    log.info("Returning merged transcript + speakers after labels",
-             upload_id=upload_id, segments=len(merged))
+    log.info("Returning merged after labels", upload_id=upload_id, segments=len(merged))
     return JSONResponse(content={"results": merged})
 
-# === Include routers & mount static ===
+# === Routers & static ===
 
 app.include_router(api_router, tags=["proxyAI"])
 app.include_router(admin_router)
