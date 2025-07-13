@@ -3,29 +3,34 @@ FROM nvidia/cuda:12.9.1-cudnn-runtime-ubuntu22.04
 
 WORKDIR /app
 
-# --- Устанавливаем системные зависимости и чистим apt-кэш ---
+# 1) Системные зависимости
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-      python3-pip python3-dev build-essential ffmpeg libsndfile1 && \
+      python3-pip python3-dev build-essential ffmpeg libsndfile1 git \
+      libavformat-dev libavcodec-dev libavutil-dev libswscale-dev libportaudio2 && \
     rm -rf /var/lib/apt/lists/*
 
-# --- Ставим «тяжёлые» пакеты для GPU: faster-whisper, pyannote.audio и CTranslate2 с CUDA ---
+# 2) Общие питон-зависимости, включая celery, redis и т.д.
 COPY requirements.txt ./
-
 RUN pip3 install --upgrade pip && \
-    pip3 install --no-cache-dir \
-      faster-whisper[cuda12]==1.1.1 \
-      ctranslate2[cuda12]>=4.6.0 \
-      pyannote.audio>=2.4.0 transformers>=4.28.1 onnxruntime>=1.14.0 && \
+    pip3 install --no-cache-dir -r requirements.txt && \
     rm -rf /root/.cache/pip
 
-# --- Копируем остальной код ---
+# 3) GPU-специфичные пакеты (onnxruntime уже в requirements)
+RUN pip3 install --no-cache-dir \
+      faster-whisper[cuda12]==1.1.1 \
+      ctranslate2[cuda12]>=4.6.0
+
+# 4) Копируем приложение
 COPY . .
 
-# Настройки GPU-воркера
+# 5) Окружение для GPU-воркера
 ENV WHISPER_DEVICE=cuda \
     WHISPER_COMPUTE_TYPE=float16 \
-    HUGGINGFACE_CACHE_DIR=/hf_cache
+    HUGGINGFACE_CACHE_DIR=/hf_cache \
+    CELERY_BROKER_URL=${CELERY_BROKER_URL} \
+    UPLOAD_FOLDER=/app/uploads \
+    RESULTS_FOLDER=/app/results
 
-# Запускаем Celery-воркер для GPU-очередей
+# 6) Запуск Celery-воркера на GPU-очередях
 CMD ["celery", "-A", "tasks", "worker", "--loglevel=info", "--concurrency=1", "--queues=transcribe_gpu,diarize_gpu"]
