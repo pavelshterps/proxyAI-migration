@@ -4,11 +4,21 @@ FROM nvidia/cuda:12.9.1-cudnn-runtime-ubuntu22.04
 
 WORKDIR /app
 
-# 1) Системные зависимости
+# 0) Отключаем проверку подписей (временное решение)
+RUN printf '\
+Acquire::AllowInsecureRepositories "true";\n\
+Acquire::AllowDowngradeToInsecureRepositories "true";\n\
+APT::Get::AllowUnauthenticated "true";\n' \
+    > /etc/apt/apt.conf.d/99no-check-signature
+
+# 1) Системные зависимости (без проверки подписи)
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-      python3-pip python3-dev build-essential ffmpeg libsndfile1 git \
-      libavformat-dev libavcodec-dev libavutil-dev libswscale-dev libportaudio2 && \
+      python3-pip python3-dev build-essential \
+      ffmpeg libsndfile1 git \
+      libavformat-dev libavcodec-dev libavutil-dev libswscale-dev \
+      libportaudio2 \
+      --allow-unauthenticated && \
     rm -rf /var/lib/apt/lists/*
 
 # 2) Все питон-зависимости (heavy + light)
