@@ -333,39 +333,61 @@ async def save_labels(
 ):
     log.info("Save labels called", upload_id=upload_id, user_id=current_user.id, mapping=mapping)
 
+    # 1) сохраняем в базу
     rec = await get_upload_for_user(db, current_user.id, upload_id)
     if not rec:
         log.error("Upload not found for saving labels", upload_id=upload_id, user_id=current_user.id)
         raise HTTPException(404, "upload_id not found")
-
-    # сохраняем в БД
     rec.label_mapping = mapping
     await db.commit()
     log.debug("Updated label_mapping in DB", upload_id=upload_id)
 
-    # обновляем локальный файл diarization.json, чтобы мгновенно вернуть UI
+    # 2) обновляем локальный файл diarization.json
     base = Path(settings.RESULTS_FOLDER) / upload_id
     dfile = base / "diarization.json"
-    updated = []
     if dfile.exists():
-        diar = json.loads(dfile.read_text(encoding="utf-8"))
-        for seg in diar:
+        raw_diar = json.loads(dfile.read_text(encoding="utf-8"))
+        updated_diar = []
+        for seg in raw_diar:
             new_spk = mapping.get(str(seg["speaker"]), seg["speaker"])
-            updated.append({
-                "start": seg["start"],
-                "end":   seg["end"],
+            updated_diar.append({
+                "start":   seg["start"],
+                "end":     seg["end"],
                 "speaker": new_spk
             })
-        dfile.write_text(
-            json.dumps(updated, ensure_ascii=False, indent=2),
-            encoding="utf-8"
-        )
-        log.info("Rewrote diarization.json with new labels", path=str(dfile), segments=len(updated))
+        dfile.write_text(json.dumps(updated_diar, ensure_ascii=False, indent=2), encoding="utf-8")
+        log.info("Rewrote diarization.json with new labels", path=str(dfile), segments=len(updated_diar))
     else:
         log.warning("Diarization file not found for updating labels", path=str(dfile))
 
-    # вернём обновлённые сегменты сразу в UI
-    return JSONResponse(content={"results": updated})
+    # === Вариант B: сразу возвращаем merged transcript + speakers ===
+    # читаем транскрипт
+    tfile = base / "transcript.json"
+    if not tfile.exists():
+        log.error("Transcript not found when merging after labels", upload_id=upload_id)
+        raise HTTPException(500, "Transcript missing for merging")
+    transcript = json.loads(tfile.read_text(encoding="utf-8"))
+
+    # читаем обновлённую диаризацию
+    diar = json.loads((base / "diarization.json").read_text(encoding="utf-8"))
+
+    # джойним
+    merged = []
+    for seg in transcript:
+        spk = next(
+            (d["speaker"] for d in diar
+             if d["start"] <= seg["start"] < d["end"]),
+            None
+        )
+        merged.append({
+            "start":   seg["start"],
+            "end":     seg["end"],
+            "text":    seg["text"],
+            "speaker": spk
+        })
+
+    log.info("Returning merged transcript + speakers after labels", upload_id=upload_id, segments=len(merged))
+    return JSONResponse(content={"results": merged})
 
 
 # === Include routers & mount static ===
