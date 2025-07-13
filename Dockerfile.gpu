@@ -1,25 +1,36 @@
+# Dockerfile.gpu
 FROM nvidia/cuda:12.9.1-cudnn-runtime-ubuntu22.04
+
 WORKDIR /app
 
+# 1) Системные зависимости
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
       python3-pip python3-dev build-essential ffmpeg libsndfile1 git \
       libavformat-dev libavcodec-dev libavutil-dev libswscale-dev libportaudio2 && \
     rm -rf /var/lib/apt/lists/*
 
+# 2) Общие питон-зависимости, включая celery, redis и т.д.
 COPY requirements.txt ./
 RUN pip3 install --upgrade pip && \
-    pip3 install --no-cache-dir -r requirements.txt
+    pip3 install --no-cache-dir -r requirements.txt && \
+    rm -rf /root/.cache/pip
 
+# 3) GPU-специфичные пакеты (onnxruntime уже в requirements)
 RUN pip3 install --no-cache-dir \
-    ctranslate2[cuda12]==4.6.* \
-    faster-whisper[cuda12]
+      faster-whisper[cuda12]==1.1.1 \
+      ctranslate2[cuda12]>=4.6.0
 
+# 4) Копируем приложение
 COPY . .
-ENV HUGGINGFACE_CACHE_DIR=/hf_cache \
-    WHISPER_DEVICE=cuda \
-    WHISPER_COMPUTE_TYPE=float16 \
-    TF_FORCE_GPU_ALLOW_GROWTH=true \
-    CTRANSFORMER_MAX_CUDA_MEMORY=0.8
 
-CMD ["celery", "-A", "tasks", "worker", "--loglevel=info", "--concurrency=1", "--queues=preprocess_gpu"]
+# 5) Окружение для GPU-воркера
+ENV WHISPER_DEVICE=cuda \
+    WHISPER_COMPUTE_TYPE=float16 \
+    HUGGINGFACE_CACHE_DIR=/hf_cache \
+    CELERY_BROKER_URL=${CELERY_BROKER_URL} \
+    UPLOAD_FOLDER=/app/uploads \
+    RESULTS_FOLDER=/app/results
+
+# 6) Запуск Celery-воркера на GPU-очередях
+CMD ["celery", "-A", "tasks", "worker", "--loglevel=info", "--concurrency=1", "--queues=transcribe_gpu,diarize_gpu"]
