@@ -131,7 +131,6 @@ async def progress_events(upload_id: str):
                 await asyncio.sleep(0.1)
         finally:
             await pubsub.unsubscribe(f"progress:{upload_id}")
-
     return EventSourceResponse(event_generator())
 
 # === Проверка статуса ===
@@ -140,7 +139,7 @@ async def get_status(upload_id: str, current_user=Depends(get_current_user)):
     log.debug("GET /status", upload_id=upload_id)
     base = Path(settings.RESULTS_FOLDER) / upload_id
 
-    # Готовы и транскрипция, и диаризация?
+    # готово и транскрипция, и диаризация?
     if (base / "transcript.json").exists() and (base / "diarization.json").exists():
         preview = json.loads(await redis.get(f"preview_result:{upload_id}") or "null")
         return {
@@ -155,7 +154,7 @@ async def get_status(upload_id: str, current_user=Depends(get_current_user)):
     if raw:
         return json.loads(raw)
 
-    # Начальное состояние
+    # начальное состояние
     return {
         "status": "processing",
         "preview": None,
@@ -191,7 +190,6 @@ async def get_results(upload_id: str, current_user=Depends(get_current_user), db
             s["speaker"] = mapping.get(str(s["speaker"]), s["speaker"])
         return JSONResponse(content={"results": segs})
 
-    # Не готово
     raise HTTPException(404, "Results not ready")
 
 # === Загрузка файла ===

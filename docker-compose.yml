@@ -34,17 +34,12 @@ services:
       - UPLOAD_FOLDER=/app/uploads
       - RESULTS_FOLDER=/app/results
 
-  worker_gpu:
+  gpu-worker:
     build:
       context: .
       dockerfile: Dockerfile.gpu
     container_name: proxyai_worker_gpu
     runtime: nvidia
-    environment:
-      - CELERY_BROKER_URL=${CELERY_BROKER_URL}
-      - UPLOAD_FOLDER=/app/uploads
-      - RESULTS_FOLDER=/app/results
-      - NVIDIA_VISIBLE_DEVICES=all
     command: >
       celery -A tasks worker
       --loglevel=info
@@ -54,6 +49,11 @@ services:
       - ./:/app
     depends_on:
       - api
+    environment:
+      - CELERY_BROKER_URL=${CELERY_BROKER_URL}
+      - UPLOAD_FOLDER=/app/uploads
+      - RESULTS_FOLDER=/app/results
+      - NVIDIA_VISIBLE_DEVICES=all
 
   redis:
     image: redis:7-alpine
