@@ -138,7 +138,7 @@ async def upload(
       1) Сохраняем файл
       2) Создаём запись в БД
       3) Инициируем download_audio и preview_transcribe —
-         транскрипция full будет запущена из preview_transcribe
+         полная транскрипция будет запущена из preview_transcribe
       4) Инициализируем прогресс в Redis
     """
     cid = x_correlation_id or str(uuid.uuid4().hex)
@@ -161,7 +161,7 @@ async def upload(
     # Стартуем цепочку обработки
     download_audio.delay(upload_id, cid)
     preview_transcribe.delay(upload_id, cid)
-    # убрали: transcribe_segments.delay(upload_id, cid)
+    # убрали прямой вызов transcribe_segments — теперь он запускается внутри preview_transcribe
 
     # Инициализируем прогресс
     state = {"status": "started", "preview": None}
@@ -198,7 +198,11 @@ async def get_status(upload_id: str, current_user=Depends(get_current_user)):
     return json.loads(raw)
 
 @app.get("/results/{upload_id}", summary="Get preview, transcript or diarization")
-async def get_results(upload_id: str, current_user=Depends(get_current_user), db=Depends(get_db)):
+async def get_results(
+    upload_id: str,
+    current_user=Depends(get_current_user),
+    db=Depends(get_db)
+):
     """
     Возвращаем:
       1) Preview, если есть
