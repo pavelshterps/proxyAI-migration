@@ -16,12 +16,10 @@
 </head>
 <body>
   <h1>proxyAI Demo UI</h1>
-
   <label>
     Ваш API-Key:
     <input type="text" id="apiKey" placeholder="X-API-Key" />
   </label>
-
   <label>
     Аудио/видео-файл:
     <input type="file" id="audioFile" accept="audio/*,video/*" />
@@ -72,10 +70,10 @@
       const file = fileEl.files[0];
       if(!file){ alert("Выберите файл"); return; }
 
-      tUpload        = performance.now();
+      tUpload = performance.now();
       statusEl.textContent = "Загружаем…";
       timingsEl.textContent = "";
-      audioEl.src    = URL.createObjectURL(file);
+      audioEl.src = URL.createObjectURL(file);
 
       // 1) Upload
       try {
@@ -83,10 +81,10 @@
         form.append("file", file, file.name);
         const res = await fetch("/upload/", {
           method: "POST",
-          headers:{ "X-API-Key": key },
+          headers: { "X-API-Key": key },
           body: form
         });
-        if(!res.ok) throw new Error("Upload error: "+res.status);
+        if(!res.ok) throw new Error("Upload error: " + res.status);
         uploadId = (await res.json()).upload_id;
       } catch(err) {
         console.error(err);
@@ -99,20 +97,19 @@
       [previewBtn, transcriptBtn, diarizeBtn, saveBtn].forEach(b=>b.disabled=true);
       container.innerHTML="";
 
-      // 2) SSE с API-ключом в query string
+      // 2) SSE
       const sseUrl = `/events/${uploadId}?api_key=${encodeURIComponent(key)}`;
       const es     = new EventSource(sseUrl);
 
-      es.onopen = () => console.log("SSE: connected", sseUrl);
+      es.onopen  = () => console.log("SSE: connected", sseUrl);
       es.onerror = e => console.error("SSE: error", e);
 
       es.onmessage = e => {
         let raw = e.data;
         console.debug("SSE ▶ raw:", raw);
 
-        // skip heartbeat/comments
-        if(!raw || raw.trim()==="") {
-          console.debug("SSE ▶ heartbeat — skip");
+        // skip heartbeat/comment lines (":" or empty)
+        if(!raw || raw.trim()==="" || raw.trim()===":") {
           return;
         }
 
@@ -170,17 +167,16 @@
       const res = await fetch(`/results/${uploadId}`, {
         headers:{ "X-API-Key": key }
       });
-      if(!res.ok) {
-        throw new Error("results fetch failed: "+res.status);
-      }
+      if(!res.ok) throw new Error("results fetch failed: " + res.status);
       const { results } = await res.json();
       render(results);
       statusEl.textContent="Готово";
     }
 
-    previewBtn.onclick    = () => {};  // noop
+    previewBtn.onclick    = () => {};
     transcriptBtn.onclick = () => loadTranscript().catch(err=>{
-      console.error(err); statusEl.textContent="Ошибка при получении транскрипта";
+      console.error(err);
+      statusEl.textContent="Ошибка при получении транскрипта";
     });
     diarizeBtn.onclick    = async () => {
       statusEl.textContent="Запрашиваем диаризацию…";
@@ -189,11 +185,11 @@
           method:"POST",
           headers:{"X-API-Key":apiKeyEl.value.trim()}
         });
-        if(!res.ok) throw new Error("Diarize request failed: "+res.status);
+        if(!res.ok) throw new Error("Diarize request failed: " + res.status);
         diarizeBtn.disabled = true;
       } catch(err) {
         console.error(err);
-        alert("Ошибка при запросе диаризации: "+err.message);
+        alert("Ошибка при запросе диаризации: " + err.message);
         statusEl.textContent = "Ошибка при запросе диаризации";
       }
     };
@@ -210,14 +206,14 @@
           },
           body:JSON.stringify(payload)
         });
-        if(!res.ok) throw new Error("Labels save failed: "+res.status);
+        if(!res.ok) throw new Error("Labels save failed: " + res.status);
         const { results } = await res.json();
         render(results);
         saveBtn.disabled = true;
         alert("Метки сохранены");
       } catch(err) {
         console.error(err);
-        alert("Ошибка при сохранении меток: "+err.message);
+        alert("Ошибка при сохранении меток: " + err.message);
       }
     };
 
