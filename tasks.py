@@ -23,9 +23,9 @@ _clustering_diarizer = None
 def get_whisper_model():
     """
     Ленивая инициализация WhisperModel.
-    - model_id берём из settings.WHISPER_MODEL_PATH (например 'guillaumekln/faster-whisper-medium').
-    - cache_dir берём из settings.HUGGINGFACE_CACHE_DIR (например '/hf_cache').
-    - На CPU запрещаем сетевые загрузки (local_files_only=True), на GPU — разрешаем (local_files_only=False).
+    - model_id берём из settings.WHISPER_MODEL_PATH.
+    - cache_dir берём из settings.HUGGINGFACE_CACHE_DIR.
+    - На CPU запрещаем сетевые загрузки (local_files_only=True), на GPU — разрешаем.
     """
     global _whisper_model
     if _whisper_model is None:
@@ -39,7 +39,7 @@ def get_whisper_model():
             f"cache_dir={cache_dir}, local_only={local_only}"
         )
 
-        # Попытка «загрости» модель в локальный кеш
+        # Скачиваем или проверяем наличие в кеше
         try:
             model_path = download_model(
                 model_id,
@@ -56,11 +56,10 @@ def get_whisper_model():
                     f"Whisper model '{model_id}' not found in local cache '{cache_dir}'"
                 )
             else:
-                logger.warning(
-                    f"Model '{model_id}' not in cache, will attempt online download: {e}"
-                )
-                # дадим WhisperModel самой подтянуть модель из сети
                 model_path = model_id
+                logger.warning(
+                    f"Model '{model_id}' not in cache, will download on-the-fly: {e}"
+                )
 
         # На CPU float16/fp16 не поддерживается
         compute = getattr(settings, "WHISPER_COMPUTE_TYPE", "int8").lower()
@@ -68,13 +67,12 @@ def get_whisper_model():
             logger.warning("FP16 unsupported on CPU, switching to int8")
             compute = "int8"
 
-        # Создаём экземпляр WhisperModel, указывая кеш и режим загрузки
+        # Создаём экземпляр WhisperModel:
+        # — model_path, device и compute_type достаточно, остальные kwargs удалены
         _whisper_model = WhisperModel(
             model_path,
             device=device,
             compute_type=compute,
-            cache_dir=cache_dir,
-            local_files_only=local_only,
         )
         logger.info("WhisperModel loaded successfully")
 
@@ -109,16 +107,14 @@ def get_clustering_diarizer():
 def preload_and_warmup(**kwargs):
     """
     Warm-up при старте воркера:
-      1) Всегда прогреваем WhisperModel на небольшом sample.wav
-      2) Если устройство GPU — дополнительно прогреваем VAD + Diarizer
+      1) WhisperModel.transcribe на test-файле
+      2) Если устройство GPU — VAD + Diarizer
     """
     sample = Path(__file__).parent / "tests/fixtures/sample.wav"
     opts = {"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {}
     try:
-        # Warm-up Whisper
         get_whisper_model().transcribe(str(sample), **opts)
         logger.info("Whisper warm-up completed")
-        # На GPU — дополнительно прогрев VAD и Diarizer
         if settings.WHISPER_DEVICE.lower() != "cpu":
             get_vad().apply({"audio": str(sample)})
             get_clustering_diarizer().apply({"audio": str(sample)})
@@ -162,14 +158,12 @@ def preview_transcribe(self, upload_id: str, correlation_id: str):
         preview["text"] += s.text
         preview["timestamps"].append({"start": s.start, "end": s.end, "text": s.text})
 
-    # Сохраняем и публикуем результат превью
     r.set(f"preview_result:{upload_id}", json.dumps(preview, ensure_ascii=False))
     state = {"status": "preview_done", "preview": preview}
     r.set(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
     r.publish(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
     logger.info(f"[{correlation_id}] Preview done for {upload_id}")
 
-    # Запускаем полную транскрипцию после превью
     transcribe_segments.delay(upload_id, correlation_id)
 
 @celery_app.task(bind=True, name="tasks.transcribe_segments", queue="transcribe_gpu")
@@ -197,7 +191,6 @@ def transcribe_segments(self, upload_id: str, correlation_id: str):
         json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8"
     )
 
-    # Обновляем статус и отсылаем callback, если есть
     state = {"status": "transcript_done", "preview": None}
     r.set(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
     r.publish(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
@@ -212,7 +205,6 @@ def transcribe_segments(self, upload_id: str, correlation_id: str):
         except Exception:
             pass
 
-    # Если пользователь запросил диаризацию — запускаем её
     if r.get(f"diarize_requested:{upload_id}") == "1":
         diarize_full.delay(upload_id, correlation_id)
 
@@ -254,9 +246,6 @@ def diarize_full(self, upload_id: str, correlation_id: str):
 
 @celery_app.task(name="tasks.cleanup_old_uploads", queue="cleanup")
 def cleanup_old_uploads():
-    """
-    Удаляем устаревшие файлы старше FILE_RETENTION_DAYS.
-    """
     cutoff = time.time() - settings.FILE_RETENTION_DAYS * 86400
     for f in Path(settings.UPLOAD_FOLDER).iterdir():
         if f.stat().st_mtime < cutoff:
