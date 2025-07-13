@@ -1,3 +1,4 @@
+# tasks.py
 import os
 import json
 import logging
@@ -22,7 +23,7 @@ _clustering_diarizer = None
 def get_whisper_model():
     """
     Ленивая инициализация WhisperModel.
-    Используем только локальный кеш (/hf_cache), не скачиваем.
+    Используем только локальный кеш (/hf_cache), без онлайновых загрузок.
     """
     global _whisper_model
     if _whisper_model is None:
@@ -30,25 +31,24 @@ def get_whisper_model():
         cache_dir = settings.HUGGINGFACE_CACHE_DIR
         logger.info(f"Initializing WhisperModel: model={model_id}, cache_dir={cache_dir}")
 
-        # Убедиться, что модель уже в кеше, иначе сбоить быстро:
+        # проверяем, что модель в кеше, иначе выдаём ошибку
         try:
             download_model(model_id, cache_dir=cache_dir, local_files_only=True)
-            logger.info(f"Model '{model_id}' found in local cache")
+            logger.info(f"Whisper model '{model_id}' found in local cache")
         except Exception as e:
-            logger.error(f"Model '{model_id}' NOT found in cache at '{cache_dir}': {e}")
+            logger.error(f"Whisper model '{model_id}' not in cache '{cache_dir}': {e}")
             raise RuntimeError(
-                f"Whisper model '{model_id}' missing from cache directory '{cache_dir}'"
+                f"Whisper model '{model_id}' missing from local cache '{cache_dir}'"
             )
 
+        # на CPU float16 не поддерживается
         device = settings.WHISPER_DEVICE.lower()
         compute = getattr(settings, "WHISPER_COMPUTE_TYPE", "int8").lower()
         if device == "cpu" and compute in ("float16", "fp16"):
-            logger.warning(
-                f"Compute type '{compute}' unsupported on CPU, switching to 'int8'"
-            )
+            logger.warning("FP16 unsupported on CPU, switching to int8")
             compute = "int8"
 
-        # Инициализировать модель, только из кеша
+        # создаём модель из кеша
         _whisper_model = WhisperModel(
             model_id,
             device=device,
@@ -62,7 +62,7 @@ def get_whisper_model():
 
 def get_vad():
     """
-    Ленивая инициализация VAD (pyannote).
+    Ленивая инициализация Voice Activity Detection (pyannote).
     """
     global _vad
     if _vad is None:
@@ -80,11 +80,10 @@ def get_clustering_diarizer():
     """
     global _clustering_diarizer
     if _clustering_diarizer is None:
-        cache = settings.DIARIZER_CACHE_DIR
-        os.makedirs(cache, exist_ok=True)
+        os.makedirs(settings.DIARIZER_CACHE_DIR, exist_ok=True)
         _clustering_diarizer = SpeakerDiarization.from_pretrained(
             settings.PYANNOTE_PIPELINE,
-            cache_dir=cache,
+            cache_dir=settings.DIARIZER_CACHE_DIR,
             use_auth_token=settings.HUGGINGFACE_TOKEN,
         )
         logger.info("Diarizer model loaded")
@@ -93,7 +92,7 @@ def get_clustering_diarizer():
 @worker_process_init.connect
 def preload_and_warmup(**kwargs):
     """
-    Warm-up models при старте воркера (ускоряет первый запрос).
+    Warm-up моделей при старте воркера (ускоряет первый запрос).
     """
     sample = Path(__file__).parent / "tests/fixtures/sample.wav"
     try:
@@ -105,7 +104,7 @@ def preload_and_warmup(**kwargs):
             get_clustering_diarizer().apply({"audio": str(sample)})
         logger.info("Warm-up completed successfully")
     except Exception as e:
-        logger.warning("Warm-up failed: %r", e)
+        logger.warning(f"Warm-up failed: {e!r}")
 
 @celery_app.task(bind=True, name="tasks.download_audio", queue="transcribe_gpu")
 def download_audio(self, upload_id: str, correlation_id: str):
@@ -171,8 +170,10 @@ def transcribe_segments(self, upload_id: str, correlation_id: str):
 
     out = [{"start": s.start, "end": s.end, "text": s.text} for s in segs]
     d = Path(settings.RESULTS_FOLDER) / upload_id
-    d.mkdir(exist_ok=True, parents=True)
-    (d / "transcript.json").write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "transcript.json").write_text(
+        json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
 
     state = {"status": "transcript_done", "preview": None}
     r.set(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
@@ -199,12 +200,16 @@ def diarize_full(self, upload_id: str, correlation_id: str):
         logger.error(f"[{correlation_id}] Diarization error: {e}")
         return
 
-    segs = [{"start": float(seg.start), "end": float(seg.end), "speaker": spk}
-            for seg, _, spk in ann.itertracks(yield_label=True)]
+    segs = [
+        {"start": float(seg.start), "end": float(seg.end), "speaker": spk}
+        for seg, _, spk in ann.itertracks(yield_label=True)
+    ]
 
     d = Path(settings.RESULTS_FOLDER) / upload_id
-    d.mkdir(exist_ok=True, parents=True)
-    (d / "diarization.json").write_text(json.dumps(segs, ensure_ascii=False, indent=2), encoding="utf-8")
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "diarization.json").write_text(
+        json.dumps(segs, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
 
     state = {"status": "diarization_done", "preview": None}
     r.set(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
@@ -213,12 +218,15 @@ def diarize_full(self, upload_id: str, correlation_id: str):
 
     for cb in json.loads(r.get(f"callbacks:{upload_id}") or "[]"):
         try:
-            requests.post(cb, json={"event":"diarization_complete","external_id":upload_id}, timeout=5)
+            requests.post(cb, json={"event": "diarization_complete", "external_id": upload_id}, timeout=5)
         except Exception:
             pass
 
 @celery_app.task(name="tasks.cleanup_old_uploads", queue="cleanup")
 def cleanup_old_uploads():
+    """
+    Удаляем устаревшие файлы старше FILE_RETENTION_DAYS.
+    """
     cutoff = time.time() - settings.FILE_RETENTION_DAYS * 86400
     for f in Path(settings.UPLOAD_FOLDER).iterdir():
         if f.stat().st_mtime < cutoff:
