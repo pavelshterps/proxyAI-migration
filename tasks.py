@@ -1,7 +1,8 @@
-import os
+# tasks.py
 import json
 import logging
 import requests
+import subprocess
 import time
 from pathlib import Path
 from celery.signals import worker_process_init
@@ -21,9 +22,9 @@ _clustering_diarizer = None
 
 def get_whisper_model():
     """
-    Ленивая инициализация WhisperModel.
-    1) Проверяем/загружаем в cache локально (для CPU) или разрешаем онлайн (для GPU).
-    2) Передаём в конструктор только model_path, device и compute_type.
+    Ленивая инициализация WhisperModel:
+      1) download_model для кеширования (или подготовка онлайн-загрузки на GPU)
+      2) передаём в конструктор только model_path, device, compute_type
     """
     global _whisper_model
     if _whisper_model is None:
@@ -33,24 +34,21 @@ def get_whisper_model():
         local_only = (device == "cpu")
 
         logger.info(
-            f"Initializing WhisperModel: model={model_id}, device={device}, "
-            f"cache_dir={cache_dir}, local_only={local_only}"
+            f"Initializing WhisperModel: model={model_id}, device={device}, local_only={local_only}"
         )
-
         try:
             model_path = download_model(
                 model_id,
                 cache_dir=cache_dir,
                 local_files_only=local_only
             )
-            logger.info(f"Whisper model '{model_id}' cached at '{model_path}'")
+            logger.info(f"Whisper model cached at '{model_path}'")
         except Exception as e:
             if local_only:
-                logger.error(f"Model '{model_id}' missing from cache: {e}")
-                raise RuntimeError(f"Whisper model '{model_id}' not in local cache")
-            else:
-                logger.warning(f"Will download '{model_id}' online at init: {e}")
-                model_path = model_id
+                logger.error(f"Model missing from cache: {e}")
+                raise RuntimeError(f"Model '{model_id}' not in local cache")
+            logger.warning(f"Will download '{model_id}' online at init: {e}")
+            model_path = model_id
 
         compute = getattr(settings, "WHISPER_COMPUTE_TYPE", "int8").lower()
         if device == "cpu" and compute in ("float16", "fp16"):
@@ -63,7 +61,6 @@ def get_whisper_model():
             compute_type=compute
         )
         logger.info("WhisperModel loaded successfully")
-
     return _whisper_model
 
 def get_vad():
@@ -82,7 +79,7 @@ def get_clustering_diarizer():
     """Ленивая инициализация SpeakerDiarization."""
     global _clustering_diarizer
     if _clustering_diarizer is None:
-        os.makedirs(settings.DIARIZER_CACHE_DIR, exist_ok=True)
+        Path(settings.DIARIZER_CACHE_DIR).mkdir(parents=True, exist_ok=True)
         _clustering_diarizer = SpeakerDiarization.from_pretrained(
             settings.PYANNOTE_PIPELINE,
             cache_dir=settings.DIARIZER_CACHE_DIR,
@@ -95,8 +92,8 @@ def get_clustering_diarizer():
 def preload_and_warmup(**kwargs):
     """
     Warm-up при старте воркера:
-      1) Прогрев WhisperModel на sample.wav
-      2) Если GPU — прогрев VAD+Diarizer
+      • WhisperModel на небольшой sample.wav
+      • Если GPU — VAD + Diarizer
     """
     sample = Path(__file__).parent / "tests/fixtures/sample.wav"
     opts   = {"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {}
@@ -126,10 +123,14 @@ def preview_transcribe(self, upload_id: str, correlation_id: str):
         logger.error(f"[{correlation_id}] Conversion error: {e}")
         return
 
-    # вырезаем первые PREVIEW_LENGTH_S секунд для быстрого превью
+    # Вырезаем первые N секунд в отдельный файл через subprocess (чуть быстрее и безопаснее)
     preview_wav = Path(settings.UPLOAD_FOLDER) / f"{upload_id}_preview.wav"
-    t = settings.PREVIEW_LENGTH_S
-    os.system(f"ffmpeg -y -i {wav_path} -t {t} {preview_wav}")
+    subprocess.run([
+        "ffmpeg", "-y",
+        "-i", str(wav_path),
+        "-t", str(settings.PREVIEW_LENGTH_S),
+        str(preview_wav)
+    ], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     try:
         model = get_whisper_model()
@@ -147,16 +148,18 @@ def preview_transcribe(self, upload_id: str, correlation_id: str):
     preview = {"text": "", "timestamps": []}
     for s in segs:
         preview["text"] += s.text
-        preview["timestamps"].append({"start": s.start, "end": s.end, "text": s.text})
+        preview["timestamps"].append({
+            "start": s.start, "end": s.end, "text": s.text
+        })
 
-    # сохраняем и публикуем превью
+    # Сохраняем и публикуем результат превью
     r.set(f"preview_result:{upload_id}", json.dumps(preview, ensure_ascii=False))
     state = {"status": "preview_done", "preview": preview}
     r.set(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
     r.publish(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
     logger.info(f"[{correlation_id}] Preview done for {upload_id}")
 
-    # запускаем полную транскрипцию
+    # Запускаем полную транскрипцию (единожды)
     transcribe_segments.delay(upload_id, correlation_id)
 
 @celery_app.task(bind=True, name="tasks.transcribe_segments", queue="transcribe_gpu")
@@ -184,13 +187,12 @@ def transcribe_segments(self, upload_id: str, correlation_id: str):
                    ensure_ascii=False, indent=2),
         encoding="utf-8"
     )
-
     state = {"status": "transcript_done", "preview": None}
     r.set(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
     r.publish(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
     logger.info(f"[{correlation_id}] Full transcription done for {upload_id}")
 
-    # callbacks
+    # Авторские callbacks
     for cb in json.loads(r.get(f"callbacks:{upload_id}") or "[]"):
         try:
             requests.post(cb,
@@ -199,7 +201,7 @@ def transcribe_segments(self, upload_id: str, correlation_id: str):
         except Exception:
             pass
 
-    # если нужно — запускаем диаризацию
+    # Если был запрос диаризации — запускаем её
     if r.get(f"diarize_requested:{upload_id}") == "1":
         diarize_full.delay(upload_id, correlation_id)
 
@@ -225,7 +227,6 @@ def diarize_full(self, upload_id: str, correlation_id: str):
         json.dumps(segs, ensure_ascii=False, indent=2),
         encoding="utf-8"
     )
-
     state = {"status": "diarization_done", "preview": None}
     r.set(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
     r.publish(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
@@ -241,9 +242,6 @@ def diarize_full(self, upload_id: str, correlation_id: str):
 
 @celery_app.task(name="tasks.cleanup_old_uploads", queue="cleanup")
 def cleanup_old_uploads():
-    """
-    Удаляем файлы старше FILE_RETENTION_DAYS.
-    """
     cutoff = time.time() - settings.FILE_RETENTION_DAYS * 86400
     for f in Path(settings.UPLOAD_FOLDER).iterdir():
         if f.stat().st_mtime < cutoff:

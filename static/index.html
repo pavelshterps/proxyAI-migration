@@ -1,3 +1,4 @@
+<!-- static/index.html -->
 <!DOCTYPE html>
 <html lang="ru">
 <head>
@@ -71,7 +72,7 @@
       if(!file){ alert("Выберите файл"); return; }
 
       fileBlob = file;
-      // сразу показываем плеер
+      // сразу показываем плеер, чтобы можно было начать слушать
       audioEl.src = URL.createObjectURL(fileBlob);
 
       statusEl.textContent = "Загружаем…";
@@ -85,31 +86,38 @@
       if(!res.ok){ alert("Upload error: "+res.status); return; }
       uploadId = (await res.json()).upload_id;
 
-      // reset UI
+      // сброс UI
       previewDone = transcriptDone = diarizeDone = false;
       [previewBtn, transcriptBtn, diarizeBtn, saveBtn].forEach(b=>b.disabled=true);
       container.innerHTML = "";
 
-      // SSE
+      // SSE-стрим прогресса
       const es = new EventSource(`/events/${uploadId}`);
       es.onmessage = async e => {
         const st = JSON.parse(e.data);
         statusEl.textContent = `Статус: ${st.status}`;
 
-        if(st.status==="preview_done" && !previewDone){
-          previewDone=true;
-          previewBtn.disabled=false;
-          await loadPreview();
+        // Превью: сразу рендерим текст из SSE (без дополнительного запроса)
+        if (st.preview && !previewDone) {
+          previewDone = true;
+          previewBtn.disabled = false;
+          render(st.preview.timestamps);
+          statusEl.textContent = "Превью готово";
         }
-        if(st.status==="transcript_done" && !transcriptDone){
-          transcriptDone=true;
-          transcriptBtn.disabled=false;
-          diarizeBtn.disabled=false;
+
+        // Полная транскрипция
+        if (st.status === "transcript_done" && !transcriptDone) {
+          transcriptDone = true;
+          transcriptBtn.disabled = false;
+          diarizeBtn.disabled = false;
+          // для полной транскрипции используем fetch на /results
           await loadTranscript();
         }
-        if(st.status==="diarization_done" && !diarizeDone){
-          diarizeDone=true;
-          saveBtn.disabled=false;
+
+        // Диаризация
+        if (st.status === "diarization_done" && !diarizeDone) {
+          diarizeDone = true;
+          saveBtn.disabled = false;
           await loadTranscript();
           es.close();
         }
@@ -118,78 +126,92 @@
       statusEl.textContent = "Файл загружен, ждём прогресса…";
     };
 
-    async function loadPreview(){
-      statusEl.textContent="Загружаю превью…";
-      const key = apiKeyEl.value.trim();
-      const res = await fetch(`/results/${uploadId}`, { headers:{ "X-API-Key":key }});
-      const { results } = await res.json();
-      render(results);
-      statusEl.textContent="Превью готово";
-    }
-
+    // Загружает полный результат (или последний доступный)
     async function loadTranscript(){
-      statusEl.textContent="Загружаю результат…";
+      statusEl.textContent = "Загружаю результат…";
       const key = apiKeyEl.value.trim();
-      const res = await fetch(`/results/${uploadId}`, { headers:{ "X-API-Key":key }});
+      const res = await fetch(`/results/${uploadId}`, {
+        headers:{ "X-API-Key": key }
+      });
       const { results } = await res.json();
       render(results);
-      statusEl.textContent="Готово";
+      statusEl.textContent = "Готово";
     }
 
-    previewBtn.onclick    = loadPreview;
     transcriptBtn.onclick = loadTranscript;
-    diarizeBtn.onclick    = async () => {
-      statusEl.textContent="Запрашиваем диаризацию…";
-      await fetch(`/diarize/${uploadId}`, {
-        method:"POST",
-        headers:{"X-API-Key":apiKeyEl.value.trim()}
-      });
-      diarizeBtn.disabled=true;
+    // Кнопка превью по-прежнему доступна, но текст уже автоматически загружен
+    previewBtn.onclick = () => {
+      if (!previewDone) return;
+      render(JSON.parse(localStorage.getItem(`preview:${uploadId}`)) || []);
     };
-    saveBtn.onclick       = async () => {
-      const key = apiKeyEl.value.trim(), payload={};
-      Object.entries(mapping).forEach(([o,n])=>o!==n&&(payload[o]=n));
-      if(!Object.keys(payload).length){ alert("Нет изменений"); return; }
+
+    diarizeBtn.onclick = async () => {
+      statusEl.textContent = "Запрашиваем диаризацию…";
+      await fetch(`/diarize/${uploadId}`, {
+        method: "POST",
+        headers: { "X-API-Key": apiKeyEl.value.trim() }
+      });
+      diarizeBtn.disabled = true;
+    };
+
+    saveBtn.onclick = async () => {
+      const key = apiKeyEl.value.trim(), payload = {};
+      Object.entries(mapping).forEach(([o,n])=>{ if (o!==n) payload[o]=n; });
+      if (!Object.keys(payload).length) {
+        alert("Нет изменений"); return;
+      }
       const res = await fetch(`/labels/${uploadId}`, {
-        method:"POST",
-        headers:{ "Content-Type":"application/json","X-API-Key":key },
+        method: "POST",
+        headers: {
+          "Content-Type":"application/json",
+          "X-API-Key": key
+        },
         body: JSON.stringify(payload)
       });
       const { results } = await res.json();
       render(results);
-      saveBtn.disabled=true;
+      saveBtn.disabled = true;
       alert("Метки сохранены");
     };
 
+    // Отрисовка списка сегментов с помощью DocumentFragment
     function render(list){
-      container.innerHTML=""; mapping={};
-      // инициализируем мэппинг для сохранения
-      list.forEach(s=>mapping[s.speaker||""]=s.speaker||"");
-      list.forEach(seg=>{
+      container.innerHTML = "";
+      mapping = {};
+
+      // инициализируем маппинг по дефолту
+      list.forEach(s => {
+        mapping[s.speaker || ""] = s.speaker || "";
+      });
+
+      const frag = document.createDocumentFragment();
+      list.forEach(seg => {
         const div = document.createElement("div");
         div.className = "segment";
 
         const t = document.createElement("span");
-        t.className="time";
-        t.textContent=fmt(seg.start*1000);
+        t.className = "time";
+        t.textContent = fmt(seg.start * 1000);
 
         const btn = document.createElement("button");
-        btn.textContent="▶️";
-        btn.onclick=()=>{
-          audioEl.currentTime=seg.start;
+        btn.textContent = "▶️";
+        btn.onclick = () => {
+          audioEl.currentTime = seg.start;
           audioEl.play();
-          setTimeout(()=>audioEl.pause(), (seg.end-seg.start)*1000);
+          setTimeout(() => audioEl.pause(), (seg.end - seg.start) * 1000);
         };
 
         const inp = document.createElement("input");
-        inp.value = seg.speaker||"";
-        inp.onchange=()=>{
-          const old=seg.speaker||"",
-                neu=inp.value.trim();
-          if(neu&&neu.length<=50){
-            mapping[old]=neu;
-            document.querySelectorAll('.segment input')
-              .forEach(i=>i.value===old&&(i.value=neu));
+        inp.value = seg.speaker || "";
+        inp.onchange = () => {
+          const old = seg.speaker || "";
+          const neu = inp.value.trim();
+          if (neu && neu.length <= 50) {
+            mapping[old] = neu;
+            // обновляем все инпуты
+            frag.querySelectorAll("input").forEach(i => {
+              if (i.value === old) i.value = neu;
+            });
           } else {
             alert("Имя 1–50 символов");
             inp.value = mapping[old];
@@ -200,8 +222,9 @@
         txt.textContent = seg.text;
 
         div.append(t, btn, inp, txt);
-        container.append(div);
+        frag.append(div);
       });
+      container.append(frag);
     }
   })();
   </script>
