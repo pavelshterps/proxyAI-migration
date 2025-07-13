@@ -66,21 +66,27 @@ def preload_and_warmup(**kwargs):
             if settings.WHISPER_LANGUAGE:
                 opts["language"] = settings.WHISPER_LANGUAGE
             get_whisper_model().transcribe(str(sample), **opts)
-        except: pass
+        except:
+            pass
     else:
-        try: get_vad().apply({"audio": str(sample)})
-        except: pass
-        try: get_clustering_diarizer().apply({"audio": str(sample)})
-        except: pass
+        try:
+            get_vad().apply({"audio": str(sample)})
+        except:
+            pass
+        try:
+            get_clustering_diarizer().apply({"audio": str(sample)})
+        except:
+            pass
 
-@app.task(bind=True, name="tasks.download_audio", queue="preprocess_gpu")
+# Все задачи пре-обработки переводим в очередь "transcribe_gpu"
+@app.task(bind=True, name="tasks.download_audio", queue="transcribe_gpu")
 def download_audio(self, upload_id: str, correlation_id: str):
     logger.info(f"[{correlation_id}] download_audio noop for {upload_id}")
 
-@app.task(bind=True, name="tasks.preview_transcribe", queue="preprocess_gpu")
+@app.task(bind=True, name="tasks.preview_transcribe", queue="transcribe_gpu")
 def preview_transcribe(self, upload_id: str, correlation_id: str):
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
-    # convert
+    # конвертация в WAV
     src = next(Path(settings.UPLOAD_FOLDER).glob(f"{upload_id}.*"), None)
     wav = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
     try:
@@ -110,12 +116,13 @@ def preview_transcribe(self, upload_id: str, correlation_id: str):
     for cb in json.loads(r.get(f"callbacks:{upload_id}") or "[]"):
         try:
             requests.post(cb, json={"event": "preview_complete", "external_id": upload_id}, timeout=5)
-        except: pass
+        except:
+            pass
 
-    # next
+    # переход к транскрипции сегментов
     transcribe_segments.delay(upload_id, correlation_id)
 
-@app.task(bind=True, name="tasks.transcribe_segments", queue="preprocess_gpu")
+@app.task(bind=True, name="tasks.transcribe_segments", queue="transcribe_gpu")
 def transcribe_segments(self, upload_id: str, correlation_id: str):
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
     wav = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
@@ -126,7 +133,10 @@ def transcribe_segments(self, upload_id: str, correlation_id: str):
     out = [{"start": s.start, "end": s.end, "text": s.text} for s in segs]
     d = Path(settings.RESULTS_FOLDER) / upload_id
     d.mkdir(exist_ok=True, parents=True)
-    (d / "transcript.json").write_text(json.dumps(out, indent=2, ensure_ascii=False), encoding="utf-8")
+    (d / "transcript.json").write_text(
+        json.dumps(out, indent=2, ensure_ascii=False),
+        encoding="utf-8"
+    )
 
     state = {"status": "transcript_done", "preview": None}
     r.set(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
@@ -134,23 +144,31 @@ def transcribe_segments(self, upload_id: str, correlation_id: str):
 
     for cb in json.loads(r.get(f"callbacks:{upload_id}") or "[]"):
         try:
-            requests.post(cb, json={"event": "transcript_complete","external_id": upload_id}, timeout=5)
-        except: pass
+            requests.post(cb, json={"event": "transcript_complete", "external_id": upload_id}, timeout=5)
+        except:
+            pass
 
+    # запустить diarization, если запрошено
     if r.get(f"diarize_requested:{upload_id}") == "1":
         diarize_full.delay(upload_id, correlation_id)
 
-@app.task(bind=True, name="tasks.diarize_full", queue="preprocess_gpu")
+# diarize_full оставляем в отдельной GPU-очереди
+@app.task(bind=True, name="tasks.diarize_full", queue="diarize_gpu")
 def diarize_full(self, upload_id: str, correlation_id: str):
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
     wav = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
     ann = get_clustering_diarizer().apply({"audio": str(wav)})
 
-    segs = [{"start": float(seg.start), "end": float(seg.end), "speaker": spk}
-            for seg, _, spk in ann.itertracks(yield_label=True)]
+    segs = [
+        {"start": float(seg.start), "end": float(seg.end), "speaker": spk}
+        for seg, _, spk in ann.itertracks(yield_label=True)
+    ]
     d = Path(settings.RESULTS_FOLDER) / upload_id
     d.mkdir(exist_ok=True, parents=True)
-    (d / "diarization.json").write_text(json.dumps(segs, indent=2, ensure_ascii=False), encoding="utf-8")
+    (d / "diarization.json").write_text(
+        json.dumps(segs, indent=2, ensure_ascii=False),
+        encoding="utf-8"
+    )
 
     state = {"status": "diarization_done", "preview": None}
     r.set(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
@@ -158,10 +176,12 @@ def diarize_full(self, upload_id: str, correlation_id: str):
 
     for cb in json.loads(r.get(f"callbacks:{upload_id}") or "[]"):
         try:
-            requests.post(cb, json={"event": "diarization_complete","external_id": upload_id}, timeout=5)
-        except: pass
+            requests.post(cb, json={"event": "diarization_complete", "external_id": upload_id}, timeout=5)
+        except:
+            pass
 
-@app.task(name="tasks.cleanup_old_uploads")
+# очистка старых файлов оставляем без очереди
+@app.task(name="tasks.cleanup_old_uploads", queue="cleanup")
 def cleanup_old_uploads():
     cutoff = time.time() - settings.FILE_RETENTION_DAYS * 86400
     for f in Path(settings.UPLOAD_FOLDER).iterdir():
