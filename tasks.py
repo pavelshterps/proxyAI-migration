@@ -23,38 +23,46 @@ _clustering_diarizer = None
 def get_whisper_model():
     """
     Ленивая инициализация WhisperModel.
-    Используем только локальный кеш (/hf_cache), без онлайновых загрузок.
+    - cache_dir берём из env: /hf_cache
+    - local_files_only=True для CPU, False для GPU (чтобы при необходимости скачать)
     """
     global _whisper_model
     if _whisper_model is None:
         model_id = settings.WHISPER_MODEL_PATH
         cache_dir = settings.HUGGINGFACE_CACHE_DIR
-        logger.info(f"Initializing WhisperModel: model={model_id}, cache_dir={cache_dir}")
-
-        # проверяем, что модель в кеше, иначе выдаём ошибку
-        try:
-            download_model(model_id, cache_dir=cache_dir, local_files_only=True)
-            logger.info(f"Whisper model '{model_id}' found in local cache")
-        except Exception as e:
-            logger.error(f"Whisper model '{model_id}' not in cache '{cache_dir}': {e}")
-            raise RuntimeError(
-                f"Whisper model '{model_id}' missing from local cache '{cache_dir}'"
-            )
-
-        # на CPU float16 не поддерживается
         device = settings.WHISPER_DEVICE.lower()
+        # на CPU не можем скачивать онлайн, на GPU — можем
+        local_only = (device == "cpu")
+
+        logger.info(f"Initializing WhisperModel: model={model_id}, cache_dir={cache_dir}, "
+                    f"device={device}, local_only={local_only}")
+
+        # Проверяем, есть ли модель в кеше
+        try:
+            download_model(model_id, cache_dir=cache_dir, local_files_only=local_only)
+            logger.info(f"Whisper model '{model_id}' found in cache")
+        except Exception as e:
+            if local_only:
+                # на CPU без онлайн-загрузки — это ошибка
+                logger.error(f"Model '{model_id}' missing from cache and download disabled: {e}")
+                raise RuntimeError(f"Whisper model '{model_id}' not in local cache '{cache_dir}'")
+            else:
+                # на GPU — просто залогируем, дальше модель сама её скачает
+                logger.warning(f"Model '{model_id}' not in cache, will download online: {e}")
+
+        # Выбираем compute_type, на CPU запрещаем float16/fp16
         compute = getattr(settings, "WHISPER_COMPUTE_TYPE", "int8").lower()
         if device == "cpu" and compute in ("float16", "fp16"):
-            logger.warning("FP16 unsupported on CPU, switching to int8")
+            logger.warning("FP16 не поддерживается на CPU, переключаем на int8")
             compute = "int8"
 
-        # создаём модель из кеша
+        # Создаём модель; на GPU local_files_only=False по умолчанию
         _whisper_model = WhisperModel(
             model_id,
             device=device,
             compute_type=compute,
             cache_dir=cache_dir,
-            local_files_only=True,
+            local_files_only=local_only,
         )
         logger.info("WhisperModel loaded successfully")
 
@@ -62,7 +70,7 @@ def get_whisper_model():
 
 def get_vad():
     """
-    Ленивая инициализация Voice Activity Detection (pyannote).
+    Ленивая инициализация VAD-модели (pyannote.audio).
     """
     global _vad
     if _vad is None:
@@ -76,7 +84,7 @@ def get_vad():
 
 def get_clustering_diarizer():
     """
-    Ленивая инициализация Speaker Diarization (pyannote).
+    Ленивая инициализация SpeakerDiarization (pyannote.audio).
     """
     global _clustering_diarizer
     if _clustering_diarizer is None:
@@ -92,18 +100,23 @@ def get_clustering_diarizer():
 @worker_process_init.connect
 def preload_and_warmup(**kwargs):
     """
-    Warm-up моделей при старте воркера (ускоряет первый запрос).
+    Warm-up моделей при старте воркера:
+    - WhisperModel.transcribe на небольшой sample.wav под любым устройством
+    - VAD и Diarizer для GPU-режима
     """
     sample = Path(__file__).parent / "tests/fixtures/sample.wav"
     try:
-        if settings.WHISPER_DEVICE.lower() == "cpu":
-            opts = {"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {}
-            get_whisper_model().transcribe(str(sample), **opts)
-        else:
+        # всегда прогреваем WhisperModel (и на GPU, и на CPU)
+        opts = {"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {}
+        get_whisper_model().transcribe(str(sample), **opts)
+        logger.info("Whisper warm-up completed")
+        # если GPU — дополнительно прогреваем VAD + Diarizer
+        if settings.WHISPER_DEVICE.lower() != "cpu":
             get_vad().apply({"audio": str(sample)})
             get_clustering_diarizer().apply({"audio": str(sample)})
-        logger.info("Warm-up completed successfully")
+            logger.info("VAD+Diarizer warm-up completed")
     except Exception as e:
+        # не фейлим воркер — просто логируем
         logger.warning(f"Warm-up failed: {e!r}")
 
 @celery_app.task(bind=True, name="tasks.download_audio", queue="transcribe_gpu")
@@ -182,7 +195,10 @@ def transcribe_segments(self, upload_id: str, correlation_id: str):
 
     for cb in json.loads(r.get(f"callbacks:{upload_id}") or "[]"):
         try:
-            requests.post(cb, json={"event": "transcript_complete", "external_id": upload_id}, timeout=5)
+            requests.post(cb,
+                json={"event": "transcript_complete", "external_id": upload_id},
+                timeout=5
+            )
         except Exception:
             pass
 
@@ -218,14 +234,17 @@ def diarize_full(self, upload_id: str, correlation_id: str):
 
     for cb in json.loads(r.get(f"callbacks:{upload_id}") or "[]"):
         try:
-            requests.post(cb, json={"event": "diarization_complete", "external_id": upload_id}, timeout=5)
+            requests.post(cb,
+                json={"event":"diarization_complete","external_id":upload_id},
+                timeout=5
+            )
         except Exception:
             pass
 
 @celery_app.task(name="tasks.cleanup_old_uploads", queue="cleanup")
 def cleanup_old_uploads():
     """
-    Удаляем устаревшие файлы старше FILE_RETENTION_DAYS.
+    Удаляем файлы старше FILE_RETENTION_DAYS.
     """
     cutoff = time.time() - settings.FILE_RETENTION_DAYS * 86400
     for f in Path(settings.UPLOAD_FOLDER).iterdir():
