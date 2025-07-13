@@ -11,8 +11,7 @@ from pyannote.audio.pipelines import VoiceActivityDetection, SpeakerDiarization
 from redis import Redis
 
 from config.settings import settings
-# Import the renamed Celery instance
-from config.celery import celery_app
+from config.celery import celery_app        # <— renamed instance
 from utils.audio import convert_to_wav
 
 logger = logging.getLogger(__name__)
@@ -144,6 +143,7 @@ def transcribe_segments(self, upload_id: str, correlation_id: str):
     r.set(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
     r.publish(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
 
+    # callbacks
     for cb in json.loads(r.get(f"callbacks:{upload_id}") or "[]"):
         try:
             requests.post(cb, json={"event": "transcript_complete", "external_id": upload_id}, timeout=5)
@@ -177,6 +177,7 @@ def diarize_full(self, upload_id: str, correlation_id: str):
     r.set(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
     r.publish(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
 
+    # callbacks
     for cb in json.loads(r.get(f"callbacks:{upload_id}") or "[]"):
         try:
             requests.post(cb, json={"event": "diarization_complete", "external_id": upload_id}, timeout=5)
