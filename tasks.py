@@ -11,7 +11,8 @@ from pyannote.audio.pipelines import VoiceActivityDetection, SpeakerDiarization
 from redis import Redis
 
 from config.settings import settings
-from config.celery import app
+# Import the renamed Celery instance
+from config.celery import celery_app
 from utils.audio import convert_to_wav
 
 logger = logging.getLogger(__name__)
@@ -78,15 +79,16 @@ def preload_and_warmup(**kwargs):
         except:
             pass
 
-# Все задачи пре-обработки переводим в очередь "transcribe_gpu"
-@app.task(bind=True, name="tasks.download_audio", queue="transcribe_gpu")
+# === All pre-processing tasks now use the "transcribe_gpu" queue ===
+
+@celery_app.task(bind=True, name="tasks.download_audio", queue="transcribe_gpu")
 def download_audio(self, upload_id: str, correlation_id: str):
     logger.info(f"[{correlation_id}] download_audio noop for {upload_id}")
 
-@app.task(bind=True, name="tasks.preview_transcribe", queue="transcribe_gpu")
+@celery_app.task(bind=True, name="tasks.preview_transcribe", queue="transcribe_gpu")
 def preview_transcribe(self, upload_id: str, correlation_id: str):
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
-    # конвертация в WAV
+    # convert to WAV
     src = next(Path(settings.UPLOAD_FOLDER).glob(f"{upload_id}.*"), None)
     wav = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
     try:
@@ -106,7 +108,7 @@ def preview_transcribe(self, upload_id: str, correlation_id: str):
         preview["text"] += s.text
         preview["timestamps"].append({"start": s.start, "end": s.end, "text": s.text})
 
-    # store & broadcast
+    # store & broadcast preview
     r.set(f"preview_result:{upload_id}", json.dumps(preview, ensure_ascii=False))
     state = {"status": "preview_done", "preview": preview}
     r.set(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
@@ -119,10 +121,10 @@ def preview_transcribe(self, upload_id: str, correlation_id: str):
         except:
             pass
 
-    # переход к транскрипции сегментов
+    # next: full transcript
     transcribe_segments.delay(upload_id, correlation_id)
 
-@app.task(bind=True, name="tasks.transcribe_segments", queue="transcribe_gpu")
+@celery_app.task(bind=True, name="tasks.transcribe_segments", queue="transcribe_gpu")
 def transcribe_segments(self, upload_id: str, correlation_id: str):
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
     wav = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
@@ -148,12 +150,13 @@ def transcribe_segments(self, upload_id: str, correlation_id: str):
         except:
             pass
 
-    # запустить diarization, если запрошено
+    # trigger diarization if requested
     if r.get(f"diarize_requested:{upload_id}") == "1":
         diarize_full.delay(upload_id, correlation_id)
 
-# diarize_full оставляем в отдельной GPU-очереди
-@app.task(bind=True, name="tasks.diarize_full", queue="diarize_gpu")
+# === Diarization remains on its own GPU queue ===
+
+@celery_app.task(bind=True, name="tasks.diarize_full", queue="diarize_gpu")
 def diarize_full(self, upload_id: str, correlation_id: str):
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
     wav = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
@@ -180,8 +183,9 @@ def diarize_full(self, upload_id: str, correlation_id: str):
         except:
             pass
 
-# очистка старых файлов оставляем без очереди
-@app.task(name="tasks.cleanup_old_uploads", queue="cleanup")
+# === Cleanup task on its own lightweight queue ===
+
+@celery_app.task(name="tasks.cleanup_old_uploads", queue="cleanup")
 def cleanup_old_uploads():
     cutoff = time.time() - settings.FILE_RETENTION_DAYS * 86400
     for f in Path(settings.UPLOAD_FOLDER).iterdir():

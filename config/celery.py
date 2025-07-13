@@ -1,15 +1,17 @@
 from celery import Celery
 from config.settings import settings
 
-app = Celery(
+# Rename the Celery instance to avoid colliding with FastAPI's `app`
+celery_app = Celery(
     'proxyai',
     broker=settings.CELERY_BROKER_URL,
     backend=settings.CELERY_RESULT_BACKEND,
     timezone=settings.CELERY_TIMEZONE,
-    include=['tasks']
+    include=['tasks'],
 )
 
-app.conf.update(
+# Keep your existing Celery configuration
+celery_app.conf.update(
     task_serializer='json',
     accept_content=['json'],
     result_serializer='json',
