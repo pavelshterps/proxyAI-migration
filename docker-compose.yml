@@ -43,7 +43,8 @@ services:
     container_name: proxyai_api
     env_file: .env
     command: >
-      uvicorn main:app --host 0.0.0.0 --port 8000 --workers ${API_WORKERS}
+      sh -c "until nc -z db 5432; do echo waiting for db; sleep 1; done;
+             uvicorn main:app --host 0.0.0.0 --port 8000 --workers ${API_WORKERS}"
     environment:
       - DATABASE_URL=${DATABASE_URL}
       - CELERY_BROKER_URL=${CELERY_BROKER_URL}
@@ -58,10 +59,8 @@ services:
     ports:
       - "8000:8000"
     depends_on:
-      db:
-        condition: service_healthy
-      redis:
-        condition: service_started
+      - db
+      - redis
     networks:
       - proxyai_net
 
