@@ -31,7 +31,7 @@ from routes import router as api_router
 from admin_routes import router as admin_router
 from tasks import download_audio, preview_transcribe, transcribe_segments, diarize_full
 
-# fastapi lifespan retry for DB migrations
+# FastAPI lifespan with retry on DB init
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     for _ in range(5):
@@ -47,7 +47,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="proxyAI", version=settings.APP_VERSION, lifespan=lifespan)
 
-# structlog
+# structlog setup
 structlog.configure(
     processors=[
         structlog.processors.add_log_level,
@@ -75,7 +75,7 @@ app.add_middleware(
     allowed_hosts=["127.0.0.1", "localhost"] + settings.ALLOWED_ORIGINS_LIST
 )
 
-# ensure upload/result dirs
+# Ensure upload/result/diarizer dirs exist
 for d in (settings.UPLOAD_FOLDER, settings.RESULTS_FOLDER, settings.DIARIZER_CACHE_DIR):
     Path(d).mkdir(parents=True, exist_ok=True)
 
@@ -113,7 +113,127 @@ async def metrics_endpoint(request: Request):
 async def root():
     return FileResponse("static/index.html")
 
-# ... your existing upload / events / results / label routes unchanged ...
+# === Upload / Events / Results / Labels routes ===
+
+@app.post("/upload/", dependencies=[Depends(get_current_user)])
+@limiter.limit("10/minute")
+async def upload(
+    request: Request,
+    file: UploadFile = File(...),
+    x_correlation_id: str | None = Header(None),
+    current_user=Depends(get_current_user),
+    db=Depends(get_db),
+):
+    cid = x_correlation_id or str(uuid.uuid4().hex)
+    data = await file.read()
+    if not data:
+        raise HTTPException(400, "File is empty")
+    ext = Path(file.filename).suffix or ""
+    upload_id = uuid.uuid4().hex
+    dest = Path(settings.UPLOAD_FOLDER) / f"{upload_id}{ext}"
+    dest.write_bytes(data)
+
+    try:
+        await create_upload_record(db, current_user.id, upload_id)
+    except Exception:
+        log.warning("Failed to create upload record", upload_id=upload_id)
+
+    log.bind(correlation_id=cid, upload_id=upload_id, user_id=current_user.id).info("upload accepted")
+    await redis.set(f"external:{upload_id}", upload_id)
+
+    # start processing chain
+    download_audio.delay(upload_id, cid)
+    preview_transcribe.delay(upload_id, cid)
+    transcribe_segments.delay(upload_id, cid)
+
+    # init progress
+    state = {"status": "started", "preview": None}
+    await redis.set(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
+    await redis.publish(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
+
+    return JSONResponse(
+        {"upload_id": upload_id, "external_id": upload_id},
+        headers={"X-Correlation-ID": cid}
+    )
+
+@app.get("/events/{upload_id}")
+async def progress_events(upload_id: str):
+    async def generator():
+        pubsub = redis.pubsub()
+        await pubsub.subscribe(f"progress:{upload_id}")
+        try:
+            while True:
+                msg = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
+                if msg and msg["type"] == "message":
+                    yield f"data: {msg['data']}\n\n"
+                await asyncio.sleep(0.1)
+        finally:
+            await pubsub.unsubscribe(f"progress:{upload_id}")
+    return EventSourceResponse(generator())
+
+@app.get("/status/{upload_id}", summary="Check processing status")
+async def get_status(upload_id: str, current_user=Depends(get_current_user)):
+    raw = await redis.get(f"progress:{upload_id}") or "{}"
+    return json.loads(raw)
+
+@app.get("/results/{upload_id}", summary="Get preview, transcript or diarization")
+async def get_results(upload_id: str, current_user=Depends(get_current_user), db=Depends(get_db)):
+    # 1) preview
+    pd = await redis.get(f"preview_result:{upload_id}")
+    if pd:
+        pl = json.loads(pd)
+        return JSONResponse(content={"results": pl["timestamps"], "text": pl["text"]})
+    # 2) full transcript
+    tp = Path(settings.RESULTS_FOLDER) / upload_id / "transcript.json"
+    if tp.exists():
+        data = json.loads(tp.read_text(encoding="utf-8"))
+        return JSONResponse(content={"results": data})
+    # 3) diarization + mapping
+    dp = Path(settings.RESULTS_FOLDER) / upload_id / "diarization.json"
+    if dp.exists():
+        segs = json.loads(dp.read_text(encoding="utf-8"))
+        rec = await get_upload_for_user(db, current_user.id, upload_id)
+        mapping = rec.label_mapping or {}
+        for s in segs:
+            s["speaker"] = mapping.get(str(s["speaker"]), s["speaker"])
+        return JSONResponse(content={"results": segs})
+    raise HTTPException(404, "Results not ready")
+
+@app.post("/diarize/{upload_id}", summary="Request diarization")
+async def request_diarization(upload_id: str, current_user=Depends(get_current_user)):
+    await redis.set(f"diarize_requested:{upload_id}", "1")
+    state = json.loads(await redis.get(f"progress:{upload_id}") or "{}")
+    state["diarize_requested"] = True
+    await redis.set(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
+    await redis.publish(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
+
+    diarize_full.delay(upload_id, None)
+    return JSONResponse({"message": "diarization started"})
+
+@app.post("/labels/{upload_id}", summary="Save speaker labels")
+async def save_labels(
+    upload_id: str,
+    mapping: dict = Body(...),
+    current_user=Depends(get_current_user),
+    db=Depends(get_db),
+):
+    rec = await get_upload_for_user(db, current_user.id, upload_id)
+    rec.label_mapping = mapping
+    await db.commit()
+
+    out = Path(settings.RESULTS_FOLDER) / upload_id / "diarization.json"
+    updated = []
+    if out.exists():
+        segs = json.loads(out.read_text(encoding="utf-8"))
+        updated = [
+            {"start": s["start"], "end": s["end"], "speaker": mapping.get(str(s["speaker"]), s["speaker"])}
+            for s in segs
+        ]
+        out.write_text(json.dumps(updated, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    return JSONResponse({"results": updated})
+
+# End of existing routes
 
 app.include_router(api_router, tags=["proxyAI"])
 app.include_router(admin_router)
