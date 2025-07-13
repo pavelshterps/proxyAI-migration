@@ -30,7 +30,7 @@ from dependencies import get_current_user
 from routes import router as api_router
 from admin_routes import router as admin_router
 
-# Теперь в tasks гарантированно есть все 4 таски:
+# импортируем все 4 таски, чтобы .delay(...) не падал
 from tasks import download_audio, preview_transcribe, transcribe_segments, diarize_full
 
 # === Application lifecycle & retry on DB init ===
@@ -51,7 +51,6 @@ async def lifespan(app: FastAPI):
 # === FastAPI & middleware setup ===
 app = FastAPI(title="proxyAI", version=settings.APP_VERSION, lifespan=lifespan)
 
-# structlog
 structlog.configure(
     processors=[
         structlog.processors.add_log_level,
@@ -134,8 +133,8 @@ async def root():
     log.debug("Serving index.html")
     return FileResponse("static/index.html")
 
+
 # === Upload endpoint ===
-# Регистрация сразу двух роутов, чтобы работали и "/upload" и "/upload/"
 @app.post("/upload", dependencies=[Depends(get_current_user)])
 @app.post("/upload/", dependencies=[Depends(get_current_user)])
 @limiter.limit("10/minute")
@@ -199,6 +198,7 @@ async def upload(
         headers={"X-Correlation-ID":cid}
     )
 
+
 # === Server-Sent Events for progress ===
 @app.get("/events/{upload_id}")
 async def progress_events(
@@ -240,8 +240,9 @@ async def progress_events(
 
     return EventSourceResponse(generator())
 
+
 # === Results endpoint ===
-@app.get("/results/{upload_id}", summary="Get preview, transcript or diarization")
+@app.get("/results/{upload_id}", summary="Get preview, transcript and speaker labels")
 async def get_results(
     upload_id: str,
     current_user=Depends(get_current_user),
@@ -249,33 +250,55 @@ async def get_results(
 ):
     log.info("Get results called", upload_id=upload_id, user_id=current_user.id)
 
-    # 1) preview
-    pd = await redis.get(f"preview_result:{upload_id}")
-    if pd:
-        pl = json.loads(pd)
-        log.info("Returning preview from Redis", upload_id=upload_id, segments=len(pl["timestamps"]))
+    base = Path(settings.RESULTS_FOLDER) / upload_id
+
+    # 1) preview (если ещё нет ни транскрипта, ни диаризации)
+    preview_file = base / "preview.json"
+    if preview_file.exists():
+        pl = json.loads(preview_file.read_text(encoding="utf-8"))
         return JSONResponse(content={"results": pl["timestamps"], "text": pl["text"]})
 
-    # 2) full transcript
-    tp = Path(settings.RESULTS_FOLDER) / upload_id / "transcript.json"
-    if tp.exists():
-        data = json.loads(tp.read_text(encoding="utf-8"))
-        log.info("Returning full transcript file", upload_id=upload_id, path=str(tp), segments=len(data))
-        return JSONResponse(content={"results": data})
+    # 2) полная транскрипция (обязательно читаем transcript.json)
+    tp = base / "transcript.json"
+    if not tp.exists():
+        log.warning("Results not ready", upload_id=upload_id)
+        raise HTTPException(404, "Results not ready")
 
-    # 3) diarization + user mapping
-    dp = Path(settings.RESULTS_FOLDER) / upload_id / "diarization.json"
+    transcript = json.loads(tp.read_text(encoding="utf-8"))
+
+    # 3) если есть результат диаризации — объединяем
+    dp = base / "diarization.json"
     if dp.exists():
-        segs = json.loads(dp.read_text(encoding="utf-8"))
-        rec = await get_upload_for_user(db, current_user.id, upload_id)
-        mapping = rec.label_mapping or {}
-        for s in segs:
-            s["speaker"] = mapping.get(str(s["speaker"]), s["speaker"])
-        log.info("Returning diarization", upload_id=upload_id, segments=len(segs))
-        return JSONResponse(content={"results": segs})
+        diar = json.loads(dp.read_text(encoding="utf-8"))
 
-    log.warning("Results not ready", upload_id=upload_id)
-    raise HTTPException(404, "Results not ready")
+        # применяем пользовательские метки
+        rec = await get_upload_for_user(db, current_user.id, upload_id)
+        label_map = rec.label_mapping or {}
+        for seg in diar:
+            seg["speaker"] = label_map.get(str(seg["speaker"]), seg["speaker"])
+
+        # джойним транскрипт и диаризацию
+        merged = []
+        for seg in transcript:
+            spk = next(
+                (d["speaker"] for d in diar
+                 if d["start"] <= seg["start"] < d["end"]),
+                None
+            )
+            merged.append({
+                "start":   seg["start"],
+                "end":     seg["end"],
+                "text":    seg["text"],
+                "speaker": spk
+            })
+
+        log.info("Returning merged transcript + speakers", upload_id=upload_id, segments=len(merged))
+        return JSONResponse(content={"results": merged})
+
+    # 4) диаризации нет — возвращаем чистый текст
+    log.info("Returning transcript only", upload_id=upload_id, segments=len(transcript))
+    return JSONResponse(content={"results": transcript})
+
 
 # === Trigger diarization manually ===
 @app.post("/diarize/{upload_id}", summary="Request diarization")
@@ -299,6 +322,7 @@ async def request_diarization(
         log.error("Failed to launch diarization", upload_id=upload_id, error=str(e))
         raise HTTPException(500, f"Diarize launch failed: {e}")
 
+
 # === Save speaker labels ===
 @app.post("/labels/{upload_id}", summary="Save speaker labels")
 async def save_labels(
@@ -308,28 +332,41 @@ async def save_labels(
     db=Depends(get_db)
 ):
     log.info("Save labels called", upload_id=upload_id, user_id=current_user.id, mapping=mapping)
+
     rec = await get_upload_for_user(db, current_user.id, upload_id)
     if not rec:
         log.error("Upload not found for saving labels", upload_id=upload_id, user_id=current_user.id)
         raise HTTPException(404, "upload_id not found")
 
+    # сохраняем в БД
     rec.label_mapping = mapping
     await db.commit()
     log.debug("Updated label_mapping in DB", upload_id=upload_id)
 
-    out = Path(settings.RESULTS_FOLDER) / upload_id / "diarization.json"
+    # обновляем локальный файл diarization.json, чтобы мгновенно вернуть UI
+    base = Path(settings.RESULTS_FOLDER) / upload_id
+    dfile = base / "diarization.json"
     updated = []
-    if out.exists():
-        segs = json.loads(out.read_text(encoding="utf-8"))
-        for s in segs:
-            new_spk = mapping.get(str(s["speaker"]), s["speaker"])
-            updated.append({"start": s["start"], "end": s["end"], "speaker": new_spk})
-        out.write_text(json.dumps(updated, ensure_ascii=False, indent=2), encoding="utf-8")
-        log.info("Rewrote diarization.json with new labels", path=str(out), segments=len(updated))
+    if dfile.exists():
+        diar = json.loads(dfile.read_text(encoding="utf-8"))
+        for seg in diar:
+            new_spk = mapping.get(str(seg["speaker"]), seg["speaker"])
+            updated.append({
+                "start": seg["start"],
+                "end":   seg["end"],
+                "speaker": new_spk
+            })
+        dfile.write_text(
+            json.dumps(updated, ensure_ascii=False, indent=2),
+            encoding="utf-8"
+        )
+        log.info("Rewrote diarization.json with new labels", path=str(dfile), segments=len(updated))
     else:
-        log.warning("Diarization file not found for updating labels", path=str(out))
+        log.warning("Diarization file not found for updating labels", path=str(dfile))
 
-    return JSONResponse({"results": updated})
+    # вернём обновлённые сегменты сразу в UI
+    return JSONResponse(content={"results": updated})
+
 
 # === Include routers & mount static ===
 app.include_router(api_router, tags=["proxyAI"])
