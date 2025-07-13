@@ -32,7 +32,7 @@ def get_whisper_model():
 
         # Сначала пытаемся загрузить локально
         try:
-            download_model(model_id, cache_dir=cache, local_files_only=True)
+            download_model(model_id, cache_dir=cache, local_files_only=False)
             logger.info(f"Loaded Whisper model '{model_id}' from local cache")
         except Exception:
             logger.info("Локальная модель не найдена, пробуем скачать из HuggingFace")
@@ -49,7 +49,7 @@ def get_whisper_model():
             device=device,
             compute_type=compute,
             cache_dir=cache,
-            local_files_only=True   # использовать только локальные файлы
+            local_files_only=False   # использовать только локальные файлы
         )
     return _whisper_model
 
