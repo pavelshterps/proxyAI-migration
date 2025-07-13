@@ -43,7 +43,7 @@
   <button id="saveLabelsBtn" disabled>Сохранить метки спикеров</button>
 
   <script>
-  (async function(){
+  (function(){
     const apiKeyEl      = document.getElementById('apiKey');
     const fileEl        = document.getElementById('audioFile');
     const uploadBtn     = document.getElementById('uploadBtn');
@@ -92,16 +92,37 @@
       [previewBtn, transcriptBtn, diarizeBtn, saveBtn].forEach(b=>b.disabled=true);
       container.innerHTML="";
 
-      // 2) SSE: передаём ключ через query-param (EventSource не позволяет заголовки)
+      // 2) SSE (ключ передаём в query)
       const sseUrl = `/events/${uploadId}?api_key=${encodeURIComponent(key)}`;
       const es = new EventSource(sseUrl);
 
       es.onopen = () => console.log("SSE: connected", sseUrl);
       es.onerror = e => console.error("SSE: error", e);
 
-      es.onmessage = async e => {
-        console.log("SSE ▶", e.data);
-        const st = JSON.parse(e.data);
+      // Обработка сообщений — НЕ async, чтобы легко отлавливать синхронные ошибки
+      es.onmessage = e => {
+        let raw = e.data;
+        console.log("SSE ▶ raw:", raw);
+
+        // фильтр «ping» или пустых строк
+        if(!raw || raw.trim()==="") {
+          console.debug("SSE ▶ heartbeat/ping — skip");
+          return;
+        }
+
+        // отрезаем лишний префикс, если вдруг приходит "data: {...}"
+        if(raw.startsWith("data:")) {
+          raw = raw.replace(/^data:\s*/, "");
+        }
+
+        let st;
+        try {
+          st = JSON.parse(raw);
+        } catch(err) {
+          console.warn("SSE parse failed, skip:", err, raw);
+          return;
+        }
+
         statusEl.textContent = `Статус: ${st.status}`;
 
         // preview
@@ -118,7 +139,7 @@
           timingsEl.innerHTML += `<div>Transcript done in ${((performance.now() - tUpload)/1000).toFixed(2)}s</div>`;
           transcriptBtn.disabled = false;
           diarizeBtn.disabled = false;
-          await loadTranscript();
+          loadTranscript().catch(console.error);
         }
 
         // diarization
@@ -126,7 +147,7 @@
           diarizeDone = true;
           timingsEl.innerHTML += `<div>Diarization done in ${((performance.now() - tUpload)/1000).toFixed(2)}s</div>`;
           saveBtn.disabled = false;
-          await loadTranscript();
+          loadTranscript().catch(console.error);
           es.close();
         }
       };
@@ -140,13 +161,14 @@
       const res = await fetch(`/results/${uploadId}`, {
         headers:{ "X-API-Key": key }
       });
+      if(!res.ok){ throw new Error("results fetch "+res.status); }
       const { results } = await res.json();
       render(results);
       statusEl.textContent="Готово";
     }
 
-    previewBtn.onclick    = () => {};  // noop (рендер через SSE)
-    transcriptBtn.onclick = loadTranscript;
+    previewBtn.onclick    = () => {};  // noop
+    transcriptBtn.onclick = () => loadTranscript().catch(console.error);
     diarizeBtn.onclick    = async () => {
       statusEl.textContent="Запрашиваем диаризацию…";
       await fetch(`/diarize/${uploadId}`, {
