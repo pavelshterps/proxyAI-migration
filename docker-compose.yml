@@ -1,29 +1,21 @@
 version: '3.8'
 
 services:
-  # ========== Postgres ==========
   db:
     image: postgres:14-alpine
     container_name: proxyai_db
     env_file: .env
     environment:
-      POSTGRES_DB:       ${POSTGRES_DB}
-      POSTGRES_USER:     ${POSTGRES_USER}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
     volumes:
       - postgres_data:/var/lib/postgresql/data
     ports:
       - "5432:5432"
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 5s
     networks:
       - proxyai_net
 
-  # ========== Redis ==========
   redis:
     image: redis:7-alpine
     container_name: proxyai_redis
@@ -35,14 +27,13 @@ services:
     networks:
       - proxyai_net
 
-  # ========== FastAPI API ==========
   api:
     build:
       context: .
       dockerfile: Dockerfile
     container_name: proxyai_api
     env_file: .env
-    command: >
+    command: >-
       sh -c "until nc -z db 5432; do echo waiting for db; sleep 1; done;
              uvicorn main:app --host 0.0.0.0 --port 8000 --workers ${API_WORKERS}"
     environment:
@@ -51,11 +42,13 @@ services:
       - UPLOAD_FOLDER=${UPLOAD_FOLDER}
       - RESULTS_FOLDER=${RESULTS_FOLDER}
       - DIARIZER_CACHE_DIR=${DIARIZER_CACHE_DIR}
+      - HUGGINGFACE_CACHE_DIR=${HUGGINGFACE_CACHE_DIR}
     volumes:
       - ./:/app:delegated
       - upload_data:${UPLOAD_FOLDER}
       - results_data:${RESULTS_FOLDER}
       - diarizer_cache:${DIARIZER_CACHE_DIR}
+      - hf_cache:${HUGGINGFACE_CACHE_DIR}
     ports:
       - "8000:8000"
     depends_on:
@@ -64,36 +57,33 @@ services:
     networks:
       - proxyai_net
 
-  # ========== CPU Worker ==========
   worker_cpu:
     build:
       context: .
       dockerfile: Dockerfile
     container_name: proxyai_worker_cpu
     env_file: .env
-    command: >
-      celery -A tasks worker
-      --loglevel=info
-      --concurrency ${CPU_CONCURRENCY}
-      --queues split_cpu,dispatch_cpu,collect_cpu
+    command: >-
+      celery -A tasks worker --loglevel=info --concurrency ${CPU_CONCURRENCY} --queues split_cpu,dispatch_cpu,collect_cpu
     environment:
       - CELERY_BROKER_URL=${CELERY_BROKER_URL}
       - UPLOAD_FOLDER=${UPLOAD_FOLDER}
       - RESULTS_FOLDER=${RESULTS_FOLDER}
       - DIARIZER_CACHE_DIR=${DIARIZER_CACHE_DIR}
       - WHISPER_DEVICE=cpu
+      - HUGGINGFACE_CACHE_DIR=${HUGGINGFACE_CACHE_DIR}
     volumes:
       - ./:/app:delegated
       - upload_data:${UPLOAD_FOLDER}
       - results_data:${RESULTS_FOLDER}
       - diarizer_cache:${DIARIZER_CACHE_DIR}:ro
+      - hf_cache:${HUGGINGFACE_CACHE_DIR}
     depends_on:
       - api
       - redis
     networks:
       - proxyai_net
 
-  # ========== GPU Worker ==========
   worker_gpu:
     build:
       context: .
@@ -101,11 +91,8 @@ services:
     container_name: proxyai_worker_gpu
     runtime: nvidia
     env_file: .env
-    command: >
-      celery -A tasks worker
-      --loglevel=info
-      --concurrency ${GPU_CONCURRENCY}
-      --queues transcribe_gpu,diarize_gpu
+    command: >-
+      celery -A tasks worker --loglevel=info --concurrency ${GPU_CONCURRENCY} --queues transcribe_gpu,diarize_gpu
     environment:
       - CELERY_BROKER_URL=${CELERY_BROKER_URL}
       - UPLOAD_FOLDER=${UPLOAD_FOLDER}
@@ -113,27 +100,26 @@ services:
       - DIARIZER_CACHE_DIR=${DIARIZER_CACHE_DIR}
       - WHISPER_DEVICE=cuda
       - NVIDIA_VISIBLE_DEVICES=all
+      - HUGGINGFACE_CACHE_DIR=${HUGGINGFACE_CACHE_DIR}
     volumes:
       - ./:/app:delegated
       - upload_data:${UPLOAD_FOLDER}
       - results_data:${RESULTS_FOLDER}
       - diarizer_cache:${DIARIZER_CACHE_DIR}
+      - hf_cache:${HUGGINGFACE_CACHE_DIR}
     depends_on:
       - api
       - redis
     networks:
       - proxyai_net
 
-  # ========== Celery Beat ==========
   beat:
     build:
       context: .
       dockerfile: Dockerfile
     container_name: proxyai_beat
     env_file: .env
-    command: >
-      celery -A tasks beat
-      --loglevel=info
+    command: celery -A tasks beat --loglevel=info
     environment:
       - CELERY_BROKER_URL=${CELERY_BROKER_URL}
     volumes:
@@ -143,16 +129,12 @@ services:
     networks:
       - proxyai_net
 
-  # ========== Flower UI ==========
   flower:
     image: mher/flower:0.9.7
     container_name: proxyai_flower
     env_file: .env
-    command: >
-      flower
-      --broker=${CELERY_BROKER_URL}
-      --basic_auth=${FLOWER_USER}:${FLOWER_PASS}
-      --port=5555
+    command: >-
+      flower --broker=${CELERY_BROKER_URL} --basic_auth=${FLOWER_USER}:${FLOWER_PASS} --port=5555
     ports:
       - "5555:5555"
     depends_on:
@@ -160,7 +142,6 @@ services:
     networks:
       - proxyai_net
 
-  # ===== Optional: Nginx Reverse Proxy =====
   nginx:
     image: nginx:stable-alpine
     container_name: proxyai_nginx
@@ -182,6 +163,7 @@ volumes:
   upload_data:
   results_data:
   diarizer_cache:
+  hf_cache:
 
 networks:
   proxyai_net:
