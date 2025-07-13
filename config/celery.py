@@ -1,7 +1,7 @@
 from celery import Celery
 from config.settings import settings
 
-# rename Celery instance so it doesn't override FastAPI's `app`
+# Переименовали экземпляр, чтобы не конфликтовал с FastAPI `app`
 celery_app = Celery(
     'proxyai',
     broker=settings.CELERY_BROKER_URL,
@@ -10,7 +10,7 @@ celery_app = Celery(
     include=['tasks'],
 )
 
-# preserve your existing broker/result configuration
+# Общая конфигурация Celery
 celery_app.conf.update(
     task_serializer='json',
     accept_content=['json'],

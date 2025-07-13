@@ -11,7 +11,8 @@ from pyannote.audio.pipelines import VoiceActivityDetection, SpeakerDiarization
 from redis import Redis
 
 from config.settings import settings
-from config.celery import celery_app        # <— renamed instance
+# Импортируем переименованный Celery-экземпляр
+from config.celery import celery_app
 from utils.audio import convert_to_wav
 
 logger = logging.getLogger(__name__)
@@ -78,7 +79,7 @@ def preload_and_warmup(**kwargs):
         except:
             pass
 
-# === All pre-processing tasks now use the "transcribe_gpu" queue ===
+# === Все пре-обработки ставим в очередь "transcribe_gpu" ===
 
 @celery_app.task(bind=True, name="tasks.download_audio", queue="transcribe_gpu")
 def download_audio(self, upload_id: str, correlation_id: str):
@@ -87,7 +88,7 @@ def download_audio(self, upload_id: str, correlation_id: str):
 @celery_app.task(bind=True, name="tasks.preview_transcribe", queue="transcribe_gpu")
 def preview_transcribe(self, upload_id: str, correlation_id: str):
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
-    # convert to WAV
+    # конвертация в WAV
     src = next(Path(settings.UPLOAD_FOLDER).glob(f"{upload_id}.*"), None)
     wav = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
     try:
@@ -107,7 +108,7 @@ def preview_transcribe(self, upload_id: str, correlation_id: str):
         preview["text"] += s.text
         preview["timestamps"].append({"start": s.start, "end": s.end, "text": s.text})
 
-    # store & broadcast preview
+    # store & broadcast
     r.set(f"preview_result:{upload_id}", json.dumps(preview, ensure_ascii=False))
     state = {"status": "preview_done", "preview": preview}
     r.set(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
@@ -120,7 +121,7 @@ def preview_transcribe(self, upload_id: str, correlation_id: str):
         except:
             pass
 
-    # next: full transcript
+    # переход к транскрипции сегментов
     transcribe_segments.delay(upload_id, correlation_id)
 
 @celery_app.task(bind=True, name="tasks.transcribe_segments", queue="transcribe_gpu")
@@ -143,18 +144,17 @@ def transcribe_segments(self, upload_id: str, correlation_id: str):
     r.set(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
     r.publish(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
 
-    # callbacks
     for cb in json.loads(r.get(f"callbacks:{upload_id}") or "[]"):
         try:
             requests.post(cb, json={"event": "transcript_complete", "external_id": upload_id}, timeout=5)
         except:
             pass
 
-    # trigger diarization if requested
+    # запустить diarization, если запрошено
     if r.get(f"diarize_requested:{upload_id}") == "1":
         diarize_full.delay(upload_id, correlation_id)
 
-# === Diarization remains on its own GPU queue ===
+# === Diarization остаётся в отдельной GPU-очереди ===
 
 @celery_app.task(bind=True, name="tasks.diarize_full", queue="diarize_gpu")
 def diarize_full(self, upload_id: str, correlation_id: str):
@@ -177,14 +177,13 @@ def diarize_full(self, upload_id: str, correlation_id: str):
     r.set(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
     r.publish(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
 
-    # callbacks
     for cb in json.loads(r.get(f"callbacks:{upload_id}") or "[]"):
         try:
             requests.post(cb, json={"event": "diarization_complete", "external_id": upload_id}, timeout=5)
         except:
             pass
 
-# === Cleanup task on its own lightweight queue ===
+# === Cleanup в своей лёгкой очереди ===
 
 @celery_app.task(name="tasks.cleanup_old_uploads", queue="cleanup")
 def cleanup_old_uploads():
