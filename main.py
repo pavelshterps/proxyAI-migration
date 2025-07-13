@@ -1,246 +1,172 @@
-import time
-import uuid
+import os
 import json
-import asyncio
+import logging
+import requests
+import time
 from pathlib import Path
-from contextlib import asynccontextmanager
 
-import structlog
-import redis.asyncio as redis_async
-from fastapi import (
-    FastAPI, UploadFile, File, HTTPException,
-    Header, Depends, Request, Response, Body
-)
-from fastapi.responses import FileResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
-from fastapi.middleware.cors import CORSMiddleware
-from starlette.middleware.trustedhost import TrustedHostMiddleware
-from fastapi.security.api_key import APIKeyHeader
-from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
-from slowapi import Limiter
-from slowapi.middleware import SlowAPIMiddleware
-from slowapi.util import get_remote_address
-
-from sse_starlette.sse import EventSourceResponse
+from celery.signals import worker_process_init
+from faster_whisper import WhisperModel
+from pyannote.audio.pipelines import VoiceActivityDetection, SpeakerDiarization
+from redis import Redis
 
 from config.settings import settings
-from database import get_db, engine, init_models
-from crud import create_upload_record, get_upload_for_user
-from dependencies import get_current_user
-from routes import router as api_router
-from admin_routes import router as admin_router
-from tasks import download_audio, preview_transcribe, transcribe_segments, diarize_full
+from config.celery import app
+from utils.audio import convert_to_wav
 
-# Повторная инициализация моделей БД с retry
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    for _ in range(5):
+logger = logging.getLogger(__name__)
+
+_whisper_model = None
+_vad = None
+_clustering_diarizer = None
+
+def get_whisper_model():
+    global _whisper_model
+    if _whisper_model is None:
+        device  = settings.WHISPER_DEVICE.lower()
+        compute = settings.WHISPER_COMPUTE_TYPE.lower()
+        if device == "cpu" and compute in ("float16", "fp16"):
+            logger.warning(f"Compute '{compute}' unsupported on CPU; using int8")
+            compute = "int8"
+        _whisper_model = WhisperModel(
+            settings.WHISPER_MODEL_PATH,
+            device=device,
+            compute_type=compute
+        )
+    return _whisper_model
+
+def get_vad():
+    global _vad
+    if _vad is None:
+        _vad = VoiceActivityDetection.from_pretrained(
+            getattr(settings, "VAD_MODEL_PATH", "pyannote/voice-activity-detection"),
+            use_auth_token=settings.HUGGINGFACE_TOKEN
+        )
+    return _vad
+
+def get_clustering_diarizer():
+    global _clustering_diarizer
+    if _clustering_diarizer is None:
+        cache = settings.DIARIZER_CACHE_DIR
+        os.makedirs(cache, exist_ok=True)
+        _clustering_diarizer = SpeakerDiarization.from_pretrained(
+            settings.PYANNOTE_PIPELINE,
+            cache_dir=cache,
+            use_auth_token=settings.HUGGINGFACE_TOKEN
+        )
+    return _clustering_diarizer
+
+@worker_process_init.connect
+def preload_and_warmup(**kwargs):
+    sample = Path(__file__).parent / "tests" / "fixtures" / "sample.wav"
+    device = settings.WHISPER_DEVICE.lower()
+    if device == "cpu":
         try:
-            await init_models(engine)
-            break
-        except OSError as e:
-            log.warning("init_models failed, retrying", error=str(e))
-            await asyncio.sleep(2)
+            opts = {}
+            if settings.WHISPER_LANGUAGE:
+                opts["language"] = settings.WHISPER_LANGUAGE
+            get_whisper_model().transcribe(str(sample), **opts)
+        except: pass
     else:
-        log.error("init_models permanently failed")
-    yield
+        try: get_vad().apply({"audio": str(sample)})
+        except: pass
+        try: get_clustering_diarizer().apply({"audio": str(sample)})
+        except: pass
 
-app = FastAPI(title="proxyAI", version=settings.APP_VERSION, lifespan=lifespan)
+# ===== все задачи ставятся теперь в общую очередь transcribe_gpu =====
 
-# structlog
-structlog.configure(
-    processors=[
-        structlog.processors.add_log_level,
-        structlog.processors.TimeStamper(fmt="iso"),
-        structlog.processors.JSONRenderer(),
-    ]
-)
-log = structlog.get_logger()
+@app.task(bind=True, name="tasks.download_audio", queue="transcribe_gpu")
+def download_audio(self, upload_id: str, correlation_id: str):
+    logger.info(f"[{correlation_id}] download_audio noop for {upload_id}")
 
-# Rate limiter
-limiter = Limiter(key_func=get_remote_address)
-app.state.limiter = limiter
-app.add_middleware(SlowAPIMiddleware)
-
-# CORS & TrustedHost
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[*settings.ALLOWED_ORIGINS_LIST],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-app.add_middleware(
-    TrustedHostMiddleware,
-    allowed_hosts=["127.0.0.1", "localhost"] + settings.ALLOWED_ORIGINS_LIST
-)
-
-# Ensure necessary directories exist
-for d in (settings.UPLOAD_FOLDER, settings.RESULTS_FOLDER, settings.DIARIZER_CACHE_DIR):
-    Path(d).mkdir(parents=True, exist_ok=True)
-
-# Redis client
-redis = redis_async.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
-
-# API-Key header
-api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
-
-# Prometheus metrics
-HTTP_REQ_COUNT = Counter("http_requests_total", "Total HTTP requests", ["method", "path"])
-HTTP_REQ_LATENCY = Histogram("http_request_duration_seconds", "HTTP request latency", ["path"])
-
-@app.middleware("http")
-async def metrics_middleware(request: Request, call_next):
-    start = time.time()
-    response = await call_next(request)
-    HTTP_REQ_COUNT.labels(request.method, request.url.path).inc()
-    HTTP_REQ_LATENCY.labels(request.url.path).observe(time.time() - start)
-    return response
-
-@app.get("/health")
-@limiter.limit("30/minute")
-async def health(request: Request):
-    return {"status": "ok", "version": app.version}
-
-@app.get("/ready")
-async def ready():
-    return {"status": "ready", "version": app.version}
-
-@app.get("/metrics")
-@limiter.limit("10/minute")
-async def metrics_endpoint(request: Request):
-    data = generate_latest()
-    return Response(content=data, media_type=CONTENT_TYPE_LATEST)
-
-@app.get("/", include_in_schema=False)
-async def root():
-    return FileResponse("static/index.html")
-
-# === SSE: прогресс обработки ===
-@app.get("/events/{upload_id}")
-async def progress_events(upload_id: str):
-    async def generator():
-        pubsub = redis.pubsub()
-        await pubsub.subscribe(f"progress:{upload_id}")
-        try:
-            while True:
-                msg = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
-                if msg and msg["type"] == "message":
-                    yield f"data: {msg['data']}\n\n"
-                await asyncio.sleep(0.1)
-        finally:
-            await pubsub.unsubscribe(f"progress:{upload_id}")
-    return EventSourceResponse(generator())
-
-# === Проверка статуса ===
-@app.get("/status/{upload_id}", summary="Check processing status")
-async def get_status(upload_id: str, current_user=Depends(get_current_user)):
-    raw = await redis.get(f"progress:{upload_id}") or "{}"
-    return json.loads(raw)
-
-# === Unified results endpoint ===
-@app.get("/results/{upload_id}", summary="Get preview, transcript or diarization")
-async def get_results(upload_id: str, current_user=Depends(get_current_user), db=Depends(get_db)):
-    # 1) Preview из Redis
-    pd = await redis.get(f"preview_result:{upload_id}")
-    if pd:
-        pl = json.loads(pd)
-        return JSONResponse(content={"results": pl["timestamps"], "text": pl["text"]})
-    # 2) Полный transcript
-    tp = Path(settings.RESULTS_FOLDER) / upload_id / "transcript.json"
-    if tp.exists():
-        data = json.loads(tp.read_text(encoding="utf-8"))
-        return JSONResponse(content={"results": data})
-    # 3) Diarization + mapping
-    dp = Path(settings.RESULTS_FOLDER) / upload_id / "diarization.json"
-    if dp.exists():
-        segs = json.loads(dp.read_text(encoding="utf-8"))
-        rec = await get_upload_for_user(db, current_user.id, upload_id)
-        mapping = rec.label_mapping or {}
-        for s in segs:
-            s["speaker"] = mapping.get(str(s["speaker"]), s["speaker"])
-        return JSONResponse(content={"results": segs})
-    raise HTTPException(404, "Results not ready")
-
-# === File upload endpoint ===
-@app.post("/upload/", dependencies=[Depends(get_current_user)])
-@limiter.limit("10/minute")
-async def upload(
-    request: Request,
-    file: UploadFile = File(...),
-    x_correlation_id: str | None = Header(None),
-    current_user=Depends(get_current_user),
-    db=Depends(get_db),
-):
-    cid = x_correlation_id or str(uuid.uuid4().hex)
-    data = await file.read()
-    if not data:
-        raise HTTPException(400, "File is empty")
-    ext = Path(file.filename).suffix or ""
-    upload_id = uuid.uuid4().hex
-    dest = Path(settings.UPLOAD_FOLDER) / f"{upload_id}{ext}"
-    dest.write_bytes(data)
-
+@app.task(bind=True, name="tasks.preview_transcribe", queue="transcribe_gpu")
+def preview_transcribe(self, upload_id: str, correlation_id: str):
+    r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
+    # convert
+    src = next(Path(settings.UPLOAD_FOLDER).glob(f"{upload_id}.*"), None)
+    wav = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
     try:
-        await create_upload_record(db, current_user.id, upload_id)
-    except Exception:
-        log.warning("Failed to create upload record", upload_id=upload_id)
+        wav_path = convert_to_wav(src, wav)
+    except Exception as e:
+        logger.error(f"[{correlation_id}] Conversion error: {e}")
+        return
 
-    log.bind(correlation_id=cid, upload_id=upload_id, user_id=current_user.id).info("upload accepted")
-    await redis.set(f"external:{upload_id}", upload_id)
+    model = get_whisper_model()
+    opts = {"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {}
+    segs, _ = model.transcribe(str(wav_path), word_timestamps=True, **opts)
 
-    # Старт цепочки обработки
-    download_audio.delay(upload_id, cid)
-    preview_transcribe.delay(upload_id, cid)
-    transcribe_segments.delay(upload_id, cid)
+    preview = {"text": "", "timestamps": []}
+    for s in segs:
+        if s.start >= settings.PREVIEW_LENGTH_S:
+            break
+        preview["text"] += s.text
+        preview["timestamps"].append({"start": s.start, "end": s.end, "text": s.text})
 
-    # Инициализация прогресса
-    state = {"status": "started", "preview": None}
-    await redis.set(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
-    await redis.publish(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
+    # store & broadcast
+    r.set(f"preview_result:{upload_id}", json.dumps(preview, ensure_ascii=False))
+    state = {"status": "preview_done", "preview": preview}
+    r.set(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
+    r.publish(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
 
-    return JSONResponse(
-        {"upload_id": upload_id, "external_id": upload_id},
-        headers={"X-Correlation-ID": cid}
-    )
+    # callbacks
+    for cb in json.loads(r.get(f"callbacks:{upload_id}") or "[]"):
+        try:
+            requests.post(cb, json={"event": "preview_complete", "external_id": upload_id}, timeout=5)
+        except: pass
 
-# === Диаризация по запросу ===
-@app.post("/diarize/{upload_id}", summary="Request diarization")
-async def request_diarization(upload_id: str, current_user=Depends(get_current_user)):
-    await redis.set(f"diarize_requested:{upload_id}", "1")
-    state = json.loads(await redis.get(f"progress:{upload_id}") or "{}")
-    state["diarize_requested"] = True
-    await redis.set(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
-    await redis.publish(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
+    # next
+    transcribe_segments.delay(upload_id, correlation_id)
 
-    diarize_full.delay(upload_id, None)
-    return JSONResponse({"message": "diarization started"})
+@app.task(bind=True, name="tasks.transcribe_segments", queue="transcribe_gpu")
+def transcribe_segments(self, upload_id: str, correlation_id: str):
+    r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
+    wav = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
+    model = get_whisper_model()
+    opts = {"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {}
+    segs, _ = model.transcribe(str(wav), word_timestamps=True, **opts)
 
-# === Сохранение меток спикеров ===
-@app.post("/labels/{upload_id}", summary="Save speaker labels")
-async def save_labels(
-    upload_id: str,
-    mapping: dict = Body(...),
-    current_user=Depends(get_current_user),
-    db=Depends(get_db),
-):
-    rec = await get_upload_for_user(db, current_user.id, upload_id)
-    rec.label_mapping = mapping
-    await db.commit()
+    out = [{"start": s.start, "end": s.end, "text": s.text} for s in segs]
+    d = Path(settings.RESULTS_FOLDER) / upload_id
+    d.mkdir(exist_ok=True, parents=True)
+    (d / "transcript.json").write_text(json.dumps(out, indent=2, ensure_ascii=False), encoding="utf-8")
 
-    out = Path(settings.RESULTS_FOLDER) / upload_id / "diarization.json"
-    updated = []
-    if out.exists():
-        segs = json.loads(out.read_text(encoding="utf-8"))
-        updated = [
-            {"start": s["start"], "end": s["end"], "speaker": mapping.get(str(s["speaker"]), s["speaker"])}
-            for s in segs
-        ]
-        out.write_text(json.dumps(updated, ensure_ascii=False, indent=2), encoding="utf-8")
+    state = {"status": "transcript_done", "preview": None}
+    r.set(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
+    r.publish(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
 
-    return JSONResponse({"results": updated})
+    for cb in json.loads(r.get(f"callbacks:{upload_id}") or "[]"):
+        try:
+            requests.post(cb, json={"event": "transcript_complete","external_id": upload_id}, timeout=5)
+        except: pass
 
-# Подключаем роутеры и статику
-app.include_router(api_router, tags=["proxyAI"])
-app.include_router(admin_router)
-app.mount("/static", StaticFiles(directory="static"), name="static")
+    if r.get(f"diarize_requested:{upload_id}") == "1":
+        diarize_full.delay(upload_id, correlation_id)
+
+# Diarization оставляем в своей очереди
+@app.task(bind=True, name="tasks.diarize_full", queue="diarize_gpu")
+def diarize_full(self, upload_id: str, correlation_id: str):
+    r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
+    wav = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
+    ann = get_clustering_diarizer().apply({"audio": str(wav)})
+
+    segs = [{"start": float(seg.start), "end": float(seg.end), "speaker": spk}
+            for seg, _, spk in ann.itertracks(yield_label=True)]
+    d = Path(settings.RESULTS_FOLDER) / upload_id
+    d.mkdir(exist_ok=True, parents=True)
+    (d / "diarization.json").write_text(json.dumps(segs, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    state = {"status": "diarization_done", "preview": None}
+    r.set(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
+    r.publish(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
+
+    for cb in json.loads(r.get(f"callbacks:{upload_id}") or "[]"):
+        try:
+            requests.post(cb, json={"event": "diarization_complete","external_id": upload_id}, timeout=5)
+        except: pass
+
+@app.task(name="tasks.cleanup_old_uploads")
+def cleanup_old_uploads():
+    cutoff = time.time() - settings.FILE_RETENTION_DAYS * 86400
+    for f in Path(settings.UPLOAD_FOLDER).iterdir():
+        if f.stat().st_mtime < cutoff:
+            f.unlink(missing_ok=True)
