@@ -22,3 +22,5 @@ docker-compose.override.yml
 
 # Jupyter
 .ipynb_checkpoints/
+.env
+.env
