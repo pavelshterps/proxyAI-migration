@@ -5,7 +5,7 @@ import asyncio
 from pathlib import Path
 from contextlib import asynccontextmanager
 
-import structlog                                   # ▲ перенёс сюда, чтобы log был готов до первого использования
+import structlog  # ▲ Инициализация логгера как можно раньше
 import redis.asyncio as redis_async
 from fastapi import (
     FastAPI, UploadFile, File, HTTPException,
@@ -30,7 +30,7 @@ from dependencies import get_current_user
 from routes import router as api_router
 from admin_routes import router as admin_router
 
-# импортим все таски, чтобы .delay() не падал
+# Импортируем все таски, чтобы .delay() не падал
 from tasks import download_audio, preview_transcribe, transcribe_segments, diarize_full
 
 # === Настройка логгера ===
@@ -135,7 +135,6 @@ async def root():
     log.debug("Serving index.html")
     return FileResponse("static/index.html")
 
-
 # === Upload endpoint ===
 @app.post("/upload", dependencies=[Depends(get_current_user)])
 @app.post("/upload/", dependencies=[Depends(get_current_user)])
@@ -192,7 +191,6 @@ async def upload(
         headers={"X-Correlation-ID":cid}
     )
 
-
 # === SSE for progress ===
 @app.get("/events/{upload_id}")
 async def progress_events(
@@ -201,7 +199,6 @@ async def progress_events(
     api_key: str = Depends(get_api_key)
 ):
     log.info("Client subscribed to SSE", upload_id=upload_id)
-
     async def generator():
         pubsub = redis.pubsub()
         await pubsub.subscribe(f"progress:{upload_id}")
@@ -227,9 +224,7 @@ async def progress_events(
         finally:
             await pubsub.unsubscribe(f"progress:{upload_id}")
             log.info("Client unsubscribed", upload_id=upload_id)
-
     return EventSourceResponse(generator())
-
 
 # === Results endpoint ===
 @app.get("/results/{upload_id}", summary="Get preview, transcript and speaker labels")
@@ -254,7 +249,7 @@ async def get_results(
         raise HTTPException(404, "Results not ready")
     transcript = json.loads(tp.read_text(encoding="utf-8"))
 
-    # 3) merge with diarization
+    # 3) merge with diarization if exists
     dp = base / "diarization.json"
     if dp.exists():
         diar = json.loads(dp.read_text(encoding="utf-8"))
@@ -275,14 +270,12 @@ async def get_results(
                 "text":    seg["text"],
                 "speaker": spk
             })
-        log.info("Returning merged transcript+speakers",
-                 upload_id=upload_id, segments=len(merged))
+        log.info("Returning merged transcript+speakers", upload_id=upload_id, segments=len(merged))
         return JSONResponse(content={"results": merged})
 
     # 4) only transcript
     log.info("Returning transcript only", upload_id=upload_id, segments=len(transcript))
     return JSONResponse(content={"results": transcript})
-
 
 # === Manual diarization trigger ===
 @app.post("/diarize/{upload_id}", summary="Request diarization")
@@ -304,7 +297,6 @@ async def request_diarization(
         log.error("Failed to launch diarization", upload_id=upload_id, error=str(e))
         raise HTTPException(500, f"Diarize launch failed: {e}")
 
-
 # === Save speaker labels & return merged immediately ===
 @app.post("/labels/{upload_id}", summary="Save speaker labels")
 async def save_labels(
@@ -313,8 +305,7 @@ async def save_labels(
     current_user=Depends(get_current_user),
     db=Depends(get_db)
 ):
-    log.info("Save labels called", upload_id=upload_id,
-             user_id=current_user.id, mapping=mapping)
+    log.info("Save labels called", upload_id=upload_id, user_id=current_user.id, mapping=mapping)
 
     rec = await get_upload_for_user(db, current_user.id, upload_id)
     if not rec:
@@ -337,7 +328,7 @@ async def save_labels(
     else:
         log.warning("Diarization file not found for updating labels", upload_id=upload_id)
 
-    # ▲ сразу собираем merged и отдаем клиенту
+    # собираем merged и отдаем клиенту
     tfile = base / "transcript.json"
     if not tfile.exists():
         log.error("Transcript not found when merging after labels", upload_id=upload_id)
@@ -359,10 +350,8 @@ async def save_labels(
             "speaker": spk
         })
 
-    log.info("Returning merged after labels",
-             upload_id=upload_id, segments=len(merged))
+    log.info("Returning merged after labels", upload_id=upload_id, segments=len(merged))
     return JSONResponse(content={"results": merged})
-
 
 # === Routers & static ===
 app.include_router(api_router, tags=["proxyAI"])
