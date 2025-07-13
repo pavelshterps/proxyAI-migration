@@ -20,15 +20,20 @@ _vad = None
 _clustering_diarizer = None
 
 def get_whisper_model():
+    """
+    Ленивая инициализация WhisperModel.
+    Имя модели (например, 'medium') берётся из settings.WHISPER_MODEL_PATH.
+    Модели ищутся в локальном кеше /hf_cache.
+    """
     global _whisper_model
     if _whisper_model is None:
-        model_id = settings.WHISPER_MODEL_PATH  # по env: /hf_cache/models--guillaumekln--faster-whisper-medium
-        cache = settings.HUGGINGFACE_CACHE_DIR  # каждый контейнер монтирует whisper_models
+        model_id = settings.WHISPER_MODEL_PATH  # должно быть 'medium', 'large', 'small', и т.д.
+        cache = settings.HUGGINGFACE_CACHE_DIR  # например, /hf_cache
 
-        # пытаемся локально
+        # Сначала пытаемся загрузить локально
         try:
             download_model(model_id, cache_dir=cache, local_files_only=True)
-            logger.info(f"Loaded Whisper model locally from {model_id}")
+            logger.info(f"Loaded Whisper model '{model_id}' from local cache")
         except Exception:
             logger.info("Локальная модель не найдена, пробуем скачать из HuggingFace")
             download_model(model_id, cache_dir=cache, local_files_only=False)
@@ -44,11 +49,14 @@ def get_whisper_model():
             device=device,
             compute_type=compute,
             cache_dir=cache,
-            local_files_only=True   # после загрузки локально
+            local_files_only=True   # использовать только локальные файлы
         )
     return _whisper_model
 
 def get_vad():
+    """
+    Ленивая инициализация Voice Activity Detection (pyannote).
+    """
     global _vad
     if _vad is None:
         _vad = VoiceActivityDetection.from_pretrained(
@@ -59,6 +67,9 @@ def get_vad():
     return _vad
 
 def get_clustering_diarizer():
+    """
+    Ленивая инициализация Speaker Diarization (pyannote).
+    """
     global _clustering_diarizer
     if _clustering_diarizer is None:
         cache = settings.DIARIZER_CACHE_DIR
@@ -72,6 +83,9 @@ def get_clustering_diarizer():
 
 @worker_process_init.connect
 def preload_and_warmup(**kwargs):
+    """
+    Прогрев моделей при старте worker-процесса (для ускорения первого запроса).
+    """
     sample = Path(__file__).parent / "tests" / "fixtures" / "sample.wav"
     try:
         if settings.WHISPER_DEVICE.lower() == "cpu":
