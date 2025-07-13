@@ -95,7 +95,7 @@
 
       // reset UI
       [previewBtn, transcriptBtn, diarizeBtn, saveBtn].forEach(b=>b.disabled=true);
-      container.innerHTML="";
+      container.innerHTML = "";
 
       // 2) SSE
       const sseUrl = `/events/${uploadId}?api_key=${encodeURIComponent(key)}`;
@@ -108,21 +108,17 @@
         let raw = e.data;
         console.debug("SSE ▶ raw:", raw);
 
-        // skip heartbeat/comment lines (":" or empty)
-        if(!raw || raw.trim()==="" || raw.trim()===":") {
-          return;
-        }
+        // skip heartbeat/comment lines
+        if(!raw || raw.trim()==="" || raw.trim()===":") return;
 
-        // strip leading "data:" if present
-        if(raw.startsWith("data:")) {
-          raw = raw.replace(/^data:\s*/, "");
-        }
+        // strip leading "data:"
+        if(raw.startsWith("data:")) raw = raw.replace(/^data:\s*/, "");
 
         let st;
         try {
           st = JSON.parse(raw);
         } catch(err) {
-          console.warn("SSE JSON parse failed, skipping:", err, raw);
+          console.warn("SSE JSON parse failed:", err, raw);
           return;
         }
 
@@ -153,16 +149,18 @@
           diarizeDone = true;
           timingsEl.innerHTML += `<div>Diarization done in ${((performance.now() - tUpload)/1000).toFixed(2)}s</div>`;
           saveBtn.disabled = false;
-          loadTranscript().catch(console.error);
           es.close();
+          loadTranscript().catch(console.error);
         }
       };
 
       statusEl.textContent = "Файл загружен, ждём прогресса…";
     };
 
+    // ВЕЩАЮЩАЯ ПРАВКА: всегда чистим контейнер перед перерисовкой
     async function loadTranscript(){
-      statusEl.textContent="Загружаю результат…";
+      container.innerHTML = "";
+      statusEl.textContent = "Загружаю результат…";
       const key = apiKeyEl.value.trim();
       const res = await fetch(`/results/${uploadId}`, {
         headers:{ "X-API-Key": key }
@@ -170,13 +168,13 @@
       if(!res.ok) throw new Error("results fetch failed: " + res.status);
       const { results } = await res.json();
       render(results);
-      statusEl.textContent="Готово";
+      statusEl.textContent = "Готово";
     }
 
     previewBtn.onclick    = () => {};
     transcriptBtn.onclick = () => loadTranscript().catch(err=>{
       console.error(err);
-      statusEl.textContent="Ошибка при получении транскрипта";
+      statusEl.textContent = "Ошибка при получении транскрипта";
     });
     diarizeBtn.onclick    = async () => {
       statusEl.textContent="Запрашиваем диаризацию…";
@@ -193,7 +191,7 @@
         statusEl.textContent = "Ошибка при запросе диаризации";
       }
     };
-    saveBtn.onclick       = async () => {
+    saveBtn.onclick = async () => {
       const key = apiKeyEl.value.trim(), payload={};
       Object.entries(mapping).forEach(([o,n])=>{ if(o!==n) payload[o]=n; });
       if(!Object.keys(payload).length){ alert("Нет изменений"); return; }
@@ -208,6 +206,8 @@
         });
         if(!res.ok) throw new Error("Labels save failed: " + res.status);
         const { results } = await res.json();
+        // сразу перерисуем финальные метки:
+        container.innerHTML = "";
         render(results);
         saveBtn.disabled = true;
         alert("Метки сохранены");
@@ -218,7 +218,7 @@
     };
 
     function render(list){
-      container.innerHTML="";
+      container.innerHTML = "";
       mapping = {};
       list.forEach(s=>mapping[s.speaker||""]=s.speaker||"");
       const frag = document.createDocumentFragment();
