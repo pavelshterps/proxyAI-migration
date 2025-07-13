@@ -37,16 +37,14 @@ services:
       - UPLOAD_FOLDER=${UPLOAD_FOLDER}
       - RESULTS_FOLDER=${RESULTS_FOLDER}
       - DIARIZER_CACHE_DIR=${DIARIZER_CACHE_DIR}
-      - HUGGINGFACE_CACHE_DIR=${HUGGINGFACE_CACHE_DIR}
+      - HUGGINGFACE_CACHE_DIR=/hf_cache                    # use this shared cache
       - WHISPER_MODEL_PATH=${WHISPER_MODEL_PATH}
-      - HF_HOME=/hf_cache       # главный каталог Hugging Face
-      - HF_HUB_CACHE=/hf_cache/hub
     volumes:
       - ./:/app:delegated
       - upload_data:${UPLOAD_FOLDER}
       - results_data:${RESULTS_FOLDER}
       - diarizer_cache:${DIARIZER_CACHE_DIR}
-      - ./data/hf_cache:/hf_cache         # общий volume для кэша
+      - ./data/hf_cache:/hf_cache                         # single HF cache volume
     ports: ["8000:8000"]
     depends_on: [db, redis]
     networks: [proxyai_net]
@@ -64,11 +62,9 @@ services:
       - UPLOAD_FOLDER=${UPLOAD_FOLDER}
       - RESULTS_FOLDER=${RESULTS_FOLDER}
       - DIARIZER_CACHE_DIR=${DIARIZER_CACHE_DIR}
-      - HUGGINGFACE_CACHE_DIR=${HUGGINGFACE_CACHE_DIR}
+      - HUGGINGFACE_CACHE_DIR=/hf_cache
       - WHISPER_MODEL_PATH=${WHISPER_MODEL_PATH}
       - WHISPER_DEVICE=cpu
-      - HF_HOME=/hf_cache
-      - HF_HUB_CACHE=/hf_cache/hub
     volumes:
       - ./:/app:delegated
       - upload_data:${UPLOAD_FOLDER}
@@ -92,12 +88,10 @@ services:
       - UPLOAD_FOLDER=${UPLOAD_FOLDER}
       - RESULTS_FOLDER=${RESULTS_FOLDER}
       - DIARIZER_CACHE_DIR=${DIARIZER_CACHE_DIR}
-      - HUGGINGFACE_CACHE_DIR=${HUGGINGFACE_CACHE_DIR}
+      - HUGGINGFACE_CACHE_DIR=/hf_cache
       - WHISPER_MODEL_PATH=${WHISPER_MODEL_PATH}
       - WHISPER_DEVICE=cuda
       - NVIDIA_VISIBLE_DEVICES=all
-      - HF_HOME=/hf_cache
-      - HF_HUB_CACHE=/hf_cache/hub
     volumes:
       - ./:/app:delegated
       - upload_data:${UPLOAD_FOLDER}

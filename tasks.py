@@ -3,7 +3,6 @@ import json
 import logging
 import requests
 import time
-import shutil
 from pathlib import Path
 from celery.signals import worker_process_init
 from faster_whisper import WhisperModel, download_model
@@ -20,52 +19,51 @@ _whisper_model = None
 _vad = None
 _clustering_diarizer = None
 
-def ensure_space(path: str, required_bytes: int = 2_000_000_000):
-    """Проверить, что в path доступно required_bytes."""
-    total, used, free = shutil.disk_usage(path)
-    if free < required_bytes:
-        raise RuntimeError(f"Недостаточно места: нужно ~{required_bytes//1e6} MB, доступно {free//1e6} MB")
-
 def get_whisper_model():
+    """
+    Ленивая инициализация WhisperModel.
+    Используем только локальный кеш (/hf_cache), не скачиваем.
+    """
     global _whisper_model
     if _whisper_model is None:
         model_id = settings.WHISPER_MODEL_PATH
-        cache = settings.HUGGINGFACE_CACHE_DIR
-        logger.info(f"WhisperModel init: model={model_id}, cache_dir={cache}")
+        cache_dir = settings.HUGGINGFACE_CACHE_DIR
+        logger.info(f"Initializing WhisperModel: model={model_id}, cache_dir={cache_dir}")
 
+        # Убедиться, что модель уже в кеше, иначе сбоить быстро:
         try:
-            ensure_space(cache)
-            download_model(model_id, cache_dir=cache, local_files_only=True)
-            logger.info(f"Model '{model_id}' найдена в локальном кеше")
-        except RuntimeError as e:
-            logger.error(f"Space check failed: {e}")
-            raise
-        except Exception:
-            logger.info(f"Модель '{model_id}' не найдена в кеше — пробуем скачать")
+            download_model(model_id, cache_dir=cache_dir, local_files_only=True)
+            logger.info(f"Model '{model_id}' found in local cache")
+        except Exception as e:
+            logger.error(f"Model '{model_id}' NOT found in cache at '{cache_dir}': {e}")
+            raise RuntimeError(
+                f"Whisper model '{model_id}' missing from cache directory '{cache_dir}'"
+            )
 
         device = settings.WHISPER_DEVICE.lower()
         compute = getattr(settings, "WHISPER_COMPUTE_TYPE", "int8").lower()
         if device == "cpu" and compute in ("float16", "fp16"):
-            logger.warning(f"FP16 не поддерживается на CPU — переключаемся на int8")
+            logger.warning(
+                f"Compute type '{compute}' unsupported on CPU, switching to 'int8'"
+            )
             compute = "int8"
 
-        try:
-            ensure_space(cache)
-            _whisper_model = WhisperModel(
-                model_id,
-                device=device,
-                compute_type=compute,
-                cache_dir=cache,
-                local_files_only=False,
-            )
-            logger.info("WhisperModel успешно загружена")
-        except RuntimeError as e:
-            logger.error(f"Failed to load WhisperModel due to space: {e}")
-            raise
+        # Инициализировать модель, только из кеша
+        _whisper_model = WhisperModel(
+            model_id,
+            device=device,
+            compute_type=compute,
+            cache_dir=cache_dir,
+            local_files_only=True,
+        )
+        logger.info("WhisperModel loaded successfully")
 
     return _whisper_model
 
 def get_vad():
+    """
+    Ленивая инициализация VAD (pyannote).
+    """
     global _vad
     if _vad is None:
         _vad = VoiceActivityDetection.from_pretrained(
@@ -73,10 +71,13 @@ def get_vad():
             cache_dir=settings.HUGGINGFACE_CACHE_DIR,
             use_auth_token=settings.HUGGINGFACE_TOKEN,
         )
-        logger.info("VAD модель загружена")
+        logger.info("VAD model loaded")
     return _vad
 
 def get_clustering_diarizer():
+    """
+    Ленивая инициализация Speaker Diarization (pyannote).
+    """
     global _clustering_diarizer
     if _clustering_diarizer is None:
         cache = settings.DIARIZER_CACHE_DIR
@@ -86,11 +87,14 @@ def get_clustering_diarizer():
             cache_dir=cache,
             use_auth_token=settings.HUGGINGFACE_TOKEN,
         )
-        logger.info("Diarizer модель загружена")
+        logger.info("Diarizer model loaded")
     return _clustering_diarizer
 
 @worker_process_init.connect
 def preload_and_warmup(**kwargs):
+    """
+    Warm-up models при старте воркера (ускоряет первый запрос).
+    """
     sample = Path(__file__).parent / "tests/fixtures/sample.wav"
     try:
         if settings.WHISPER_DEVICE.lower() == "cpu":
@@ -99,9 +103,9 @@ def preload_and_warmup(**kwargs):
         else:
             get_vad().apply({"audio": str(sample)})
             get_clustering_diarizer().apply({"audio": str(sample)})
-        logger.info("Warm‑up моделей выполнен успешно")
+        logger.info("Warm-up completed successfully")
     except Exception as e:
-        logger.warning("Warm‑up моделей не удался: %r", e)
+        logger.warning("Warm-up failed: %r", e)
 
 @celery_app.task(bind=True, name="tasks.download_audio", queue="transcribe_gpu")
 def download_audio(self, upload_id: str, correlation_id: str):
@@ -116,20 +120,20 @@ def preview_transcribe(self, upload_id: str, correlation_id: str):
     try:
         wav_path = convert_to_wav(src, wav)
     except Exception as e:
-        logger.error(f"[{correlation_id}] Ошибка конверсии: {e}")
+        logger.error(f"[{correlation_id}] Conversion error: {e}")
         return
 
     try:
         model = get_whisper_model()
     except Exception as e:
-        logger.error(f"[{correlation_id}] Невозможно загрузить модель: {e}")
+        logger.error(f"[{correlation_id}] Cannot load WhisperModel: {e}")
         return
 
     opts = {"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {}
     try:
         segs, _ = model.transcribe(str(wav_path), word_timestamps=True, **opts)
     except Exception as e:
-        logger.error(f"[{correlation_id}] Ошибка при транскрипции preview: {e}")
+        logger.error(f"[{correlation_id}] Preview transcription error: {e}")
         return
 
     preview = {"text": "", "timestamps": []}
@@ -143,7 +147,7 @@ def preview_transcribe(self, upload_id: str, correlation_id: str):
     state = {"status": "preview_done", "preview": preview}
     r.set(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
     r.publish(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
-    logger.info(f"[{correlation_id}] Preview транскрибирован для {upload_id}")
+    logger.info(f"[{correlation_id}] Preview done for {upload_id}")
 
     transcribe_segments.delay(upload_id, correlation_id)
 
@@ -155,29 +159,29 @@ def transcribe_segments(self, upload_id: str, correlation_id: str):
     try:
         model = get_whisper_model()
     except Exception as e:
-        logger.error(f"[{correlation_id}] Невозможно загрузить модель: {e}")
+        logger.error(f"[{correlation_id}] Cannot load WhisperModel: {e}")
         return
 
     opts = {"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {}
     try:
         segs, _ = model.transcribe(str(wav), word_timestamps=True, **opts)
     except Exception as e:
-        logger.error(f"[{correlation_id}] Ошибка транскрипции segments: {e}")
+        logger.error(f"[{correlation_id}] Full transcription error: {e}")
         return
 
     out = [{"start": s.start, "end": s.end, "text": s.text} for s in segs]
     d = Path(settings.RESULTS_FOLDER) / upload_id
-    d.mkdir(parents=True, exist_ok=True)
+    d.mkdir(exist_ok=True, parents=True)
     (d / "transcript.json").write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
 
     state = {"status": "transcript_done", "preview": None}
     r.set(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
     r.publish(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
-    logger.info(f"[{correlation_id}] Полная транскрипция завершена для {upload_id}")
+    logger.info(f"[{correlation_id}] Full transcription done for {upload_id}")
 
     for cb in json.loads(r.get(f"callbacks:{upload_id}") or "[]"):
         try:
-            requests.post(cb, json={"event": "transcript_complete","external_id":upload_id}, timeout=5)
+            requests.post(cb, json={"event": "transcript_complete", "external_id": upload_id}, timeout=5)
         except Exception:
             pass
 
@@ -192,20 +196,20 @@ def diarize_full(self, upload_id: str, correlation_id: str):
     try:
         ann = get_clustering_diarizer().apply({"audio": str(wav)})
     except Exception as e:
-        logger.error(f"[{correlation_id}] Ошибка при диаризации: {e}")
+        logger.error(f"[{correlation_id}] Diarization error: {e}")
         return
 
     segs = [{"start": float(seg.start), "end": float(seg.end), "speaker": spk}
             for seg, _, spk in ann.itertracks(yield_label=True)]
 
     d = Path(settings.RESULTS_FOLDER) / upload_id
-    d.mkdir(parents=True, exist_ok=True)
+    d.mkdir(exist_ok=True, parents=True)
     (d / "diarization.json").write_text(json.dumps(segs, ensure_ascii=False, indent=2), encoding="utf-8")
 
     state = {"status": "diarization_done", "preview": None}
     r.set(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
     r.publish(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
-    logger.info(f"[{correlation_id}] Диаризация завершена для {upload_id}")
+    logger.info(f"[{correlation_id}] Diarization done for {upload_id}")
 
     for cb in json.loads(r.get(f"callbacks:{upload_id}") or "[]"):
         try:
@@ -219,4 +223,4 @@ def cleanup_old_uploads():
     for f in Path(settings.UPLOAD_FOLDER).iterdir():
         if f.stat().st_mtime < cutoff:
             f.unlink(missing_ok=True)
-    logger.info("Очищены старые загрузки")
+    logger.info("Old uploads cleaned up")
