@@ -54,15 +54,20 @@
     const container     = document.getElementById('transcriptContainer');
     const saveBtn       = document.getElementById('saveLabelsBtn');
 
-    let uploadId, previewDone=false, transcriptDone=false, diarizeDone=false;
-    let mapping = {}, tUpload;
+    let uploadId,
+        previewDone=false,
+        transcriptDone=false,
+        diarizeDone=false;
+    let mapping = {},
+        tUpload;
 
-    const fmt = ms => {
+    // === Утилита форматирования времени ===
+    function formatTime(ms){
       const sec = Math.floor(ms/1000),
             m   = String(Math.floor(sec/60)).padStart(2,'0'),
             s   = String(sec%60).padStart(2,'0');
       return `${m}:${s}`;
-    };
+    }
 
     // === Загрузка файла и подписка на SSE ===
     uploadBtn.onclick = async () => {
@@ -94,7 +99,7 @@
         return;
       }
 
-      // reset UI
+      // Reset UI
       [previewBtn, transcriptBtn, diarizeBtn, saveBtn].forEach(b=>b.disabled=true);
       container.innerHTML = "";
 
@@ -111,7 +116,7 @@
         // preview
         if(st.preview && !previewDone){
           previewDone = true;
-          timingsEl.innerHTML += `<div>Preview: ${(performance.now()-tUpload)/1000}s</div>`;
+          timingsEl.innerHTML += `<div>Preview: ${((performance.now()-tUpload)/1000).toFixed(2)}s</div>`;
           previewBtn.disabled = false;
           render(st.preview.timestamps);
         }
@@ -119,7 +124,7 @@
         // full transcript
         if(st.status==="transcript_done" && !transcriptDone){
           transcriptDone = true;
-          timingsEl.innerHTML += `<div>Transcript: ${(performance.now()-tUpload)/1000}s</div>`;
+          timingsEl.innerHTML += `<div>Transcript: ${((performance.now()-tUpload)/1000).toFixed(2)}s</div>`;
           transcriptBtn.disabled = false;
           diarizeBtn.disabled = false;
           loadTranscript().catch(console.error);
@@ -128,7 +133,7 @@
         // diarization
         if(st.status==="diarization_done" && !diarizeDone){
           diarizeDone = true;
-          timingsEl.innerHTML += `<div>Diarization: ${(performance.now()-tUpload)/1000}s</div>`;
+          timingsEl.innerHTML += `<div>Diarization: ${((performance.now()-tUpload)/1000).toFixed(2)}s</div>`;
           saveBtn.disabled = false;
           sse.close();
           loadTranscript().catch(console.error);
@@ -189,9 +194,9 @@
           body: JSON.stringify(payload)
         });
         if(!res.ok) throw new Error("Labels save failed: " + res.status);
-        const { results } = await res.json();          // ▲ сразу получаем merged
+        const { results } = await res.json();       // сразу merged
         container.innerHTML = "";
-        render(results);                                // ▲ и перерисовываем
+        render(results);                             // перерисовываем новые сегменты
         saveBtn.disabled = true;
         statusEl.textContent = "Метки сохранены";
       } catch(err) {
@@ -205,18 +210,18 @@
     function render(list){
       container.innerHTML = "";
       mapping = {};
-      list.forEach(s => {
-        mapping[s.speaker||""] = s.speaker||"";
-      });
       const frag = document.createDocumentFragment();
+
       list.forEach(seg => {
-        const orig = seg.speaker||"";                  // сохраняем оригинальный ключ
+        const orig = seg.speaker||"";
+        mapping[orig] = orig;
+
         const div = document.createElement("div");
         div.className = "segment";
 
         const t = document.createElement("span");
         t.className = "time";
-        t.textContent = fmt(seg.start * 1000);
+        t.textContent = formatTime(seg.start * 1000);
 
         const btn = document.createElement("button");
         btn.textContent = "▶️";
@@ -227,8 +232,8 @@
         };
 
         const inp = document.createElement("input");
-        inp.value = seg.speaker||"";
-        inp.dataset.orig = orig;                       // ▲ храним оригинал в data-атрибуте
+        inp.value = orig;
+        inp.dataset.orig = orig;
         inp.onchange = () => {
           const oldName = inp.dataset.orig;
           const newName = inp.value.trim();
@@ -238,7 +243,6 @@
             return;
           }
           mapping[oldName] = newName;
-          // обновляем все input с тем же orig
           frag.querySelectorAll("input").forEach(i => {
             if(i.dataset.orig === oldName) i.value = newName;
           });
@@ -251,15 +255,8 @@
         div.append(t, btn, inp, txt);
         frag.append(div);
       });
-      container.append(frag);
-    }
 
-    // === Утилита форматирования времени ===
-    function fmt(ms){
-      const sec = Math.floor(ms/1000),
-            m   = String(Math.floor(sec/60)).padStart(2,'0'),
-            s   = String(sec%60).padStart(2,'0');
-      return `${m}:${s}`;
+      container.append(frag);
     }
   })();
   </script>
