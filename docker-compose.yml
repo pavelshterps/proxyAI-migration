@@ -168,7 +168,9 @@ services:
       - /etc/letsencrypt/live/tonage.io/fullchain.pem:/etc/nginx/certs/fullchain.pem:ro
       - /etc/letsencrypt/live/tonage.io/privkey.pem:/etc/nginx/certs/privkey.pem:ro
     networks:
-      - proxyai_net
+      proxyai_net:
+        aliases:
+          - api
 
 volumes:
   postgres_data:
