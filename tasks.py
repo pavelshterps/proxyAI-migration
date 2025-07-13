@@ -25,15 +25,15 @@ def get_whisper_model():
         model_id = settings.WHISPER_MODEL_PATH
         cache = settings.HUGGINGFACE_CACHE_DIR
 
-        # Попытка использовать локальные файлы
+        # сначала пробуем локальную модель из cache
         try:
             download_model(model_id, cache_dir=cache, local_files_only=True)
         except Exception:
-            logger.info("Локальная модель не найдена, скачиваем из HF")
+            logger.info("Локальная модель не найдена, скачиваем из HuggingFace")
             download_model(model_id, cache_dir=cache, local_files_only=False)
 
         device = settings.WHISPER_DEVICE.lower()
-        compute = settings.WHISPER_COMPUTE_TYPE.lower()
+        compute = getattr(settings, "WHISPER_COMPUTE_TYPE", "int8").lower()
         if device == "cpu" and compute in ("float16", "fp16"):
             logger.warning(f"Compute '{compute}' unsupported on CPU — switching на int8")
             compute = "int8"
