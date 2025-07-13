@@ -1,4 +1,5 @@
 # main.py
+
 import time
 import uuid
 import json
@@ -139,7 +140,6 @@ async def root():
     log.debug("Serving index.html")
     return FileResponse("static/index.html")
 
-
 # === Upload endpoint ===
 
 @app.post("/upload/", dependencies=[Depends(get_current_user)])
@@ -221,7 +221,6 @@ async def upload(
         headers={"X-Correlation-ID": cid}
     )
 
-
 # === Server-Sent Events for progress ===
 
 @app.get("/events/{upload_id}")
@@ -244,7 +243,6 @@ async def progress_events(upload_id: str):
             await pubsub.unsubscribe(f"progress:{upload_id}")
             log.info("Client unsubscribed from SSE", upload_id=upload_id)
     return EventSourceResponse(generator())
-
 
 # === Results endpoint ===
 
@@ -284,7 +282,6 @@ async def get_results(
     log.warning("Results not ready", upload_id=upload_id)
     raise HTTPException(404, "Results not ready")
 
-
 # === Trigger diarization manually ===
 
 @app.post("/diarize/{upload_id}", summary="Request diarization")
@@ -305,7 +302,6 @@ async def request_diarization(
     log.info("Launched diarize_full task", upload_id=upload_id)
 
     return JSONResponse({"message": "diarization started"})
-
 
 # === Save speaker labels ===
 
