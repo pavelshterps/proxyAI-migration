@@ -1,242 +1,37 @@
-import time
-import uuid
-import json
-from pathlib import Path
-from contextlib import asynccontextmanager
+# Dockerfile.gpu
+FROM nvidia/cuda:12.9.1-cudnn-runtime-ubuntu22.04
 
-import structlog
-import redis.asyncio as redis_async
-from fastapi import (
-    FastAPI, UploadFile, File, HTTPException,
-    Header, Depends, Request, Response, Body
-)
-from fastapi.responses import FileResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
-from fastapi.middleware.cors import CORSMiddleware
-from starlette.middleware.trustedhost import TrustedHostMiddleware
-from fastapi.security.api_key import APIKeyHeader
-from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
-from slowapi import Limiter
-from slowapi.middleware import SlowAPIMiddleware
-from slowapi.util import get_remote_address
+WORKDIR /app
 
-from sse_starlette.sse import EventSourceResponse
+# 1) System dependencies
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+      python3-pip python3-dev build-essential ffmpeg libsndfile1 git \
+      libavformat-dev libavcodec-dev libavutil-dev libswscale-dev libportaudio2 && \
+    rm -rf /var/lib/apt/lists/*
 
-from config.settings import settings
-from database import get_db, engine, init_models
-from crud import create_upload_record, get_upload_for_user
-from dependencies import get_current_user
-from routes import router as api_router
-from admin_routes import router as admin_router
-from tasks import download_audio, preview_transcribe, transcribe_segments, diarize_full
+# 2) Common Python deps
+COPY requirements.txt ./
+RUN pip3 install --upgrade pip && \
+    pip3 install --no-cache-dir -r requirements.txt && \
+    rm -rf /root/.cache/pip
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    try:
-        await init_models(engine)
-    except Exception as e:
-        structlog.get_logger().warning(f"init_models failed: {e}")
-    yield
+# 3) GPU-specific packages
+RUN pip3 install --no-cache-dir \
+      faster-whisper[cuda12]==1.1.1 \
+      ctranslate2[cuda12]>=4.6.0
 
-app = FastAPI(title="proxyAI", version=settings.APP_VERSION, lifespan=lifespan)
+# 4) Application code
+COPY . .
 
-# structlog
-structlog.configure(
-    processors=[
-        structlog.processors.add_log_level,
-        structlog.processors.TimeStamper(fmt="iso"),
-        structlog.processors.JSONRenderer(),
-    ]
-)
-log = structlog.get_logger()
+# 5) GPU worker env
+ENV WHISPER_DEVICE=cuda \
+    WHISPER_COMPUTE_TYPE=float16 \
+    HUGGINGFACE_CACHE_DIR=/hf_cache \
+    CELERY_BROKER_URL=${CELERY_BROKER_URL} \
+    UPLOAD_FOLDER=/app/uploads \
+    RESULTS_FOLDER=/app/results
 
-# Rate limiter
-limiter = Limiter(key_func=get_remote_address)
-app.state.limiter = limiter
-app.add_middleware(SlowAPIMiddleware)
-
-# CORS & TrustedHost
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[*settings.ALLOWED_ORIGINS_LIST],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-app.add_middleware(
-    TrustedHostMiddleware,
-    allowed_hosts=["127.0.0.1", "localhost"] + settings.ALLOWED_ORIGINS_LIST
-)
-
-# Ensure necessary directories exist
-for d in (settings.UPLOAD_FOLDER, settings.RESULTS_FOLDER, settings.DIARIZER_CACHE_DIR):
-    Path(d).mkdir(parents=True, exist_ok=True)
-
-# Redis client
-redis = redis_async.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
-
-# API-Key header
-api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
-
-# Prometheus metrics
-HTTP_REQ_COUNT = Counter("http_requests_total", "Total HTTP requests", ["method", "path"])
-HTTP_REQ_LATENCY = Histogram("http_request_duration_seconds", "HTTP request latency", ["path"])
-
-@app.middleware("http")
-async def metrics_middleware(request: Request, call_next):
-    start = time.time()
-    response = await call_next(request)
-    HTTP_REQ_COUNT.labels(request.method, request.url.path).inc()
-    HTTP_REQ_LATENCY.labels(request.url.path).observe(time.time() - start)
-    return response
-
-@app.get("/health")
-@limiter.limit("30/minute")
-async def health(request: Request):
-    return {"status": "ok", "version": app.version}
-
-@app.get("/ready")
-async def ready():
-    return {"status": "ready", "version": app.version}
-
-@app.get("/metrics")
-@limiter.limit("10/minute")
-async def metrics_endpoint(request: Request):
-    data = generate_latest()
-    return Response(content=data, media_type=CONTENT_TYPE_LATEST)
-
-@app.get("/", include_in_schema=False)
-async def root():
-    return FileResponse("static/index.html")
-
-# === SSE: прогресс обработки ===
-@app.get("/events/{upload_id}")
-async def progress_events(upload_id: str):
-    async def generator():
-        pubsub = redis.pubsub()
-        await pubsub.subscribe(f"progress:{upload_id}")
-        try:
-            while True:
-                msg = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
-                if msg and msg["type"] == "message":
-                    yield f"data: {msg['data']}\n\n"
-                await asyncio.sleep(0.1)
-        finally:
-            await pubsub.unsubscribe(f"progress:{upload_id}")
-    return EventSourceResponse(generator())
-
-# === Проверка статуса по upload_id ===
-@app.get("/status/{upload_id}", summary="Check processing status")
-async def get_status(upload_id: str, current_user=Depends(get_current_user)):
-    raw = await redis.get(f"progress:{upload_id}") or "{}"
-    return json.loads(raw)
-
-# === Unified results endpoint ===
-@app.get("/results/{upload_id}", summary="Get preview, transcript or diarization")
-async def get_results(upload_id: str, current_user=Depends(get_current_user), db=Depends(get_db)):
-    # 1) Preview from Redis
-    pd = await redis.get(f"preview_result:{upload_id}")
-    if pd:
-        pl = json.loads(pd)
-        return JSONResponse(content={"results": pl["timestamps"], "text": pl["text"]})
-
-    # 2) Full transcript file
-    tp = Path(settings.RESULTS_FOLDER) / upload_id / "transcript.json"
-    if tp.exists():
-        data = json.loads(tp.read_text(encoding="utf-8"))
-        return JSONResponse(content={"results": data})
-
-    # 3) Diarization + apply label_mapping
-    dp = Path(settings.RESULTS_FOLDER) / upload_id / "diarization.json"
-    if dp.exists():
-        segs = json.loads(dp.read_text(encoding="utf-8"))
-        rec = await get_upload_for_user(db, current_user.id, upload_id)
-        mapping = rec.label_mapping or {}
-        for s in segs:
-            s["speaker"] = mapping.get(str(s["speaker"]), s["speaker"])
-        return JSONResponse(content={"results": segs})
-
-    raise HTTPException(404, "Results not ready")
-
-# === File upload endpoint ===
-@app.post("/upload/", dependencies=[Depends(get_current_user)])
-@limiter.limit("10/minute")
-async def upload(
-    request: Request,
-    file: UploadFile = File(...),
-    x_correlation_id: str | None = Header(None),
-    current_user=Depends(get_current_user),
-    db=Depends(get_db),
-):
-    cid = x_correlation_id or str(uuid.uuid4().hex)
-    data = await file.read()
-    if not data:
-        raise HTTPException(400, "File is empty")
-    ext = Path(file.filename).suffix or ""
-    upload_id = uuid.uuid4().hex
-    dest = Path(settings.UPLOAD_FOLDER) / f"{upload_id}{ext}"
-    dest.write_bytes(data)
-
-    try:
-        await create_upload_record(db, current_user.id, upload_id)
-    except Exception:
-        log.warning("Failed to create upload record", upload_id=upload_id)
-
-    log.bind(correlation_id=cid, upload_id=upload_id, user_id=current_user.id).info("upload accepted")
-    await redis.set(f"external:{upload_id}", upload_id)
-
-    # start chain
-    download_audio.delay(upload_id, cid)
-    preview_transcribe.delay(upload_id, cid)
-    transcribe_segments.delay(upload_id, cid)
-
-    # init progress
-    state = {"status": "started", "preview": None}
-    await redis.set(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
-    await redis.publish(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
-
-    return JSONResponse(
-        {"upload_id": upload_id, "external_id": upload_id},
-        headers={"X-Correlation-ID": cid}
-    )
-
-# === Manual diarization trigger ===
-@app.post("/diarize/{upload_id}", summary="Request diarization")
-async def request_diarization(upload_id: str, current_user=Depends(get_current_user)):
-    await redis.set(f"diarize_requested:{upload_id}", "1")
-    state = json.loads(await redis.get(f"progress:{upload_id}") or "{}")
-    state["diarize_requested"] = True
-    await redis.set(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
-    await redis.publish(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
-
-    diarize_full.delay(upload_id, None)
-    return JSONResponse({"message": "diarization started"})
-
-# === Save speaker-label mapping endpoint ===
-@app.post("/labels/{upload_id}", summary="Save speaker labels")
-async def save_labels(
-    upload_id: str,
-    mapping: dict = Body(...),
-    current_user=Depends(get_current_user),
-    db=Depends(get_db),
-):
-    rec = await get_upload_for_user(db, current_user.id, upload_id)
-    rec.label_mapping = mapping
-    await db.commit()
-
-    out = Path(settings.RESULTS_FOLDER) / upload_id / "diarization.json"
-    updated = []
-    if out.exists():
-        segs = json.loads(out.read_text(encoding="utf-8"))
-        updated = [
-            {"start": s["start"], "end": s["end"], "speaker": mapping.get(str(s["speaker"]), s["speaker"])}
-            for s in segs
-        ]
-        out.write_text(json.dumps(updated, ensure_ascii=False, indent=2), encoding="utf-8")
-
-    return JSONResponse({"results": updated})
-
-# routers & static
-app.include_router(api_router, tags=["proxyAI"])
-app.include_router(admin_router)
-app.mount("/static", StaticFiles(directory="static"), name="static")
+# 6) Use shell entrypoint so 'celery' is on PATH under NVIDIA image
+ENTRYPOINT ["sh", "-c"]
+CMD ["exec celery -A tasks worker --loglevel=info --concurrency=1 --queues=transcribe_gpu,diarize_gpu"]
