@@ -1,4 +1,3 @@
-<!-- static/index.html -->
 <!DOCTYPE html>
 <html lang="ru">
 <head>
@@ -57,10 +56,8 @@
     const container     = document.getElementById('transcriptContainer');
     const saveBtn       = document.getElementById('saveLabelsBtn');
 
-    let uploadId, fileBlob;
-    let previewDone=false, transcriptDone=false, diarizeDone=false;
-    let mapping = {};
-    let tUpload;
+    let uploadId, previewDone=false, transcriptDone=false, diarizeDone=false;
+    let mapping = {}, tUpload;
 
     const fmt = ms => {
       const sec = Math.floor(ms/1000),
@@ -75,14 +72,12 @@
       const file = fileEl.files[0];
       if(!file){ alert("Выберите файл"); return; }
 
-      fileBlob  = file;
       tUpload   = performance.now();
-      audioEl.src = URL.createObjectURL(fileBlob);
-
       statusEl.textContent = "Загружаем…";
       timingsEl.textContent = "";
+      audioEl.src = URL.createObjectURL(file);
 
-      // 1) Отправляем файл
+      // 1) Загрузка
       const form = new FormData();
       form.append("file", file, file.name);
       const res = await fetch("/upload/", {
@@ -93,43 +88,43 @@
       if(!res.ok){ alert("Upload error: "+res.status); return; }
       uploadId = (await res.json()).upload_id;
 
-      // сброс кнопок и разметки
+      // сброс
       [previewBtn, transcriptBtn, diarizeBtn, saveBtn].forEach(b=>b.disabled=true);
       container.innerHTML="";
 
-      // 2) Открываем SSE-поток, передаём ключ через query-param,
-      //    т.к. EventSource не умеет кастомные заголовки
-      const es = new EventSource(
-        `/events/${uploadId}?api_key=${encodeURIComponent(key)}`
-      );
+      // 2) SSE: передаём ключ через query-param (EventSource не позволяет заголовки)
+      const sseUrl = `/events/${uploadId}?api_key=${encodeURIComponent(key)}`;
+      const es = new EventSource(sseUrl);
+
+      es.onopen = () => console.log("SSE: connected", sseUrl);
+      es.onerror = e => console.error("SSE: error", e);
+
       es.onmessage = async e => {
+        console.log("SSE ▶", e.data);
         const st = JSON.parse(e.data);
         statusEl.textContent = `Статус: ${st.status}`;
 
-        // preview через встроенный в SSE payload
+        // preview
         if(st.preview && !previewDone){
           previewDone = true;
-          const dt = ((performance.now() - tUpload)/1000).toFixed(2);
-          timingsEl.innerHTML += `<div>Preview done in ${dt}s</div>`;
+          timingsEl.innerHTML += `<div>Preview done in ${((performance.now() - tUpload)/1000).toFixed(2)}s</div>`;
           previewBtn.disabled = false;
           render(st.preview.timestamps);
         }
 
-        // полная транскрипция
+        // full transcript
         if(st.status==="transcript_done" && !transcriptDone){
           transcriptDone = true;
-          const dt = ((performance.now() - tUpload)/1000).toFixed(2);
-          timingsEl.innerHTML += `<div>Transcript done in ${dt}s</div>`;
+          timingsEl.innerHTML += `<div>Transcript done in ${((performance.now() - tUpload)/1000).toFixed(2)}s</div>`;
           transcriptBtn.disabled = false;
           diarizeBtn.disabled = false;
           await loadTranscript();
         }
 
-        // диаризация
+        // diarization
         if(st.status==="diarization_done" && !diarizeDone){
           diarizeDone = true;
-          const dt = ((performance.now() - tUpload)/1000).toFixed(2);
-          timingsEl.innerHTML += `<div>Diarization done in ${dt}s</div>`;
+          timingsEl.innerHTML += `<div>Diarization done in ${((performance.now() - tUpload)/1000).toFixed(2)}s</div>`;
           saveBtn.disabled = false;
           await loadTranscript();
           es.close();
@@ -150,7 +145,7 @@
       statusEl.textContent="Готово";
     }
 
-    previewBtn.onclick    = () => {};  // noop, рендер через SSE
+    previewBtn.onclick    = () => {};  // noop (рендер через SSE)
     transcriptBtn.onclick = loadTranscript;
     diarizeBtn.onclick    = async () => {
       statusEl.textContent="Запрашиваем диаризацию…";
@@ -204,8 +199,7 @@
           const old=seg.speaker||"", neu=inp.value.trim();
           if(neu&&neu.length<=50){
             mapping[old] = neu;
-            frag.querySelectorAll("input")
-                .forEach(i=> i.value===old && (i.value=neu));
+            frag.querySelectorAll("input").forEach(i=>{ if(i.value===old) i.value=neu; });
           } else {
             alert("Имя 1–50 символов"); inp.value=mapping[old];
           }

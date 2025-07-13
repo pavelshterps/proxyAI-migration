@@ -11,7 +11,7 @@ import structlog
 import redis.asyncio as redis_async
 from fastapi import (
     FastAPI, UploadFile, File, HTTPException,
-    Header, Depends, Request, Response, Body
+    Header, Depends, Request, Response, Body, Query
 )
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -98,6 +98,18 @@ for d in (settings.UPLOAD_FOLDER, settings.RESULTS_FOLDER, settings.DIARIZER_CAC
 # Redis & security
 redis = redis_async.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+async def get_api_key(
+    x_api_key: str = Depends(api_key_header),
+    api_key: str = Query(None)
+):
+    """
+    Получаем API-ключ из HTTP-заголовка X-API-Key или из query-параметра api_key.
+    """
+    key = x_api_key or api_key
+    if not key:
+        raise HTTPException(401, "Missing API Key")
+    return key
 
 # Prometheus metrics
 HTTP_REQ_COUNT = Counter(
@@ -224,11 +236,17 @@ async def upload(
 # === Server-Sent Events for progress ===
 
 @app.get("/events/{upload_id}")
-async def progress_events(upload_id: str):
+async def progress_events(
+    upload_id: str,
+    request: Request,
+    api_key: str = Depends(get_api_key)
+):
     """
     SSE stream прогресса обработки (Redis pub/sub).
+    Подписка требует передачи API-ключа через X-API-Key или ?api_key=...
     """
     log.info("Client subscribed to SSE", upload_id=upload_id)
+
     async def generator():
         pubsub = redis.pubsub()
         await pubsub.subscribe(f"progress:{upload_id}")
@@ -238,10 +256,14 @@ async def progress_events(upload_id: str):
                 if msg and msg["type"] == "message":
                     log.debug("SSE: sending message to client", upload_id=upload_id, data=msg["data"])
                     yield f"data: {msg['data']}\n\n"
+                # keep the loop alive and responsive to client disconnects
+                if await request.is_disconnected():
+                    break
                 await asyncio.sleep(0.1)
         finally:
             await pubsub.unsubscribe(f"progress:{upload_id}")
             log.info("Client unsubscribed from SSE", upload_id=upload_id)
+
     return EventSourceResponse(generator())
 
 # === Results endpoint ===
@@ -318,7 +340,6 @@ async def save_labels(
     await db.commit()
     log.debug("Updated label_mapping in DB", upload_id=upload_id)
 
-    # update local diarization file accordingly
     out = Path(settings.RESULTS_FOLDER) / upload_id / "diarization.json"
     updated = []
     if out.exists():
