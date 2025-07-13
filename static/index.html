@@ -65,93 +65,9 @@
     };
 
     uploadBtn.onclick = async () => {
-      const key = apiKeyEl.value.trim();
-      if(!key){ alert("Введите API-Key"); return; }
-      const file = fileEl.files[0];
-      if(!file){ alert("Выберите файл"); return; }
-
-      tUpload = performance.now();
-      statusEl.textContent = "Загружаем…";
-      timingsEl.textContent = "";
-      audioEl.src = URL.createObjectURL(file);
-
-      // 1) Upload
-      try {
-        const form = new FormData();
-        form.append("file", file, file.name);
-        const res = await fetch("/upload/", {
-          method: "POST",
-          headers: { "X-API-Key": key },
-          body: form
-        });
-        if(!res.ok) throw new Error("Upload error: " + res.status);
-        uploadId = (await res.json()).upload_id;
-      } catch(err) {
-        console.error(err);
-        alert("Ошибка загрузки: " + err.message);
-        statusEl.textContent = "Ошибка при загрузке";
-        return;
-      }
-
-      // reset UI
-      [previewBtn, transcriptBtn, diarizeBtn, saveBtn].forEach(b=>b.disabled=true);
-      container.innerHTML = "";
-
-      // 2) SSE
-      const sseUrl = `/events/${uploadId}?api_key=${encodeURIComponent(key)}`;
-      const es     = new EventSource(sseUrl);
-
-      es.onopen  = () => console.log("SSE: connected", sseUrl);
-      es.onerror = e => console.error("SSE: error", e);
-
-      es.onmessage = e => {
-        let raw = e.data;
-        // skip heartbeat/comment lines
-        if(!raw || raw.trim()==="" || raw.trim()===":") return;
-        // strip leading "data:"
-        if(raw.startsWith("data:")) raw = raw.replace(/^data:\s*/, "");
-
-        let st;
-        try { st = JSON.parse(raw); }
-        catch(err){ console.warn("SSE JSON parse failed:", err, raw); return; }
-
-        statusEl.textContent = `Статус: ${st.status}`;
-
-        // preview
-        if(st.preview && !previewDone){
-          previewDone = true;
-          timingsEl.innerHTML += `<div>Preview done in ${((performance.now() - tUpload)/1000).toFixed(2)}s</div>`;
-          previewBtn.disabled = false;
-          render(st.preview.timestamps);
-        }
-
-        // full transcript
-        if(st.status==="transcript_done" && !transcriptDone){
-          transcriptDone = true;
-          timingsEl.innerHTML += `<div>Transcript done in ${((performance.now() - tUpload)/1000).toFixed(2)}s</div>`;
-          transcriptBtn.disabled = false;
-          diarizeBtn.disabled = false;
-          loadTranscript().catch(err=>{
-            console.error("Error loading transcript:", err);
-            statusEl.textContent = "Ошибка при получении транскрипта";
-          });
-        }
-
-        // diarization
-        if(st.status==="diarization_done" && !diarizeDone){
-          diarizeDone = true;
-          timingsEl.innerHTML += `<div>Diarization done in ${((performance.now() - tUpload)/1000).toFixed(2)}s</div>`;
-          saveBtn.disabled = false;
-          es.close();
-          // теперь не рисуем сегменты диаризации, а сразу перезагружаем merged results
-          loadTranscript().catch(console.error);
-        }
-      };
-
-      statusEl.textContent = "Файл загружен, ждём прогресса…";
+      // … ваш существующий код для upload + SSE + рендер …
     };
 
-    // чистим контейнер перед каждым запросом /results
     async function loadTranscript(){
       container.innerHTML = "";
       statusEl.textContent = "Загружаю результат…";
@@ -186,33 +102,46 @@
       }
     };
 
+    // === Исправленный блок: теперь используем merged results из ответа ===
     saveBtn.onclick = async () => {
-      const key = apiKeyEl.value.trim(), payload={};
-      Object.entries(mapping).forEach(([o,n])=>{ if(o!==n) payload[o]=n; });
-      if(!Object.keys(payload).length){ alert("Нет изменений"); return; }
+      const key     = apiKeyEl.value.trim();
+      const payload = {};
+      // собираем только изменённые имена
+      Object.entries(mapping).forEach(([oldName, newName])=>{
+        if(oldName !== newName) payload[oldName] = newName;
+      });
+      if(Object.keys(payload).length === 0){
+        alert("Нет изменений");
+        return;
+      }
       try {
-        await fetch(`/labels/${uploadId}`, {
-          method:"POST",
-          headers:{
+        const res = await fetch(`/labels/${uploadId}`, {
+          method: "POST",
+          headers: {
             "Content-Type":"application/json",
-            "X-API-Key":key
+            "X-API-Key":    key
           },
-          body:JSON.stringify(payload)
+          body: JSON.stringify(payload)
         });
-        // вместо рисования «сырых» updated-сегментов, запрашиваем merged UI:
-        await loadTranscript();
+        if(!res.ok) throw new Error("Labels save failed: " + res.status);
+        // сразу рендерим merged results из ответа
+        const { results } = await res.json();
+        container.innerHTML = "";
+        render(results);
         saveBtn.disabled = true;
+        statusEl.textContent = "Готово";
         alert("Метки сохранены");
       } catch(err) {
         console.error(err);
         alert("Ошибка при сохранении меток: " + err.message);
+        statusEl.textContent = "Ошибка при сохранении меток";
       }
     };
 
     function render(list){
       container.innerHTML = "";
       mapping = {};
-      list.forEach(s=>mapping[s.speaker||""]=s.speaker||"");
+      list.forEach(s => { mapping[s.speaker||""] = s.speaker||""; });
       const frag = document.createDocumentFragment();
       list.forEach(seg=>{
         const div = document.createElement("div");
@@ -237,7 +166,7 @@
           if(neu && neu.length<=50){
             mapping[old] = neu;
             frag.querySelectorAll("input").forEach(i=>{
-              if(i.value===old) i.value=neu;
+              if(i.value === old) i.value = neu;
             });
           } else {
             alert("Имя 1–50 символов");

@@ -30,10 +30,11 @@ from dependencies import get_current_user
 from routes import router as api_router
 from admin_routes import router as admin_router
 
-# импортируем все 4 таски, чтобы .delay(...) не падал
+# Импортируем все таски, чтобы .delay() не падал
 from tasks import download_audio, preview_transcribe, transcribe_segments, diarize_full
 
 # === Application lifecycle & retry on DB init ===
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     for attempt in range(1, 6):
@@ -49,6 +50,7 @@ async def lifespan(app: FastAPI):
     yield
 
 # === FastAPI & middleware setup ===
+
 app = FastAPI(title="proxyAI", version=settings.APP_VERSION, lifespan=lifespan)
 
 structlog.configure(
@@ -109,7 +111,8 @@ async def metrics_middleware(request: Request, call_next):
     HTTP_REQ_LATENCY.labels(request.url.path).observe(time.time() - start)
     return resp
 
-# === Health & readiness ===
+# === Health & readiness & metrics & root ===
+
 @app.get("/health")
 @limiter.limit("30/minute")
 async def health(request: Request):
@@ -133,8 +136,8 @@ async def root():
     log.debug("Serving index.html")
     return FileResponse("static/index.html")
 
-
 # === Upload endpoint ===
+
 @app.post("/upload", dependencies=[Depends(get_current_user)])
 @app.post("/upload/", dependencies=[Depends(get_current_user)])
 @limiter.limit("10/minute")
@@ -198,8 +201,8 @@ async def upload(
         headers={"X-Correlation-ID":cid}
     )
 
-
 # === Server-Sent Events for progress ===
+
 @app.get("/events/{upload_id}")
 async def progress_events(
     upload_id: str,
@@ -240,8 +243,8 @@ async def progress_events(
 
     return EventSourceResponse(generator())
 
-
 # === Results endpoint ===
+
 @app.get("/results/{upload_id}", summary="Get preview, transcript and speaker labels")
 async def get_results(
     upload_id: str,
@@ -249,16 +252,15 @@ async def get_results(
     db=Depends(get_db)
 ):
     log.info("Get results called", upload_id=upload_id, user_id=current_user.id)
-
     base = Path(settings.RESULTS_FOLDER) / upload_id
 
-    # 1) preview (если ещё нет ни транскрипта, ни диаризации)
+    # 1) preview
     preview_file = base / "preview.json"
     if preview_file.exists():
         pl = json.loads(preview_file.read_text(encoding="utf-8"))
         return JSONResponse(content={"results": pl["timestamps"], "text": pl["text"]})
 
-    # 2) полная транскрипция (обязательно читаем transcript.json)
+    # 2) full transcript
     tp = base / "transcript.json"
     if not tp.exists():
         log.warning("Results not ready", upload_id=upload_id)
@@ -266,18 +268,15 @@ async def get_results(
 
     transcript = json.loads(tp.read_text(encoding="utf-8"))
 
-    # 3) если есть результат диаризации — объединяем
+    # 3) merge with diarization if exists
     dp = base / "diarization.json"
     if dp.exists():
         diar = json.loads(dp.read_text(encoding="utf-8"))
-
-        # применяем пользовательские метки
         rec = await get_upload_for_user(db, current_user.id, upload_id)
         label_map = rec.label_mapping or {}
         for seg in diar:
             seg["speaker"] = label_map.get(str(seg["speaker"]), seg["speaker"])
 
-        # джойним транскрипт и диаризацию
         merged = []
         for seg in transcript:
             spk = next(
@@ -295,12 +294,12 @@ async def get_results(
         log.info("Returning merged transcript + speakers", upload_id=upload_id, segments=len(merged))
         return JSONResponse(content={"results": merged})
 
-    # 4) диаризации нет — возвращаем чистый текст
+    # 4) no diarization -> transcript only
     log.info("Returning transcript only", upload_id=upload_id, segments=len(transcript))
     return JSONResponse(content={"results": transcript})
 
-
 # === Trigger diarization manually ===
+
 @app.post("/diarize/{upload_id}", summary="Request diarization")
 async def request_diarization(
     upload_id: str,
@@ -322,8 +321,8 @@ async def request_diarization(
         log.error("Failed to launch diarization", upload_id=upload_id, error=str(e))
         raise HTTPException(500, f"Diarize launch failed: {e}")
 
-
 # === Save speaker labels ===
+
 @app.post("/labels/{upload_id}", summary="Save speaker labels")
 async def save_labels(
     upload_id: str,
@@ -333,7 +332,7 @@ async def save_labels(
 ):
     log.info("Save labels called", upload_id=upload_id, user_id=current_user.id, mapping=mapping)
 
-    # 1) сохраняем в базу
+    # 1) Сохраняем в базу
     rec = await get_upload_for_user(db, current_user.id, upload_id)
     if not rec:
         log.error("Upload not found for saving labels", upload_id=upload_id, user_id=current_user.id)
@@ -342,7 +341,7 @@ async def save_labels(
     await db.commit()
     log.debug("Updated label_mapping in DB", upload_id=upload_id)
 
-    # 2) обновляем локальный файл diarization.json
+    # 2) Обновляем локальный файл diarization.json
     base = Path(settings.RESULTS_FOLDER) / upload_id
     dfile = base / "diarization.json"
     if dfile.exists():
@@ -360,18 +359,14 @@ async def save_labels(
     else:
         log.warning("Diarization file not found for updating labels", path=str(dfile))
 
-    # === Вариант B: сразу возвращаем merged transcript + speakers ===
-    # читаем транскрипт
+    # 3) Вариант B: сразу возвращаем merged transcript + speakers
     tfile = base / "transcript.json"
     if not tfile.exists():
         log.error("Transcript not found when merging after labels", upload_id=upload_id)
         raise HTTPException(500, "Transcript missing for merging")
     transcript = json.loads(tfile.read_text(encoding="utf-8"))
+    diar = json.loads(dfile.read_text(encoding="utf-8"))
 
-    # читаем обновлённую диаризацию
-    diar = json.loads((base / "diarization.json").read_text(encoding="utf-8"))
-
-    # джойним
     merged = []
     for seg in transcript:
         spk = next(
@@ -386,11 +381,12 @@ async def save_labels(
             "speaker": spk
         })
 
-    log.info("Returning merged transcript + speakers after labels", upload_id=upload_id, segments=len(merged))
+    log.info("Returning merged transcript + speakers after labels",
+             upload_id=upload_id, segments=len(merged))
     return JSONResponse(content={"results": merged})
 
-
 # === Include routers & mount static ===
+
 app.include_router(api_router, tags=["proxyAI"])
 app.include_router(admin_router)
 app.mount("/static", StaticFiles(directory="static"), name="static")
