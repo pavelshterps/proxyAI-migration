@@ -36,13 +36,10 @@ services:
       dockerfile: Dockerfile
     container_name: proxyai_api
     env_file: .env
-    command: >
-      uvicorn main:app
-      --host 0.0.0.0
-      --port 8000
-      --workers ${API_WORKERS}
+    command: >  # ожидание поднятия БД перед запуском
+      sh -c "until nc -z db 5432; do echo waiting for db; sleep 1; done;
+             uvicorn main:app --host 0.0.0.0 --port 8000 --workers ${API_WORKERS}"
     environment:
-      # DATABASE_URL формируется из .env
       - DATABASE_URL=${DATABASE_URL}
       - CELERY_BROKER_URL=${CELERY_BROKER_URL}
       - UPLOAD_FOLDER=${UPLOAD_FOLDER}

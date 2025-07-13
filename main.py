@@ -31,12 +31,18 @@ from routes import router as api_router
 from admin_routes import router as admin_router
 from tasks import download_audio, preview_transcribe, transcribe_segments, diarize_full
 
+# Повторная инициализация моделей БД с retry
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    try:
-        await init_models(engine)
-    except Exception as e:
-        structlog.get_logger().warning(f"init_models failed: {e}")
+    for _ in range(5):
+        try:
+            await init_models(engine)
+            break
+        except OSError as e:
+            log.warning("init_models failed, retrying", error=str(e))
+            await asyncio.sleep(2)
+    else:
+        log.error("init_models permanently failed")
     yield
 
 app = FastAPI(title="proxyAI", version=settings.APP_VERSION, lifespan=lifespan)
@@ -126,7 +132,7 @@ async def progress_events(upload_id: str):
             await pubsub.unsubscribe(f"progress:{upload_id}")
     return EventSourceResponse(generator())
 
-# === Проверка статуса по upload_id ===
+# === Проверка статуса ===
 @app.get("/status/{upload_id}", summary="Check processing status")
 async def get_status(upload_id: str, current_user=Depends(get_current_user)):
     raw = await redis.get(f"progress:{upload_id}") or "{}"
@@ -135,19 +141,17 @@ async def get_status(upload_id: str, current_user=Depends(get_current_user)):
 # === Unified results endpoint ===
 @app.get("/results/{upload_id}", summary="Get preview, transcript or diarization")
 async def get_results(upload_id: str, current_user=Depends(get_current_user), db=Depends(get_db)):
-    # 1) Preview from Redis
+    # 1) Preview из Redis
     pd = await redis.get(f"preview_result:{upload_id}")
     if pd:
         pl = json.loads(pd)
         return JSONResponse(content={"results": pl["timestamps"], "text": pl["text"]})
-
-    # 2) Full transcript file
+    # 2) Полный transcript
     tp = Path(settings.RESULTS_FOLDER) / upload_id / "transcript.json"
     if tp.exists():
         data = json.loads(tp.read_text(encoding="utf-8"))
         return JSONResponse(content={"results": data})
-
-    # 3) Diarization + apply label_mapping
+    # 3) Diarization + mapping
     dp = Path(settings.RESULTS_FOLDER) / upload_id / "diarization.json"
     if dp.exists():
         segs = json.loads(dp.read_text(encoding="utf-8"))
@@ -156,7 +160,6 @@ async def get_results(upload_id: str, current_user=Depends(get_current_user), db
         for s in segs:
             s["speaker"] = mapping.get(str(s["speaker"]), s["speaker"])
         return JSONResponse(content={"results": segs})
-
     raise HTTPException(404, "Results not ready")
 
 # === File upload endpoint ===
@@ -186,12 +189,12 @@ async def upload(
     log.bind(correlation_id=cid, upload_id=upload_id, user_id=current_user.id).info("upload accepted")
     await redis.set(f"external:{upload_id}", upload_id)
 
-    # start chain
+    # Старт цепочки обработки
     download_audio.delay(upload_id, cid)
     preview_transcribe.delay(upload_id, cid)
     transcribe_segments.delay(upload_id, cid)
 
-    # init progress
+    # Инициализация прогресса
     state = {"status": "started", "preview": None}
     await redis.set(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
     await redis.publish(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
@@ -201,7 +204,7 @@ async def upload(
         headers={"X-Correlation-ID": cid}
     )
 
-# === Manual diarization trigger ===
+# === Диаризация по запросу ===
 @app.post("/diarize/{upload_id}", summary="Request diarization")
 async def request_diarization(upload_id: str, current_user=Depends(get_current_user)):
     await redis.set(f"diarize_requested:{upload_id}", "1")
@@ -213,7 +216,7 @@ async def request_diarization(upload_id: str, current_user=Depends(get_current_u
     diarize_full.delay(upload_id, None)
     return JSONResponse({"message": "diarization started"})
 
-# === Save speaker-label mapping endpoint ===
+# === Сохранение меток спикеров ===
 @app.post("/labels/{upload_id}", summary="Save speaker labels")
 async def save_labels(
     upload_id: str,
@@ -237,7 +240,7 @@ async def save_labels(
 
     return JSONResponse({"results": updated})
 
-# routers & static
+# Подключаем роутеры и статику
 app.include_router(api_router, tags=["proxyAI"])
 app.include_router(admin_router)
 app.mount("/static", StaticFiles(directory="static"), name="static")
