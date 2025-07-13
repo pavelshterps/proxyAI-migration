@@ -1,4 +1,3 @@
-# tasks.py
 import json
 import logging
 import subprocess
@@ -13,10 +12,11 @@ from utils.audio import convert_to_wav
 
 logger = logging.getLogger(__name__)
 
-# Проверяем, доступны ли тяжёлые библиотеки
+# Флаги наличия тяжёлых библиотек
 _HF_AVAILABLE = False
 _PN_AVAILABLE = False
 
+# Ленивый импорт faster_whisper
 try:
     from faster_whisper import WhisperModel, download_model
     _HF_AVAILABLE = True
@@ -24,6 +24,7 @@ try:
 except ImportError as e:
     logger.warning(f"[INIT] faster_whisper not available: {e}")
 
+# Ленивый импорт pyannote.audio
 try:
     from pyannote.audio.pipelines import VoiceActivityDetection, SpeakerDiarization
     _PN_AVAILABLE = True
@@ -31,7 +32,8 @@ try:
 except ImportError as e:
     logger.warning(f"[INIT] pyannote.audio not available: {e}")
 
-# Ленивые инстансы
+# === Lazy-инициализации ===
+
 _whisper_model = None
 _vad = None
 _clustering_diarizer = None
@@ -41,28 +43,28 @@ def get_whisper_model():
         raise RuntimeError("WhisperModel unavailable")
     global _whisper_model
     if _whisper_model is None:
-        model_id  = settings.WHISPER_MODEL_PATH
-        cache_dir = settings.HUGGINGFACE_CACHE_DIR
-        device    = settings.WHISPER_DEVICE.lower()
+        model_id   = settings.WHISPER_MODEL_PATH
+        cache_dir  = settings.HUGGINGFACE_CACHE_DIR
+        device     = settings.WHISPER_DEVICE.lower()
         local_only = (device == "cpu")
 
         logger.info(f"[INIT] WhisperModel init: model={model_id}, device={device}, local_only={local_only}")
         try:
-            path = download_model(model_id, cache_dir=cache_dir, local_files_only=local_only)
-            logger.info(f"[INIT] Model cached at: {path}")
+            model_path = download_model(model_id, cache_dir=cache_dir, local_files_only=local_only)
+            logger.info(f"[INIT] Model cached at: {model_path}")
         except Exception as e:
             if local_only:
-                logger.error(f"[INIT] Model missing in cache: {e}")
+                logger.error(f"[INIT] Model missing from cache: {e}")
                 raise
             logger.warning(f"[INIT] Will download '{model_id}' online: {e}")
-            path = model_id
+            model_path = model_id
 
         compute = getattr(settings, "WHISPER_COMPUTE_TYPE", "int8").lower()
         if device == "cpu" and compute in ("float16","fp16"):
             logger.warning("[INIT] FP16 unsupported on CPU, switching to int8")
             compute = "int8"
 
-        _whisper_model = WhisperModel(path, device=device, compute_type=compute)
+        _whisper_model = WhisperModel(model_path, device=device, compute_type=compute)
         logger.info("[INIT] WhisperModel loaded successfully")
     return _whisper_model
 
@@ -97,7 +99,6 @@ def get_clustering_diarizer():
 
 @worker_process_init.connect
 def preload_and_warmup(**kwargs):
-    """Прогоним модёли на примере небольшого sample.wav."""
     sample = Path(__file__).parent / "tests/fixtures/sample.wav"
     try:
         logger.info("[WARMUP] Starting Whisper warm-up")
@@ -106,7 +107,6 @@ def preload_and_warmup(**kwargs):
             **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {})
         )
         logger.info("[WARMUP] Whisper warm-up completed")
-
         if settings.WHISPER_DEVICE.lower() != "cpu":
             logger.info("[WARMUP] Starting VAD + Diarizer warm-up")
             get_vad().apply({"audio": str(sample)})
