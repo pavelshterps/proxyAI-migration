@@ -22,14 +22,15 @@ _clustering_diarizer = None
 def get_whisper_model():
     global _whisper_model
     if _whisper_model is None:
-        model_id = settings.WHISPER_MODEL_PATH
-        cache = settings.HUGGINGFACE_CACHE_DIR
+        model_id = settings.WHISPER_MODEL_PATH  # по env: /hf_cache/models--guillaumekln--faster-whisper-medium
+        cache = settings.HUGGINGFACE_CACHE_DIR  # каждый контейнер монтирует whisper_models
 
-        # сначала пробуем локальную модель из cache
+        # пытаемся локально
         try:
             download_model(model_id, cache_dir=cache, local_files_only=True)
+            logger.info(f"Loaded Whisper model locally from {model_id}")
         except Exception:
-            logger.info("Локальная модель не найдена, скачиваем из HuggingFace")
+            logger.info("Локальная модель не найдена, пробуем скачать из HuggingFace")
             download_model(model_id, cache_dir=cache, local_files_only=False)
 
         device = settings.WHISPER_DEVICE.lower()
@@ -43,7 +44,7 @@ def get_whisper_model():
             device=device,
             compute_type=compute,
             cache_dir=cache,
-            local_files_only=True
+            local_files_only=True   # после загрузки локально
         )
     return _whisper_model
 
@@ -134,7 +135,7 @@ def transcribe_segments(self, upload_id: str, correlation_id: str):
 
     for cb in json.loads(r.get(f"callbacks:{upload_id}") or "[]"):
         try:
-            requests.post(cb, json={"event": "transcript_complete", "external_id": upload_id}, timeout=5)
+            requests.post(cb, json={"event": "transcript_complete","external_id":upload_id}, timeout=5)
         except:
             pass
 
@@ -147,8 +148,8 @@ def diarize_full(self, upload_id: str, correlation_id: str):
     wav = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
     ann = get_clustering_diarizer().apply({"audio": str(wav)})
 
-    segs = [{"start": float(seg.start), "end": float(seg.end), "speaker": spk}
-            for seg, _, spk in ann.itertracks(yield_label=True)]
+    segs = [{"start":float(seg.start),"end":float(seg.end),"speaker":spk}
+            for seg,_,spk in ann.itertracks(yield_label=True)]
     d = Path(settings.RESULTS_FOLDER) / upload_id
     d.mkdir(exist_ok=True, parents=True)
     (d / "diarization.json").write_text(json.dumps(segs, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -159,7 +160,7 @@ def diarize_full(self, upload_id: str, correlation_id: str):
 
     for cb in json.loads(r.get(f"callbacks:{upload_id}") or "[]"):
         try:
-            requests.post(cb, json={"event": "diarization_complete", "external_id": upload_id}, timeout=5)
+            requests.post(cb, json={"event":"diarization_complete","external_id":upload_id}, timeout=5)
         except:
             pass
 

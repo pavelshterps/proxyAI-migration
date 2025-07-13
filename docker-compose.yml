@@ -33,7 +33,7 @@ services:
       dockerfile: Dockerfile
     container_name: proxyai_api
     env_file: .env
-    command: >
+    command: >-
       sh -c "until nc -z db 5432; do echo waiting for db; sleep 1; done;
              uvicorn main:app --host 0.0.0.0 --port 8000 --workers ${API_WORKERS}"
     environment:
@@ -43,12 +43,13 @@ services:
       - RESULTS_FOLDER=${RESULTS_FOLDER}
       - DIARIZER_CACHE_DIR=${DIARIZER_CACHE_DIR}
       - HUGGINGFACE_CACHE_DIR=${HUGGINGFACE_CACHE_DIR}
+      - WHISPER_MODEL_PATH=${WHISPER_MODEL_PATH}
     volumes:
       - ./:/app:delegated
       - upload_data:${UPLOAD_FOLDER}
       - results_data:${RESULTS_FOLDER}
       - diarizer_cache:${DIARIZER_CACHE_DIR}
-      - whisper_models:${HUGGINGFACE_CACHE_DIR}   # монтируем здесь
+      - whisper_models:${HUGGINGFACE_CACHE_DIR}  # монтируем модели Whisper
     ports:
       - "8000:8000"
     depends_on:
@@ -63,15 +64,16 @@ services:
       dockerfile: Dockerfile
     container_name: proxyai_worker_cpu
     env_file: .env
-    command: >
+    command: >-
       celery -A tasks worker --loglevel=info --concurrency ${CPU_CONCURRENCY} --queues split_cpu,dispatch_cpu,collect_cpu
     environment:
       - CELERY_BROKER_URL=${CELERY_BROKER_URL}
       - UPLOAD_FOLDER=${UPLOAD_FOLDER}
       - RESULTS_FOLDER=${RESULTS_FOLDER}
       - DIARIZER_CACHE_DIR=${DIARIZER_CACHE_DIR}
-      - WHISPER_DEVICE=cpu
       - HUGGINGFACE_CACHE_DIR=${HUGGINGFACE_CACHE_DIR}
+      - WHISPER_MODEL_PATH=${WHISPER_MODEL_PATH}
+      - WHISPER_DEVICE=cpu
     volumes:
       - ./:/app:delegated
       - upload_data:${UPLOAD_FOLDER}
@@ -91,16 +93,17 @@ services:
     container_name: proxyai_worker_gpu
     runtime: nvidia
     env_file: .env
-    command: >
+    command: >-
       celery -A tasks worker --loglevel=info --concurrency ${GPU_CONCURRENCY} --queues transcribe_gpu,diarize_gpu
     environment:
       - CELERY_BROKER_URL=${CELERY_BROKER_URL}
       - UPLOAD_FOLDER=${UPLOAD_FOLDER}
       - RESULTS_FOLDER=${RESULTS_FOLDER}
       - DIARIZER_CACHE_DIR=${DIARIZER_CACHE_DIR}
-      - WHISPER_DEVICE=${WHISPER_DEVICE}
-      - NVIDIA_VISIBLE_DEVICES=all
       - HUGGINGFACE_CACHE_DIR=${HUGGINGFACE_CACHE_DIR}
+      - WHISPER_MODEL_PATH=${WHISPER_MODEL_PATH}
+      - WHISPER_DEVICE=cuda
+      - NVIDIA_VISIBLE_DEVICES=all
     volumes:
       - ./:/app:delegated
       - upload_data:${UPLOAD_FOLDER}
@@ -133,7 +136,7 @@ services:
     image: mher/flower:0.9.7
     container_name: proxyai_flower
     env_file: .env
-    command: >
+    command: >-
       flower --broker=${CELERY_BROKER_URL} --basic_auth=${FLOWER_USER}:${FLOWER_PASS} --port=5555
     ports:
       - "5555:5555"
@@ -163,7 +166,7 @@ volumes:
   upload_data:
   results_data:
   diarizer_cache:
-  whisper_models:  # volume для модели
+  whisper_models:
 
 networks:
   proxyai_net:
