@@ -6,7 +6,7 @@ WORKDIR /app
 # --- Устанавливаем системные зависимости и чистим apt-кэш ---
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-      python3-pip build-essential ffmpeg libsndfile1 libpq-dev && \
+      python3-pip build-essential ffmpeg libsndfile1 libpq-dev netcat && \
     rm -rf /var/lib/apt/lists/*
 
 # --- Копируем и ставим только необходимые для API и CPU-воркера Python-пакеты ---

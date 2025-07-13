@@ -28,7 +28,7 @@ services:
       - "6379:6379"
     networks:
       - proxyai_net
-
+      -
   # ========== FastAPI API ==========
   api:
     build:
@@ -36,7 +36,7 @@ services:
       dockerfile: Dockerfile
     container_name: proxyai_api
     env_file: .env
-    command: >  # ожидание поднятия БД перед запуском
+    command: >
       sh -c "until nc -z db 5432; do echo waiting for db; sleep 1; done;
              uvicorn main:app --host 0.0.0.0 --port 8000 --workers ${API_WORKERS}"
     environment:
@@ -86,6 +86,7 @@ services:
       - redis
     networks:
       - proxyai_net
+
 
   # ========== GPU Worker ==========
   worker_gpu:
