@@ -1,0 +1,12 @@
+# НЕ включаем в build-контекст — уменьшаем размер передачи
+data/hf_cache
+upload_data
+results_data
+diarizer_cache
+
+# прочие «мусорные» файлы
+*.log
+.git
+.env
+__pycache__
+*.pyc
