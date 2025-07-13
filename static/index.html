@@ -58,43 +58,60 @@
     let mapping = {};
 
     const fmt = ms => {
-      const sec = Math.floor(ms/1000), m = String(Math.floor(sec/60)).padStart(2,'0'), s = String(sec%60).padStart(2,'0');
+      const sec = Math.floor(ms/1000),
+            m = String(Math.floor(sec/60)).padStart(2,'0'),
+            s = String(sec%60).padStart(2,'0');
       return `${m}:${s}`;
     };
 
     uploadBtn.onclick = async () => {
-      const key = apiKeyEl.value.trim(); if(!key){alert("Введите API-Key");return;}
-      const file = fileEl.files[0]; if(!file){alert("Выберите файл");return;}
+      const key = apiKeyEl.value.trim();
+      if(!key){ alert("Введите API-Key"); return; }
+      const file = fileEl.files[0];
+      if(!file){ alert("Выберите файл"); return; }
 
       fileBlob = file;
+      // сразу показываем плеер
+      audioEl.src = URL.createObjectURL(fileBlob);
+
       statusEl.textContent = "Загружаем…";
-      const form = new FormData(); form.append("file", file, file.name);
+      const form = new FormData();
+      form.append("file", file, file.name);
       const res = await fetch("/upload/", {
         method: "POST",
         headers: { "X-API-Key": key },
         body: form
       });
-      if(!res.ok){alert("Upload error: "+res.status);return;}
+      if(!res.ok){ alert("Upload error: "+res.status); return; }
       uploadId = (await res.json()).upload_id;
 
       // reset UI
       previewDone = transcriptDone = diarizeDone = false;
       [previewBtn, transcriptBtn, diarizeBtn, saveBtn].forEach(b=>b.disabled=true);
-      container.innerHTML = ""; audioEl.src = "";
+      container.innerHTML = "";
 
       // SSE
       const es = new EventSource(`/events/${uploadId}`);
       es.onmessage = async e => {
         const st = JSON.parse(e.data);
         statusEl.textContent = `Статус: ${st.status}`;
+
         if(st.status==="preview_done" && !previewDone){
-          previewDone=true; previewBtn.disabled=false; await loadPreview();
+          previewDone=true;
+          previewBtn.disabled=false;
+          await loadPreview();
         }
         if(st.status==="transcript_done" && !transcriptDone){
-          transcriptDone=true; transcriptBtn.disabled=false; diarizeBtn.disabled=false; await loadTranscript();
+          transcriptDone=true;
+          transcriptBtn.disabled=false;
+          diarizeBtn.disabled=false;
+          await loadTranscript();
         }
         if(st.status==="diarization_done" && !diarizeDone){
-          diarizeDone=true; saveBtn.disabled=false; await loadTranscript(); es.close();
+          diarizeDone=true;
+          saveBtn.disabled=false;
+          await loadTranscript();
+          es.close();
         }
       };
 
@@ -106,7 +123,6 @@
       const key = apiKeyEl.value.trim();
       const res = await fetch(`/results/${uploadId}`, { headers:{ "X-API-Key":key }});
       const { results } = await res.json();
-      audioEl.src = URL.createObjectURL(fileBlob);
       render(results);
       statusEl.textContent="Превью готово";
     }
@@ -116,22 +132,24 @@
       const key = apiKeyEl.value.trim();
       const res = await fetch(`/results/${uploadId}`, { headers:{ "X-API-Key":key }});
       const { results } = await res.json();
-      audioEl.src = URL.createObjectURL(fileBlob);
       render(results);
       statusEl.textContent="Готово";
     }
 
-    previewBtn.onclick = loadPreview;
+    previewBtn.onclick    = loadPreview;
     transcriptBtn.onclick = loadTranscript;
-    diarizeBtn.onclick = async () => {
+    diarizeBtn.onclick    = async () => {
       statusEl.textContent="Запрашиваем диаризацию…";
-      await fetch(`/diarize/${uploadId}`, { method:"POST", headers:{"X-API-Key":apiKeyEl.value.trim()}});
+      await fetch(`/diarize/${uploadId}`, {
+        method:"POST",
+        headers:{"X-API-Key":apiKeyEl.value.trim()}
+      });
       diarizeBtn.disabled=true;
     };
-    saveBtn.onclick = async () => {
+    saveBtn.onclick       = async () => {
       const key = apiKeyEl.value.trim(), payload={};
       Object.entries(mapping).forEach(([o,n])=>o!==n&&(payload[o]=n));
-      if(!Object.keys(payload).length){alert("Нет изменений");return;}
+      if(!Object.keys(payload).length){ alert("Нет изменений"); return; }
       const res = await fetch(`/labels/${uploadId}`, {
         method:"POST",
         headers:{ "Content-Type":"application/json","X-API-Key":key },
@@ -145,20 +163,43 @@
 
     function render(list){
       container.innerHTML=""; mapping={};
+      // инициализируем мэппинг для сохранения
       list.forEach(s=>mapping[s.speaker||""]=s.speaker||"");
       list.forEach(seg=>{
-        const div=document.createElement("div"); div.className="segment";
-        const t=document.createElement("span"); t.className="time"; t.textContent=fmt(seg.start*1000);
-        const btn=document.createElement("button"); btn.textContent="▶️";
-        btn.onclick=()=>{ audioEl.currentTime=seg.start; audioEl.play(); setTimeout(()=>audioEl.pause(),(seg.end-seg.start)*1000); };
-        const inp=document.createElement("input"); inp.value=seg.speaker||"";
-        inp.onchange=()=>{
-          const old=seg.speaker||"", neu=inp.value.trim();
-          if(neu&&neu.length<=50){ mapping[old]=neu; document.querySelectorAll('.segment input').forEach(i=>i.value===old&&(i.value=neu)); }
-          else{ alert("Имя 1–50 символов"); inp.value=mapping[old]; }
+        const div = document.createElement("div");
+        div.className = "segment";
+
+        const t = document.createElement("span");
+        t.className="time";
+        t.textContent=fmt(seg.start*1000);
+
+        const btn = document.createElement("button");
+        btn.textContent="▶️";
+        btn.onclick=()=>{
+          audioEl.currentTime=seg.start;
+          audioEl.play();
+          setTimeout(()=>audioEl.pause(), (seg.end-seg.start)*1000);
         };
-        const txt=document.createElement("span"); txt.textContent=seg.text;
-        div.append(t,btn,inp,txt);
+
+        const inp = document.createElement("input");
+        inp.value = seg.speaker||"";
+        inp.onchange=()=>{
+          const old=seg.speaker||"",
+                neu=inp.value.trim();
+          if(neu&&neu.length<=50){
+            mapping[old]=neu;
+            document.querySelectorAll('.segment input')
+              .forEach(i=>i.value===old&&(i.value=neu));
+          } else {
+            alert("Имя 1–50 символов");
+            inp.value = mapping[old];
+          }
+        };
+
+        const txt = document.createElement("span");
+        txt.textContent = seg.text;
+
+        div.append(t, btn, inp, txt);
         container.append(div);
       });
     }

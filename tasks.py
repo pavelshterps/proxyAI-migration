@@ -22,9 +22,8 @@ _clustering_diarizer = None
 def get_whisper_model():
     """
     Ленивая инициализация WhisperModel.
-    1) Скачиваем/проверяем модель через download_model(...) (cache_dir, local_files_only).
-    2) Инициализируем WhisperModel только с нужными аргументами:
-       model_path, device, compute_type.
+    1) Проверяем/загружаем в cache локально (для CPU) или разрешаем онлайн (для GPU).
+    2) Передаём в конструктор только model_path, device и compute_type.
     """
     global _whisper_model
     if _whisper_model is None:
@@ -38,7 +37,6 @@ def get_whisper_model():
             f"cache_dir={cache_dir}, local_only={local_only}"
         )
 
-        # 1) Попытка загрузить модель в кеш
         try:
             model_path = download_model(
                 model_id,
@@ -48,19 +46,17 @@ def get_whisper_model():
             logger.info(f"Whisper model '{model_id}' cached at '{model_path}'")
         except Exception as e:
             if local_only:
-                logger.error(f"Model '{model_id}' missing from cache and download disabled: {e}")
-                raise RuntimeError(f"Whisper model '{model_id}' not found in local cache '{cache_dir}'")
+                logger.error(f"Model '{model_id}' missing from cache: {e}")
+                raise RuntimeError(f"Whisper model '{model_id}' not in local cache")
             else:
-                logger.warning(f"Model '{model_id}' not in cache, will download online at init: {e}")
-                model_path = model_id  # отдадим конструктору сам идентификатор
+                logger.warning(f"Will download '{model_id}' online at init: {e}")
+                model_path = model_id
 
-        # 2) Переключаем compute_type на int8, если CPU не поддерживает fp16
         compute = getattr(settings, "WHISPER_COMPUTE_TYPE", "int8").lower()
         if device == "cpu" and compute in ("float16", "fp16"):
             logger.warning("FP16 unsupported on CPU, switching to int8")
             compute = "int8"
 
-        # 3) Инициализация WhisperModel без cache_dir/local_files_only
         _whisper_model = WhisperModel(
             model_path,
             device=device,
@@ -71,7 +67,7 @@ def get_whisper_model():
     return _whisper_model
 
 def get_vad():
-    """Ленивая инициализация Voice Activity Detection (pyannote.audio)."""
+    """Ленивая инициализация VAD (pyannote.audio)."""
     global _vad
     if _vad is None:
         _vad = VoiceActivityDetection.from_pretrained(
@@ -83,7 +79,7 @@ def get_vad():
     return _vad
 
 def get_clustering_diarizer():
-    """Ленивая инициализация Speaker Diarization (pyannote.audio)."""
+    """Ленивая инициализация SpeakerDiarization."""
     global _clustering_diarizer
     if _clustering_diarizer is None:
         os.makedirs(settings.DIARIZER_CACHE_DIR, exist_ok=True)
@@ -99,11 +95,11 @@ def get_clustering_diarizer():
 def preload_and_warmup(**kwargs):
     """
     Warm-up при старте воркера:
-      1) Всегда прогреваем WhisperModel на коротком sample.wav
-      2) Если GPU — прогреваем также VAD и Diarizer
+      1) Прогрев WhisperModel на sample.wav
+      2) Если GPU — прогрев VAD+Diarizer
     """
     sample = Path(__file__).parent / "tests/fixtures/sample.wav"
-    opts = {"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {}
+    opts   = {"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {}
     try:
         get_whisper_model().transcribe(str(sample), **opts)
         logger.info("Whisper warm-up completed")
@@ -130,6 +126,11 @@ def preview_transcribe(self, upload_id: str, correlation_id: str):
         logger.error(f"[{correlation_id}] Conversion error: {e}")
         return
 
+    # вырезаем первые PREVIEW_LENGTH_S секунд для быстрого превью
+    preview_wav = Path(settings.UPLOAD_FOLDER) / f"{upload_id}_preview.wav"
+    t = settings.PREVIEW_LENGTH_S
+    os.system(f"ffmpeg -y -i {wav_path} -t {t} {preview_wav}")
+
     try:
         model = get_whisper_model()
     except Exception as e:
@@ -138,26 +139,24 @@ def preview_transcribe(self, upload_id: str, correlation_id: str):
 
     opts = {"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {}
     try:
-        segs, _ = model.transcribe(str(wav_path), word_timestamps=True, **opts)
+        segs, _ = model.transcribe(str(preview_wav), word_timestamps=True, **opts)
     except Exception as e:
         logger.error(f"[{correlation_id}] Preview transcription error: {e}")
         return
 
     preview = {"text": "", "timestamps": []}
     for s in segs:
-        if s.start >= settings.PREVIEW_LENGTH_S:
-            break
-        preview["text"]      += s.text
+        preview["text"] += s.text
         preview["timestamps"].append({"start": s.start, "end": s.end, "text": s.text})
 
-    # Сохраняем превью и публикуем событие
+    # сохраняем и публикуем превью
     r.set(f"preview_result:{upload_id}", json.dumps(preview, ensure_ascii=False))
     state = {"status": "preview_done", "preview": preview}
     r.set(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
     r.publish(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
     logger.info(f"[{correlation_id}] Preview done for {upload_id}")
 
-    # Запускаем полную транскрипцию
+    # запускаем полную транскрипцию
     transcribe_segments.delay(upload_id, correlation_id)
 
 @celery_app.task(bind=True, name="tasks.transcribe_segments", queue="transcribe_gpu")
@@ -191,7 +190,7 @@ def transcribe_segments(self, upload_id: str, correlation_id: str):
     r.publish(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
     logger.info(f"[{correlation_id}] Full transcription done for {upload_id}")
 
-    # Авторские callbacks
+    # callbacks
     for cb in json.loads(r.get(f"callbacks:{upload_id}") or "[]"):
         try:
             requests.post(cb,
@@ -200,7 +199,7 @@ def transcribe_segments(self, upload_id: str, correlation_id: str):
         except Exception:
             pass
 
-    # Если был запрос на диаризацию — запускаем
+    # если нужно — запускаем диаризацию
     if r.get(f"diarize_requested:{upload_id}") == "1":
         diarize_full.delay(upload_id, correlation_id)
 
