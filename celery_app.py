@@ -5,15 +5,14 @@ from config.settings import settings
 from tasks import get_whisper_model, get_diarizer
 
 app = Celery("proxyai")
-# читаем всю конфигурацию из config/celery.py
 app.config_from_object("config.celery")
 
 @signals.worker_process_init.connect
 def preload_models(**kwargs):
     """
-    При старте каждого процесса-воркера:
-    - CPU-воркеры прогревают PyAnnote-диаризер
-    - GPU-воркеры прогревают WhisperModel
+    Прогрев моделей при старте воркера:
+      • CPU-воркеры (device='cpu') — PyAnnote-диаризер
+      • GPU-воркеры — WhisperModel
     """
     device = settings.WHISPER_DEVICE.lower()
     if device == "cpu":

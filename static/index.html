@@ -82,6 +82,7 @@
       statusEl.textContent = "Загружаем…";
       timingsEl.textContent = "";
 
+      // 1) Отправляем файл
       const form = new FormData();
       form.append("file", file, file.name);
       const res = await fetch("/upload/", {
@@ -92,16 +93,20 @@
       if(!res.ok){ alert("Upload error: "+res.status); return; }
       uploadId = (await res.json()).upload_id;
 
+      // сброс кнопок и разметки
       [previewBtn, transcriptBtn, diarizeBtn, saveBtn].forEach(b=>b.disabled=true);
       container.innerHTML="";
 
-      // SSE stream
-      const es = new EventSource(`/events/${uploadId}`);
+      // 2) Открываем SSE-поток, передаём ключ через query-param,
+      //    т.к. EventSource не умеет кастомные заголовки
+      const es = new EventSource(
+        `/events/${uploadId}?api_key=${encodeURIComponent(key)}`
+      );
       es.onmessage = async e => {
         const st = JSON.parse(e.data);
         statusEl.textContent = `Статус: ${st.status}`;
 
-        // preview via SSE payload
+        // preview через встроенный в SSE payload
         if(st.preview && !previewDone){
           previewDone = true;
           const dt = ((performance.now() - tUpload)/1000).toFixed(2);
@@ -110,7 +115,7 @@
           render(st.preview.timestamps);
         }
 
-        // full transcript
+        // полная транскрипция
         if(st.status==="transcript_done" && !transcriptDone){
           transcriptDone = true;
           const dt = ((performance.now() - tUpload)/1000).toFixed(2);
@@ -120,7 +125,7 @@
           await loadTranscript();
         }
 
-        // diarization
+        // диаризация
         if(st.status==="diarization_done" && !diarizeDone){
           diarizeDone = true;
           const dt = ((performance.now() - tUpload)/1000).toFixed(2);
@@ -145,7 +150,7 @@
       statusEl.textContent="Готово";
     }
 
-    previewBtn.onclick    = () => {};  // no-op: auto-rendered
+    previewBtn.onclick    = () => {};  // noop, рендер через SSE
     transcriptBtn.onclick = loadTranscript;
     diarizeBtn.onclick    = async () => {
       statusEl.textContent="Запрашиваем диаризацию…";
@@ -199,7 +204,8 @@
           const old=seg.speaker||"", neu=inp.value.trim();
           if(neu&&neu.length<=50){
             mapping[old] = neu;
-            frag.querySelectorAll("input").forEach(i=>{ if(i.value===old) i.value=neu; });
+            frag.querySelectorAll("input")
+                .forEach(i=> i.value===old && (i.value=neu));
           } else {
             alert("Имя 1–50 символов"); inp.value=mapping[old];
           }
