@@ -29,11 +29,14 @@ from crud import create_upload_record, get_upload_for_user
 from dependencies import get_current_user
 from routes import router as api_router
 from admin_routes import router as admin_router
-from tasks import download_audio, preview_transcribe, diarize_full
+
+# Импорт задач — после правок tasks.py не будет падать
+from tasks import download_audio, preview_transcribe, transcribe_segments, diarize_full
 
 # === Application lifecycle & retry on DB init ===
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    """Retry init_models при старте до 5 раз."""
     for attempt in range(1, 6):
         try:
             await init_models(engine)
@@ -131,7 +134,6 @@ async def root():
     log.debug("Serving index.html")
     return FileResponse("static/index.html")
 
-
 # === Upload endpoint ===
 @app.post("/upload/", dependencies=[Depends(get_current_user)])
 @limiter.limit("10/minute")
@@ -195,7 +197,6 @@ async def upload(
         headers={"X-Correlation-ID":cid}
     )
 
-
 # === Server-Sent Events for progress ===
 @app.get("/events/{upload_id}")
 async def progress_events(
@@ -212,7 +213,6 @@ async def progress_events(
 
         try:
             while True:
-                # detect client disconnect
                 if await request.is_disconnected():
                     log.info("Client disconnected before completion", upload_id=upload_id)
                     break
@@ -224,14 +224,11 @@ async def progress_events(
                     payload = msg["data"]
                     log.debug("SSE ▶ sending JSON", upload_id=upload_id, data=payload)
                     yield f"data: {payload}\n\n"
-
-                # heartbeat comment once per second
                 elif now - last_hb > 1.0:
                     yield ":\n\n"
                     last_hb = now
 
                 await asyncio.sleep(0.1)
-
         except Exception as e:
             log.error("Error in SSE generator", upload_id=upload_id, error=str(e))
             yield f"data: {{\"status\":\"error\",\"message\":\"{str(e)}\"}}\n\n"
@@ -240,7 +237,6 @@ async def progress_events(
             log.info("Client unsubscribed from SSE", upload_id=upload_id)
 
     return EventSourceResponse(generator())
-
 
 # === Results endpoint ===
 @app.get("/results/{upload_id}", summary="Get preview, transcript or diarization")
@@ -251,21 +247,21 @@ async def get_results(
 ):
     log.info("Get results called", upload_id=upload_id, user_id=current_user.id)
 
-    # 1) preview
+    # 1) preview from Redis
     pd = await redis.get(f"preview_result:{upload_id}")
     if pd:
         pl = json.loads(pd)
         log.info("Returning preview from Redis", upload_id=upload_id, segments=len(pl["timestamps"]))
         return JSONResponse(content={"results": pl["timestamps"], "text": pl["text"]})
 
-    # 2) full transcript
+    # 2) full transcript file
     tp = Path(settings.RESULTS_FOLDER) / upload_id / "transcript.json"
     if tp.exists():
         data = json.loads(tp.read_text(encoding="utf-8"))
         log.info("Returning full transcript file", upload_id=upload_id, path=str(tp), segments=len(data))
         return JSONResponse(content={"results": data})
 
-    # 3) diarization + user mapping
+    # 3) diarization + apply user labels
     dp = Path(settings.RESULTS_FOLDER) / upload_id / "diarization.json"
     if dp.exists():
         segs = json.loads(dp.read_text(encoding="utf-8"))
@@ -278,7 +274,6 @@ async def get_results(
 
     log.warning("Results not ready", upload_id=upload_id)
     raise HTTPException(404, "Results not ready")
-
 
 # === Trigger diarization manually ===
 @app.post("/diarize/{upload_id}", summary="Request diarization")
@@ -301,7 +296,6 @@ async def request_diarization(
     except Exception as e:
         log.error("Failed to launch diarization", upload_id=upload_id, error=str(e))
         raise HTTPException(500, f"Diarize launch failed: {e}")
-
 
 # === Save speaker labels ===
 @app.post("/labels/{upload_id}", summary="Save speaker labels")
@@ -334,7 +328,6 @@ async def save_labels(
         log.warning("Diarization file not found for updating labels", path=str(out))
 
     return JSONResponse({"results": updated})
-
 
 # === Include routers & mount static ===
 app.include_router(api_router, tags=["proxyAI"])
