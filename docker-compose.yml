@@ -28,7 +28,7 @@ services:
       dockerfile: Dockerfile
     container_name: proxyai_api
     env_file: .env
-    command: >-
+    command: >
       sh -c "until nc -z db 5432; do sleep 1; done;
              uvicorn main:app --host 0.0.0.0 --port 8000 --workers ${API_WORKERS}"
     environment:
@@ -39,12 +39,14 @@ services:
       - DIARIZER_CACHE_DIR=${DIARIZER_CACHE_DIR}
       - HUGGINGFACE_CACHE_DIR=${HUGGINGFACE_CACHE_DIR}
       - WHISPER_MODEL_PATH=${WHISPER_MODEL_PATH}
+      - HF_HOME=/hf_cache       # главный каталог Hugging Face
+      - HF_HUB_CACHE=/hf_cache/hub
     volumes:
       - ./:/app:delegated
       - upload_data:${UPLOAD_FOLDER}
       - results_data:${RESULTS_FOLDER}
       - diarizer_cache:${DIARIZER_CACHE_DIR}
-      - ./data/whisper-models:/hf_cache
+      - ./data/hf_cache:/hf_cache         # общий volume для кэша
     ports: ["8000:8000"]
     depends_on: [db, redis]
     networks: [proxyai_net]
@@ -65,12 +67,14 @@ services:
       - HUGGINGFACE_CACHE_DIR=${HUGGINGFACE_CACHE_DIR}
       - WHISPER_MODEL_PATH=${WHISPER_MODEL_PATH}
       - WHISPER_DEVICE=cpu
+      - HF_HOME=/hf_cache
+      - HF_HUB_CACHE=/hf_cache/hub
     volumes:
       - ./:/app:delegated
       - upload_data:${UPLOAD_FOLDER}
       - results_data:${RESULTS_FOLDER}
       - diarizer_cache:${DIARIZER_CACHE_DIR}
-      - ./data/whisper-models:/hf_cache
+      - ./data/hf_cache:/hf_cache
     depends_on: [api, redis]
     networks: [proxyai_net]
 
@@ -92,12 +96,14 @@ services:
       - WHISPER_MODEL_PATH=${WHISPER_MODEL_PATH}
       - WHISPER_DEVICE=cuda
       - NVIDIA_VISIBLE_DEVICES=all
+      - HF_HOME=/hf_cache
+      - HF_HUB_CACHE=/hf_cache/hub
     volumes:
       - ./:/app:delegated
       - upload_data:${UPLOAD_FOLDER}
       - results_data:${RESULTS_FOLDER}
       - diarizer_cache:${DIARIZER_CACHE_DIR}
-      - ./data/whisper-models:/hf_cache
+      - ./data/hf_cache:/hf_cache
     depends_on: [api, redis]
     networks: [proxyai_net]
 
