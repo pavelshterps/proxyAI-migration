@@ -106,21 +106,14 @@
 
       es.onmessage = e => {
         let raw = e.data;
-        console.debug("SSE ▶ raw:", raw);
-
         // skip heartbeat/comment lines
         if(!raw || raw.trim()==="" || raw.trim()===":") return;
-
         // strip leading "data:"
         if(raw.startsWith("data:")) raw = raw.replace(/^data:\s*/, "");
 
         let st;
-        try {
-          st = JSON.parse(raw);
-        } catch(err) {
-          console.warn("SSE JSON parse failed:", err, raw);
-          return;
-        }
+        try { st = JSON.parse(raw); }
+        catch(err){ console.warn("SSE JSON parse failed:", err, raw); return; }
 
         statusEl.textContent = `Статус: ${st.status}`;
 
@@ -150,6 +143,7 @@
           timingsEl.innerHTML += `<div>Diarization done in ${((performance.now() - tUpload)/1000).toFixed(2)}s</div>`;
           saveBtn.disabled = false;
           es.close();
+          // теперь не рисуем сегменты диаризации, а сразу перезагружаем merged results
           loadTranscript().catch(console.error);
         }
       };
@@ -157,7 +151,7 @@
       statusEl.textContent = "Файл загружен, ждём прогресса…";
     };
 
-    // ВЕЩАЮЩАЯ ПРАВКА: всегда чистим контейнер перед перерисовкой
+    // чистим контейнер перед каждым запросом /results
     async function loadTranscript(){
       container.innerHTML = "";
       statusEl.textContent = "Загружаю результат…";
@@ -174,7 +168,7 @@
     previewBtn.onclick    = () => {};
     transcriptBtn.onclick = () => loadTranscript().catch(err=>{
       console.error(err);
-      statusEl.textContent = "Ошибка при получении транскрипта";
+      statusEl.textContent="Ошибка при получении транскрипта";
     });
     diarizeBtn.onclick    = async () => {
       statusEl.textContent="Запрашиваем диаризацию…";
@@ -191,12 +185,13 @@
         statusEl.textContent = "Ошибка при запросе диаризации";
       }
     };
+
     saveBtn.onclick = async () => {
       const key = apiKeyEl.value.trim(), payload={};
       Object.entries(mapping).forEach(([o,n])=>{ if(o!==n) payload[o]=n; });
       if(!Object.keys(payload).length){ alert("Нет изменений"); return; }
       try {
-        const res = await fetch(`/labels/${uploadId}`, {
+        await fetch(`/labels/${uploadId}`, {
           method:"POST",
           headers:{
             "Content-Type":"application/json",
@@ -204,11 +199,8 @@
           },
           body:JSON.stringify(payload)
         });
-        if(!res.ok) throw new Error("Labels save failed: " + res.status);
-        const { results } = await res.json();
-        // сразу перерисуем финальные метки:
-        container.innerHTML = "";
-        render(results);
+        // вместо рисования «сырых» updated-сегментов, запрашиваем merged UI:
+        await loadTranscript();
         saveBtn.disabled = true;
         alert("Метки сохранены");
       } catch(err) {
@@ -241,7 +233,7 @@
         const inp = document.createElement("input");
         inp.value = seg.speaker||"";
         inp.onchange = ()=>{
-          const old=seg.speaker||"", neu=inp.value.trim();
+          const old = seg.speaker||"", neu = inp.value.trim();
           if(neu && neu.length<=50){
             mapping[old] = neu;
             frag.querySelectorAll("input").forEach(i=>{
@@ -249,12 +241,12 @@
             });
           } else {
             alert("Имя 1–50 символов");
-            inp.value=mapping[old];
+            inp.value = mapping[old];
           }
         };
 
         const txt = document.createElement("span");
-        txt.textContent = seg.text;
+        txt.textContent = seg.text || "";
 
         div.append(t, btn, inp, txt);
         frag.append(div);
