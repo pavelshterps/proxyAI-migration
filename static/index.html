@@ -64,7 +64,7 @@
       return `${m}:${s}`;
     };
 
-    // === Полная логика загрузки, SSE и первоначального рендеринга ===
+    // === Загрузка файла и подписка на SSE ===
     uploadBtn.onclick = async () => {
       const key = apiKeyEl.value.trim();
       if(!key){ alert("Введите API-Key"); return; }
@@ -94,19 +94,18 @@
         return;
       }
 
-      // Reset UI
+      // reset UI
       [previewBtn, transcriptBtn, diarizeBtn, saveBtn].forEach(b=>b.disabled=true);
       container.innerHTML = "";
 
-      // 2) SSE подписка
+      // 2) SSE
       const sse = new EventSource(`/events/${uploadId}?api_key=${encodeURIComponent(key)}`);
       sse.onmessage = e => {
         let raw = e.data;
         if(!raw || raw.trim()==="" || raw.trim()===":") return;
         if(raw.startsWith("data:")) raw = raw.replace(/^data:\s*/, "");
         let st;
-        try { st = JSON.parse(raw); }
-        catch { return; }
+        try { st = JSON.parse(raw); } catch { return; }
         statusEl.textContent = `Статус: ${st.status}`;
 
         // preview
@@ -123,7 +122,7 @@
           timingsEl.innerHTML += `<div>Transcript: ${(performance.now()-tUpload)/1000}s</div>`;
           transcriptBtn.disabled = false;
           diarizeBtn.disabled = false;
-          loadTranscript();
+          loadTranscript().catch(console.error);
         }
 
         // diarization
@@ -132,28 +131,28 @@
           timingsEl.innerHTML += `<div>Diarization: ${(performance.now()-tUpload)/1000}s</div>`;
           saveBtn.disabled = false;
           sse.close();
-          loadTranscript();
+          loadTranscript().catch(console.error);
         }
       };
+
       statusEl.textContent = "Загружено, ждём прогресса…";
     };
 
-    // === Загрузка /results и рендеринг ===
+    // === Получить и отрисовать (/results) ===
     async function loadTranscript(){
       container.innerHTML = "";
       statusEl.textContent = "Загружаю результат…";
-      const key = apiKeyEl.value.trim();
       const res = await fetch(`/results/${uploadId}`, {
-        headers:{ "X-API-Key": key }
+        headers:{ "X-API-Key": apiKeyEl.value.trim() }
       });
       if(!res.ok) throw new Error("results fetch failed: " + res.status);
       const { results } = await res.json();
       render(results);
       statusEl.textContent = "Готово";
     }
-    transcriptBtn.onclick = () => loadTranscript();
+    transcriptBtn.onclick = () => loadTranscript().catch(console.error);
 
-    // === Ручной запрос диаризации ===
+    // === Запрос диаризации вручную ===
     diarizeBtn.onclick = async () => {
       statusEl.textContent = "Запрашиваем диаризацию…";
       try {
@@ -165,19 +164,18 @@
         diarizeBtn.disabled = true;
       } catch(err) {
         console.error(err);
-        alert("Ошибка при запросе диаризации: " + err.message);
-        statusEl.textContent = "Ошибка при диаризации";
+        alert("Ошибка при диаризации: " + err.message);
+        statusEl.textContent = "Ошибка при запросе";
       }
     };
 
-    // === Сохранение меток спикеров и обновление UI ===
+    // === Сохранение меток и мгновенная перерисовка ===
     saveBtn.onclick = async () => {
-      const key     = apiKeyEl.value.trim();
       const payload = {};
-      Object.entries(mapping).forEach(([oldName, newName]) => {
+      Object.entries(mapping).forEach(([oldName,newName])=>{
         if(oldName !== newName) payload[oldName] = newName;
       });
-      if(Object.keys(payload).length === 0){
+      if(Object.keys(payload).length===0){
         alert("Нет изменений");
         return;
       }
@@ -186,14 +184,14 @@
           method: "POST",
           headers: {
             "Content-Type":"application/json",
-            "X-API-Key":    key
+            "X-API-Key":    apiKeyEl.value.trim()
           },
           body: JSON.stringify(payload)
         });
         if(!res.ok) throw new Error("Labels save failed: " + res.status);
-        const { results } = await res.json();                      // <-- сразу мёрженные сегменты
+        const { results } = await res.json();          // ▲ сразу получаем merged
         container.innerHTML = "";
-        render(results);
+        render(results);                                // ▲ и перерисовываем
         saveBtn.disabled = true;
         statusEl.textContent = "Метки сохранены";
       } catch(err) {
@@ -207,9 +205,12 @@
     function render(list){
       container.innerHTML = "";
       mapping = {};
-      list.forEach(s => { mapping[s.speaker||""] = s.speaker||""; });
+      list.forEach(s => {
+        mapping[s.speaker||""] = s.speaker||"";
+      });
       const frag = document.createDocumentFragment();
       list.forEach(seg => {
+        const orig = seg.speaker||"";                  // сохраняем оригинальный ключ
         const div = document.createElement("div");
         div.className = "segment";
 
@@ -222,22 +223,26 @@
         btn.onclick = () => {
           audioEl.currentTime = seg.start;
           audioEl.play();
-          setTimeout(() => audioEl.pause(), (seg.end - seg.start) * 1000);
+          setTimeout(()=>audioEl.pause(), (seg.end-seg.start)*1000);
         };
 
         const inp = document.createElement("input");
-        inp.value = seg.speaker || "";
+        inp.value = seg.speaker||"";
+        inp.dataset.orig = orig;                       // ▲ храним оригинал в data-атрибуте
         inp.onchange = () => {
-          const old = seg.speaker || "", neu = inp.value.trim();
-          if(neu && neu.length <= 50){
-            mapping[old] = neu;
-            frag.querySelectorAll("input").forEach(i => {
-              if(i.value === old) i.value = neu;
-            });
-          } else {
+          const oldName = inp.dataset.orig;
+          const newName = inp.value.trim();
+          if(!newName || newName.length>50){
             alert("Имя 1–50 символов");
-            inp.value = mapping[old];
+            inp.value = mapping[oldName];
+            return;
           }
+          mapping[oldName] = newName;
+          // обновляем все input с тем же orig
+          frag.querySelectorAll("input").forEach(i => {
+            if(i.dataset.orig === oldName) i.value = newName;
+          });
+          saveBtn.disabled = false;
         };
 
         const txt = document.createElement("span");
@@ -247,6 +252,14 @@
         frag.append(div);
       });
       container.append(frag);
+    }
+
+    // === Утилита форматирования времени ===
+    function fmt(ms){
+      const sec = Math.floor(ms/1000),
+            m   = String(Math.floor(sec/60)).padStart(2,'0'),
+            s   = String(sec%60).padStart(2,'0');
+      return `${m}:${s}`;
     }
   })();
   </script>
