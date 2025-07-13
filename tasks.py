@@ -23,29 +23,34 @@ _clustering_diarizer = None
 def get_whisper_model():
     """
     Ленивая инициализация WhisperModel.
-    - cache_dir из settings.HUGGINGFACE_CACHE_DIR (/hf_cache)
-    - local_files_only=True для CPU (без сети), False для GPU (с сетью)
+    - Берём путь из settings.WHISPER_MODEL_PATH (например 'guillaumekln/faster-whisper-medium').
+    - Скачиваем только в локальный кеш на CPU, на GPU разрешаем онлайн-загрузку.
+    - download_model(...) вернёт путь к локально загруженной модели.
+    - Затем передаём этот путь в конструктор WhisperModel().
     """
     global _whisper_model
     if _whisper_model is None:
         model_id = settings.WHISPER_MODEL_PATH
         cache_dir = settings.HUGGINGFACE_CACHE_DIR
         device = settings.WHISPER_DEVICE.lower()
-        # на CPU запрещаем скачивание из сети, на GPU – разрешаем
+        # на CPU запрет загрузки из сети
         local_only = (device == "cpu")
 
         logger.info(
-            f"Initializing WhisperModel: model={model_id}, "
-            f"device={device}, cache_dir={cache_dir}, local_only={local_only}"
+            f"Initializing WhisperModel: model={model_id}, cache_dir={cache_dir}, "
+            f"device={device}, local_only={local_only}"
         )
 
-        # проверяем, есть ли нужный снапшот в кеше
+        # скачиваем (или проверяем) модель в cache_dir
         try:
-            download_model(model_id, cache_dir=cache_dir, local_files_only=local_only)
-            logger.info(f"Whisper model '{model_id}' found in cache")
+            model_path = download_model(
+                model_id,
+                cache_dir=cache_dir,
+                local_files_only=local_only
+            )
+            logger.info(f"Whisper model '{model_id}' available at '{model_path}'")
         except Exception as e:
             if local_only:
-                # CPU-режим, без сети – считаем это фатальной ошибкой
                 logger.error(
                     f"Model '{model_id}' missing from cache and download disabled: {e}"
                 )
@@ -53,24 +58,25 @@ def get_whisper_model():
                     f"Whisper model '{model_id}' not in local cache '{cache_dir}'"
                 )
             else:
-                # GPU-режим – модель подтянется при инициализации
                 logger.warning(
-                    f"Model '{model_id}' not in cache, will attempt download: {e}"
+                    f"Couldn't pre‐download '{model_id}', will try online in constructor: {e}"
                 )
+                # если GPU, позволяем WhisperModel самому достать из HF
 
-        # на CPU float16/fp16 не поддерживается – переключаемся на int8
+                # в этом случае просто используем идентификатор модели
+                model_path = model_id
+
+        # на CPU float16/fp16 не поддерживается
         compute = getattr(settings, "WHISPER_COMPUTE_TYPE", "int8").lower()
         if device == "cpu" and compute in ("float16", "fp16"):
             logger.warning("FP16 unsupported on CPU, switching to int8")
             compute = "int8"
 
-        # создаём экземпляр модели
+        # создаём модель из локального пути (или из сети, если GPU)
         _whisper_model = WhisperModel(
-            model_id,
+            model_path,
             device=device,
-            compute_type=compute,
-            cache_dir=cache_dir,
-            local_files_only=local_only
+            compute_type=compute
         )
         logger.info("WhisperModel loaded successfully")
 
@@ -78,21 +84,21 @@ def get_whisper_model():
 
 def get_vad():
     """
-    Ленивая инициализация Voice Activity Detection (pyannote.audio).
+    Ленивая инициализация VAD-модели (pyannote.audio).
     """
     global _vad
     if _vad is None:
         _vad = VoiceActivityDetection.from_pretrained(
             settings.VAD_MODEL_PATH,
             cache_dir=settings.HUGGINGFACE_CACHE_DIR,
-            use_auth_token=settings.HUGGINGFACE_TOKEN
+            use_auth_token=settings.HUGGINGFACE_TOKEN,
         )
         logger.info("VAD model loaded")
     return _vad
 
 def get_clustering_diarizer():
     """
-    Ленивая инициализация Speaker Diarization (pyannote.audio).
+    Ленивая инициализация SpeakerDiarization (pyannote.audio).
     """
     global _clustering_diarizer
     if _clustering_diarizer is None:
@@ -100,7 +106,7 @@ def get_clustering_diarizer():
         _clustering_diarizer = SpeakerDiarization.from_pretrained(
             settings.PYANNOTE_PIPELINE,
             cache_dir=settings.DIARIZER_CACHE_DIR,
-            use_auth_token=settings.HUGGINGFACE_TOKEN
+            use_auth_token=settings.HUGGINGFACE_TOKEN,
         )
         logger.info("Diarizer model loaded")
     return _clustering_diarizer
@@ -108,25 +114,23 @@ def get_clustering_diarizer():
 @worker_process_init.connect
 def preload_and_warmup(**kwargs):
     """
-    Warm-up моделей при старте воркера:
-    - всегда прогревается WhisperModel.transcribe на небольшом sample.wav
-    - при GPU дополнительно прогреваются VAD и Diarizer
+    Warm-up при старте воркера:
+      1) Всегда прогреваем WhisperModel на небольшом sample.wav
+      2) Если GPU — дополнительно прогреваем VAD и Diarizer
     """
     sample = Path(__file__).parent / "tests/fixtures/sample.wav"
+    opts = {"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {}
     try:
-        # прогреваем Whisper
-        opts = {"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {}
+        # Warm-up Whisper
         get_whisper_model().transcribe(str(sample), **opts)
         logger.info("Whisper warm-up completed")
-
-        # если GPU, то прогреваем и pyannote-модели
+        # Если GPU — прогреваем pyannote
         if settings.WHISPER_DEVICE.lower() != "cpu":
             get_vad().apply({"audio": str(sample)})
             get_clustering_diarizer().apply({"audio": str(sample)})
             logger.info("VAD + Diarizer warm-up completed")
-
     except Exception as e:
-        # не фейлим запуск воркера – просто логируем
+        # Не фейлим воркер, просто логируем
         logger.warning(f"Warm-up failed: {e!r}")
 
 @celery_app.task(bind=True, name="tasks.download_audio", queue="transcribe_gpu")
@@ -203,7 +207,16 @@ def transcribe_segments(self, upload_id: str, correlation_id: str):
     r.publish(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
     logger.info(f"[{correlation_id}] Full transcription done for {upload_id}")
 
-    # при запросе диаризации запускаем её
+    # авторский callback
+    for cb in json.loads(r.get(f"callbacks:{upload_id}") or "[]"):
+        try:
+            requests.post(cb,
+                json={"event": "transcript_complete", "external_id": upload_id},
+                timeout=5
+            )
+        except Exception:
+            pass
+
     if r.get(f"diarize_requested:{upload_id}") == "1":
         diarize_full.delay(upload_id, correlation_id)
 
@@ -229,13 +242,24 @@ def diarize_full(self, upload_id: str, correlation_id: str):
         json.dumps(segs, ensure_ascii=False, indent=2), encoding="utf-8"
     )
 
-    r.publish(f"progress:{upload_id}", json.dumps({"status": "diarization_done"}, ensure_ascii=False))
+    state = {"status": "diarization_done", "preview": None}
+    r.set(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
+    r.publish(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
     logger.info(f"[{correlation_id}] Diarization done for {upload_id}")
+
+    for cb in json.loads(r.get(f"callbacks:{upload_id}") or "[]"):
+        try:
+            requests.post(cb,
+                json={"event":"diarization_complete","external_id":upload_id},
+                timeout=5
+            )
+        except Exception:
+            pass
 
 @celery_app.task(name="tasks.cleanup_old_uploads", queue="cleanup")
 def cleanup_old_uploads():
     """
-    Удаляем устаревшие файлы старше FILE_RETENTION_DAYS.
+    Удаляем файлы старше FILE_RETENTION_DAYS.
     """
     cutoff = time.time() - settings.FILE_RETENTION_DAYS * 86400
     for f in Path(settings.UPLOAD_FOLDER).iterdir():
