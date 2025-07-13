@@ -1,4 +1,5 @@
-# Dockerfile.gpu
+# Dockerfile.gpu — для GPU-воркера
+
 FROM nvidia/cuda:12.9.1-cudnn-runtime-ubuntu22.04
 
 WORKDIR /app
@@ -10,13 +11,14 @@ RUN apt-get update && \
       libavformat-dev libavcodec-dev libavutil-dev libswscale-dev libportaudio2 && \
     rm -rf /var/lib/apt/lists/*
 
-# 2) Общие питон-зависимости, включая celery, redis и т.д.
+# 2) Все питон-зависимости (heavy + light)
 COPY requirements.txt ./
+ENV PIP_NO_PROGRESS_BAR=off
 RUN pip3 install --upgrade pip && \
-    pip3 install --no-cache-dir -r requirements.txt && \
+    pip3 install -q --no-cache-dir --progress-bar off -r requirements.txt && \
     rm -rf /root/.cache/pip
 
-# 3) GPU-специфичные пакеты (onnxruntime уже в requirements)
+# 3) GPU-специфичные оптимизации
 RUN pip3 install --no-cache-dir \
       faster-whisper[cuda12]==1.1.1 \
       ctranslate2[cuda12]>=4.6.0
@@ -32,5 +34,9 @@ ENV WHISPER_DEVICE=cuda \
     UPLOAD_FOLDER=/app/uploads \
     RESULTS_FOLDER=/app/results
 
-# 6) Запуск Celery-воркера на GPU-очередях
-CMD ["celery", "-A", "tasks", "worker", "--loglevel=info", "--concurrency=1", "--queues=transcribe_gpu,diarize_gpu"]
+# 6) Запуск GPU-воркера
+CMD ["celery", "-A", "tasks", "worker", \
+     "--loglevel=info", \
+     "--concurrency=${GPU_CONCURRENCY}", \
+     "--queues=transcribe_gpu,diarize_gpu" \
+]

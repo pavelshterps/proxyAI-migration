@@ -1,6 +1,5 @@
-# requirements.txt
+# requirements-cpu.txt
 
-# — API/CPU deps
 fastapi>=0.95.0
 uvicorn[standard]>=0.22.0
 celery>=5.5.3
@@ -17,7 +16,7 @@ slowapi>=0.1.5
 limits>=2.8.0
 yamlargparse>=0.27.0
 structlog>=23.3.0
-pyannote.audio>=2.4.0
+pyannote.audio>=2.4.0        # нужен для VAD/diarization
 webrtcvad>=2.0.10
 pydub>=0.25.1
 librosa>=0.10.0
@@ -25,12 +24,3 @@ soundfile>=0.12.1
 httpx>=0.24.0
 sse-starlette>=2.4.1
 psycopg2-binary
-
-# — heavy GPU deps
-transformers>=4.28.1
-faster-whisper==1.1.1
-ctranslate2>=4.6.0
-chainer>=7.8.0
-numpy<2.0
-cupy-cuda12x
-h5py>=3.0.0
