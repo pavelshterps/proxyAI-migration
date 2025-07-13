@@ -72,45 +72,51 @@
       const file = fileEl.files[0];
       if(!file){ alert("Выберите файл"); return; }
 
-      tUpload   = performance.now();
+      tUpload        = performance.now();
       statusEl.textContent = "Загружаем…";
       timingsEl.textContent = "";
-      audioEl.src = URL.createObjectURL(file);
+      audioEl.src    = URL.createObjectURL(file);
 
-      // 1) Загрузка
-      const form = new FormData();
-      form.append("file", file, file.name);
-      const res = await fetch("/upload/", {
-        method: "POST",
-        headers: { "X-API-Key": key },
-        body: form
-      });
-      if(!res.ok){ alert("Upload error: "+res.status); return; }
-      uploadId = (await res.json()).upload_id;
+      // 1) Upload
+      try {
+        const form = new FormData();
+        form.append("file", file, file.name);
+        const res = await fetch("/upload/", {
+          method: "POST",
+          headers:{ "X-API-Key": key },
+          body: form
+        });
+        if(!res.ok) throw new Error("Upload error: "+res.status);
+        uploadId = (await res.json()).upload_id;
+      } catch(err) {
+        console.error(err);
+        alert("Ошибка загрузки: " + err.message);
+        statusEl.textContent = "Ошибка при загрузке";
+        return;
+      }
 
-      // сброс
+      // reset UI
       [previewBtn, transcriptBtn, diarizeBtn, saveBtn].forEach(b=>b.disabled=true);
       container.innerHTML="";
 
-      // 2) SSE (ключ передаём в query)
+      // 2) SSE с API-ключом в query string
       const sseUrl = `/events/${uploadId}?api_key=${encodeURIComponent(key)}`;
-      const es = new EventSource(sseUrl);
+      const es     = new EventSource(sseUrl);
 
       es.onopen = () => console.log("SSE: connected", sseUrl);
       es.onerror = e => console.error("SSE: error", e);
 
-      // Обработка сообщений — НЕ async, чтобы легко отлавливать синхронные ошибки
       es.onmessage = e => {
         let raw = e.data;
-        console.log("SSE ▶ raw:", raw);
+        console.debug("SSE ▶ raw:", raw);
 
-        // фильтр «ping» или пустых строк
+        // skip heartbeat/comments
         if(!raw || raw.trim()==="") {
-          console.debug("SSE ▶ heartbeat/ping — skip");
+          console.debug("SSE ▶ heartbeat — skip");
           return;
         }
 
-        // отрезаем лишний префикс, если вдруг приходит "data: {...}"
+        // strip leading "data:" if present
         if(raw.startsWith("data:")) {
           raw = raw.replace(/^data:\s*/, "");
         }
@@ -119,7 +125,7 @@
         try {
           st = JSON.parse(raw);
         } catch(err) {
-          console.warn("SSE parse failed, skip:", err, raw);
+          console.warn("SSE JSON parse failed, skipping:", err, raw);
           return;
         }
 
@@ -139,7 +145,10 @@
           timingsEl.innerHTML += `<div>Transcript done in ${((performance.now() - tUpload)/1000).toFixed(2)}s</div>`;
           transcriptBtn.disabled = false;
           diarizeBtn.disabled = false;
-          loadTranscript().catch(console.error);
+          loadTranscript().catch(err=>{
+            console.error("Error loading transcript:", err);
+            statusEl.textContent = "Ошибка при получении транскрипта";
+          });
         }
 
         // diarization
@@ -161,37 +170,55 @@
       const res = await fetch(`/results/${uploadId}`, {
         headers:{ "X-API-Key": key }
       });
-      if(!res.ok){ throw new Error("results fetch "+res.status); }
+      if(!res.ok) {
+        throw new Error("results fetch failed: "+res.status);
+      }
       const { results } = await res.json();
       render(results);
       statusEl.textContent="Готово";
     }
 
     previewBtn.onclick    = () => {};  // noop
-    transcriptBtn.onclick = () => loadTranscript().catch(console.error);
+    transcriptBtn.onclick = () => loadTranscript().catch(err=>{
+      console.error(err); statusEl.textContent="Ошибка при получении транскрипта";
+    });
     diarizeBtn.onclick    = async () => {
       statusEl.textContent="Запрашиваем диаризацию…";
-      await fetch(`/diarize/${uploadId}`, {
-        method:"POST", headers:{"X-API-Key":apiKeyEl.value.trim()}
-      });
-      diarizeBtn.disabled = true;
+      try {
+        const res = await fetch(`/diarize/${uploadId}`, {
+          method:"POST",
+          headers:{"X-API-Key":apiKeyEl.value.trim()}
+        });
+        if(!res.ok) throw new Error("Diarize request failed: "+res.status);
+        diarizeBtn.disabled = true;
+      } catch(err) {
+        console.error(err);
+        alert("Ошибка при запросе диаризации: "+err.message);
+        statusEl.textContent = "Ошибка при запросе диаризации";
+      }
     };
     saveBtn.onclick       = async () => {
       const key = apiKeyEl.value.trim(), payload={};
       Object.entries(mapping).forEach(([o,n])=>{ if(o!==n) payload[o]=n; });
       if(!Object.keys(payload).length){ alert("Нет изменений"); return; }
-      const res = await fetch(`/labels/${uploadId}`, {
-        method:"POST",
-        headers:{
-          "Content-Type":"application/json",
-          "X-API-Key":key
-        },
-        body:JSON.stringify(payload)
-      });
-      const { results } = await res.json();
-      render(results);
-      saveBtn.disabled = true;
-      alert("Метки сохранены");
+      try {
+        const res = await fetch(`/labels/${uploadId}`, {
+          method:"POST",
+          headers:{
+            "Content-Type":"application/json",
+            "X-API-Key":key
+          },
+          body:JSON.stringify(payload)
+        });
+        if(!res.ok) throw new Error("Labels save failed: "+res.status);
+        const { results } = await res.json();
+        render(results);
+        saveBtn.disabled = true;
+        alert("Метки сохранены");
+      } catch(err) {
+        console.error(err);
+        alert("Ошибка при сохранении меток: "+err.message);
+      }
     };
 
     function render(list){
@@ -219,11 +246,14 @@
         inp.value = seg.speaker||"";
         inp.onchange = ()=>{
           const old=seg.speaker||"", neu=inp.value.trim();
-          if(neu&&neu.length<=50){
+          if(neu && neu.length<=50){
             mapping[old] = neu;
-            frag.querySelectorAll("input").forEach(i=>{ if(i.value===old) i.value=neu; });
+            frag.querySelectorAll("input").forEach(i=>{
+              if(i.value===old) i.value=neu;
+            });
           } else {
-            alert("Имя 1–50 символов"); inp.value=mapping[old];
+            alert("Имя 1–50 символов");
+            inp.value=mapping[old];
           }
         };
 

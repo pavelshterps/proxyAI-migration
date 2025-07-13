@@ -35,6 +35,7 @@ from tasks import download_audio, preview_transcribe, diarize_full
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    """Retry init_models при старте сервера до 5 раз."""
     for attempt in range(1, 6):
         try:
             await init_models(engine)
@@ -47,11 +48,17 @@ async def lifespan(app: FastAPI):
         log.error("init_models permanently failed after 5 attempts")
     yield
 
+# === FastAPI & middleware setup ===
+
 app = FastAPI(title="proxyAI", version=settings.APP_VERSION, lifespan=lifespan)
+
+# structlog configuration
 structlog.configure(
-    processors=[structlog.processors.add_log_level,
-                structlog.processors.TimeStamper(fmt="iso"),
-                structlog.processors.JSONRenderer()]
+    processors=[
+        structlog.processors.add_log_level,
+        structlog.processors.TimeStamper(fmt="iso"),
+        structlog.processors.JSONRenderer(),
+    ]
 )
 log = structlog.get_logger()
 
@@ -61,13 +68,17 @@ app.state.limiter = limiter
 app.add_middleware(SlowAPIMiddleware)
 
 # CORS & trusted hosts
-app.add_middleware(CORSMiddleware,
-                   allow_origins=[*settings.ALLOWED_ORIGINS_LIST],
-                   allow_credentials=True,
-                   allow_methods=["*"],
-                   allow_headers=["*"])
-app.add_middleware(TrustedHostMiddleware,
-                   allowed_hosts=["127.0.0.1", "localhost"] + settings.ALLOWED_ORIGINS_LIST)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[*settings.ALLOWED_ORIGINS_LIST],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+app.add_middleware(
+    TrustedHostMiddleware,
+    allowed_hosts=["127.0.0.1", "localhost"] + settings.ALLOWED_ORIGINS_LIST
+)
 
 # ensure directories exist
 for d in (settings.UPLOAD_FOLDER, settings.RESULTS_FOLDER, settings.DIARIZER_CACHE_DIR):
@@ -82,8 +93,12 @@ async def get_api_key(
     x_api_key: str = Depends(api_key_header),
     api_key: str = Query(None)
 ):
+    """
+    Получаем API-ключ из HTTP-заголовка X-API-Key или из query-параметра api_key.
+    """
     key = x_api_key or api_key
     if not key:
+        log.warning("Missing API key in request", path=str(api_key))
         raise HTTPException(401, "Missing API Key")
     return key
 
@@ -98,6 +113,8 @@ async def metrics_middleware(request: Request, call_next):
     HTTP_REQ_COUNT.labels(request.method, request.url.path).inc()
     HTTP_REQ_LATENCY.labels(request.url.path).observe(time.time() - start)
     return resp
+
+# === Health & readiness ===
 
 @app.get("/health")
 @limiter.limit("30/minute")
@@ -122,6 +139,8 @@ async def root():
     log.debug("Serving index.html")
     return FileResponse("static/index.html")
 
+# === Upload endpoint ===
+
 @app.post("/upload/", dependencies=[Depends(get_current_user)])
 @limiter.limit("10/minute")
 async def upload(
@@ -133,8 +152,10 @@ async def upload(
 ):
     start_ts = time.time()
     cid = x_correlation_id or uuid.uuid4().hex
-    log.info("Upload endpoint called", user_id=current_user.id,
-             correlation_id=cid, client=request.client.host)
+    log.info("Upload endpoint called",
+             user_id=current_user.id,
+             correlation_id=cid,
+             client=request.client.host)
 
     data = await file.read()
     if not data:
@@ -143,26 +164,33 @@ async def upload(
 
     ext = Path(file.filename).suffix or ""
     upload_id = uuid.uuid4().hex
-    dest = Path(settings.UPLOAD_FOLDER)/f"{upload_id}{ext}"
+    dest = Path(settings.UPLOAD_FOLDER) / f"{upload_id}{ext}"
     dest.write_bytes(data)
-    log.info("File saved", upload_id=upload_id,
-             path=str(dest), size_bytes=len(data),
-             elapsed_s=(time.time()-start_ts))
+    log.info("File saved",
+             upload_id=upload_id,
+             path=str(dest),
+             size_bytes=len(data),
+             elapsed_s=(time.time() - start_ts))
 
+    # create DB record
     try:
         await create_upload_record(db, current_user.id, upload_id)
         log.info("DB record created", upload_id=upload_id, user_id=current_user.id)
     except Exception as e:
-        log.warning("Failed to create upload record", upload_id=upload_id, error=str(e))
+        log.warning("Failed to create upload record",
+                    upload_id=upload_id,
+                    error=str(e))
 
-    # external mapping
+    # set external mapping
     await redis.set(f"external:{upload_id}", upload_id)
     log.debug("Set external ID in Redis", upload_id=upload_id)
 
+    # dispatch Celery tasks
     download_audio.delay(upload_id, cid)
     preview_transcribe.delay(upload_id, cid)
-    log.info("Dispatched Celery tasks", upload_id=upload_id,
-             tasks=["download_audio","preview_transcribe"])
+    log.info("Dispatched Celery tasks",
+             upload_id=upload_id,
+             tasks=["download_audio", "preview_transcribe"])
 
     # publish initial progress
     state = {"status":"started","preview":None}
@@ -170,8 +198,12 @@ async def upload(
     await redis.publish(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
     log.info("Published initial progress", upload_id=upload_id, state=state)
 
-    return JSONResponse({"upload_id":upload_id,"external_id":upload_id},
-                        headers={"X-Correlation-ID":cid})
+    return JSONResponse(
+        {"upload_id":upload_id,"external_id":upload_id},
+        headers={"X-Correlation-ID":cid}
+    )
+
+# === Server-Sent Events for progress ===
 
 @app.get("/events/{upload_id}")
 async def progress_events(
@@ -185,33 +217,44 @@ async def progress_events(
         pubsub = redis.pubsub()
         await pubsub.subscribe(f"progress:{upload_id}")
         last_hb = time.time()
+
         try:
             while True:
+                # disconnect detection
                 if await request.is_disconnected():
-                    log.info("Client disconnected", upload_id=upload_id)
+                    log.info("Client disconnected before completion", upload_id=upload_id)
                     break
 
+                # try to fetch a real message
                 msg = await pubsub.get_message(ignore_subscribe_messages=True, timeout=0.5)
                 now = time.time()
 
-                if msg and msg["type"]=="message":
-                    payload = msg["data"]  # только чистый JSON
+                if msg and msg["type"] == "message":
+                    payload = msg["data"]
                     log.debug("SSE ▶ sending JSON", upload_id=upload_id, data=payload)
-                    # отдаем без ручного "data:"
-                    yield f"{payload}\n\n"
-                # Heartbeat раз в секунду
+                    # correct SSE framing
+                    yield f"data: {payload}\n\n"
+                # heartbeat ping every second
                 elif now - last_hb > 1.0:
                     yield ":\n\n"
                     last_hb = now
 
                 await asyncio.sleep(0.1)
+
+        except Exception as e:
+            log.error("Error in SSE generator", upload_id=upload_id, error=str(e))
+            # let client know
+            yield f"data: {{\"status\":\"error\",\"message\":\"{str(e)}\"}}\n\n"
         finally:
             await pubsub.unsubscribe(f"progress:{upload_id}")
             log.info("Client unsubscribed from SSE", upload_id=upload_id)
 
     return EventSourceResponse(generator())
 
-# ... остальной код (results, diarize, labels) без изменений; они уже проверены и работают.
+# === Results ===
+# (остальные endpoints: /results, /diarize, /labels остаются без изменений —
+# они у вас уже стабильно работают по итогам предыдущих тестов)
+
 app.include_router(api_router, tags=["proxyAI"])
 app.include_router(admin_router)
 app.mount("/static", StaticFiles(directory="static"), name="static")
