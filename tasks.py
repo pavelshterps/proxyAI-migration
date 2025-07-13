@@ -26,7 +26,7 @@ def get_whisper_model():
         device  = settings.WHISPER_DEVICE.lower()
         compute = settings.WHISPER_COMPUTE_TYPE.lower()
         if device == "cpu" and compute in ("float16", "fp16"):
-            logger.warning(f"Compute '{compute}' unsupported on CPU, using int8")
+            logger.warning(f"Compute '{compute}' unsupported on CPU; using int8")
             compute = "int8"
         _whisper_model = WhisperModel(
             settings.WHISPER_MODEL_PATH,
@@ -47,18 +47,18 @@ def get_vad():
 def get_clustering_diarizer():
     global _clustering_diarizer
     if _clustering_diarizer is None:
-        cache_dir = settings.DIARIZER_CACHE_DIR
-        os.makedirs(cache_dir, exist_ok=True)
+        cache = settings.DIARIZER_CACHE_DIR
+        os.makedirs(cache, exist_ok=True)
         _clustering_diarizer = SpeakerDiarization.from_pretrained(
             settings.PYANNOTE_PIPELINE,
-            cache_dir=cache_dir,
+            cache_dir=cache,
             use_auth_token=settings.HUGGINGFACE_TOKEN
         )
     return _clustering_diarizer
 
 @worker_process_init.connect
 def preload_and_warmup(**kwargs):
-    sample = Path(__file__).resolve().parent / "tests" / "fixtures" / "sample.wav"
+    sample = Path(__file__).parent / "tests" / "fixtures" / "sample.wav"
     device = settings.WHISPER_DEVICE.lower()
     if device == "cpu":
         try:
@@ -66,8 +66,7 @@ def preload_and_warmup(**kwargs):
             if settings.WHISPER_LANGUAGE:
                 opts["language"] = settings.WHISPER_LANGUAGE
             get_whisper_model().transcribe(str(sample), **opts)
-        except:
-            pass
+        except: pass
     else:
         try: get_vad().apply({"audio": str(sample)})
         except: pass
@@ -80,131 +79,91 @@ def download_audio(self, upload_id: str, correlation_id: str):
 
 @app.task(bind=True, name="tasks.preview_transcribe", queue="preprocess_gpu")
 def preview_transcribe(self, upload_id: str, correlation_id: str):
-    redis_client = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
-    upload_folder = Path(settings.UPLOAD_FOLDER)
-    candidates = list(upload_folder.glob(f"{upload_id}.*"))
-    if not candidates:
-        logger.error(f"[{correlation_id}] Source for {upload_id} not found")
-        return
-    wav = upload_folder / f"{upload_id}.wav"
+    r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
+    # convert
+    src = next(Path(settings.UPLOAD_FOLDER).glob(f"{upload_id}.*"), None)
+    wav = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
     try:
-        wav_path = convert_to_wav(candidates[0], wav)
+        wav_path = convert_to_wav(src, wav)
     except Exception as e:
         logger.error(f"[{correlation_id}] Conversion error: {e}")
         return
 
     model = get_whisper_model()
     opts = {"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {}
-    segments, _ = model.transcribe(str(wav_path), word_timestamps=True, **opts)
+    segs, _ = model.transcribe(str(wav_path), word_timestamps=True, **opts)
 
     preview = {"text": "", "timestamps": []}
-    for seg in segments:
-        if seg.start >= settings.PREVIEW_LENGTH_S:
+    for s in segs:
+        if s.start >= settings.PREVIEW_LENGTH_S:
             break
-        preview["text"] += seg.text
-        preview["timestamps"].append({
-            "start": seg.start, "end": seg.end, "text": seg.text
-        })
+        preview["text"] += s.text
+        preview["timestamps"].append({"start": s.start, "end": s.end, "text": s.text})
 
-    redis_client.set(f"preview_result:{upload_id}", json.dumps(preview, ensure_ascii=False))
-    redis_client.set(f"progress:{upload_id}", "preview_done")
-    redis_client.publish(f"progress:{upload_id}", "preview_done")
+    # store & broadcast
+    r.set(f"preview_result:{upload_id}", json.dumps(preview, ensure_ascii=False))
+    state = {"status": "preview_done", "preview": preview}
+    r.set(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
+    r.publish(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
 
-    for url in json.loads(redis_client.get(f"callbacks:{upload_id}") or "[]"):
+    # callbacks
+    for cb in json.loads(r.get(f"callbacks:{upload_id}") or "[]"):
         try:
-            requests.post(url, json={
-                "external_id": upload_id,
-                "event":       "preview_complete",
-                "url_to_result": None
-            }, timeout=5)
-        except:
-            pass
+            requests.post(cb, json={"event": "preview_complete", "external_id": upload_id}, timeout=5)
+        except: pass
 
+    # next
     transcribe_segments.delay(upload_id, correlation_id)
 
 @app.task(bind=True, name="tasks.transcribe_segments", queue="preprocess_gpu")
 def transcribe_segments(self, upload_id: str, correlation_id: str):
-    redis_client = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
-    upload_folder = Path(settings.UPLOAD_FOLDER)
-    candidates = list(upload_folder.glob(f"{upload_id}.*"))
-    if not candidates:
-        logger.error(f"[{correlation_id}] Source for {upload_id} not found")
-        return
-    wav = upload_folder / f"{upload_id}.wav"
-    try:
-        wav_path = convert_to_wav(candidates[0], wav)
-    except Exception as e:
-        logger.error(f"[{correlation_id}] Conversion error: {e}")
-        return
-
+    r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
+    wav = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
     model = get_whisper_model()
     opts = {"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {}
-    segments, _ = model.transcribe(str(wav_path), word_timestamps=True, **opts)
+    segs, _ = model.transcribe(str(wav), word_timestamps=True, **opts)
 
-    out_dir = Path(settings.RESULTS_FOLDER) / upload_id
-    out_dir.mkdir(parents=True, exist_ok=True)
-    transcript = [
-        {"start": seg.start, "end": seg.end, "text": seg.text}
-        for seg in segments
-    ]
-    (out_dir / "transcript.json").write_text(
-        json.dumps(transcript, ensure_ascii=False, indent=2),
-        encoding="utf-8"
-    )
+    out = [{"start": s.start, "end": s.end, "text": s.text} for s in segs]
+    d = Path(settings.RESULTS_FOLDER) / upload_id
+    d.mkdir(exist_ok=True, parents=True)
+    (d / "transcript.json").write_text(json.dumps(out, indent=2, ensure_ascii=False), encoding="utf-8")
 
-    redis_client.set(f"progress:{upload_id}", "transcript_done")
-    redis_client.publish(f"progress:{upload_id}", "transcript_done")
-    for url in json.loads(redis_client.get(f"callbacks:{upload_id}") or "[]"):
+    state = {"status": "transcript_done", "preview": None}
+    r.set(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
+    r.publish(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
+
+    for cb in json.loads(r.get(f"callbacks:{upload_id}") or "[]"):
         try:
-            requests.post(url, json={
-                "external_id": upload_id,
-                "event":       "transcript_complete"
-            }, timeout=5)
-        except:
-            pass
+            requests.post(cb, json={"event": "transcript_complete","external_id": upload_id}, timeout=5)
+        except: pass
 
-    if redis_client.get(f"diarize_requested:{upload_id}") == "1":
+    if r.get(f"diarize_requested:{upload_id}") == "1":
         diarize_full.delay(upload_id, correlation_id)
 
 @app.task(bind=True, name="tasks.diarize_full", queue="preprocess_gpu")
 def diarize_full(self, upload_id: str, correlation_id: str):
-    redis_client = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
-    wav_file = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
-    if not wav_file.exists():
-        logger.error(f"[{correlation_id}] WAV for {upload_id} not found")
-        return
+    r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
+    wav = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
+    ann = get_clustering_diarizer().apply({"audio": str(wav)})
 
-    annotation = get_clustering_diarizer().apply({"audio": str(wav_file)})
+    segs = [{"start": float(seg.start), "end": float(seg.end), "speaker": spk}
+            for seg, _, spk in ann.itertracks(yield_label=True)]
+    d = Path(settings.RESULTS_FOLDER) / upload_id
+    d.mkdir(exist_ok=True, parents=True)
+    (d / "diarization.json").write_text(json.dumps(segs, indent=2, ensure_ascii=False), encoding="utf-8")
 
-    segments = []
-    for segment, _, speaker in annotation.itertracks(yield_label=True):
-        segments.append({
-            "start": float(segment.start),
-            "end":   float(segment.end),
-            "speaker": speaker
-        })
+    state = {"status": "diarization_done", "preview": None}
+    r.set(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
+    r.publish(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
 
-    out_dir = Path(settings.RESULTS_FOLDER) / upload_id
-    out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / "diarization.json").write_text(
-        json.dumps(segments, ensure_ascii=False, indent=2),
-        encoding="utf-8"
-    )
-
-    redis_client.set(f"progress:{upload_id}", "diarization_done")
-    redis_client.publish(f"progress:{upload_id}", "diarization_done")
-    for url in json.loads(redis_client.get(f"callbacks:{upload_id}") or "[]"):
+    for cb in json.loads(r.get(f"callbacks:{upload_id}") or "[]"):
         try:
-            requests.post(url, json={
-                "external_id": upload_id,
-                "event":       "diarization_complete"
-            }, timeout=5)
-        except:
-            pass
+            requests.post(cb, json={"event": "diarization_complete","external_id": upload_id}, timeout=5)
+        except: pass
 
 @app.task(name="tasks.cleanup_old_uploads")
 def cleanup_old_uploads():
-    cutoff = time.time() - 24 * 3600
+    cutoff = time.time() - settings.FILE_RETENTION_DAYS * 86400
     for f in Path(settings.UPLOAD_FOLDER).iterdir():
         if f.stat().st_mtime < cutoff:
             f.unlink(missing_ok=True)
