@@ -7,8 +7,8 @@ services:
     container_name: proxyai_db
     env_file: .env
     environment:
-      POSTGRES_DB:     ${POSTGRES_DB}
-      POSTGRES_USER:   ${POSTGRES_USER}
+      POSTGRES_DB:       ${POSTGRES_DB}
+      POSTGRES_USER:     ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
     volumes:
       - postgres_data:/var/lib/postgresql/data
@@ -36,7 +36,6 @@ services:
       dockerfile: Dockerfile
     container_name: proxyai_api
     env_file: .env
-    # ждем, пока dns-имя db появится и порт 5432 станет доступен
     command: >
       sh -c "until nc -z db 5432; do echo waiting for db; sleep 1; done;
              uvicorn main:app --host 0.0.0.0 --port 8000 --workers ${API_WORKERS}"
@@ -169,9 +168,7 @@ services:
       - /etc/letsencrypt/live/tonage.io/fullchain.pem:/etc/nginx/certs/fullchain.pem:ro
       - /etc/letsencrypt/live/tonage.io/privkey.pem:/etc/nginx/certs/privkey.pem:ro
     networks:
-      proxyai_net:
-        aliases:
-          - api
+      - proxyai_net
 
 volumes:
   postgres_data:
