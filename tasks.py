@@ -106,7 +106,7 @@ def preload_on_startup(**kwargs):
 
 
 # --------------------------------------------------
-# Preview + full transcription on GPU queue
+# Preview + full transcription на GPU
 # --------------------------------------------------
 
 @celery_app.task(bind=True, queue="transcribe_gpu")
@@ -117,11 +117,12 @@ def preview_transcribe(self, upload_id, correlation_id):
     t0 = time.time()
 
     try:
+        # исходный файл и директория результатов
         src     = next(Path(settings.UPLOAD_FOLDER).glob(f"{upload_id}.*"))
         out_dir = Path(settings.RESULTS_FOLDER) / upload_id
         out_dir.mkdir(exist_ok=True, parents=True)
 
-        # ffmpeg → stdout (pipe), первые PREVIEW_LENGTH_S секунд, на 2 потоках
+        # ffmpeg → stdout (pipe), первые PREVIEW_LENGTH_S секунд, 2 потока
         cmd = [
             "ffmpeg", "-y", "-threads", "2", "-i", str(src),
             "-ss", "0", "-t", str(settings.PREVIEW_LENGTH_S),
@@ -130,11 +131,11 @@ def preview_transcribe(self, upload_id, correlation_id):
         ]
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
 
+        # транскрипция по мере поступления
         segments, _ = get_whisper_model().transcribe(
             proc.stdout,
             word_timestamps=True,
-            **({"language": settings.WHISPER_LANGUAGE}
-               if settings.WHISPER_LANGUAGE else {})
+            **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {})
         )
         proc.stdout.close()
         proc.wait()
@@ -156,10 +157,8 @@ def preview_transcribe(self, upload_id, correlation_id):
         )
         return
 
-    preview = {
-        "text": "".join(s["text"] for s in segs),
-        "timestamps": segs
-    }
+    # сохраняем превью
+    preview = {"text": "".join(s["text"] for s in segs), "timestamps": segs}
     (out_dir / "preview_transcript.json").write_text(
         json.dumps(preview, ensure_ascii=False, indent=2)
     )
@@ -168,6 +167,7 @@ def preview_transcribe(self, upload_id, correlation_id):
         json.dumps({"status": "preview_done", "preview": preview})
     )
 
+    # запускаем полный транскрипт
     transcribe_segments.delay(upload_id, correlation_id)
     logger.info(f"[{cid}] PREVIEW TRANSCRIBE done in {time.time()-t0:.2f}s")
 
@@ -183,7 +183,7 @@ def transcribe_segments(self, upload_id, correlation_id):
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
     t0 = time.time()
 
-    # находим исходник
+    # ищем исходный файл
     try:
         src = next(Path(settings.UPLOAD_FOLDER).glob(f"{upload_id}.*"))
     except StopIteration:
@@ -195,7 +195,7 @@ def transcribe_segments(self, upload_id, correlation_id):
         )
         return
 
-    # узнаём длительность
+    # пробуем узнать длительность
     duration = None
     try:
         out = subprocess.check_output([
@@ -213,7 +213,7 @@ def transcribe_segments(self, upload_id, correlation_id):
     chunk_s = getattr(settings, "CHUNK_LENGTH_S", None)
 
     if duration and chunk_s and duration > chunk_s:
-        # длинный файл — режем на чанки
+        # длинный файл — транскрибируем чанками
         for start in range(0, int(duration), int(chunk_s)):
             cmd = [
                 "ffmpeg", "-y", "-threads", "2", "-i", str(src),
@@ -225,8 +225,7 @@ def transcribe_segments(self, upload_id, correlation_id):
             segs, _ = get_whisper_model().transcribe(
                 proc.stdout,
                 word_timestamps=True,
-                **({"language": settings.WHISPER_LANGUAGE}
-                   if settings.WHISPER_LANGUAGE else {})
+                **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {})
             )
             proc.stdout.close()
             proc.wait()
@@ -237,16 +236,16 @@ def transcribe_segments(self, upload_id, correlation_id):
                     "text":  seg.text
                 })
     else:
-        # короткий — одним куском
+        # короткий файл — одним куском
         segs, _ = get_whisper_model().transcribe(
             str(src),
             word_timestamps=True,
-            **({"language": settings.WHISPER_LANGUAGE}
-               if settings.WHISPER_LANGUAGE else {})
+            **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {})
         )
         for seg in segs:
             segments_acc.append({"start": seg.start, "end": seg.end, "text": seg.text})
 
+    # сохраняем полный транскрипт
     out_dir = Path(settings.RESULTS_FOLDER) / upload_id
     out_dir.mkdir(exist_ok=True)
     (out_dir / "transcript.json").write_text(
@@ -254,10 +253,7 @@ def transcribe_segments(self, upload_id, correlation_id):
     )
     r.publish(f"progress:{upload_id}", json.dumps({"status": "transcript_done"}))
 
-    if r.get(f"diarize_requested:{upload_id}") == "1":
-        diarize_full.delay(upload_id, correlation_id)
-        logger.info(f"[{cid}] auto-diarize queued")
-
+    # автоматический триггер удалён — теперь диаризацию запускаем только через /diarize
     logger.info(f"[{cid}] TRANSCRIBE done in {time.time()-t0:.2f}s")
 
 
@@ -275,8 +271,10 @@ def diarize_full(self, upload_id, correlation_id):
     try:
         src = next(Path(settings.UPLOAD_FOLDER).glob(f"{upload_id}.*"))
         wav_path = str(src)
+        # сначала VAD
         speech = get_vad().apply({"audio": wav_path})
-        ann    = get_clustering_diarizer().apply({
+        # затем кластеризация на активах речи
+        ann = get_clustering_diarizer().apply({
             "audio": wav_path,
             "speech": speech
         })
