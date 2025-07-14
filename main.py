@@ -254,7 +254,7 @@ class AdminCreatePayload(BaseModel):
 admin_key_header = APIKeyHeader(name="X-Admin-Key", auto_error=False)
 
 async def verify_admin_key(key: str = Depends(admin_key_header)):
-    # now correctly uses ADMIN_API_KEY from settings
+    # теперь проверяем правильный параметр из settings
     if key != settings.ADMIN_API_KEY:
         raise HTTPException(403, "Invalid admin key")
     return key
@@ -266,11 +266,13 @@ async def create_admin_user(
 ):
     """
     Создать нового admin-пользователя.
-    Требует заголовок X-Admin-Key==settings.ADMIN_API_KEY
+    Требует заголовок X-Admin-Key == settings.ADMIN_API_KEY
     """
-    new_user = await crud_create_admin_user(db, name=payload.name)
+    # создаём пользователя (api_key сгенерируется автоматически)
+    new_user = await crud_create_admin_user(db, payload.name)
     return {
         "id": new_user.id,
         "name": new_user.name,
+        "api_key": new_user.api_key,
         "is_admin": getattr(new_user, "is_admin", False)
     }
