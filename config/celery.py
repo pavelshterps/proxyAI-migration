@@ -27,7 +27,7 @@ celery_app.conf.update(
         Queue('diarize_gpu'),
     ],
     task_routes={
-        'tasks.preview_slice':      {'queue': 'transcribe_cpu'},
+        'tasks.preview_slice':      {'queue': 'transcribe_gpu'},
         'tasks.transcribe_segments':{'queue': 'transcribe_gpu'},
         'tasks.diarize_full':       {'queue': 'diarize_gpu'},
     },

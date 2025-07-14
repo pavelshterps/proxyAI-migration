@@ -1,14 +1,13 @@
 import json
 import logging
 import time
+import subprocess
 from pathlib import Path
 from celery.signals import worker_process_init
 from redis import Redis
-from pydub import AudioSegment
 
 from config.settings import settings
 from config.celery import celery_app
-from utils.audio import convert_to_wav
 
 logger = logging.getLogger(__name__)
 
@@ -44,9 +43,13 @@ def get_whisper_model():
             path = download_model(model_id, cache_dir=cache, local_files_only=local)
         except:
             path = model_id
-        compute = getattr(settings, "WHISPER_COMPUTE_TYPE", "int8").lower()
+
+        # При использовании CUDA — принудительно float16
+        compute = getattr(settings, "WHISPER_COMPUTE_TYPE",
+                          "float16" if device.startswith("cuda") else "int8").lower()
         if device == "cpu" and compute in ("fp16", "float16"):
             compute = "int8"
+
         _whisper_model = WhisperModel(path, device=device, compute_type=compute)
         logger.info(f"[WHISPER] model ready on {device} ({compute})")
     return _whisper_model
@@ -82,37 +85,57 @@ def preload_on_startup(**kwargs):
     if _HF_AVAILABLE:
         sample = Path(__file__).parent / "tests/fixtures/sample.wav"
         try:
-            get_whisper_model().transcribe(str(sample), max_initial_timestamp=settings.PREVIEW_LENGTH_S)
+            get_whisper_model().transcribe(
+                str(sample),
+                max_initial_timestamp=settings.PREVIEW_LENGTH_S
+            )
             logger.info("[WARMUP] Whisper warmup ok")
         except:
             logger.warning("[WARMUP] Whisper warmup failed")
     if _PN_AVAILABLE and settings.WHISPER_DEVICE.lower().startswith("cuda"):
         try:
-            get_vad(); get_clustering_diarizer()
+            get_vad()
+            get_clustering_diarizer()
             logger.info("[WARMUP] VAD & diarizer warmup ok")
         except:
             logger.warning("[WARMUP] VAD/diarizer warmup failed")
 
 
-@celery_app.task(bind=True, queue="transcribe_cpu")
+# --------------------------------------------------
+# 1) Быстрая обрезка через ffmpeg, 2) на GPU-очереди
+# --------------------------------------------------
+@celery_app.task(bind=True, queue="transcribe_gpu")
 def preview_slice(self, upload_id, correlation_id):
     cid = correlation_id or "?"
     logger.info(f"[{cid}] PREVIEW SLICE start {upload_id}")
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
 
     try:
+        # исходный файл (xxx.ext)
         src = next(Path(settings.UPLOAD_FOLDER).glob(f"{upload_id}.*"))
-        wav_full = convert_to_wav(src, Path(settings.UPLOAD_FOLDER)/f"{upload_id}.wav")
-        audio = AudioSegment.from_file(str(wav_full))
-        preview_audio = audio[: int(settings.PREVIEW_LENGTH_S * 1000)]
-        preview_path = Path(settings.UPLOAD_FOLDER)/f"{upload_id}_preview.wav"
-        preview_audio.export(str(preview_path), format="wav")
+        out_dir = Path(settings.RESULTS_FOLDER) / upload_id
+        out_dir.mkdir(exist_ok=True, parents=True)
+
+        # путь превью
+        preview_path = out_dir / f"{upload_id}_preview.wav"
+        # ffmpeg стрим-декод + обрезка
+        cmd = [
+            "ffmpeg", "-y", "-i", str(src),
+            "-ss", "0", "-t", str(settings.PREVIEW_LENGTH_S),
+            "-acodec", "pcm_s16le", "-ac", "1", "-ar", "16k",
+            str(preview_path)
+        ]
+        subprocess.run(cmd, check=True,
+                       stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL)
     except Exception as e:
         logger.error(f"[{cid}] preview_slice error", exc_info=True)
-        r.publish(f"progress:{upload_id}", json.dumps({"status":"error","error":str(e)}))
+        r.publish(f"progress:{upload_id}",
+                  json.dumps({"status": "error", "error": str(e)}))
         return
 
-    r.publish(f"progress:{upload_id}", json.dumps({"status":"preview_sliced"}))
+    r.publish(f"progress:{upload_id}",
+              json.dumps({"status": "preview_sliced"}))
     preview_whisper.delay(upload_id, correlation_id)
     logger.info(f"[{cid}] PREVIEW SLICE done")
 
@@ -125,28 +148,35 @@ def preview_whisper(self, upload_id, correlation_id):
     t0 = time.time()
 
     try:
-        preview_path = Path(settings.UPLOAD_FOLDER)/f"{upload_id}_preview.wav"
+        preview_path = Path(settings.RESULTS_FOLDER) / upload_id / f"{upload_id}_preview.wav"
         segs, _ = get_whisper_model().transcribe(
             str(preview_path),
             word_timestamps=True,
-            **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {})
+            **({"language": settings.WHISPER_LANGUAGE}
+               if settings.WHISPER_LANGUAGE else {})
         )
     except Exception as e:
         logger.error(f"[{cid}] preview_whisper error", exc_info=True)
-        r.publish(f"progress:{upload_id}", json.dumps({"status":"error","error":str(e)}))
+        r.publish(f"progress:{upload_id}",
+                  json.dumps({"status": "error", "error": str(e)}))
         return
 
     segs = list(segs)
     preview = {
         "text": "".join(s.text for s in segs),
-        "timestamps": [{"start": s.start, "end": s.end, "text": s.text} for s in segs]
+        "timestamps": [
+            {"start": s.start, "end": s.end, "text": s.text}
+            for s in segs
+        ]
     }
-    out = Path(settings.RESULTS_FOLDER)/upload_id
+    out = Path(settings.RESULTS_FOLDER) / upload_id
     out.mkdir(exist_ok=True)
-    # Переименовали, чтобы совпадать с routes.py и front:
-    (out/"preview_transcript.json").write_text(json.dumps(preview, ensure_ascii=False, indent=2))
+    (out / "preview_transcript.json").write_text(
+        json.dumps(preview, ensure_ascii=False, indent=2)
+    )
 
-    r.publish(f"progress:{upload_id}", json.dumps({"status":"preview_done","preview":preview}))
+    r.publish(f"progress:{upload_id}",
+              json.dumps({"status": "preview_done", "preview": preview}))
     transcribe_segments.delay(upload_id, correlation_id)
     logger.info(f"[{cid}] PREVIEW WHISPER done in {time.time()-t0:.2f}s")
 
@@ -163,25 +193,30 @@ def transcribe_segments(self, upload_id, correlation_id):
     t0 = time.time()
 
     try:
-        wav = Path(settings.UPLOAD_FOLDER)/f"{upload_id}.wav"
+        wav = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
         segs, _ = get_whisper_model().transcribe(
             str(wav),
             word_timestamps=True,
-            **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {})
+            **({"language": settings.WHISPER_LANGUAGE}
+               if settings.WHISPER_LANGUAGE else {})
         )
     except Exception as e:
         logger.error(f"[{cid}] transcribe_segments error", exc_info=True)
-        r.publish(f"progress:{upload_id}", json.dumps({"status":"error","error":str(e)}))
+        r.publish(f"progress:{upload_id}",
+                  json.dumps({"status": "error", "error": str(e)}))
         return
 
     segs = list(segs)
-    out = Path(settings.RESULTS_FOLDER)/upload_id
+    out = Path(settings.RESULTS_FOLDER) / upload_id
     out.mkdir(exist_ok=True)
-    (out/"transcript.json").write_text(json.dumps(
-        [{"start": s.start, "end": s.end, "text": s.text} for s in segs],
-        ensure_ascii=False, indent=2
+    (out / "transcript.json").write_text(json.dumps(
+        [{"start": s.start, "end": s.end, "text": s.text}
+         for s in segs],
+        ensure_ascii=False,
+        indent=2
     ))
-    r.publish(f"progress:{upload_id}", json.dumps({"status":"transcript_done"}))
+    r.publish(f"progress:{upload_id}",
+              json.dumps({"status": "transcript_done"}))
 
     if r.get(f"diarize_requested:{upload_id}") == "1":
         diarize_full.delay(upload_id, correlation_id)
@@ -202,20 +237,25 @@ def diarize_full(self, upload_id, correlation_id):
     t0 = time.time()
 
     try:
-        wav = Path(settings.UPLOAD_FOLDER)/f"{upload_id}.wav"
-        get_vad(); get_clustering_diarizer()
+        wav = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
+        get_vad()
+        get_clustering_diarizer()
         ann = get_clustering_diarizer().apply({"audio": str(wav)})
     except Exception as e:
         logger.error(f"[{cid}] diarize_full error", exc_info=True)
-        r.publish(f"progress:{upload_id}", json.dumps({"status":"error","error":str(e)}))
+        r.publish(f"progress:{upload_id}",
+                  json.dumps({"status": "error", "error": str(e)}))
         return
 
     segs = [
         {"start": float(s.start), "end": float(s.end), "speaker": spk}
         for s, _, spk in ann.itertracks(yield_label=True)
     ]
-    out = Path(settings.RESULTS_FOLDER)/upload_id
+    out = Path(settings.RESULTS_FOLDER) / upload_id
     out.mkdir(exist_ok=True)
-    (out/"diarization.json").write_text(json.dumps(segs, ensure_ascii=False, indent=2))
-    r.publish(f"progress:{upload_id}", json.dumps({"status":"diarization_done"}))
+    (out / "diarization.json").write_text(
+        json.dumps(segs, ensure_ascii=False, indent=2)
+    )
+    r.publish(f"progress:{upload_id}",
+              json.dumps({"status": "diarization_done"}))
     logger.info(f"[{cid}] DIARIZE done in {time.time()-t0:.2f}s")
