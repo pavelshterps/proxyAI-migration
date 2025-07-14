@@ -8,8 +8,7 @@ from contextlib import asynccontextmanager
 import structlog
 import redis.asyncio as redis_async
 from fastapi import (
-    FastAPI,
-    UploadFile, File, HTTPException,
+    FastAPI, UploadFile, File, HTTPException,
     Header, Depends, Request, Response, Body, Query
 )
 from fastapi.responses import FileResponse, JSONResponse
@@ -17,7 +16,6 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.security.api_key import APIKeyHeader
-from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
 from slowapi import Limiter
 from slowapi.middleware import SlowAPIMiddleware
 from slowapi.util import get_remote_address
@@ -30,10 +28,10 @@ from dependencies import get_current_user
 from routes import router as api_router
 from admin_routes import router as admin_router
 
-# импорт задач
+# импорт Celery-тасков
 from tasks import download_audio, preview_transcribe, transcribe_segments, diarize_full
 
-# === Lifecycle & DB init retry ===
+# === Application lifecycle & retry DB init ===
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     for attempt in range(1, 6):
@@ -57,7 +55,7 @@ structlog.configure(
 )
 log = structlog.get_logger()
 
-# === Rate limit, CORS, TrustedHost ===
+# === Rate limit, CORS and TrustedHost ===
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 app.add_middleware(SlowAPIMiddleware)
@@ -73,14 +71,15 @@ app.add_middleware(
     allowed_hosts=["127.0.0.1", "localhost"] + settings.ALLOWED_ORIGINS_LIST
 )
 
-# === Ensure directories exist ===
+# === Ensure upload, results and cache dirs exist ===
 for d in (settings.UPLOAD_FOLDER, settings.RESULTS_FOLDER, settings.DIARIZER_CACHE_DIR):
     Path(d).mkdir(parents=True, exist_ok=True)
     log.debug("Ensured dir exists", path=str(d))
 
-# === Redis & API-Key dependency ===
+# === Redis & API Key dependency ===
 redis = redis_async.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
 async def get_api_key(
     x_api_key: str = Depends(api_key_header),
     api_key: str = Query(None)
@@ -91,7 +90,7 @@ async def get_api_key(
         raise HTTPException(401, "Missing API Key")
     return key
 
-# === SSE for progress (два маршрута — с и без «/») ===
+# === SSE endpoint: subscribe to progress updates (with and without trailing slash) ===
 @app.get("/events/{upload_id}", include_in_schema=False)
 @app.get("/events/{upload_id}/", include_in_schema=False)
 async def progress_events(
@@ -112,7 +111,9 @@ async def progress_events(
                 msg = await pubsub.get_message(ignore_subscribe_messages=True, timeout=0.5)
                 now = time.time()
                 if msg and msg["type"] == "message":
-                    yield f"data: {msg['data']}\n\n"
+                    payload = msg["data"]
+                    log.debug("SSE ▶", upload_id=upload_id, data=payload)
+                    yield f"data: {payload}\n\n"
                 elif now - last_hb > 1.0:
                     yield ":\n\n"
                     last_hb = now
@@ -122,7 +123,7 @@ async def progress_events(
             log.info("SSE unsubscribed", upload_id=upload_id)
     return EventSourceResponse(generator())
 
-# === Serve UI ===
+# === Serve frontend ===
 @app.get("/", include_in_schema=False)
 async def root():
     return FileResponse("static/index.html")
@@ -143,24 +144,26 @@ async def upload(
     if not data:
         raise HTTPException(400, "File is empty")
 
+    # Сохраняем файл
     ext = Path(file.filename).suffix or ""
     upload_id = uuid.uuid4().hex
     dest = Path(settings.UPLOAD_FOLDER) / f"{upload_id}{ext}"
     dest.write_bytes(data)
     log.info("File saved", upload_id=upload_id, path=str(dest), size=len(data))
 
+    # Запись в БД
     try:
         await create_upload_record(db, current_user.id, upload_id)
     except Exception:
         log.warning("DB record create failed", upload_id=upload_id)
 
-    # dispatch tasks
+    # Диспетчеризация Celery-тасков
     await redis.set(f"external:{upload_id}", upload_id)
     download_audio.delay(upload_id, cid)
     preview_transcribe.delay(upload_id, cid)
 
-    # publish initial state (preview=None)
-    init_state = {"status":"started","preview":None}
+    # Initial SSE state
+    init_state = {"status": "started", "preview": None}
     await redis.set(f"progress:{upload_id}", json.dumps(init_state, ensure_ascii=False))
     await redis.publish(f"progress:{upload_id}", json.dumps(init_state, ensure_ascii=False))
 
@@ -169,7 +172,7 @@ async def upload(
         headers={"X-Correlation-ID": cid}
     )
 
-# === Results endpoint ===
+# === Results endpoint: возвращает превью / полный текст / merge с диаризацией ===
 @app.get("/results/{upload_id}", summary="Get transcript and speaker labels")
 async def get_results(
     upload_id: str,
@@ -178,10 +181,11 @@ async def get_results(
 ):
     base = Path(settings.RESULTS_FOLDER) / upload_id
 
-    # 1) полная транскрипция + (если есть) merge с diarization
+    # 1. Полный текст уже готов?
     tp = base / "transcript.json"
     if tp.exists():
         transcript = json.loads(tp.read_text(encoding="utf-8"))
+        # Если есть diarization.json — мёрджим с ней
         dp = base / "diarization.json"
         if dp.exists():
             raw_d = json.loads(dp.read_text(encoding="utf-8"))
@@ -200,10 +204,10 @@ async def get_results(
                     "speaker": speaker
                 })
             return JSONResponse({"results": merged})
-        # только transcript
+        # иначе просто текст
         return JSONResponse({"results": transcript})
 
-    # 2) preview (если transcript ещё нет)
+    # 2. Ещё нет полного текста — отдаем preview.json
     pf = base / "preview.json"
     if pf.exists():
         pl = json.loads(pf.read_text(encoding="utf-8"))
@@ -211,7 +215,7 @@ async def get_results(
 
     raise HTTPException(404, "Results not ready")
 
-# === Request diarization ===
+# === Ручной триггер диаризации ===
 @app.post("/diarize/{upload_id}", summary="Request diarization")
 async def request_diarization(
     upload_id: str,
@@ -225,7 +229,7 @@ async def request_diarization(
     diarize_full.delay(upload_id, None)
     return JSONResponse({"message": "diarization started"})
 
-# === Save speaker labels ===
+# === Сохранение меток спикеров ===
 @app.post("/labels/{upload_id}", summary="Save speaker labels")
 async def save_labels(
     upload_id: str,
@@ -242,17 +246,16 @@ async def save_labels(
 
     base = Path(settings.RESULTS_FOLDER) / upload_id
     raw_d = json.loads((base / "diarization.json").read_text(encoding="utf-8"))
-    # перезаписываем .json с новыми спикерами
+    # Перезаписываем diarization.json
     updated = []
     for seg in raw_d:
         new_spk = mapping.get(str(seg["speaker"]), seg["speaker"])
         updated.append({"start": seg["start"], "end": seg["end"], "speaker": new_spk})
     (base / "diarization.json").write_text(
-      json.dumps(updated, ensure_ascii=False, indent=2),
-      encoding="utf-8"
+        json.dumps(updated, ensure_ascii=False, indent=2), encoding="utf-8"
     )
 
-    # возвращаем сразу merged
+    # Сразу отдаем merged
     transcript = json.loads((base / "transcript.json").read_text(encoding="utf-8"))
     merged = []
     for seg in transcript:
@@ -268,7 +271,7 @@ async def save_labels(
         })
     return JSONResponse({"results": merged})
 
-# === Routers & static files ===
+# === Routers & StaticFiles ===
 app.include_router(api_router, tags=["proxyAI"])
 app.include_router(admin_router)
 app.mount("/static", StaticFiles(directory="static"), name="static")
