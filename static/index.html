@@ -3,30 +3,38 @@
 <head>
   <!-- … ваши стили … -->
   <meta charset="utf-8">
-  <title>ProxyAI Transcriber</title>
+  <title>proxyAI Demo UI</title>
   <style>
-    /* пример стилей */
-    body { font-family: sans-serif; margin: 1rem; }
-    .segment { margin-bottom: 0.5rem; }
-    .segment .time { color: #555; margin-right: 0.5rem; }
-    .segment input { width: 100px; margin: 0 0.5rem; }
+    /* Пример простых стилей, замените на свои */
+    body { font-family: sans-serif; padding: 20px; }
+    .controls button { margin-right: 8px; }
+    .segment { margin: 8px 0; display: flex; align-items: center; }
+    .segment .time { width: 50px; }
+    .segment input { width: 80px; margin: 0 8px; }
   </style>
 </head>
 <body>
-  <!-- … ваши кнопки и элементы … -->
-  <div>
-    <input id="apiKey" placeholder="API-Key" />
-    <input type="file" id="audioFile" />
+  <h1>proxyAI Demo UI</h1>
+  <div class="controls">
+    Ваш API-Key:
+    <input id="apiKey" type="text" value="" size="32">
+    <input id="audioFile" type="file" accept="audio/*,video/*">
     <button id="uploadBtn">Загрузить</button>
     <button id="previewBtn" disabled>Preview</button>
     <button id="transcriptBtn" disabled>Transcript</button>
     <button id="requestDiarizeBtn" disabled>Запустить Diarизацию</button>
     <button id="saveLabelsBtn" disabled>Сохранить метки</button>
   </div>
-  <div id="status" style="margin-top:1rem;"></div>
-  <div id="timings" style="margin-top:1rem;"></div>
-  <audio id="audio" controls style="display:block; margin-top:1rem;"></audio>
-  <div id="transcriptContainer" style="margin-top:1rem;"></div>
+
+  <div id="timings" style="margin-top:16px;">
+    <!-- здесь будут тайминги: Preview, Transcript, Diarization -->
+  </div>
+
+  <audio id="audio" controls style="width:100%; margin-top:16px;"></audio>
+
+  <div id="status" style="margin-top:8px; font-weight:bold;"></div>
+
+  <div id="transcriptContainer" style="margin-top:16px;"></div>
 
 <script>
 ;(function(){
@@ -42,7 +50,10 @@
         audioEl     = document.getElementById("audio"),
         container   = document.getElementById("transcriptContainer");
 
-  let uploadId, mapping = {}, savePending = false, es = null;
+  let uploadId,
+      mapping     = {},
+      savePending = false,
+      es          = null;
 
   function fmt(ms){
     const sec = Math.floor(ms/1000),
@@ -52,7 +63,7 @@
   }
 
   uploadBtn.onclick = async () => {
-    // 1) Tear down any existing SSE
+    // 1) Закрываем предыдущий SSE, если открыт
     if (es) { es.close(); es = null; }
 
     const key  = apiKeyEl.value.trim(),
@@ -62,7 +73,7 @@
       return;
     }
 
-    // 2) Reset UI
+    // 2) Сбрасываем UI
     statusEl.textContent      = "Загружаем…";
     timingsEl.innerHTML       = "";
     container.innerHTML       = "";
@@ -75,7 +86,7 @@
 
     audioEl.src = URL.createObjectURL(file);
 
-    // 3) Upload to /upload
+    // 3) Отправляем файл
     let res, data;
     try {
       const form = new FormData();
@@ -96,7 +107,7 @@
 
     statusEl.textContent = "Ждём результатов…";
 
-    // 4) Open SSE on /events
+    // 4) Открываем новый SSE
     es = new EventSource(`/events/${uploadId}?api_key=${encodeURIComponent(key)}`);
 
     es.onmessage = e => {
@@ -113,11 +124,11 @@
         render(st.preview.timestamps);
         mapping.__initialized = true;
         timingsEl.innerHTML += `<div>Preview: ${(performance.now()/1000).toFixed(2)}s</div>`;
-        previewBtn.disabled = false;
+        previewBtn.removeAttribute("disabled");
       }
 
       if (st.status === "transcript_done") {
-        transcriptBtn.disabled = false;
+        transcriptBtn.removeAttribute("disabled");
         timingsEl.innerHTML += `<div>Transcript: ${(performance.now()/1000).toFixed(2)}s</div>`;
         loadResults();
       }
@@ -132,12 +143,19 @@
     };
 
     es.onerror = () => {
-      es && es.close();
-      es = null;
-      statusEl.textContent = "Ошибка потока событий";
-      diarizeBtn.disabled  = true;
-      saveBtn.disabled     = true;
+      if (es) { es.close(); es = null; }
+      statusEl.textContent    = "Ошибка потока событий";
+      diarizeBtn.disabled     = true;
+      saveBtn.disabled        = true;
     };
+  };
+
+  previewBtn.onclick = () => {
+    // просто для визуальной кнопки — ничего не делает, всё через SSE
+  };
+
+  transcriptBtn.onclick = () => {
+    loadResults();
   };
 
   async function loadResults(){
@@ -188,8 +206,8 @@
     const {results} = await res.json();
     render(results);
     statusEl.textContent = "Метки сохранены";
-    savePending        = false;
-    saveBtn.disabled   = true;
+    savePending         = false;
+    saveBtn.disabled    = true;
   };
 
   function render(segments){
@@ -217,19 +235,19 @@
       div.append(pb);
 
       const inp = document.createElement("input");
-      inp.value       = mapping[orig];
-      inp.dataset.orig= orig;
-      inp.onchange    = () => {
+      inp.value = mapping[orig];
+      inp.dataset.orig = orig;
+      inp.onchange = () => {
         const v = inp.value.trim();
         if (!v || v.length > 50) {
           alert("Имя 1-50 символов");
           inp.value = mapping[orig];
           return;
         }
-        mapping[orig]     = v;
-        savePending       = true;
-        saveBtn.disabled  = false;
-        // sync across inputs
+        mapping[orig]    = v;
+        savePending      = true;
+        saveBtn.disabled = false;
+        // синхронизируем поля
         container.querySelectorAll("input").forEach(i => {
           if (i.dataset.orig === orig) i.value = v;
         });
