@@ -11,7 +11,7 @@ from utils.audio import convert_to_wav, download_audio
 
 logger = logging.getLogger(__name__)
 
-# Импорт whisper / pyannote
+# Импорт моделей и флагов
 try:
     from faster_whisper import WhisperModel, download_model
     _HF_AVAILABLE = True
@@ -78,12 +78,16 @@ def preload_on_startup(**kwargs):
             logger.warning("[WARMUP] Whisper warm-up failed")
     if _PN_AVAILABLE and settings.WHISPER_DEVICE.lower().startswith("cuda"):
         try:
-            get_vad(); get_clustering_diarizer()
+            get_vad()
+            get_clustering_diarizer()
         except Exception:
             logger.warning("[WARMUP] VAD/Diarizer warm-up failed")
 
 @celery_app.task(bind=True, queue="transcribe_gpu")
-def preview_transcribe(self, upload_id, correlation_id, url=None):
+def preview_transcribe(self, upload_id, correlation_id, url: str):
+    """
+    Task: download audio from URL, convert to wav, perform Whisper preview.
+    """
     cid = correlation_id or "?"
     if not _HF_AVAILABLE:
         logger.error(f"[{cid}] no Whisper available")
@@ -93,12 +97,8 @@ def preview_transcribe(self, upload_id, correlation_id, url=None):
     t0 = time.time()
 
     try:
-        if url:
-            src = download_audio(url, Path(settings.UPLOAD_FOLDER) / f"{upload_id}_src")
-        else:
-            src = next(Path(settings.UPLOAD_FOLDER).glob(f"{upload_id}.*"), None)
+        src = download_audio(url, Path(settings.UPLOAD_FOLDER), f"{upload_id}")
         wav = convert_to_wav(src, Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav")
-
         segs, _ = get_whisper_model().transcribe(
             str(wav),
             word_timestamps=True,
@@ -117,7 +117,10 @@ def preview_transcribe(self, upload_id, correlation_id, url=None):
     }
     out = Path(settings.RESULTS_FOLDER) / upload_id
     out.mkdir(exist_ok=True)
-    (out / "preview.json").write_text(json.dumps(preview, ensure_ascii=False, indent=2), encoding="utf-8")
+    (out / "preview.json").write_text(
+        json.dumps(preview, ensure_ascii=False, indent=2),
+        encoding="utf-8"
+    )
     r.publish(f"progress:{upload_id}", json.dumps({"status": "preview_done", "preview": preview}))
 
     transcribe_segments.delay(upload_id, correlation_id)
@@ -129,10 +132,8 @@ def transcribe_segments(self, upload_id, correlation_id):
     if not _HF_AVAILABLE:
         logger.error(f"[{cid}] no Whisper available")
         return
-
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
     t0 = time.time()
-
     try:
         wav = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
         segs, _ = get_whisper_model().transcribe(
@@ -148,14 +149,12 @@ def transcribe_segments(self, upload_id, correlation_id):
     segs = list(segs)
     out = Path(settings.RESULTS_FOLDER) / upload_id
     out.mkdir(exist_ok=True)
-
     (out / "transcript.json").write_text(
         json.dumps([{"start": s.start, "end": s.end, "text": s.text} for s in segs],
                    ensure_ascii=False, indent=2),
         encoding="utf-8"
     )
     r.publish(f"progress:{upload_id}", json.dumps({"status": "transcript_done"}))
-
     if r.get(f"diarize_requested:{upload_id}") == "1":
         diarize_full.delay(upload_id, correlation_id)
     logger.info(f"[{cid}] TRANSCRIBE done in {time.time()-t0:.2f}s")
@@ -166,23 +165,27 @@ def diarize_full(self, upload_id, correlation_id):
     if not _PN_AVAILABLE:
         logger.error(f"[{cid}] no pyannote available")
         return
-
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
     t0 = time.time()
-
     try:
         wav = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
-        get_vad(); get_clustering_diarizer()
+        get_vad()
+        get_clustering_diarizer()
         ann = get_clustering_diarizer().apply({"audio": str(wav)})
     except Exception as e:
         logger.error(f"[{cid}] diarize error", exc_info=True)
         r.publish(f"progress:{upload_id}", json.dumps({"status": "error", "error": str(e)}))
         return
 
-    segs = [{"start": float(s.start), "end": float(s.end), "speaker": spk}
-            for s, _, spk in ann.itertracks(yield_label=True)]
+    segs = [
+        {"start": float(s.start), "end": float(s.end), "speaker": spk}
+        for s, _, spk in ann.itertracks(yield_label=True)
+    ]
     out = Path(settings.RESULTS_FOLDER) / upload_id
     out.mkdir(exist_ok=True)
-    (out / "diarization.json").write_text(json.dumps(segs, ensure_ascii=False, indent=2), encoding="utf-8")
+    (out / "diarization.json").write_text(
+        json.dumps(segs, ensure_ascii=False, indent=2),
+        encoding="utf-8"
+    )
     r.publish(f"progress:{upload_id}", json.dumps({"status": "diarization_done"}))
     logger.info(f"[{cid}] DIARIZE done in {time.time()-t0:.2f}s")
