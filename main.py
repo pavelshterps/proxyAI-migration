@@ -31,7 +31,11 @@ from crud import (
     create_admin_user as crud_create_admin_user
 )
 from dependencies import get_current_user
+
+# Импортим единый таск превью и остальное
 from tasks import preview_transcribe, transcribe_segments, diarize_full
+
+# Подключаем дополнительные маршруты из routes.py (если есть)
 from routes import router as api_router
 
 # --- structlog setup ---
@@ -152,6 +156,7 @@ async def upload(
     ext = Path(file.filename).suffix or ""
     upload_id = uuid.uuid4().hex
     Path(settings.UPLOAD_FOLDER).joinpath(f"{upload_id}{ext}").write_bytes(data)
+
     try:
         await create_upload_record(db, current_user.id, upload_id)
     except Exception:
@@ -161,8 +166,9 @@ async def upload(
     await redis.set(f"progress:{upload_id}", json.dumps({"status":"started"}))
     await redis.publish(f"progress:{upload_id}", json.dumps({"status":"started"}))
 
-    # Запускаем единый таск превью на GPU
+    # Теперь всегда запускаем единый таск preview_transcribe на GPU
     preview_transcribe.delay(upload_id, cid)
+
     return JSONResponse({"upload_id": upload_id}, headers={"X-Correlation-ID": cid})
 
 @app.get("/results/{upload_id}")
@@ -223,7 +229,8 @@ async def save_labels(
 
     base = Path(settings.RESULTS_FOLDER) / upload_id
     transcript = json.loads((base/"transcript.json").read_text())
-    raw = (base/"diarization.json").exists() and json.loads((base/"diarization.json").read_text()) or []
+    raw = (base/"diarization.json").exists() \
+          and json.loads((base/"diarization.json").read_text()) or []
     merged = []
     for seg in transcript:
         orig = next(

@@ -49,7 +49,7 @@ class Settings(BaseSettings):
     # HF cache & token
     HUGGINGFACE_CACHE_DIR: Optional[str] = Field(None, env="HUGGINGFACE_CACHE_DIR")
     HUGGINGFACE_TOKEN: str = Field(..., env="HUGGINGFACE_TOKEN")
-
+    FILE_RETENTION_DAYS: int = Field(60, env="FILE_RETENTION_DAYS")
     # Pyannote (clustering-based)
     PYANNOTE_PIPELINE: str = Field(..., env="PYANNOTE_PIPELINE")
 

@@ -1,4 +1,5 @@
 from celery import Celery
+from celery.schedules import crontab
 from kombu import Queue
 from config.settings import settings
 
@@ -31,3 +32,11 @@ celery_app.conf.update(
         'tasks.diarize_full':          {'queue': 'diarize_gpu'},
     },
 )
+
+# Расписание для очистки старых файлов
+celery_app.conf.beat_schedule = {
+    'daily-cleanup-old-files': {
+        'task': 'tasks.cleanup_old_files',
+        'schedule': crontab(hour=3, minute=0),
+    },
+}
