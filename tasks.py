@@ -2,6 +2,7 @@ import json
 import logging
 import time
 import subprocess
+from datetime import datetime, timedelta
 from pathlib import Path
 from celery.signals import worker_process_init
 from redis import Redis
@@ -11,7 +12,7 @@ from config.celery import celery_app
 
 logger = logging.getLogger(__name__)
 
-# Attempt to import faster_whisper
+# Импорт Whisper
 try:
     from faster_whisper import WhisperModel, download_model
     _HF_AVAILABLE = True
@@ -20,7 +21,7 @@ except ImportError as e:
     _HF_AVAILABLE = False
     logger.warning(f"[INIT] faster_whisper not available: {e}")
 
-# Attempt to import pyannote for diarization
+# Импорт Pyannote
 try:
     from pyannote.audio.pipelines import VoiceActivityDetection, SpeakerDiarization
     _PN_AVAILABLE = True
@@ -41,17 +42,10 @@ def get_whisper_model():
         cache    = settings.HUGGINGFACE_CACHE_DIR
         device   = settings.WHISPER_DEVICE.lower()
         local    = (device == "cpu")
-
         try:
-            path = download_model(
-                model_id,
-                cache_dir=cache,
-                local_files_only=local
-            )
+            path = download_model(model_id, cache_dir=cache, local_files_only=local)
         except:
             path = model_id
-
-        # Force float16 on CUDA, int8 on CPU
         compute = getattr(
             settings,
             "WHISPER_COMPUTE_TYPE",
@@ -59,12 +53,7 @@ def get_whisper_model():
         ).lower()
         if device == "cpu" and compute in ("fp16", "float16"):
             compute = "int8"
-
-        _whisper_model = WhisperModel(
-            path,
-            device=device,
-            compute_type=compute
-        )
+        _whisper_model = WhisperModel(path, device=device, compute_type=compute)
         logger.info(f"[WHISPER] model ready on {device} ({compute})")
     return _whisper_model
 
@@ -99,7 +88,6 @@ def preload_on_startup(**kwargs):
     if _HF_AVAILABLE:
         sample = Path(__file__).parent / "tests/fixtures/sample.wav"
         try:
-            # Warm up only the preview portion
             get_whisper_model().transcribe(
                 str(sample),
                 max_initial_timestamp=settings.PREVIEW_LENGTH_S
@@ -115,72 +103,59 @@ def preload_on_startup(**kwargs):
         except:
             logger.warning("[WARMUP] VAD/diarizer warmup failed")
 
-
-# --------------------------------------------------
-# Preview + full transcription both on GPU queue
-# --------------------------------------------------
-
+# Preview + full transcription on GPU queue
 @celery_app.task(bind=True, queue="transcribe_gpu")
 def preview_transcribe(self, upload_id, correlation_id):
     cid = correlation_id or "?"
     logger.info(f"[{cid}] PREVIEW TRANSCRIBE start {upload_id}")
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
     t0 = time.time()
-
     try:
-        # 1) Cut preview with ffmpeg
         src     = next(Path(settings.UPLOAD_FOLDER).glob(f"{upload_id}.*"))
         out_dir = Path(settings.RESULTS_FOLDER) / upload_id
         out_dir.mkdir(exist_ok=True, parents=True)
-
         preview_wav = out_dir / f"{upload_id}_preview.wav"
         subprocess.run(
-            [
-                "ffmpeg", "-y", "-i", str(src),
-                "-ss", "0", "-t", str(settings.PREVIEW_LENGTH_S),
-                "-acodec", "pcm_s16le", "-ac", "1", "-ar", "16k",
-                str(preview_wav)
-            ],
+            ["ffmpeg", "-y", "-i", str(src),
+             "-ss", "0", "-t", str(settings.PREVIEW_LENGTH_S),
+             "-acodec", "pcm_s16le", "-ac", "1", "-ar", "16k",
+             str(preview_wav)],
             check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
-
-        # 2) Transcribe preview
-        segs, _ = get_whisper_model().transcribe(
+        # асинхронная отправка частичных результатов
+        segment_acc = []
+        for seg, _ in get_whisper_model().transcribe(
             str(preview_wav),
             word_timestamps=True,
-            **({"language": settings.WHISPER_LANGUAGE}
-               if settings.WHISPER_LANGUAGE else {})
-        )
-
+            **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {})
+        ):
+            frag = {"start": seg.start, "end": seg.end, "text": seg.text}
+            segment_acc.append(frag)
+            r.publish(f"progress:{upload_id}", json.dumps({
+                "status": "preview_partial",
+                "fragment": frag
+            }))
+        segs = segment_acc
     except Exception as e:
         logger.error(f"[{cid}] preview_transcribe error", exc_info=True)
-        r.publish(
-            f"progress:{upload_id}",
-            json.dumps({"status": "error", "error": str(e)})
-        )
+        r.publish(f"progress:{upload_id}", json.dumps({
+            "status": "error",
+            "error": str(e)
+        }))
         return
-
-    # Build preview JSON
-    segs = list(segs)
     preview = {
-        "text": "".join(s.text for s in segs),
-        "timestamps": [
-            {"start": s.start, "end": s.end, "text": s.text}
-            for s in segs
-        ]
+        "text": "".join(s["text"] for s in segs),
+        "timestamps": segs
     }
     (out_dir / "preview_transcript.json").write_text(
         json.dumps(preview, ensure_ascii=False, indent=2)
     )
-
-    # Notify and queue full transcription
-    r.publish(
-        f"progress:{upload_id}",
-        json.dumps({"status": "preview_done", "preview": preview})
-    )
+    r.publish(f"progress:{upload_id}", json.dumps({
+        "status": "preview_done",
+        "preview": preview
+    }))
     transcribe_segments.delay(upload_id, correlation_id)
     logger.info(f"[{cid}] PREVIEW TRANSCRIBE done in {time.time()-t0:.2f}s")
-
 
 @celery_app.task(bind=True, queue="transcribe_gpu")
 def transcribe_segments(self, upload_id, correlation_id):
@@ -189,46 +164,34 @@ def transcribe_segments(self, upload_id, correlation_id):
     if not _HF_AVAILABLE:
         logger.error(f"[{cid}] no Whisper, skip transcribe")
         return
-
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
     t0 = time.time()
-
     try:
         wav = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
-        # ==== NO chunk_length_s here! ====
         segs, _ = get_whisper_model().transcribe(
             str(wav),
             word_timestamps=True,
-            **({"language": settings.WHISPER_LANGUAGE}
-               if settings.WHISPER_LANGUAGE else {})
+            **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {})
         )
     except Exception as e:
         logger.error(f"[{cid}] transcribe_segments error", exc_info=True)
-        r.publish(
-            f"progress:{upload_id}",
-            json.dumps({"status": "error", "error": str(e)})
-        )
+        r.publish(f"progress:{upload_id}", json.dumps({
+            "status": "error",
+            "error": str(e)
+        }))
         return
-
     segs = list(segs)
     out = Path(settings.RESULTS_FOLDER) / upload_id
     out.mkdir(exist_ok=True)
-    (out / "transcript.json").write_text(
-        json.dumps(
-            [{"start": s.start, "end": s.end, "text": s.text}
-             for s in segs],
-            ensure_ascii=False,
-            indent=2
-        )
-    )
+    (out / "transcript.json").write_text(json.dumps(
+        [{"start": s.start, "end": s.end, "text": s.text} for s in segs],
+        ensure_ascii=False, indent=2
+    ))
     r.publish(f"progress:{upload_id}", json.dumps({"status": "transcript_done"}))
-
     if r.get(f"diarize_requested:{upload_id}") == "1":
         diarize_full.delay(upload_id, correlation_id)
         logger.info(f"[{cid}] auto-diarize queued")
-
     logger.info(f"[{cid}] TRANSCRIBE done in {time.time()-t0:.2f}s")
-
 
 @celery_app.task(bind=True, queue="diarize_gpu")
 def diarize_full(self, upload_id, correlation_id):
@@ -237,10 +200,8 @@ def diarize_full(self, upload_id, correlation_id):
     if not _PN_AVAILABLE:
         logger.error(f"[{cid}] no pyannote, skip diarize")
         return
-
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
     t0 = time.time()
-
     try:
         wav = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
         get_vad()
@@ -248,12 +209,11 @@ def diarize_full(self, upload_id, correlation_id):
         ann = get_clustering_diarizer().apply({"audio": str(wav)})
     except Exception as e:
         logger.error(f"[{cid}] diarize_full error", exc_info=True)
-        r.publish(
-            f"progress:{upload_id}",
-            json.dumps({"status": "error", "error": str(e)})
-        )
+        r.publish(f"progress:{upload_id}", json.dumps({
+            "status": "error",
+            "error": str(e)
+        }))
         return
-
     segs = [
         {"start": float(s.start), "end": float(s.end), "speaker": spk}
         for s, _, spk in ann.itertracks(yield_label=True)
@@ -265,3 +225,21 @@ def diarize_full(self, upload_id, correlation_id):
     )
     r.publish(f"progress:{upload_id}", json.dumps({"status": "diarization_done"}))
     logger.info(f"[{cid}] DIARIZE done in {time.time()-t0:.2f}s")
+
+@celery_app.task(bind=True, queue="transcribe_cpu")
+def cleanup_old_files(self):
+    """
+    Удаляет файлы старше settings.FILE_RETENTION_DAYS.
+    """
+    age_limit = settings.FILE_RETENTION_DAYS
+    cutoff = datetime.utcnow() - timedelta(days=age_limit)
+    deleted = 0
+    for base in (Path(settings.UPLOAD_FOLDER), Path(settings.RESULTS_FOLDER)):
+        for path in base.glob("**/*"):
+            try:
+                if datetime.utcfromtimestamp(path.stat().st_mtime) < cutoff:
+                    (path.rmdir() if path.is_dir() else path.unlink())
+                    deleted += 1
+            except:
+                continue
+    logger.info(f"[CLEANUP] удалено {deleted} устаревших файлов/папок")
