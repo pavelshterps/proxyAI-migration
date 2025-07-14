@@ -99,11 +99,11 @@ def preload_and_warmup(**kwargs):
             max_initial_timestamp=settings.PREVIEW_LENGTH_S
         )
         logger.info("[WARMUP] Whisper warm-up completed")
-        if settings.WHISPER_DEVICE.lower() != "cpu":
-            logger.info("[WARMUP] VAD + Diarizer warm-up")
-            get_vad().apply({"audio": str(sample)})
-            get_clustering_diarizer().apply({"audio": str(sample)})
-            logger.info("[WARMUP] VAD + Diarizer warm-up completed")
+        # Always warm up VAD+diarizer to avoid cold load later
+        logger.info("[WARMUP] VAD + Diarizer warm-up")
+        get_vad().apply({"audio": str(sample)})
+        get_clustering_diarizer().apply({"audio": str(sample)})
+        logger.info("[WARMUP] VAD + Diarizer warm-up completed")
     except Exception as e:
         logger.warning(f"[WARMUP] Failed: {e!r}")
 
@@ -113,7 +113,6 @@ def download_audio(self, upload_id: str, correlation_id: str):
 
 @celery_app.task(bind=True, name="tasks.preview_transcribe", queue="transcribe_gpu")
 def preview_transcribe(self, upload_id: str, correlation_id: str):
-    """Превью-транскрипция без ffmpeg-обрезки, с max_initial_timestamp."""
     if not _HF_AVAILABLE:
         logger.error(f"[{correlation_id}] faster_whisper unavailable — skip preview")
         return
@@ -150,14 +149,21 @@ def preview_transcribe(self, upload_id: str, correlation_id: str):
 
     preview = {
         "text": "".join(s.text for s in segs),
-        "timestamps": [{"start": s.start, "end": s.end, "text": s.text} for s in segs]
+        "timestamps": [
+            {"start": s.start, "end": s.end, "text": s.text}
+            for s in segs
+        ]
     }
 
     out = Path(settings.RESULTS_FOLDER) / upload_id
     out.mkdir(parents=True, exist_ok=True)
-    (out / "preview.json").write_text(json.dumps(preview, ensure_ascii=False, indent=2), encoding="utf-8")
+    (out / "preview.json").write_text(
+        json.dumps(preview, ensure_ascii=False, indent=2),
+        encoding="utf-8"
+    )
     logger.info(f"[{correlation_id}] Preview saved")
 
+    # — publish the *full* preview object under key “preview”
     state = {"status": "preview_done", "preview": preview}
     r.set(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
     r.publish(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
@@ -168,9 +174,8 @@ def preview_transcribe(self, upload_id: str, correlation_id: str):
 
 @celery_app.task(bind=True, name="tasks.transcribe_segments", queue="transcribe_gpu")
 def transcribe_segments(self, upload_id: str, correlation_id: str):
-    """Полная транскрипция всего файла."""
     if not _HF_AVAILABLE:
-        logger.error(f"[{correlation_id}] faster_whisper unavailable — пропускаем full transcript")
+        logger.error(f"[{correlation_id}] faster_whisper unavailable — skip full transcript")
         return
 
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
@@ -178,9 +183,9 @@ def transcribe_segments(self, upload_id: str, correlation_id: str):
     logger.info(f"[{correlation_id}] <<< TRANSCRIBE START >>> for {upload_id}")
 
     try:
-        wav   = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
+        wav = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
         model = get_whisper_model()
-        opts  = {"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {}
+        opts = {"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {}
         segs, _ = model.transcribe(str(wav), word_timestamps=True, **opts)
         segs = list(segs)
         logger.info(f"[{correlation_id}] Full segments count: {len(segs)}")
@@ -189,17 +194,21 @@ def transcribe_segments(self, upload_id: str, correlation_id: str):
         out_dir.mkdir(parents=True, exist_ok=True)
         transcript_file = out_dir / "transcript.json"
         transcript_file.write_text(
-            json.dumps([{"start": s.start, "end": s.end, "text": s.text} for s in segs],
-                       ensure_ascii=False, indent=2),
+            json.dumps([
+                {"start": s.start, "end": s.end, "text": s.text}
+                for s in segs
+            ], ensure_ascii=False, indent=2),
             encoding="utf-8"
         )
         logger.info(f"[{correlation_id}] Transcript JSON saved to {transcript_file}")
 
+        # — publish transcript_done
         state = {"status": "transcript_done", "preview": None}
         r.set(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
         r.publish(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
-        logger.info(f"[{correlation_id}] <<< TRANSCRIBE DONE >>> for {upload_id} in {time.time()-t0:.2f}s")
+        logger.info(f"[{correlation_id}] <<< TRANSCRIBE DONE >>> in {time.time()-t0:.2f}s")
 
+        # auto‐trigger diarization if requested
         if r.get(f"diarize_requested:{upload_id}") == "1":
             diarize_full.delay(upload_id, correlation_id)
     except Exception as e:
@@ -207,9 +216,8 @@ def transcribe_segments(self, upload_id: str, correlation_id: str):
 
 @celery_app.task(bind=True, name="tasks.diarize_full", queue="diarize_gpu")
 def diarize_full(self, upload_id: str, correlation_id: str):
-    """Диаризация спикеров."""
     if not _PN_AVAILABLE:
-        logger.error(f"[{correlation_id}] pyannote.audio unavailable — пропускаем diarization")
+        logger.error(f"[{correlation_id}] pyannote.audio unavailable — skip diarization")
         return
 
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
@@ -228,12 +236,16 @@ def diarize_full(self, upload_id: str, correlation_id: str):
         out_dir = Path(settings.RESULTS_FOLDER) / upload_id
         out_dir.mkdir(parents=True, exist_ok=True)
         diar_file = out_dir / "diarization.json"
-        diar_file.write_text(json.dumps(segs, ensure_ascii=False, indent=2), encoding="utf-8")
+        diar_file.write_text(
+            json.dumps(segs, ensure_ascii=False, indent=2),
+            encoding="utf-8"
+        )
         logger.info(f"[{correlation_id}] Diarization JSON saved to {diar_file}")
 
+        # — publish diarization_done
         state = {"status": "diarization_done", "preview": None}
         r.set(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
         r.publish(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
-        logger.info(f"[{correlation_id}] <<< DIARIZE DONE >>> for {upload_id} in {time.time()-t0:.2f}s")
+        logger.info(f"[{correlation_id}] <<< DIARIZE DONE >>> in {time.time()-t0:.2f}s")
     except Exception as e:
         logger.error(f"[{correlation_id}] Diarization error: {e}", exc_info=True)
