@@ -104,7 +104,6 @@ def preview_transcribe(self, upload_id, correlation_id):
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
     t0 = time.time()
     try:
-        # находим любой исходник (расширение)
         src = next(Path(settings.UPLOAD_FOLDER).glob(f"{upload_id}.*"))
         wav = convert_to_wav(src, Path(settings.UPLOAD_FOLDER)/f"{upload_id}.wav")
         segs, _ = get_whisper_model().transcribe(
@@ -119,9 +118,15 @@ def preview_transcribe(self, upload_id, correlation_id):
         return
 
     segs = list(segs)
-    preview = {"text":"".join(s.text for s in segs),
-               "timestamps":[{"start":s.start,"end":s.end,"text":s.text} for s in segs]}
-    out = Path(settings.RESULTS_FOLDER)/upload_id; out.mkdir(exist_ok=True)
+    preview = {
+        "text": "".join(s.text for s in segs),
+        "timestamps": [
+            {"start": s.start, "end": s.end, "text": s.text}
+            for s in segs
+        ]
+    }
+    out = Path(settings.RESULTS_FOLDER) / upload_id
+    out.mkdir(exist_ok=True)
     (out/"preview.json").write_text(json.dumps(preview, ensure_ascii=False, indent=2))
     r.publish(f"progress:{upload_id}", json.dumps({"status":"preview_done","preview":preview}))
     transcribe_segments.delay(upload_id, correlation_id)
@@ -140,7 +145,8 @@ def transcribe_segments(self, upload_id, correlation_id):
     try:
         wav = Path(settings.UPLOAD_FOLDER)/f"{upload_id}.wav"
         segs, _ = get_whisper_model().transcribe(
-            str(wav), word_timestamps=True,
+            str(wav),
+            word_timestamps=True,
             **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {})
         )
     except Exception as e:
@@ -149,13 +155,15 @@ def transcribe_segments(self, upload_id, correlation_id):
         return
 
     segs = list(segs)
-    out = Path(settings.RESULTS_FOLDER)/upload_id; out.mkdir(exist_ok=True)
+    out = Path(settings.RESULTS_FOLDER) / upload_id
+    out.mkdir(exist_ok=True)
     (out/"transcript.json").write_text(json.dumps(
-        [{"start":s.start,"end":s.end,"text":s.text} for s in segs],
-        ensure_ascii=False, indent=2))
+        [{"start": s.start, "end": s.end, "text": s.text} for s in segs],
+        ensure_ascii=False, indent=2
+    ))
     r.publish(f"progress:{upload_id}", json.dumps({"status":"transcript_done"}))
 
-    if r.get(f"diarize_requested:{upload_id}")=="1":
+    if r.get(f"diarize_requested:{upload_id}") == "1":
         diarize_full.delay(upload_id, correlation_id)
         logger.info(f"[{cid}] auto-diarize queued")
 
@@ -180,9 +188,12 @@ def diarize_full(self, upload_id, correlation_id):
         r.publish(f"progress:{upload_id}", json.dumps({"status":"error","error":str(e)}))
         return
 
-    segs = [{"start":float(s.start),"end":float(s.end),"speaker":spk}
-            for s,_,spk in ann.itertracks(yield_label=True)]
-    out = Path(settings.RESULTS_FOLDER)/upload_id; out.mkdir(exist_ok=True)
+    segs = [
+        {"start": float(s.start), "end": float(s.end), "speaker": spk}
+        for s, _, spk in ann.itertracks(yield_label=True)
+    ]
+    out = Path(settings.RESULTS_FOLDER) / upload_id
+    out.mkdir(exist_ok=True)
     (out/"diarization.json").write_text(json.dumps(segs, ensure_ascii=False, indent=2))
     r.publish(f"progress:{upload_id}", json.dumps({"status":"diarization_done"}))
     logger.info(f"[{cid}] DIARIZE done in {time.time()-t0:.2f}s")

@@ -1,17 +1,30 @@
 <!DOCTYPE html>
 <html lang="ru">
 <head>
-  <!-- … ваши стили … -->
+  <!-- ваши стили -->
+  <style>
+    body { font-family: sans-serif; padding: 1rem; }
+    .segment { margin-bottom: 0.5rem; }
+    .time { display: inline-block; width: 4rem; }
+    input { margin: 0 0.5rem; width: 6rem; }
+    button { margin-right: 0.5rem; }
+  </style>
 </head>
 <body>
-  <!-- … ваши кнопки и элементы … -->
+  <h1>proxyAI</h1>
+
+  <label>API-Key:
+    <input id="apiKey" type="text" placeholder="Введите API-Key">
+  </label>
+  <input id="audioFile" type="file" accept="audio/*">
   <button id="uploadBtn">Загрузить</button>
   <button id="requestDiarizeBtn" disabled>Запустить Диаризацию</button>
   <button id="saveLabelsBtn">Сохранить метки</button>
-  <!-- … остальной UI … -->
-  <div id="status"></div>
-  <div id="timings"></div>
-  <div id="transcriptContainer"></div>
+
+  <div id="status" style="margin-top:1rem; font-weight:bold;"></div>
+  <div id="timings" style="margin-top:0.5rem;"></div>
+  <audio id="audio" controls style="display:block; margin-top:1rem; width:100%;"></audio>
+  <div id="transcriptContainer" style="margin-top:1rem;"></div>
 
 <script>
 ;(function(){
@@ -25,7 +38,11 @@
         audioEl    = document.getElementById("audio"),
         container  = document.getElementById("transcriptContainer");
 
-  let uploadId, mapping = {}, savePending = false, startTs;
+  let uploadId,
+      mapping     = {},
+      savePending = false,
+      startTs     = 0,
+      es          = null;
 
   function fmt(ms){
     const sec = Math.floor(ms/1000),
@@ -35,28 +52,30 @@
   }
 
   uploadBtn.onclick = async () => {
-    // reset UI
-    diarizeBtn.disabled = true;
-    saveBtn.disabled = false;      // всегда активна
-    container.innerHTML = "";
-    timingsEl.innerHTML  = "";
-    mapping              = {};
-    savePending          = false;
+    // Закрываем старый SSE
+    if (es) { es.close(); es = null; }
+
+    // Сброс UI
+    statusEl.textContent   = "";
+    timingsEl.innerHTML    = "";
+    container.innerHTML    = "";
+    diarizeBtn.disabled    = true;
+    saveBtn.disabled       = false;  // всегда доступна
+    mapping                = {};
+    savePending            = false;
 
     const key  = apiKeyEl.value.trim(),
           file = fileEl.files[0];
     if (!key || !file) {
-      alert("API-Key и файл обязательно");
+      alert("API-Key и файл обязательны");
       return;
     }
 
-    audioEl.src   = URL.createObjectURL(file);
+    audioEl.src = URL.createObjectURL(file);
     statusEl.textContent = "Загружаем…";
-
-    // start timer
     startTs = performance.now();
 
-    let res;
+    let res, data;
     try {
       const form = new FormData();
       form.append("file", file);
@@ -66,7 +85,7 @@
         body: form
       });
       if (!res.ok) throw new Error(res.statusText);
-      const data = await res.json();
+      data = await res.json();
       uploadId = data.upload_id;
     } catch(e) {
       alert("Ошибка: " + e.message);
@@ -75,8 +94,7 @@
     }
 
     statusEl.textContent = "Ждём результатов…";
-
-    const es = new EventSource(`/events/${uploadId}?api_key=${encodeURIComponent(key)}`);
+    es = new EventSource(`/events/${uploadId}?api_key=${encodeURIComponent(key)}`);
 
     es.onmessage = e => {
       const msg = e.data.trim();
@@ -87,30 +105,27 @@
       if (st.preview && !mapping.__initialized) {
         mapping.__initialized = true;
         render(st.preview.timestamps);
-        timingsEl.innerHTML += `<div>Preview: ${((performance.now() - startTs)/1000).toFixed(2)}s</div>`;
+        timingsEl.innerHTML += `<div>Preview: ${((performance.now()-startTs)/1000).toFixed(2)}s</div>`;
       }
-
       if (st.status === "transcript_done") {
-        timingsEl.innerHTML += `<div>Transcript: ${((performance.now() - startTs)/1000).toFixed(2)}s</div>`;
+        timingsEl.innerHTML += `<div>Transcript: ${((performance.now()-startTs)/1000).toFixed(2)}s</div>`;
         loadResults();
       }
-
       if (st.status === "diarize_requested") {
         diarizeBtn.disabled = false;
       }
-
       if (st.status === "diarization_done") {
-        timingsEl.innerHTML += `<div>Diarization: ${((performance.now() - startTs)/1000).toFixed(2)}s</div>`;
+        timingsEl.innerHTML += `<div>Diarization: ${((performance.now()-startTs)/1000).toFixed(2)}s</div>`;
         saveBtn.disabled = false;
         loadResults();
-        es.close();
+        es.close(); es = null;
       }
     };
 
     es.onerror = () => {
-      statusEl.textContent = "Ошибка потока событий";
-      diarizeBtn.disabled = true;
-      saveBtn.disabled    = false;  // пусть остаётся активной
+      statusEl.textContent = "Ошибка SSE";
+      diarizeBtn.disabled  = true;
+      saveBtn.disabled     = false;
     };
   };
 
@@ -143,7 +158,7 @@
     if (!savePending) return;
     const key     = apiKeyEl.value.trim(),
           payload = {};
-    Object.entries(mapping).forEach(([orig, s]) => {
+    Object.entries(mapping).forEach(([orig,s]) => {
       if (orig !== "__initialized") payload[orig] = s;
     });
     const res = await fetch(`/labels/${uploadId}`, {
@@ -154,10 +169,7 @@
       },
       body: JSON.stringify(payload)
     });
-    if (!res.ok) {
-      alert("Ошибка");
-      return;
-    }
+    if (!res.ok) { alert("Ошибка"); return; }
     const {results} = await res.json();
     render(results);
     statusEl.textContent = "Метки сохранены";
