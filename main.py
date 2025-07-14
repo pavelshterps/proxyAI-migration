@@ -249,51 +249,51 @@ async def get_results(
 
     base = Path(settings.RESULTS_FOLDER) / upload_id
 
-    # 1) preview
+    # 1) сначала полная транскрипция + merge с диаризацией
+    tp = base / "transcript.json"
+    if tp.exists():
+        transcript = json.loads(tp.read_text(encoding="utf-8"))
+
+        dp = base / "diarization.json"
+        if dp.exists():
+            diar = json.loads(dp.read_text(encoding="utf-8"))
+            # применяем сохранённые пользовательские метки
+            rec = await get_upload_for_user(db, current_user.id, upload_id)
+            label_map = rec.label_mapping or {}
+            for seg in diar:
+                seg["speaker"] = label_map.get(str(seg["speaker"]), seg["speaker"])
+
+            merged = []
+            for seg in transcript:
+                spk = next(
+                    (d["speaker"] for d in diar
+                     if d["start"] <= seg["start"] < d["end"]),
+                    None
+                )
+                merged.append({
+                    "start":   seg["start"],
+                    "end":     seg["end"],
+                    "text":    seg["text"],
+                    "speaker": spk
+                })
+
+            log.info("Returning merged transcript + speakers", upload_id=upload_id, segments=len(merged))
+            return JSONResponse(content={"results": merged})
+
+        # если диаризации нет — просто транскрипт
+        log.info("Returning transcript only", upload_id=upload_id, segments=len(transcript))
+        return JSONResponse(content={"results": transcript})
+
+    # 2) если полной транскрипции нет — возвращаем превью
     preview_file = base / "preview.json"
     if preview_file.exists():
         pl = json.loads(preview_file.read_text(encoding="utf-8"))
+        log.info("Returning preview", upload_id=upload_id)
         return JSONResponse(content={"results": pl["timestamps"], "text": pl["text"]})
 
-    # 2) full transcript
-    tp = base / "transcript.json"
-    if not tp.exists():
-        log.warning("Results not ready", upload_id=upload_id)
-        raise HTTPException(404, "Results not ready")
-
-    transcript = json.loads(tp.read_text(encoding="utf-8"))
-
-    # 3) merge with diarization if exists
-    dp = base / "diarization.json"
-    if dp.exists():
-        diar = json.loads(dp.read_text(encoding="utf-8"))
-
-        # apply user labels
-        rec = await get_upload_for_user(db, current_user.id, upload_id)
-        label_map = rec.label_mapping or {}
-        for seg in diar:
-            seg["speaker"] = label_map.get(str(seg["speaker"]), seg["speaker"])
-
-        merged = []
-        for seg in transcript:
-            spk = next(
-                (d["speaker"] for d in diar
-                 if d["start"] <= seg["start"] < d["end"]),
-                None
-            )
-            merged.append({
-                "start":   seg["start"],
-                "end":     seg["end"],
-                "text":    seg["text"],
-                "speaker": spk
-            })
-
-        log.info("Returning merged transcript + speakers", upload_id=upload_id, segments=len(merged))
-        return JSONResponse(content={"results": merged})
-
-    # 4) only transcript
-    log.info("Returning transcript only", upload_id=upload_id, segments=len(transcript))
-    return JSONResponse(content={"results": transcript})
+    # 3) ничего нет — 404
+    log.warning("Results not ready", upload_id=upload_id)
+    raise HTTPException(404, "Results not ready")
 
 # === Trigger diarization manually ===
 @app.post("/diarize/{upload_id}", summary="Request diarization")
@@ -356,18 +356,19 @@ async def save_labels(
     else:
         log.warning("Diarization file not found for updating labels", path=str(dfile))
 
-    # return merged immediately
+    # возвращаем сразу merged после сохранения меток
     merged = []
-    for seg in json.loads((base / "transcript.json").read_text(encoding="utf-8")):
+    transcript = json.loads((base / "transcript.json").read_text(encoding="utf-8"))
+    for seg in transcript:
         spk = next(
             (d["speaker"] for d in updated
              if d["start"] <= seg["start"] < d["end"]),
             None
         )
         merged.append({
-            "start": seg["start"],
-            "end":   seg["end"],
-            "text":  seg["text"],
+            "start":   seg["start"],
+            "end":     seg["end"],
+            "text":    seg["text"],
             "speaker": spk
         })
     log.info("Returning merged transcript + speakers after labels", upload_id=upload_id, segments=len(merged))
