@@ -4,6 +4,7 @@ import time
 from pathlib import Path
 from celery.signals import worker_process_init
 from redis import Redis
+from pydub import AudioSegment
 
 from config.settings import settings
 from config.celery import celery_app
@@ -104,12 +105,19 @@ def preview_transcribe(self, upload_id, correlation_id):
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
     t0 = time.time()
     try:
+        # ищем исходник
         src = next(Path(settings.UPLOAD_FOLDER).glob(f"{upload_id}.*"))
-        wav = convert_to_wav(src, Path(settings.UPLOAD_FOLDER)/f"{upload_id}.wav")
+        # конвертируем в WAV (если ещё нет)
+        wav_full = convert_to_wav(src, Path(settings.UPLOAD_FOLDER)/f"{upload_id}.wav")
+        # обрезаем первые PREVIEW_LENGTH_S секунд
+        audio = AudioSegment.from_file(str(wav_full))
+        preview_audio = audio[: int(settings.PREVIEW_LENGTH_S * 1000)]
+        preview_path = Path(settings.UPLOAD_FOLDER)/f"{upload_id}_preview.wav"
+        preview_audio.export(str(preview_path), format="wav")
+        # транскрибируем preview
         segs, _ = get_whisper_model().transcribe(
-            str(wav),
+            str(preview_path),
             word_timestamps=True,
-            max_initial_timestamp=settings.PREVIEW_LENGTH_S,
             **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {})
         )
     except Exception as e:
@@ -120,12 +128,9 @@ def preview_transcribe(self, upload_id, correlation_id):
     segs = list(segs)
     preview = {
         "text": "".join(s.text for s in segs),
-        "timestamps": [
-            {"start": s.start, "end": s.end, "text": s.text}
-            for s in segs
-        ]
+        "timestamps": [{"start": s.start, "end": s.end, "text": s.text} for s in segs]
     }
-    out = Path(settings.RESULTS_FOLDER) / upload_id
+    out = Path(settings.RESULTS_FOLDER)/upload_id
     out.mkdir(exist_ok=True)
     (out/"preview.json").write_text(json.dumps(preview, ensure_ascii=False, indent=2))
     r.publish(f"progress:{upload_id}", json.dumps({"status":"preview_done","preview":preview}))
@@ -155,7 +160,7 @@ def transcribe_segments(self, upload_id, correlation_id):
         return
 
     segs = list(segs)
-    out = Path(settings.RESULTS_FOLDER) / upload_id
+    out = Path(settings.RESULTS_FOLDER)/upload_id
     out.mkdir(exist_ok=True)
     (out/"transcript.json").write_text(json.dumps(
         [{"start": s.start, "end": s.end, "text": s.text} for s in segs],
@@ -192,7 +197,7 @@ def diarize_full(self, upload_id, correlation_id):
         {"start": float(s.start), "end": float(s.end), "speaker": spk}
         for s, _, spk in ann.itertracks(yield_label=True)
     ]
-    out = Path(settings.RESULTS_FOLDER) / upload_id
+    out = Path(settings.RESULTS_FOLDER)/upload_id
     out.mkdir(exist_ok=True)
     (out/"diarization.json").write_text(json.dumps(segs, ensure_ascii=False, indent=2))
     r.publish(f"progress:{upload_id}", json.dumps({"status":"diarization_done"}))

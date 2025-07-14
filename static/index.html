@@ -1,17 +1,19 @@
 <!DOCTYPE html>
 <html lang="ru">
 <head>
-  <!-- ваши стили -->
+  <meta charset="UTF-8">
+  <title>proxyAI Demo</title>
   <style>
     body { font-family: sans-serif; padding: 1rem; }
     .segment { margin-bottom: 0.5rem; }
     .time { display: inline-block; width: 4rem; }
     input { margin: 0 0.5rem; width: 6rem; }
     button { margin-right: 0.5rem; }
+    #timings div { margin-top: 0.25rem; }
   </style>
 </head>
 <body>
-  <h1>proxyAI</h1>
+  <h1>proxyAI Demo UI</h1>
 
   <label>API-Key:
     <input id="apiKey" type="text" placeholder="Введите API-Key">
@@ -21,7 +23,7 @@
   <button id="requestDiarizeBtn" disabled>Запустить Диаризацию</button>
   <button id="saveLabelsBtn">Сохранить метки</button>
 
-  <div id="status" style="margin-top:1rem; font-weight:bold;"></div>
+  <div id="status" style="margin-top:1rem; font-weight:bold;">Готово</div>
   <div id="timings" style="margin-top:0.5rem;"></div>
   <audio id="audio" controls style="display:block; margin-top:1rem; width:100%;"></audio>
   <div id="transcriptContainer" style="margin-top:1rem;"></div>
@@ -38,11 +40,7 @@
         audioEl    = document.getElementById("audio"),
         container  = document.getElementById("transcriptContainer");
 
-  let uploadId,
-      mapping     = {},
-      savePending = false,
-      startTs     = 0,
-      es          = null;
+  let uploadId, mapping = {}, savePending = false, startTs = 0, es = null;
 
   function fmt(ms){
     const sec = Math.floor(ms/1000),
@@ -52,15 +50,13 @@
   }
 
   uploadBtn.onclick = async () => {
-    // Закрываем старый SSE
     if (es) { es.close(); es = null; }
 
-    // Сброс UI
     statusEl.textContent   = "";
     timingsEl.innerHTML    = "";
     container.innerHTML    = "";
     diarizeBtn.disabled    = true;
-    saveBtn.disabled       = false;  // всегда доступна
+    saveBtn.disabled       = false;
     mapping                = {};
     savePending            = false;
 
@@ -75,11 +71,11 @@
     statusEl.textContent = "Загружаем…";
     startTs = performance.now();
 
-    let res, data;
+    let data;
     try {
       const form = new FormData();
       form.append("file", file);
-      res = await fetch("/upload/", {
+      const res = await fetch("/upload/", {
         method: "POST",
         headers: {"X-API-Key": key},
         body: form
@@ -109,10 +105,8 @@
       }
       if (st.status === "transcript_done") {
         timingsEl.innerHTML += `<div>Transcript: ${((performance.now()-startTs)/1000).toFixed(2)}s</div>`;
-        loadResults();
-      }
-      if (st.status === "diarize_requested") {
         diarizeBtn.disabled = false;
+        loadResults();
       }
       if (st.status === "diarization_done") {
         timingsEl.innerHTML += `<div>Diarization: ${((performance.now()-startTs)/1000).toFixed(2)}s</div>`;
@@ -126,6 +120,7 @@
       statusEl.textContent = "Ошибка SSE";
       diarizeBtn.disabled  = true;
       saveBtn.disabled     = false;
+      if (es) es.close();
     };
   };
 
@@ -158,13 +153,13 @@
     if (!savePending) return;
     const key     = apiKeyEl.value.trim(),
           payload = {};
-    Object.entries(mapping).forEach(([orig,s]) => {
-      if (orig !== "__initialized") payload[orig] = s;
+    Object.entries(mapping).forEach(([orig,v]) => {
+      if (orig !== "__initialized") payload[orig] = v;
     });
     const res = await fetch(`/labels/${uploadId}`, {
       method: "POST",
       headers: {
-        "Content-Type": "application/json",
+        "Content-Type":"application/json",
         "X-API-Key": key
       },
       body: JSON.stringify(payload)
@@ -188,7 +183,7 @@
 
       const ts = document.createElement("span");
       ts.className  = "time";
-      ts.textContent = fmt(seg.start * 1000);
+      ts.textContent = fmt(seg.start*1000);
       div.append(ts);
 
       const pb = document.createElement("button");
@@ -196,7 +191,7 @@
       pb.onclick = () => {
         audioEl.currentTime = seg.start;
         audioEl.play();
-        setTimeout(() => audioEl.pause(), (seg.end - seg.start)*1000);
+        setTimeout(()=>audioEl.pause(), (seg.end-seg.start)*1000);
       };
       div.append(pb);
 
@@ -205,11 +200,7 @@
       inp.dataset.orig = orig;
       inp.onchange = () => {
         const v = inp.value.trim();
-        if (!v || v.length > 50) {
-          alert("Имя 1–50 символов");
-          inp.value = mapping[orig];
-          return;
-        }
+        if (!v||v.length>50) { alert("Имя 1–50 символов"); inp.value=mapping[orig]; return; }
         mapping[orig]    = v;
         savePending      = true;
         saveBtn.disabled = false;
@@ -226,7 +217,6 @@
       container.append(div);
     });
   }
-
 })();
 </script>
 </body>
