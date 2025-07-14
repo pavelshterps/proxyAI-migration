@@ -4,6 +4,7 @@ import time
 import subprocess
 from datetime import datetime, timedelta
 from pathlib import Path
+
 from celery.signals import worker_process_init
 from redis import Redis
 
@@ -116,48 +117,50 @@ def preview_transcribe(self, upload_id, correlation_id):
     t0 = time.time()
 
     try:
+        # Исходник и результирующая папка
         src     = next(Path(settings.UPLOAD_FOLDER).glob(f"{upload_id}.*"))
         out_dir = Path(settings.RESULTS_FOLDER) / upload_id
         out_dir.mkdir(exist_ok=True, parents=True)
 
-        # транскрипция превью (first N seconds)
+        # ffmpeg → stdout (pipe), сразу подаём первые PREVIEW_LENGTH_S секунд
+        cmd = [
+            "ffmpeg", "-y", "-i", str(src),
+            "-ss", "0", "-t", str(settings.PREVIEW_LENGTH_S),
+            "-acodec", "pcm_s16le", "-ac", "1", "-ar", "16k",
+            "-f", "wav", "pipe:1"
+        ]
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
+        # транскрипция по фрагментам из pipe
         segments, _ = get_whisper_model().transcribe(
-            str(src),
+            proc.stdout,
             word_timestamps=True,
-            max_initial_timestamp=settings.PREVIEW_LENGTH_S,
             **({"language": settings.WHISPER_LANGUAGE}
                if settings.WHISPER_LANGUAGE else {})
         )
+        proc.stdout.close()
+        proc.wait()
 
         segs = []
         for seg in segments:
             frag = {"start": seg.start, "end": seg.end, "text": seg.text}
             segs.append(frag)
-            r.publish(
-                f"progress:{upload_id}",
-                json.dumps({"status": "preview_partial", "fragment": frag})
-            )
+            r.publish(f"progress:{upload_id}",
+                      json.dumps({"status": "preview_partial", "fragment": frag}))
 
     except Exception as e:
         logger.error(f"[{cid}] preview_transcribe error", exc_info=True)
-        r.publish(
-            f"progress:{upload_id}",
-            json.dumps({"status": "error", "error": str(e)})
-        )
+        r.publish(f"progress:{upload_id}", json.dumps({"status": "error", "error": str(e)}))
         return
 
-    preview = {
-        "text": "".join(s["text"] for s in segs),
-        "timestamps": segs
-    }
+    # финальный JSON превью
+    preview = {"text": "".join(s["text"] for s in segs), "timestamps": segs}
     (out_dir / "preview_transcript.json").write_text(
         json.dumps(preview, ensure_ascii=False, indent=2)
     )
-    r.publish(
-        f"progress:{upload_id}",
-        json.dumps({"status": "preview_done", "preview": preview})
-    )
+    r.publish(f"progress:{upload_id}", json.dumps({"status": "preview_done", "preview": preview}))
 
+    # запускаем полный транскрипт
     transcribe_segments.delay(upload_id, correlation_id)
     logger.info(f"[{cid}] PREVIEW TRANSCRIBE done in {time.time()-t0:.2f}s")
 
@@ -173,30 +176,74 @@ def transcribe_segments(self, upload_id, correlation_id):
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
     t0 = time.time()
 
+    src = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
+    duration = None
     try:
-        wav = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
-        segments, _ = get_whisper_model().transcribe(
-            str(wav),
+        # узнаём длительность через ffprobe
+        cmd = [
+            "ffprobe", "-v", "error",
+            "-select_streams", "a:0",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            str(src)
+        ]
+        out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL)
+        duration = float(out.strip())
+    except:
+        logger.warning(f"[{cid}] cannot probe duration, defaulting to full")
+    finally:
+        # если duration не узнали — транскрибируем целиком
+        pass
+
+    segments_acc = []
+
+    # если длинный файл — режем на чанки
+    chunk_s = getattr(settings, "CHUNK_LENGTH_S", None)
+    if duration and chunk_s and duration > chunk_s:
+        # по чанкам
+        for start in range(0, int(duration), int(chunk_s)):
+            cmd = [
+                "ffmpeg", "-y", "-i", str(src),
+                "-ss", str(start), "-t", str(chunk_s),
+                "-acodec", "pcm_s16le", "-ac", "1", "-ar", "16k",
+                "-f", "wav", "pipe:1"
+            ]
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            segs, _ = get_whisper_model().transcribe(
+                proc.stdout,
+                word_timestamps=True,
+                **({"language": settings.WHISPER_LANGUAGE}
+                   if settings.WHISPER_LANGUAGE else {})
+            )
+            proc.stdout.close()
+            proc.wait()
+            # добавляем оффсет
+            for seg in segs:
+                segments_acc.append({
+                    "start": seg.start + start,
+                    "end":   seg.end   + start,
+                    "text":  seg.text
+                })
+    else:
+        # короткий — одним куском
+        segs, _ = get_whisper_model().transcribe(
+            str(src),
             word_timestamps=True,
             **({"language": settings.WHISPER_LANGUAGE}
                if settings.WHISPER_LANGUAGE else {})
         )
-    except Exception as e:
-        logger.error(f"[{cid}] transcribe_segments error", exc_info=True)
-        r.publish(
-            f"progress:{upload_id}",
-            json.dumps({"status": "error", "error": str(e)})
-        )
-        return
+        for seg in segs:
+            segments_acc.append({"start": seg.start, "end": seg.end, "text": seg.text})
 
-    segs = [{"start": s.start, "end": s.end, "text": s.text} for s in segments]
-    out = Path(settings.RESULTS_FOLDER) / upload_id
-    out.mkdir(exist_ok=True)
-    (out / "transcript.json").write_text(
-        json.dumps(segs, ensure_ascii=False, indent=2)
+    # сохраняем полный транскрипт
+    out_dir = Path(settings.RESULTS_FOLDER) / upload_id
+    out_dir.mkdir(exist_ok=True)
+    (out_dir / "transcript.json").write_text(
+        json.dumps(segments_acc, ensure_ascii=False, indent=2)
     )
     r.publish(f"progress:{upload_id}", json.dumps({"status": "transcript_done"}))
 
+    # по запросу — диаризация
     if r.get(f"diarize_requested:{upload_id}") == "1":
         diarize_full.delay(upload_id, correlation_id)
         logger.info(f"[{cid}] auto-diarize queued")
@@ -216,27 +263,23 @@ def diarize_full(self, upload_id, correlation_id):
     t0 = time.time()
 
     try:
-        wav = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
-        speech = get_vad().apply({"audio": str(wav)})
-        ann = get_clustering_diarizer().apply({
-            "audio": str(wav),
-            "speech": speech
-        })
+        wav_path = str(Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav")
+        # сначала VAD
+        speech = get_vad().apply({"audio": wav_path})
+        # затем кластеризация только на активах речи
+        ann = get_clustering_diarizer().apply({"audio": wav_path, "speech": speech})
     except Exception as e:
         logger.error(f"[{cid}] diarize_full error", exc_info=True)
-        r.publish(
-            f"progress:{upload_id}",
-            json.dumps({"status": "error", "error": str(e)})
-        )
+        r.publish(f"progress:{upload_id}", json.dumps({"status": "error", "error": str(e)}))
         return
 
     segs = [
         {"start": float(s.start), "end": float(s.end), "speaker": spk}
         for s, _, spk in ann.itertracks(yield_label=True)
     ]
-    out = Path(settings.RESULTS_FOLDER) / upload_id
-    out.mkdir(exist_ok=True)
-    (out / "diarization.json").write_text(
+    out_dir = Path(settings.RESULTS_FOLDER) / upload_id
+    out_dir.mkdir(exist_ok=True)
+    (out_dir / "diarization.json").write_text(
         json.dumps(segs, ensure_ascii=False, indent=2)
     )
     r.publish(f"progress:{upload_id}", json.dumps({"status": "diarization_done"}))
@@ -255,10 +298,7 @@ def cleanup_old_files(self):
         for path in base.glob("**/*"):
             try:
                 if datetime.utcfromtimestamp(path.stat().st_mtime) < cutoff:
-                    if path.is_dir():
-                        path.rmdir()
-                    else:
-                        path.unlink()
+                    path.rmdir() if path.is_dir() else path.unlink()
                     deleted += 1
             except:
                 continue
