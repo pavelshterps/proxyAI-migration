@@ -30,10 +30,10 @@ from dependencies import get_current_user
 from routes import router as api_router
 from admin_routes import router as admin_router
 
-# таски
+# импорт задач
 from tasks import download_audio, preview_transcribe, transcribe_segments, diarize_full
 
-# === Application lifecycle & DB init retry ===
+# === Lifecycle & DB init retry ===
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     for attempt in range(1, 6):
@@ -73,15 +73,14 @@ app.add_middleware(
     allowed_hosts=["127.0.0.1", "localhost"] + settings.ALLOWED_ORIGINS_LIST
 )
 
-# === Ensure folders exist ===
+# === Ensure directories exist ===
 for d in (settings.UPLOAD_FOLDER, settings.RESULTS_FOLDER, settings.DIARIZER_CACHE_DIR):
     Path(d).mkdir(parents=True, exist_ok=True)
     log.debug("Ensured dir exists", path=str(d))
 
-# === Redis + API key dependency ===
+# === Redis & API-Key dependency ===
 redis = redis_async.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
-
 async def get_api_key(
     x_api_key: str = Depends(api_key_header),
     api_key: str = Query(None)
@@ -92,10 +91,7 @@ async def get_api_key(
         raise HTTPException(401, "Missing API Key")
     return key
 
-# === Prometheus middleware omitted for brevity ===
-
-
-# === SSE endpoints for progress (with and without trailing slash) ===
+# === SSE for progress (два маршрута — с и без «/») ===
 @app.get("/events/{upload_id}", include_in_schema=False)
 @app.get("/events/{upload_id}/", include_in_schema=False)
 async def progress_events(
@@ -116,9 +112,7 @@ async def progress_events(
                 msg = await pubsub.get_message(ignore_subscribe_messages=True, timeout=0.5)
                 now = time.time()
                 if msg and msg["type"] == "message":
-                    payload = msg["data"]
-                    log.debug("SSE ▶", upload_id=upload_id, data=payload)
-                    yield f"data: {payload}\n\n"
+                    yield f"data: {msg['data']}\n\n"
                 elif now - last_hb > 1.0:
                     yield ":\n\n"
                     last_hb = now
@@ -128,12 +122,10 @@ async def progress_events(
             log.info("SSE unsubscribed", upload_id=upload_id)
     return EventSourceResponse(generator())
 
-
-# === Serve index.html ===
+# === Serve UI ===
 @app.get("/", include_in_schema=False)
 async def root():
     return FileResponse("static/index.html")
-
 
 # === Upload endpoint ===
 @app.post("/upload", dependencies=[Depends(get_current_user)])
@@ -167,7 +159,7 @@ async def upload(
     download_audio.delay(upload_id, cid)
     preview_transcribe.delay(upload_id, cid)
 
-    # publish initial state
+    # publish initial state (preview=None)
     init_state = {"status":"started","preview":None}
     await redis.set(f"progress:{upload_id}", json.dumps(init_state, ensure_ascii=False))
     await redis.publish(f"progress:{upload_id}", json.dumps(init_state, ensure_ascii=False))
@@ -176,7 +168,6 @@ async def upload(
         {"upload_id": upload_id, "external_id": upload_id},
         headers={"X-Correlation-ID": cid}
     )
-
 
 # === Results endpoint ===
 @app.get("/results/{upload_id}", summary="Get transcript and speaker labels")
@@ -187,7 +178,7 @@ async def get_results(
 ):
     base = Path(settings.RESULTS_FOLDER) / upload_id
 
-    # 1) Full transcript?
+    # 1) полная транскрипция + (если есть) merge с diarization
     tp = base / "transcript.json"
     if tp.exists():
         transcript = json.loads(tp.read_text(encoding="utf-8"))
@@ -209,10 +200,10 @@ async def get_results(
                     "speaker": speaker
                 })
             return JSONResponse({"results": merged})
-        # no diarization yet
+        # только transcript
         return JSONResponse({"results": transcript})
 
-    # 2) Preview?
+    # 2) preview (если transcript ещё нет)
     pf = base / "preview.json"
     if pf.exists():
         pl = json.loads(pf.read_text(encoding="utf-8"))
@@ -220,8 +211,7 @@ async def get_results(
 
     raise HTTPException(404, "Results not ready")
 
-
-# === Trigger diarization manually ===
+# === Request diarization ===
 @app.post("/diarize/{upload_id}", summary="Request diarization")
 async def request_diarization(
     upload_id: str,
@@ -234,7 +224,6 @@ async def request_diarization(
     await redis.publish(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
     diarize_full.delay(upload_id, None)
     return JSONResponse({"message": "diarization started"})
-
 
 # === Save speaker labels ===
 @app.post("/labels/{upload_id}", summary="Save speaker labels")
@@ -253,12 +242,15 @@ async def save_labels(
 
     base = Path(settings.RESULTS_FOLDER) / upload_id
     raw_d = json.loads((base / "diarization.json").read_text(encoding="utf-8"))
-    # перезаписываем diarization.json
+    # перезаписываем .json с новыми спикерами
     updated = []
     for seg in raw_d:
         new_spk = mapping.get(str(seg["speaker"]), seg["speaker"])
         updated.append({"start": seg["start"], "end": seg["end"], "speaker": new_spk})
-    (base / "diarization.json").write_text(json.dumps(updated, ensure_ascii=False, indent=2))
+    (base / "diarization.json").write_text(
+      json.dumps(updated, ensure_ascii=False, indent=2),
+      encoding="utf-8"
+    )
 
     # возвращаем сразу merged
     transcript = json.loads((base / "transcript.json").read_text(encoding="utf-8"))
@@ -275,7 +267,6 @@ async def save_labels(
             "speaker": speaker
         })
     return JSONResponse({"results": merged})
-
 
 # === Routers & static files ===
 app.include_router(api_router, tags=["proxyAI"])

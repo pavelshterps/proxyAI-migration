@@ -64,17 +64,20 @@
       if(!key){ alert("Введите API-Key"); return; }
       if(!file){ alert("Выберите файл"); return; }
 
+      // сбросим состояние UI
       statusEl.textContent = "Загружаем…";
       audioEl.src = URL.createObjectURL(file);
       timingsEl.textContent = "";
       previewDone = transcriptDone = diarizeDone = false;
-      saveBtn.disabled = true;
+      saveBtn.disabled   = true;
       diarizeBtn.disabled = true;
 
+      // загрузка файла
+      let res;
       try {
         const form = new FormData();
         form.append("file", file);
-        const res = await fetch("/upload/", {
+        res = await fetch("/upload/", {
           method: "POST",
           headers: { "X-API-Key": key },
           body: form
@@ -87,7 +90,7 @@
         return;
       }
 
-      // SSE подписка
+      // подписка на SSE
       const es = new EventSource(`/events/${uploadId}?api_key=${encodeURIComponent(key)}`);
       es.onmessage = e => {
         let d = e.data.trim();
@@ -96,10 +99,11 @@
         let st; try { st = JSON.parse(d) } catch { return; }
         statusEl.textContent = `Статус: ${st.status}`;
 
+        // как только приходит превью — рендерим его сразу
         if(st.preview && !previewDone){
           previewDone = true;
           timingsEl.innerHTML += `<div>Preview: ${(performance.now()/1000).toFixed(2)}s</div>`;
-          render(st.preview.timestamps);                // <-- рендерим превью
+          render(st.preview.timestamps);
         }
         if(st.status==="transcript_done" && !transcriptDone){
           transcriptDone = true;
@@ -110,7 +114,7 @@
         if(st.status==="diarization_done" && !diarizeDone){
           diarizeDone = true;
           timingsEl.innerHTML += `<div>Diarization: ${(performance.now()/1000).toFixed(2)}s</div>`;
-          saveBtn.disabled = false;                     // активируем кнопку
+          saveBtn.disabled = false;
           es.close();
           loadResults();
         }
@@ -154,13 +158,15 @@
         const current = seg.speaker ?? orig;
         mapping[orig] = current;
 
-        const div   = document.createElement("div");
+        const div = document.createElement("div");
         div.className = "segment";
 
+        // время
         const t = document.createElement("span");
         t.className = "time";
         t.textContent = fmt(seg.start * 1000);
 
+        // кнопка плеера
         const p = document.createElement("button");
         p.textContent = "▶️";
         p.onclick = () => {
@@ -169,23 +175,26 @@
           setTimeout(()=>audioEl.pause(), (seg.end - seg.start)*1000);
         };
 
+        // input для имени
         const inp = document.createElement("input");
-        inp.value = current;
+        inp.value       = current;
         inp.dataset.orig = orig;
         inp.onchange = () => {
-          const newName = inp.value.trim();
-          if(!newName || newName.length>50){
+          const v = inp.value.trim();
+          if(!v || v.length>50){
             alert("Имя 1–50 символов");
             inp.value = mapping[orig];
             return;
           }
-          mapping[orig] = newName;
+          mapping[orig] = v;
+          // обновляем сразу все поля с тем же orig
           container.querySelectorAll('input').forEach(i => {
-            if(i.dataset.orig === orig) i.value = newName;
+            if(i.dataset.orig === orig) i.value = v;
           });
-          saveBtn.disabled = false;                   // кнопка снова активируется при изменении
+          saveBtn.disabled = false;
         };
 
+        // текст сегмента
         const txt = document.createElement("span");
         txt.textContent = seg.text;
 
@@ -193,10 +202,8 @@
         frag.append(div);
       });
 
-      // всегда держим кнопку Save активной после рендера
+      // после каждого рендера держим кнопку Save активной
       saveBtn.disabled = false;
-
-      // навешиваем «Сохранить»
       saveBtn.onclick = async () => {
         const key = apiKeyEl.value.trim();
         const payload = {};
@@ -220,9 +227,8 @@
           return;
         }
         const { results } = await res.json();
-        render(results);
+        render(results);             // перерендер с новыми именами
         statusEl.textContent = "Метки сохранены";
-        // не отключаем кнопку, чтобы можно было править снова
       };
 
       container.append(frag);
