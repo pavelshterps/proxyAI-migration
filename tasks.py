@@ -1,6 +1,7 @@
 import json
 import logging
 import time
+import subprocess
 from pathlib import Path
 from celery.signals import worker_process_init
 from redis import Redis
@@ -10,6 +11,7 @@ from config.celery import celery_app
 
 logger = logging.getLogger(__name__)
 
+# Attempt to import faster_whisper
 try:
     from faster_whisper import WhisperModel, download_model
     _HF_AVAILABLE = True
@@ -18,6 +20,7 @@ except ImportError as e:
     _HF_AVAILABLE = False
     logger.warning(f"[INIT] faster_whisper not available: {e}")
 
+# Attempt to import pyannote for diarization
 try:
     from pyannote.audio.pipelines import VoiceActivityDetection, SpeakerDiarization
     _PN_AVAILABLE = True
@@ -35,15 +38,20 @@ def get_whisper_model():
     if _whisper_model is None:
         logger.info("[WHISPER] initializing model")
         model_id = settings.WHISPER_MODEL_PATH
-        cache = settings.HUGGINGFACE_CACHE_DIR
-        device = settings.WHISPER_DEVICE.lower()
-        local = (device == "cpu")
+        cache    = settings.HUGGINGFACE_CACHE_DIR
+        device   = settings.WHISPER_DEVICE.lower()
+        local    = (device == "cpu")
+
         try:
-            path = download_model(model_id, cache_dir=cache, local_files_only=local)
+            path = download_model(
+                model_id,
+                cache_dir=cache,
+                local_files_only=local
+            )
         except:
             path = model_id
 
-        # При использовании CUDA — принудительно float16, иначе int8
+        # Force float16 on CUDA, int8 on CPU
         compute = getattr(
             settings,
             "WHISPER_COMPUTE_TYPE",
@@ -52,7 +60,11 @@ def get_whisper_model():
         if device == "cpu" and compute in ("fp16", "float16"):
             compute = "int8"
 
-        _whisper_model = WhisperModel(path, device=device, compute_type=compute)
+        _whisper_model = WhisperModel(
+            path,
+            device=device,
+            compute_type=compute
+        )
         logger.info(f"[WHISPER] model ready on {device} ({compute})")
     return _whisper_model
 
@@ -87,6 +99,7 @@ def preload_on_startup(**kwargs):
     if _HF_AVAILABLE:
         sample = Path(__file__).parent / "tests/fixtures/sample.wav"
         try:
+            # Warm up only the preview portion
             get_whisper_model().transcribe(
                 str(sample),
                 max_initial_timestamp=settings.PREVIEW_LENGTH_S
@@ -104,8 +117,9 @@ def preload_on_startup(**kwargs):
 
 
 # --------------------------------------------------
-# Preview: встроенная резка через max_initial_timestamp
+# Preview + full transcription both on GPU queue
 # --------------------------------------------------
+
 @celery_app.task(bind=True, queue="transcribe_gpu")
 def preview_transcribe(self, upload_id, correlation_id):
     cid = correlation_id or "?"
@@ -114,17 +128,30 @@ def preview_transcribe(self, upload_id, correlation_id):
     t0 = time.time()
 
     try:
-        # полный файл .wav
-        wav_path = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
+        # 1) Cut preview with ffmpeg
+        src     = next(Path(settings.UPLOAD_FOLDER).glob(f"{upload_id}.*"))
+        out_dir = Path(settings.RESULTS_FOLDER) / upload_id
+        out_dir.mkdir(exist_ok=True, parents=True)
 
-        # транскрибируем только первые PREVIEW_LENGTH_S секунд
-        model = get_whisper_model()
-        segs, _ = model.transcribe(
-            str(wav_path),
-            word_timestamps=True,
-            max_initial_timestamp=settings.PREVIEW_LENGTH_S,
-            **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {})
+        preview_wav = out_dir / f"{upload_id}_preview.wav"
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-i", str(src),
+                "-ss", "0", "-t", str(settings.PREVIEW_LENGTH_S),
+                "-acodec", "pcm_s16le", "-ac", "1", "-ar", "16k",
+                str(preview_wav)
+            ],
+            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
+
+        # 2) Transcribe preview
+        segs, _ = get_whisper_model().transcribe(
+            str(preview_wav),
+            word_timestamps=True,
+            **({"language": settings.WHISPER_LANGUAGE}
+               if settings.WHISPER_LANGUAGE else {})
+        )
+
     except Exception as e:
         logger.error(f"[{cid}] preview_transcribe error", exc_info=True)
         r.publish(
@@ -133,7 +160,7 @@ def preview_transcribe(self, upload_id, correlation_id):
         )
         return
 
-    # Формируем и сохраняем превью
+    # Build preview JSON
     segs = list(segs)
     preview = {
         "text": "".join(s.text for s in segs),
@@ -142,13 +169,11 @@ def preview_transcribe(self, upload_id, correlation_id):
             for s in segs
         ]
     }
-    out_dir = Path(settings.RESULTS_FOLDER) / upload_id
-    out_dir.mkdir(exist_ok=True, parents=True)
     (out_dir / "preview_transcript.json").write_text(
         json.dumps(preview, ensure_ascii=False, indent=2)
     )
 
-    # Отправляем статус и результат, затем запускаем полный транскрипт
+    # Notify and queue full transcription
     r.publish(
         f"progress:{upload_id}",
         json.dumps({"status": "preview_done", "preview": preview})
@@ -170,12 +195,12 @@ def transcribe_segments(self, upload_id, correlation_id):
 
     try:
         wav = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
-        model = get_whisper_model()
-        segs, _ = model.transcribe(
+        # ==== NO chunk_length_s here! ====
+        segs, _ = get_whisper_model().transcribe(
             str(wav),
             word_timestamps=True,
-            chunk_length_s=600,  # разбивка на 10-мин чанки для GPU-параллелизма
-            **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {})
+            **({"language": settings.WHISPER_LANGUAGE}
+               if settings.WHISPER_LANGUAGE else {})
         )
     except Exception as e:
         logger.error(f"[{cid}] transcribe_segments error", exc_info=True)
@@ -190,12 +215,12 @@ def transcribe_segments(self, upload_id, correlation_id):
     out.mkdir(exist_ok=True)
     (out / "transcript.json").write_text(
         json.dumps(
-            [{"start": s.start, "end": s.end, "text": s.text} for s in segs],
+            [{"start": s.start, "end": s.end, "text": s.text}
+             for s in segs],
             ensure_ascii=False,
             indent=2
         )
     )
-
     r.publish(f"progress:{upload_id}", json.dumps({"status": "transcript_done"}))
 
     if r.get(f"diarize_requested:{upload_id}") == "1":
