@@ -7,7 +7,7 @@ from redis import Redis
 
 from config.settings import settings
 from config.celery import celery_app
-from utils.audio import convert_to_wav
+from utils.audio import convert_to_wav, download_audio  # добавлен download_audio
 
 logger = logging.getLogger(__name__)
 
@@ -36,13 +36,12 @@ def get_whisper_model():
         cache = settings.HUGGINGFACE_CACHE_DIR
         device = settings.WHISPER_DEVICE.lower()
         local = (device == "cpu")
-        logger.info(f"[INIT] WhisperModel init on {device}")
         try:
             path = download_model(model_id, cache_dir=cache, local_files_only=local)
-        except:
+        except Exception:
             path = model_id
         compute = getattr(settings, "WHISPER_COMPUTE_TYPE", "int8").lower()
-        if device == "cpu" and compute in ("fp16","float16"):
+        if device == "cpu" and compute in ("fp16", "float16"):
             compute = "int8"
         _whisper_model = WhisperModel(path, device=device, compute_type=compute)
     return _whisper_model
@@ -71,18 +70,16 @@ def get_clustering_diarizer():
 @worker_process_init.connect
 def preload_on_startup(**kwargs):
     if _HF_AVAILABLE:
-        sample = Path(__file__).parent/"tests/fixtures/sample.wav"
-        logger.info("[WARMUP] Whisper warm-up")
+        sample = Path(__file__).parent / "tests/fixtures/sample.wav"
         try:
             get_whisper_model().transcribe(str(sample), max_initial_timestamp=settings.PREVIEW_LENGTH_S)
-        except:
+        except Exception:
             logger.warning("[WARMUP] Whisper warm-up failed")
     if _PN_AVAILABLE and settings.WHISPER_DEVICE.lower().startswith("cuda"):
-        logger.info("[WARMUP] Warm-up VAD & Diarizer on GPU")
         try:
             get_vad()
             get_clustering_diarizer()
-        except:
+        except Exception:
             logger.warning("[WARMUP] VAD/Diarizer warm-up failed")
 
 @celery_app.task(bind=True, queue="transcribe_gpu")
@@ -92,27 +89,29 @@ def preview_transcribe(self, upload_id, correlation_id):
         logger.error(f"[{cid}] no Whisper available")
         return
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
-    t0=time.time()
-    src=next(Path(settings.UPLOAD_FOLDER).glob(f"{upload_id}.*"), None)
+    t0 = time.time()
+    src = next(Path(settings.UPLOAD_FOLDER).glob(f"{upload_id}.*"), None)
     try:
-        wav = convert_to_wav(src, Path(settings.UPLOAD_FOLDER)/f"{upload_id}.wav")
-        segs,_=get_whisper_model().transcribe(
+        wav = convert_to_wav(src, Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav")
+        segs, _ = get_whisper_model().transcribe(
             str(wav), word_timestamps=True,
             max_initial_timestamp=settings.PREVIEW_LENGTH_S,
             **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {})
         )
     except Exception as e:
         logger.error(f"[{cid}] preview error", exc_info=True)
+        r.publish(f"progress:{upload_id}", json.dumps({"status": "error", "error": str(e)}))
         return
-    segs=list(segs)
-    preview={"text":"".join(s.text for s in segs),"timestamps":[{"start":s.start,"end":s.end,"text":s.text} for s in segs]}
-    out=Path(settings.RESULTS_FOLDER)/upload_id; out.mkdir(exist_ok=True)
-    (out/"preview.json").write_text(json.dumps(preview, ensure_ascii=False, indent=2), encoding="utf-8")
-    payload={"status":"preview_done","preview":preview}
-    r.publish(f"progress:{upload_id}", json.dumps(payload, ensure_ascii=False))
-    logger.info(f"[{cid}] PREVIEW done in {(time.time()-t0):.2f}s")
+    segs = list(segs)
+    preview = {"text": "".join(s.text for s in segs),
+               "timestamps": [{"start": s.start, "end": s.end, "text": s.text} for s in segs]}
+    out = Path(settings.RESULTS_FOLDER) / upload_id
+    out.mkdir(exist_ok=True)
+    (out / "preview.json").write_text(json.dumps(preview, ensure_ascii=False, indent=2), encoding="utf-8")
+    r.publish(f"progress:{upload_id}", json.dumps({"status": "preview_done", "preview": preview}))
     from tasks import transcribe_segments
     transcribe_segments.delay(upload_id, correlation_id)
+    logger.info(f"[{cid}] PREVIEW done in {time.time()-t0:.2f}s")
 
 @celery_app.task(bind=True, queue="transcribe_gpu")
 def transcribe_segments(self, upload_id, correlation_id):
@@ -121,25 +120,29 @@ def transcribe_segments(self, upload_id, correlation_id):
         logger.error(f"[{cid}] no Whisper available")
         return
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
-    t0=time.time()
+    t0 = time.time()
     try:
-        wav=Path(settings.UPLOAD_FOLDER)/f"{upload_id}.wav"
-        segs,_=get_whisper_model().transcribe(str(wav), word_timestamps=True,
-                                             **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {}))
+        wav = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
+        segs, _ = get_whisper_model().transcribe(
+            str(wav), word_timestamps=True,
+            **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {})
+        )
     except Exception as e:
         logger.error(f"[{cid}] transcribe error", exc_info=True)
+        r.publish(f"progress:{upload_id}", json.dumps({"status": "error", "error": str(e)}))
         return
-    segs=list(segs)
-    out=Path(settings.RESULTS_FOLDER)/upload_id
+    segs = list(segs)
+    out = Path(settings.RESULTS_FOLDER) / upload_id
     out.mkdir(exist_ok=True)
-    (out/"transcript.json").write_text(json.dumps([{"start":s.start,"end":s.end,"text":s.text} for s in segs],
-                                                  ensure_ascii=False, indent=2), encoding="utf-8")
-    payload={"status":"transcript_done"}
-    r.publish(f"progress:{upload_id}", json.dumps(payload, ensure_ascii=False))
-    logger.info(f"[{cid}] TRANSCRIBE done in {(time.time()-t0):.2f}s")
-    if r.get(f"diarize_requested:{upload_id}")=="1":
+    (out / "transcript.json").write_text(
+        json.dumps([{"start": s.start, "end": s.end, "text": s.text} for s in segs], ensure_ascii=False, indent=2),
+        encoding="utf-8"
+    )
+    r.publish(f"progress:{upload_id}", json.dumps({"status": "transcript_done"}))
+    if r.get(f"diarize_requested:{upload_id}") == "1":
         from tasks import diarize_full
         diarize_full.delay(upload_id, correlation_id)
+    logger.info(f"[{cid}] TRANSCRIBE done in {time.time()-t0:.2f}s")
 
 @celery_app.task(bind=True, queue="diarize_gpu")
 def diarize_full(self, upload_id, correlation_id):
@@ -148,17 +151,19 @@ def diarize_full(self, upload_id, correlation_id):
         logger.error(f"[{cid}] no pyannote available")
         return
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
-    t0=time.time()
+    t0 = time.time()
     try:
-        wav=Path(settings.UPLOAD_FOLDER)/f"{upload_id}.wav"
+        wav = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
         get_vad(); get_clustering_diarizer()
-        ann=get_clustering_diarizer().apply({"audio": str(wav)})
+        ann = get_clustering_diarizer().apply({"audio": str(wav)})
     except Exception as e:
-        logger.error(f"[{cid}] diarize warm-up error", exc_info=True)
+        logger.error(f"[{cid}] diarize error", exc_info=True)
+        r.publish(f"progress:{upload_id}", json.dumps({"status": "error", "error": str(e)}))
         return
-    segs=[{"start":float(s.start),"end":float(s.end),"speaker":spk} for s,_,spk in ann.itertracks(yield_label=True)]
-    out=Path(settings.RESULTS_FOLDER)/upload_id; out.mkdir(exist_ok=True)
-    (out/"diarization.json").write_text(json.dumps(segs, ensure_ascii=False, indent=2), encoding="utf-8")
-    payload={"status":"diarization_done"}
-    r.publish(f"progress:{upload_id}", json.dumps(payload, ensure_ascii=False))
-    logger.info(f"[{cid}] DIARIZE done in {(time.time()-t0):.2f}s")
+    segs = [{"start": float(s.start), "end": float(s.end), "speaker": spk}
+            for s, _, spk in ann.itertracks(yield_label=True)]
+    out = Path(settings.RESULTS_FOLDER) / upload_id
+    out.mkdir(exist_ok=True)
+    (out / "diarization.json").write_text(json.dumps(segs, ensure_ascii=False, indent=2), encoding="utf-8")
+    r.publish(f"progress:{upload_id}", json.dumps({"status": "diarization_done"}))
+    logger.info(f"[{cid}] DIARIZE done in {time.time()-t0:.2f}s")
