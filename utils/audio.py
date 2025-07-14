@@ -1,38 +1,42 @@
-# utils/audio.py
-
 import subprocess
-from pathlib import Path
 import logging
+from pathlib import Path
+from urllib.parse import urlparse
 import requests
 
 logger = logging.getLogger(__name__)
 
-def download_url_to_path(url: str, dst_path: Path) -> Path:
+def download_audio(url: str, dst: Path = None, timeout: int = 30) -> Path:
     """
-    Скачать файл по URL в локальный путь.
-
-    Args:
-        url (str): HTTP(S) ссылка на файл.
-        dst_path (Path): Локальный путь (директория или файл).
-
-    Returns:
-        Path: Путь к сохранённому файлу.
+    Download an audio file from a URL to local disk.
+    Supports HTTP/HTTPS. Returns local file path.
     """
-    dst = Path(dst_path)
-    if dst.is_dir():
-        dst = dst / Path(url).name
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(f"Unsupported URL scheme: {parsed.scheme}")
+
+    if dst is None:
+        fname = Path(parsed.path).name or "downloaded_audio"
+        dst = Path.cwd() / fname
     dst.parent.mkdir(parents=True, exist_ok=True)
 
-    logger.info(f"Downloading {url} → {dst}")
-    with requests.get(url, stream=True) as resp:
-        resp.raise_for_status()
-        with open(dst, 'wb') as f:
-            for chunk in resp.iter_content(8192):
+    logger.info(f"Downloading audio from {url} to {dst}")
+    resp = requests.get(url, stream=True, timeout=timeout)
+    resp.raise_for_status()
+    with open(dst, "wb") as f:
+        for chunk in resp.iter_content(chunk_size=8192):
+            if chunk:
                 f.write(chunk)
     return dst
 
 def convert_to_wav(src_path, dst_path=None) -> Path:
+    """
+    Convert an audio file to WAV (mono, 16 kHz). If already WAV, reuse.
+    """
     src = Path(src_path)
+    if not src.exists():
+        raise FileNotFoundError(f"Source audio not found: {src}")
+
     if dst_path:
         dst = Path(dst_path)
     else:
@@ -53,11 +57,10 @@ def convert_to_wav(src_path, dst_path=None) -> Path:
         "-vn", "-ac", "1", "-ar", "16000", "-f", "wav",
         str(dst)
     ]
-
+    logger.info(f"Converting to WAV: {' '.join(cmd)}")
     try:
         subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
     except subprocess.CalledProcessError as e:
-        logger.error(f"convert_to_wav failed for {src} → {dst}: {e}")
+        logger.error(f"FFmpeg conversion failed: {e}")
         raise
-
     return dst
