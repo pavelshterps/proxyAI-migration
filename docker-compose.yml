@@ -64,11 +64,10 @@ services:
     container_name: proxyai_worker_cpu
     env_file: .env
     command: >
-      celery -A config.celery:celery_app
-             worker
-             --loglevel=info
-             --concurrency=${CPU_CONCURRENCY}
-             --queues=default,split_cpu,dispatch_cpu,collect_cpu
+      celery -A config.celery:celery_app worker
+      --loglevel=info
+      --concurrency=${CPU_CONCURRENCY}
+      --queues=transcribe_cpu
     environment:
       - CELERY_BROKER_URL=${CELERY_BROKER_URL}
       - UPLOAD_FOLDER=${UPLOAD_FOLDER}
@@ -97,11 +96,10 @@ services:
     runtime: nvidia
     env_file: .env
     command: >
-      celery -A config.celery:celery_app
-             worker
-             --loglevel=info
-             --concurrency=${GPU_CONCURRENCY}
-             --queues=transcribe_gpu,diarize_gpu
+      celery -A config.celery:celery_app worker
+      --loglevel=info
+      --concurrency=${GPU_CONCURRENCY}
+      --queues=transcribe_gpu,diarize_gpu
     environment:
       - CELERY_BROKER_URL=${CELERY_BROKER_URL}
       - UPLOAD_FOLDER=${UPLOAD_FOLDER}

@@ -1,6 +1,6 @@
 # config/celery.py
-
 from celery import Celery
+from kombu import Queue
 from config.settings import settings
 
 celery_app = Celery(
@@ -8,7 +8,7 @@ celery_app = Celery(
     broker=settings.CELERY_BROKER_URL,
     backend=settings.CELERY_RESULT_BACKEND,
     timezone=settings.CELERY_TIMEZONE,
-    include=['tasks'],     # автозагрузка вашего модуля с тасками
+    include=['tasks'],
 )
 
 celery_app.conf.update(
@@ -18,10 +18,14 @@ celery_app.conf.update(
     broker_url=settings.CELERY_BROKER_URL,
     result_backend=settings.CELERY_RESULT_BACKEND,
 
-    # 📌 Прогоним все транскрибирующие таски сразу на GPU-очередь,
-    # чтобы gpu-воркер подхватывал их без задержки
+    task_queues=[
+        Queue('transcribe_cpu'),        # ← новая очередь для превью
+        Queue('transcribe_gpu'),
+        Queue('diarize_gpu'),
+    ],
     task_routes={
-        'tasks.preview_transcribe':  {'queue': 'transcribe_gpu'},
+        'tasks.preview_transcribe':  {'queue': 'transcribe_cpu'},
         'tasks.transcribe_segments': {'queue': 'transcribe_gpu'},
+        'tasks.diarize_full':        {'queue': 'diarize_gpu'},
     },
 )

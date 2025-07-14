@@ -12,7 +12,6 @@ from utils.audio import convert_to_wav
 
 logger = logging.getLogger(__name__)
 
-# проверки наличия моделей
 try:
     from faster_whisper import WhisperModel, download_model
     _HF_AVAILABLE = True
@@ -94,7 +93,7 @@ def preload_on_startup(**kwargs):
         except:
             logger.warning("[WARMUP] VAD/diarizer warmup failed")
 
-@celery_app.task(bind=True, queue="transcribe_gpu")
+@celery_app.task(bind=True, queue="transcribe_cpu")
 def preview_transcribe(self, upload_id, correlation_id):
     cid = correlation_id or "?"
     logger.info(f"[{cid}] PREVIEW start {upload_id}")
@@ -105,16 +104,12 @@ def preview_transcribe(self, upload_id, correlation_id):
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
     t0 = time.time()
     try:
-        # ищем исходник
         src = next(Path(settings.UPLOAD_FOLDER).glob(f"{upload_id}.*"))
-        # конвертируем в WAV (если ещё нет)
         wav_full = convert_to_wav(src, Path(settings.UPLOAD_FOLDER)/f"{upload_id}.wav")
-        # обрезаем первые PREVIEW_LENGTH_S секунд
         audio = AudioSegment.from_file(str(wav_full))
         preview_audio = audio[: int(settings.PREVIEW_LENGTH_S * 1000)]
         preview_path = Path(settings.UPLOAD_FOLDER)/f"{upload_id}_preview.wav"
         preview_audio.export(str(preview_path), format="wav")
-        # транскрибируем preview
         segs, _ = get_whisper_model().transcribe(
             str(preview_path),
             word_timestamps=True,
@@ -193,10 +188,8 @@ def diarize_full(self, upload_id, correlation_id):
         r.publish(f"progress:{upload_id}", json.dumps({"status":"error","error":str(e)}))
         return
 
-    segs = [
-        {"start": float(s.start), "end": float(s.end), "speaker": spk}
-        for s, _, spk in ann.itertracks(yield_label=True)
-    ]
+    segs = [{"start": float(s.start), "end": float(s.end), "speaker": spk}
+            for s, _, spk in ann.itertracks(yield_label=True)]
     out = Path(settings.RESULTS_FOLDER)/upload_id
     out.mkdir(exist_ok=True)
     (out/"diarization.json").write_text(json.dumps(segs, ensure_ascii=False, indent=2))

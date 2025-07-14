@@ -6,9 +6,6 @@ import requests
 logger = logging.getLogger(__name__)
 
 def convert_to_wav(src_path, dst_path=None) -> Path:
-    """
-    Convert an audio file to WAV format with mono channel and 16 kHz sample rate.
-    """
     src = Path(src_path)
     if dst_path:
         dst = Path(dst_path)
@@ -24,7 +21,6 @@ def convert_to_wav(src_path, dst_path=None) -> Path:
         pass
 
     dst.parent.mkdir(parents=True, exist_ok=True)
-
     cmd = [
         "ffmpeg",
         "-y", "-i", str(src),
@@ -39,12 +35,7 @@ def convert_to_wav(src_path, dst_path=None) -> Path:
     return dst
 
 def download_audio(url: str, folder: Path, filename: str) -> Path:
-    """
-    Download audio file by URL (supports HTTP/S, S3 presigned links, etc.)
-    and save it into folder/filename.ext (сохраняя исходное расширение).
-    """
     folder.mkdir(parents=True, exist_ok=True)
-    # определяем расширение из URL
     ext = Path(url.split("?")[0]).suffix or ".dat"
     out_path = folder / f"{filename}{ext}"
     try:
