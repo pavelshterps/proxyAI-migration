@@ -26,9 +26,10 @@ def convert_to_wav(src_path, dst_path=None) -> Path:
     dst.parent.mkdir(parents=True, exist_ok=True)
 
     cmd = [
-        "ffmpeg", "-y", "-i", str(src),
-        "-vn", "-ac", "1", "-ar", "16000", "-f", "wav",
-        str(dst)
+        "ffmpeg",
+        "-y", "-i", str(src),
+        "-vn", "-ac", "1", "-ar", "16000",
+        "-f", "wav", str(dst)
     ]
     try:
         subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
@@ -37,22 +38,23 @@ def convert_to_wav(src_path, dst_path=None) -> Path:
         raise
     return dst
 
-def download_audio(url: str, dst_folder: Path, filename: str) -> Path:
+def download_audio(url: str, folder: Path, filename: str) -> Path:
     """
-    Download audio from URL into dst_folder/filename.
-    Returns the downloaded file path.
+    Download audio file by URL (supports HTTP/S, S3 presigned links, etc.)
+    and save it into folder/filename.ext (сохраняя исходное расширение).
     """
-    dst_folder.mkdir(parents=True, exist_ok=True)
-    dst = dst_folder / filename
-
+    folder.mkdir(parents=True, exist_ok=True)
+    # определяем расширение из URL
+    ext = Path(url.split("?")[0]).suffix or ".dat"
+    out_path = folder / f"{filename}{ext}"
     try:
-        resp = requests.get(url, stream=True, timeout=30)
-        resp.raise_for_status()
-        with open(dst, "wb") as f:
-            for chunk in resp.iter_content(chunk_size=8192):
-                if chunk:
-                    f.write(chunk)
+        with requests.get(url, stream=True, timeout=30) as r:
+            r.raise_for_status()
+            with open(out_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
     except Exception as e:
-        logger.error(f"download_audio: failed to download {url} → {dst}: {e}")
+        logger.error(f"download_audio: failed to download {url}: {e}")
         raise
-    return dst
+    return out_path
