@@ -27,7 +27,7 @@ from database import init_models, engine, get_db
 from crud import (
     create_upload_record,
     get_upload_for_user,
-    create_admin_user as crud_create_admin_user  # новый CRUD для админа
+    create_admin_user as crud_create_admin_user
 )
 from dependencies import get_current_user
 from tasks import preview_transcribe, transcribe_segments, diarize_full
@@ -124,7 +124,7 @@ async def progress_events(
 @app.post("/upload")
 @limiter.limit("10/minute")
 async def upload(
-    request: Request,  # нужен для slowapi
+    request: Request,
     file: UploadFile = File(...),
     x_correlation_id: str | None = Header(None),
     current_user=Depends(get_current_user),
@@ -246,6 +246,5 @@ async def create_admin_user(
     Создать нового admin-пользователя.
     Требует заголовок X-Admin-Key==settings.ADMIN_KEY
     """
-    # В crud должен быть определён create_admin_user
     new_user = await crud_create_admin_user(db, name=payload.name)
     return {"id": new_user.id, "name": new_user.name, "is_admin": new_user.is_admin}
