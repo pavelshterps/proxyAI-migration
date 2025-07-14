@@ -120,7 +120,7 @@ def preview_transcribe(self, upload_id, correlation_id):
         out_dir = Path(settings.RESULTS_FOLDER) / upload_id
         out_dir.mkdir(exist_ok=True, parents=True)
 
-        # нативный slice через Whisper
+        # транскрипция превью (first N seconds)
         segments, _ = get_whisper_model().transcribe(
             str(src),
             word_timestamps=True,
@@ -175,10 +175,9 @@ def transcribe_segments(self, upload_id, correlation_id):
 
     try:
         wav = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
-        segs, _ = get_whisper_model().transcribe(
+        segments, _ = get_whisper_model().transcribe(
             str(wav),
             word_timestamps=True,
-            chunk_length_s=getattr(settings, "CHUNK_LENGTH_S", None),
             **({"language": settings.WHISPER_LANGUAGE}
                if settings.WHISPER_LANGUAGE else {})
         )
@@ -190,15 +189,11 @@ def transcribe_segments(self, upload_id, correlation_id):
         )
         return
 
-    segs = list(segs)
+    segs = [{"start": s.start, "end": s.end, "text": s.text} for s in segments]
     out = Path(settings.RESULTS_FOLDER) / upload_id
     out.mkdir(exist_ok=True)
     (out / "transcript.json").write_text(
-        json.dumps(
-            [{"start": s.start, "end": s.end, "text": s.text} for s in segs],
-            ensure_ascii=False,
-            indent=2
-        )
+        json.dumps(segs, ensure_ascii=False, indent=2)
     )
     r.publish(f"progress:{upload_id}", json.dumps({"status": "transcript_done"}))
 
@@ -222,10 +217,7 @@ def diarize_full(self, upload_id, correlation_id):
 
     try:
         wav = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
-
-        # сначала VAD
         speech = get_vad().apply({"audio": str(wav)})
-        # затем диаризация только по речевым участкам
         ann = get_clustering_diarizer().apply({
             "audio": str(wav),
             "speech": speech
@@ -263,7 +255,10 @@ def cleanup_old_files(self):
         for path in base.glob("**/*"):
             try:
                 if datetime.utcfromtimestamp(path.stat().st_mtime) < cutoff:
-                    (path.rmdir() if path.is_dir() else path.unlink())
+                    if path.is_dir():
+                        path.rmdir()
+                    else:
+                        path.unlink()
                     deleted += 1
             except:
                 continue
