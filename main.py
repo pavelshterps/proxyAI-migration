@@ -166,7 +166,7 @@ async def upload(
     await redis.set(f"progress:{upload_id}", json.dumps({"status":"started"}))
     await redis.publish(f"progress:{upload_id}", json.dumps({"status":"started"}))
 
-    preview_transcribe.delay(upload_id, cid)
+    preview_slice.delay(upload_id, cid)
     return JSONResponse({"upload_id": upload_id}, headers={"X-Correlation-ID": cid})
 
 # Get results
