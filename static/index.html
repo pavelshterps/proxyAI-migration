@@ -1,149 +1,243 @@
 <!DOCTYPE html>
 <html lang="ru">
-<head>… стили …</head>
+<head>
+  <!-- … ваши стили … -->
+  <meta charset="utf-8">
+  <title>ProxyAI Transcriber</title>
+  <style>
+    /* пример стилей */
+    body { font-family: sans-serif; margin: 1rem; }
+    .segment { margin-bottom: 0.5rem; }
+    .segment .time { color: #555; margin-right: 0.5rem; }
+    .segment input { width: 100px; margin: 0 0.5rem; }
+  </style>
+</head>
 <body>
-  … кнопки, элементы …
+  <!-- … ваши кнопки и элементы … -->
+  <div>
+    <input id="apiKey" placeholder="API-Key" />
+    <input type="file" id="audioFile" />
+    <button id="uploadBtn">Загрузить</button>
+    <button id="previewBtn" disabled>Preview</button>
+    <button id="transcriptBtn" disabled>Transcript</button>
+    <button id="requestDiarizeBtn" disabled>Запустить Diarизацию</button>
+    <button id="saveLabelsBtn" disabled>Сохранить метки</button>
+  </div>
+  <div id="status" style="margin-top:1rem;"></div>
+  <div id="timings" style="margin-top:1rem;"></div>
+  <audio id="audio" controls style="display:block; margin-top:1rem;"></audio>
+  <div id="transcriptContainer" style="margin-top:1rem;"></div>
+
 <script>
 ;(function(){
-  const apiKeyEl=document.getElementById("apiKey"),
-        fileEl=document.getElementById("audioFile"),
-        uploadBtn=document.getElementById("uploadBtn"),
-        statusEl=document.getElementById("status"),
-        timingsEl=document.getElementById("timings"),
-        diarizeBtn=document.getElementById("requestDiarizeBtn"),
-        saveBtn=document.getElementById("saveLabelsBtn"),
-        audioEl=document.getElementById("audio"),
-        container=document.getElementById("transcriptContainer");
+  const apiKeyEl    = document.getElementById("apiKey"),
+        fileEl      = document.getElementById("audioFile"),
+        uploadBtn   = document.getElementById("uploadBtn"),
+        previewBtn  = document.getElementById("previewBtn"),
+        transcriptBtn = document.getElementById("transcriptBtn"),
+        diarizeBtn  = document.getElementById("requestDiarizeBtn"),
+        saveBtn     = document.getElementById("saveLabelsBtn"),
+        statusEl    = document.getElementById("status"),
+        timingsEl   = document.getElementById("timings"),
+        audioEl     = document.getElementById("audio"),
+        container   = document.getElementById("transcriptContainer");
 
-  let uploadId, mapping={}, savePending=false;
+  let uploadId, mapping = {}, savePending = false, es = null;
 
   function fmt(ms){
-    const sec=Math.floor(ms/1000),m=String(Math.floor(sec/60)).padStart(2,"0"),
-          s=String(sec%60).padStart(2,"0");
+    const sec = Math.floor(ms/1000),
+          m   = String(Math.floor(sec/60)).padStart(2,"0"),
+          s   = String(sec%60).padStart(2,"0");
     return `${m}:${s}`;
   }
 
-  uploadBtn.onclick=async()=>{
-    const key=apiKeyEl.value.trim(), file=fileEl.files[0];
-    if(!key||!file){alert("API‑Key и файл обязательно"); return;}
-    statusEl.textContent="Загружаем…";
-    audioEl.src=URL.createObjectURL(file);
-    timingsEl.textContent="";
-    diarizeBtn.disabled=true; saveBtn.disabled=true;
-    mapping={}; savePending=false;
+  uploadBtn.onclick = async () => {
+    // 1) Tear down any existing SSE
+    if (es) { es.close(); es = null; }
 
-    try{
-      const form=new FormData(); form.append("file",file);
-      const res=await fetch("/upload/",{method:"POST",headers:{"X‑API‑Key":key},body:form});
-      if(!res.ok) throw new Error(res.statusText);
-      uploadId=(await res.json()).upload_id;
-    }catch(e){alert("Ошибка: "+e.message); statusEl.textContent="Ошибка"; return;}
+    const key  = apiKeyEl.value.trim(),
+          file = fileEl.files[0];
+    if (!key || !file) {
+      alert("API-Key и файл обязательно");
+      return;
+    }
 
-    const es=new EventSource(`/events/${uploadId}?api_key=${encodeURIComponent(key)}`);
-    statusEl.textContent="Ждём результатов…";
+    // 2) Reset UI
+    statusEl.textContent      = "Загружаем…";
+    timingsEl.innerHTML       = "";
+    container.innerHTML       = "";
+    previewBtn.disabled       = true;
+    transcriptBtn.disabled    = true;
+    diarizeBtn.disabled       = true;
+    saveBtn.disabled          = true;
+    mapping                   = {};
+    savePending               = false;
 
-    es.onmessage=e=>{
-      const data=e.data.trim();
-      if(!data||data===":")return;
-      let st; try{st=JSON.parse(data.replace(/^data:\s*/,""));}catch{return;}
-      statusEl.textContent=`Статус: ${st.status}`;
+    audioEl.src = URL.createObjectURL(file);
 
-      if(st.preview && !mapping.__initialized){
-        mapping={}; render(st.preview.timestamps);
-        mapping.__initialized=true;
-        timingsEl.innerHTML+=`<div>Preview: ${(performance.now()/1000).toFixed(2)}s</div>`;
+    // 3) Upload to /upload
+    let res, data;
+    try {
+      const form = new FormData();
+      form.append("file", file);
+      res = await fetch("/upload/", {
+        method: "POST",
+        headers: {"X-API-Key": key},
+        body: form
+      });
+      if (!res.ok) throw new Error(res.statusText);
+      data = await res.json();
+      uploadId = data.upload_id;
+    } catch (e) {
+      alert("Ошибка: " + e.message);
+      statusEl.textContent = "Ошибка";
+      return;
+    }
+
+    statusEl.textContent = "Ждём результатов…";
+
+    // 4) Open SSE on /events
+    es = new EventSource(`/events/${uploadId}?api_key=${encodeURIComponent(key)}`);
+
+    es.onmessage = e => {
+      const msg = e.data.trim();
+      if (!msg || msg === ":") return;
+      let st;
+      try { st = JSON.parse(msg.replace(/^data:\s*/,"")); }
+      catch { return; }
+
+      statusEl.textContent = `Статус: ${st.status}`;
+
+      if (st.preview && !mapping.__initialized) {
+        mapping = {};
+        render(st.preview.timestamps);
+        mapping.__initialized = true;
+        timingsEl.innerHTML += `<div>Preview: ${(performance.now()/1000).toFixed(2)}s</div>`;
+        previewBtn.disabled = false;
       }
-      if(st.status==="transcript_done"){
-        diarizeBtn.disabled=false;
-        timingsEl.innerHTML+=`<div>Transcript: ${(performance.now()/1000).toFixed(2)}s</div>`;
+
+      if (st.status === "transcript_done") {
+        transcriptBtn.disabled = false;
+        timingsEl.innerHTML += `<div>Transcript: ${(performance.now()/1000).toFixed(2)}s</div>`;
         loadResults();
       }
-      if(st.status==="diarization_done"){
-        timingsEl.innerHTML+=`<div>Diarization: ${(performance.now()/1000).toFixed(2)}s</div>`;
-        saveBtn.disabled=false;
+
+      if (st.status === "diarization_done") {
+        timingsEl.innerHTML += `<div>Diarization: ${(performance.now()/1000).toFixed(2)}s</div>`;
+        saveBtn.disabled = false;
         loadResults();
         es.close();
+        es = null;
       }
     };
 
-    es.onerror=()=>{
-      es.close();
-      statusEl.textContent="Ошибка потока событий";
-      diarizeBtn.disabled=true;
-      saveBtn.disabled=true;
+    es.onerror = () => {
+      es && es.close();
+      es = null;
+      statusEl.textContent = "Ошибка потока событий";
+      diarizeBtn.disabled  = true;
+      saveBtn.disabled     = true;
     };
   };
 
   async function loadResults(){
-    statusEl.textContent="Загружаю…";
-    const key=apiKeyEl.value.trim();
-    const res=await fetch(`/results/${uploadId}`,{headers:{"X‑API‑Key":key}});
-    if(!res.ok){statusEl.textContent="Ошибка";return;}
-    const {results}=await res.json();
+    statusEl.textContent = "Загружаю…";
+    const key = apiKeyEl.value.trim();
+    const res = await fetch(`/results/${uploadId}`, {
+      headers: {"X-API-Key": key}
+    });
+    if (!res.ok) {
+      statusEl.textContent = "Ошибка";
+      return;
+    }
+    const {results} = await res.json();
     render(results);
-    statusEl.textContent="Готово";
+    statusEl.textContent = "Готово";
   }
 
-  diarizeBtn.onclick=async()=>{
-    statusEl.textContent="Запрос диаризации…";
-    const key=apiKeyEl.value.trim();
-    const res=await fetch(`/diarize/${uploadId}`,{method:"POST",headers:{"X‑API‑Key":key}});
-    if(!res.ok)alert("Ошибка"); diarizeBtn.disabled=true;
+  diarizeBtn.onclick = async () => {
+    statusEl.textContent = "Запрос диаризации…";
+    const key = apiKeyEl.value.trim();
+    const res = await fetch(`/diarize/${uploadId}`, {
+      method: "POST",
+      headers: {"X-API-Key": key}
+    });
+    if (!res.ok) alert("Ошибка");
+    diarizeBtn.disabled = true;
   };
 
-  saveBtn.onclick=async()=>{
-    if(!savePending)return;
-    const key=apiKeyEl.value.trim(), payload={};
-    Object.entries(mapping).forEach(([orig,s])=>{
-      if(orig!=="__initialized") payload[orig]=s;
+  saveBtn.onclick = async () => {
+    if (!savePending) return;
+    const key     = apiKeyEl.value.trim(),
+          payload = {};
+    Object.entries(mapping).forEach(([orig, s]) => {
+      if (orig !== "__initialized") payload[orig] = s;
     });
-    const res=await fetch(`/labels/${uploadId}`,{
-      method:"POST",
-      headers:{"Content-Type":"application/json","X‑API‑Key":key},
-      body:JSON.stringify(payload)
+    const res = await fetch(`/labels/${uploadId}`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-API-Key": key
+      },
+      body: JSON.stringify(payload)
     });
-    if(!res.ok){alert("Ошибка");return;}
-    const {results}=await res.json();
+    if (!res.ok) {
+      alert("Ошибка");
+      return;
+    }
+    const {results} = await res.json();
     render(results);
-    statusEl.textContent="Метки сохранены";
-    savePending=false; saveBtn.disabled=true;
+    statusEl.textContent = "Метки сохранены";
+    savePending        = false;
+    saveBtn.disabled   = true;
   };
 
   function render(segments){
-    container.innerHTML="";
-    mapping.__initialized=mapping.__initialized||false;
-    segments.forEach(seg=>{
-      const orig=String(seg.orig ?? seg.speaker ?? "");
-      if(!mapping.hasOwnProperty(orig)) mapping[orig]=seg.speaker||orig;
+    container.innerHTML = "";
+    mapping.__initialized = mapping.__initialized || false;
+    segments.forEach(seg => {
+      const orig = String(seg.orig ?? seg.speaker ?? "");
+      if (!mapping.hasOwnProperty(orig)) mapping[orig] = seg.speaker || orig;
 
-      const div=document.createElement("div"); div.className="segment";
-      const ts=document.createElement("span");
-      ts.className="time"; ts.textContent=fmt(seg.start*1000);
+      const div = document.createElement("div");
+      div.className = "segment";
+
+      const ts = document.createElement("span");
+      ts.className = "time";
+      ts.textContent = fmt(seg.start * 1000);
       div.append(ts);
 
-      const pb=document.createElement("button");
-      pb.textContent="▶️"; pb.onclick=()=>{
-        audioEl.currentTime=seg.start;
+      const pb = document.createElement("button");
+      pb.textContent = "▶️";
+      pb.onclick = () => {
+        audioEl.currentTime = seg.start;
         audioEl.play();
-        setTimeout(()=>audioEl.pause(),(seg.end-seg.start)*1000);
+        setTimeout(() => audioEl.pause(), (seg.end - seg.start) * 1000);
       };
       div.append(pb);
 
-      const inp=document.createElement("input");
-      inp.value=mapping[orig];
-      inp.dataset.orig=orig;
-      inp.onchange=()=>{
-        const v=inp.value.trim();
-        if(!v||v.length>50){alert("Имя 1‑50 символов"); inp.value=mapping[orig]; return;}
-        mapping[orig]=v; savePending=true; saveBtn.disabled=false;
-        container.querySelectorAll("input").forEach(i=>{
-          if(i.dataset.orig===orig)i.value=v;
+      const inp = document.createElement("input");
+      inp.value       = mapping[orig];
+      inp.dataset.orig= orig;
+      inp.onchange    = () => {
+        const v = inp.value.trim();
+        if (!v || v.length > 50) {
+          alert("Имя 1-50 символов");
+          inp.value = mapping[orig];
+          return;
+        }
+        mapping[orig]     = v;
+        savePending       = true;
+        saveBtn.disabled  = false;
+        // sync across inputs
+        container.querySelectorAll("input").forEach(i => {
+          if (i.dataset.orig === orig) i.value = v;
         });
       };
       div.append(inp);
 
-      const txt=document.createElement("span");
-      txt.textContent=seg.text;
+      const txt = document.createElement("span");
+      txt.textContent = seg.text;
       div.append(txt);
 
       container.append(div);
@@ -152,4 +246,5 @@
 
 })();
 </script>
-</body></html>
+</body>
+</html>
