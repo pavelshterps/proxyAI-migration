@@ -165,8 +165,9 @@
       body: JSON.stringify(payload)
     });
     if (!res.ok) { alert("Ошибка"); return; }
-    const {results} = await res.json();
-    render(results);
+
+    // Заменили локальный render на перезагрузку результатов
+    await loadResults();
     statusEl.textContent = "Метки сохранены";
     savePending = false;
   };
