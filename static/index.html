@@ -1,62 +1,31 @@
 <!DOCTYPE html>
 <html lang="ru">
 <head>
-  <meta charset="UTF-8">
-  <title>proxyAI Demo UI</title>
-  <style>
-    body { font-family: sans-serif; padding: 20px; }
-    .controls { margin-bottom: 1em; }
-    .controls input, .controls button { margin-right: 0.5em; }
-    #timings div { margin-top: 0.2em; color: #555; }
-    .segment { display: flex; align-items: center; margin: 0.5em 0; }
-    .segment .time { width: 50px; }
-    .segment button { margin: 0 0.5em; }
-    .segment input { width: 100px; margin-right: 1em; }
-    .segment span { flex: 1; }
-  </style>
+  <!-- … ваши стили … -->
 </head>
 <body>
-  <h1>proxyAI Demo UI</h1>
-
-  <div class="controls">
-    <label>Ваш API-Key:
-      <input type="text" id="apiKey" placeholder="вставьте ваш ключ" size="32">
-    </label>
-    <label>Аудио/видео-файл:
-      <input type="file" id="audioFile" accept="audio/*,video/*">
-    </label>
-    <button id="uploadBtn">Загрузить</button>
-    <button id="previewBtn" disabled>Preview</button>
-    <button id="transcriptBtn" disabled>Transcript</button>
-    <button id="requestDiarizeBtn" disabled>Запустить Диаризацию</button>
-    <button id="saveLabelsBtn" disabled>Сохранить метки</button>
-  </div>
-
-  <div id="status">Статус: —</div>
+  <!-- … ваши кнопки и элементы … -->
+  <button id="uploadBtn">Загрузить</button>
+  <button id="requestDiarizeBtn" disabled>Запустить Диаризацию</button>
+  <button id="saveLabelsBtn">Сохранить метки</button>
+  <!-- … остальной UI … -->
+  <div id="status"></div>
   <div id="timings"></div>
-
-  <audio id="audio" controls style="width:100%; margin:1em 0;"></audio>
-
   <div id="transcriptContainer"></div>
 
 <script>
 ;(function(){
-  const apiKeyEl    = document.getElementById("apiKey"),
-        fileEl      = document.getElementById("audioFile"),
-        uploadBtn   = document.getElementById("uploadBtn"),
-        previewBtn  = document.getElementById("previewBtn"),
-        transcriptBtn = document.getElementById("transcriptBtn"),
-        diarizeBtn  = document.getElementById("requestDiarizeBtn"),
-        saveBtn     = document.getElementById("saveLabelsBtn"),
-        statusEl    = document.getElementById("status"),
-        timingsEl   = document.getElementById("timings"),
-        audioEl     = document.getElementById("audio"),
-        container   = document.getElementById("transcriptContainer");
+  const apiKeyEl   = document.getElementById("apiKey"),
+        fileEl     = document.getElementById("audioFile"),
+        uploadBtn  = document.getElementById("uploadBtn"),
+        statusEl   = document.getElementById("status"),
+        timingsEl  = document.getElementById("timings"),
+        diarizeBtn = document.getElementById("requestDiarizeBtn"),
+        saveBtn    = document.getElementById("saveLabelsBtn"),
+        audioEl    = document.getElementById("audio"),
+        container  = document.getElementById("transcriptContainer");
 
-  let uploadId,
-      mapping     = {},
-      savePending = false,
-      es          = null;
+  let uploadId, mapping = {}, savePending = false, startTs;
 
   function fmt(ms){
     const sec = Math.floor(ms/1000),
@@ -66,8 +35,13 @@
   }
 
   uploadBtn.onclick = async () => {
-    // 1) Закрываем старый SSE, если есть
-    if (es) { es.close(); es = null; }
+    // reset UI
+    diarizeBtn.disabled = true;
+    saveBtn.disabled = false;      // всегда активна
+    container.innerHTML = "";
+    timingsEl.innerHTML  = "";
+    mapping              = {};
+    savePending          = false;
 
     const key  = apiKeyEl.value.trim(),
           file = fileEl.files[0];
@@ -76,21 +50,13 @@
       return;
     }
 
-    // 2) Полный reset UI
-    statusEl.textContent        = "Статус: Загружаем…";
-    timingsEl.innerHTML         = "";
-    container.innerHTML         = "";
-    previewBtn.disabled         = true;
-    transcriptBtn.disabled      = true;
-    diarizeBtn.disabled         = true;
-    saveBtn.disabled            = true;
-    mapping                     = {};
-    savePending                 = false;
+    audioEl.src   = URL.createObjectURL(file);
+    statusEl.textContent = "Загружаем…";
 
-    audioEl.src = URL.createObjectURL(file);
+    // start timer
+    startTs = performance.now();
 
-    // 3) Загрузка
-    let res, data;
+    let res;
     try {
       const form = new FormData();
       form.append("file", file);
@@ -100,92 +66,77 @@
         body: form
       });
       if (!res.ok) throw new Error(res.statusText);
-      data = await res.json();
+      const data = await res.json();
       uploadId = data.upload_id;
     } catch(e) {
       alert("Ошибка: " + e.message);
-      statusEl.textContent = "Статус: Ошибка";
+      statusEl.textContent = "Ошибка";
       return;
     }
 
-    statusEl.textContent = "Статус: Ждём результатов…";
+    statusEl.textContent = "Ждём результатов…";
 
-    // 4) Новый SSE
-    es = new EventSource(`/events/${uploadId}?api_key=${encodeURIComponent(key)}`);
+    const es = new EventSource(`/events/${uploadId}?api_key=${encodeURIComponent(key)}`);
+
     es.onmessage = e => {
       const msg = e.data.trim();
       if (!msg || msg === ":") return;
-      let st;
-      try { st = JSON.parse(msg.replace(/^data:\s*/, "")); }
-      catch { return; }
-
+      const st = JSON.parse(msg.replace(/^data:\s*/,""));
       statusEl.textContent = `Статус: ${st.status}`;
 
       if (st.preview && !mapping.__initialized) {
-        mapping = {};
-        render(st.preview.timestamps);
         mapping.__initialized = true;
-        timingsEl.innerHTML += `<div>Preview: ${(performance.now()/1000).toFixed(2)}s</div>`;
-        previewBtn.disabled = false;
+        render(st.preview.timestamps);
+        timingsEl.innerHTML += `<div>Preview: ${((performance.now() - startTs)/1000).toFixed(2)}s</div>`;
       }
 
       if (st.status === "transcript_done") {
-        transcriptBtn.disabled = false;
-        timingsEl.innerHTML += `<div>Transcript: ${(performance.now()/1000).toFixed(2)}s</div>`;
+        timingsEl.innerHTML += `<div>Transcript: ${((performance.now() - startTs)/1000).toFixed(2)}s</div>`;
         loadResults();
+      }
+
+      if (st.status === "diarize_requested") {
+        diarizeBtn.disabled = false;
       }
 
       if (st.status === "diarization_done") {
-        timingsEl.innerHTML += `<div>Diarization: ${(performance.now()/1000).toFixed(2)}s</div>`;
+        timingsEl.innerHTML += `<div>Diarization: ${((performance.now() - startTs)/1000).toFixed(2)}s</div>`;
         saveBtn.disabled = false;
         loadResults();
-        es.close(); es = null;
+        es.close();
       }
     };
+
     es.onerror = () => {
-      es && es.close(); es = null;
-      statusEl.textContent = "Статус: Ошибка потока событий";
-      diarizeBtn.disabled  = true;
-      saveBtn.disabled     = true;
+      statusEl.textContent = "Ошибка потока событий";
+      diarizeBtn.disabled = true;
+      saveBtn.disabled    = false;  // пусть остаётся активной
     };
-  };
-
-  previewBtn.onclick = () => {
-    // ничего, просто кнопка активна для UX
-  };
-
-  transcriptBtn.onclick = () => {
-    // ничего, все загружается автоматически
   };
 
   async function loadResults(){
-    statusEl.textContent = "Статус: Загружаю…";
+    statusEl.textContent = "Загружаю…";
     const key = apiKeyEl.value.trim();
     const res = await fetch(`/results/${uploadId}`, {
       headers: {"X-API-Key": key}
     });
     if (!res.ok) {
-      statusEl.textContent = "Статус: Ошибка загрузки";
+      statusEl.textContent = "Ошибка";
       return;
     }
     const {results} = await res.json();
     render(results);
-    statusEl.textContent = "Статус: Готово";
-    diarizeBtn.disabled = false;   // диаризацию можно запустить вновь
+    statusEl.textContent = "Готово";
   }
 
   diarizeBtn.onclick = async () => {
-    statusEl.textContent = "Статус: Запрос диаризации…";
+    diarizeBtn.disabled = true;
+    statusEl.textContent = "Запрос диаризации…";
     const key = apiKeyEl.value.trim();
-    const res = await fetch(`/diarize/${uploadId}`, {
+    await fetch(`/diarize/${uploadId}`, {
       method: "POST",
       headers: {"X-API-Key": key}
     });
-    if (!res.ok) {
-      alert("Ошибка при запросе диаризации");
-      return;
-    }
-    diarizeBtn.disabled = true;
   };
 
   saveBtn.onclick = async () => {
@@ -204,14 +155,13 @@
       body: JSON.stringify(payload)
     });
     if (!res.ok) {
-      alert("Ошибка сохранения меток");
+      alert("Ошибка");
       return;
     }
     const {results} = await res.json();
     render(results);
-    statusEl.textContent = "Статус: Метки сохранены";
-    savePending         = false;
-    saveBtn.disabled    = true;
+    statusEl.textContent = "Метки сохранены";
+    savePending = false;
   };
 
   function render(segments){
@@ -225,7 +175,7 @@
       div.className = "segment";
 
       const ts = document.createElement("span");
-      ts.className = "time";
+      ts.className  = "time";
       ts.textContent = fmt(seg.start * 1000);
       div.append(ts);
 
@@ -234,7 +184,7 @@
       pb.onclick = () => {
         audioEl.currentTime = seg.start;
         audioEl.play();
-        setTimeout(() => audioEl.pause(), (seg.end - seg.start) * 1000);
+        setTimeout(() => audioEl.pause(), (seg.end - seg.start)*1000);
       };
       div.append(pb);
 
@@ -244,14 +194,13 @@
       inp.onchange = () => {
         const v = inp.value.trim();
         if (!v || v.length > 50) {
-          alert("Имя 1-50 символов");
+          alert("Имя 1–50 символов");
           inp.value = mapping[orig];
           return;
         }
         mapping[orig]    = v;
         savePending      = true;
         saveBtn.disabled = false;
-        // синхронизируем все inputs с тем же orig
         container.querySelectorAll("input").forEach(i => {
           if (i.dataset.orig === orig) i.value = v;
         });
