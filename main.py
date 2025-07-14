@@ -31,7 +31,7 @@ from crud import (
     create_admin_user as crud_create_admin_user
 )
 from dependencies import get_current_user
-from tasks import preview_slice, transcribe_segments, diarize_full  # <-- здесь
+from tasks import preview_slice, transcribe_segments, diarize_full  # <-- use preview_slice here
 
 # --- structlog setup ---
 structlog.configure(processors=[
@@ -157,7 +157,7 @@ async def upload(
     await redis.set(f"progress:{upload_id}", json.dumps({"status":"started"}))
     await redis.publish(f"progress:{upload_id}", json.dumps({"status":"started"}))
 
-    preview_slice.delay(upload_id, cid)  # <-- здесь
+    preview_slice.delay(upload_id, cid)  # <-- dispatch slice task
 
     return JSONResponse({"upload_id": upload_id}, headers={"X-Correlation-ID": cid})
 

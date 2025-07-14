@@ -21,6 +21,7 @@ def convert_to_wav(src_path, dst_path=None) -> Path:
         pass
 
     dst.parent.mkdir(parents=True, exist_ok=True)
+
     cmd = [
         "ffmpeg",
         "-y", "-i", str(src),
