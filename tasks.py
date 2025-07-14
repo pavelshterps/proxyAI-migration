@@ -11,9 +11,9 @@ from utils.audio import convert_to_wav
 
 logger = logging.getLogger(__name__)
 
-# Проверяем доступность библиотек
-_HF_AVAILABLE = False
-_PN_AVAILABLE = False
+# Флаги наличия библиотек
+_HF_AVAILABLE = False  # faster_whisper
+_PN_AVAILABLE = False  # pyannote.audio
 
 try:
     from faster_whisper import WhisperModel, download_model
@@ -29,18 +29,21 @@ try:
 except ImportError as e:
     logger.warning(f"[INIT] pyannote.audio not available: {e}")
 
+# Кешированные экземпляры моделей
 _whisper_model = None
 _vad = None
 _clustering_diarizer = None
 
+
 def get_whisper_model():
+    """Ленивая инициализация WhisperModel."""
     if not _HF_AVAILABLE:
         raise RuntimeError("WhisperModel unavailable")
     global _whisper_model
     if _whisper_model is None:
-        model_id  = settings.WHISPER_MODEL_PATH
-        cache_dir = settings.HUGGINGFACE_CACHE_DIR
-        device    = settings.WHISPER_DEVICE.lower()
+        model_id   = settings.WHISPER_MODEL_PATH
+        cache_dir  = settings.HUGGINGFACE_CACHE_DIR
+        device     = settings.WHISPER_DEVICE.lower()
         local_only = (device == "cpu")
 
         logger.info(f"[INIT] WhisperModel init: model={model_id}, device={device}, local_only={local_only}")
@@ -51,7 +54,7 @@ def get_whisper_model():
             path = model_id
             logger.info(f"[INIT] Will download '{model_id}' online")
         compute = getattr(settings, "WHISPER_COMPUTE_TYPE", "int8").lower()
-        if device == "cpu" and compute in ("fp16","float16"):
+        if device == "cpu" and compute in ("fp16", "float16"):
             logger.warning("[INIT] FP16 unsupported on CPU, switching to int8")
             compute = "int8"
 
@@ -59,7 +62,9 @@ def get_whisper_model():
         logger.info("[INIT] WhisperModel loaded successfully")
     return _whisper_model
 
+
 def get_vad():
+    """Ленивая инициализация VAD."""
     if not _PN_AVAILABLE:
         raise RuntimeError("VAD unavailable")
     global _vad
@@ -73,7 +78,9 @@ def get_vad():
         logger.info("[INIT] VAD model loaded")
     return _vad
 
+
 def get_clustering_diarizer():
+    """Ленивая инициализация SpeakerDiarization."""
     if not _PN_AVAILABLE:
         raise RuntimeError("Diarizer unavailable")
     global _clustering_diarizer
@@ -88,31 +95,47 @@ def get_clustering_diarizer():
         logger.info("[INIT] Diarizer model loaded")
     return _clustering_diarizer
 
+
 @worker_process_init.connect
 def preload_and_warmup(**kwargs):
+    """
+    При старте каждого worker'а прогреваем модели на небольшом примере,
+    чтобы не холдить первый реальный запрос.
+    """
     sample = Path(__file__).parent / "tests/fixtures/sample.wav"
     try:
-        logger.info("[WARMUP] Whisper warm-up")
-        get_whisper_model().transcribe(
-            str(sample),
-            **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {}),
-            max_initial_timestamp=settings.PREVIEW_LENGTH_S
-        )
-        logger.info("[WARMUP] Whisper warm-up completed")
-        # Always warm up VAD+diarizer to avoid cold load later
-        logger.info("[WARMUP] VAD + Diarizer warm-up")
-        get_vad().apply({"audio": str(sample)})
-        get_clustering_diarizer().apply({"audio": str(sample)})
-        logger.info("[WARMUP] VAD + Diarizer warm-up completed")
+        if _HF_AVAILABLE:
+            logger.info("[WARMUP] Whisper warm-up")
+            get_whisper_model().transcribe(
+                str(sample),
+                **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {}),
+                max_initial_timestamp=settings.PREVIEW_LENGTH_S
+            )
+            logger.info("[WARMUP] Whisper warm-up completed")
+        if _PN_AVAILABLE:
+            logger.info("[WARMUP] VAD + Diarizer warm-up")
+            get_vad().apply({"audio": str(sample)})
+            get_clustering_diarizer().apply({"audio": str(sample)})
+            logger.info("[WARMUP] VAD + Diarizer warm-up completed")
     except Exception as e:
         logger.warning(f"[WARMUP] Failed: {e!r}")
 
+
 @celery_app.task(bind=True, name="tasks.download_audio", queue="transcribe_gpu")
 def download_audio(self, upload_id: str, correlation_id: str):
+    """
+    Ничего не делает — здесь можно было бы обрезать видео или получить mp3.
+    Для простоты у нас noop.
+    """
     logger.info(f"[{correlation_id}] download_audio noop for {upload_id}")
+
 
 @celery_app.task(bind=True, name="tasks.preview_transcribe", queue="transcribe_gpu")
 def preview_transcribe(self, upload_id: str, correlation_id: str):
+    """
+    Делает транскрипцию первых N секунд (PREVIEW_LENGTH_S) без ffmpeg-обрезки.
+    Публикует сразу весь объект preview под ключом "preview".
+    """
     if not _HF_AVAILABLE:
         logger.error(f"[{correlation_id}] faster_whisper unavailable — skip preview")
         return
@@ -121,7 +144,7 @@ def preview_transcribe(self, upload_id: str, correlation_id: str):
     t0 = time.time()
     logger.info(f"[{correlation_id}] <<< PREVIEW START >>> for {upload_id}")
 
-    # конверсия
+    # Конверсия в WAV
     src = next(Path(settings.UPLOAD_FOLDER).glob(f"{upload_id}.*"), None)
     wav = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
     try:
@@ -131,17 +154,17 @@ def preview_transcribe(self, upload_id: str, correlation_id: str):
         logger.error(f"[{correlation_id}] Conversion error: {e}")
         return
 
-    # транскрипция первых N секунд напрямую
+    # Транскрипция первых N секунд
     try:
         model = get_whisper_model()
         opts = {"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {}
-        segs, _ = model.transcribe(
+        segments, _ = model.transcribe(
             str(wav_path),
             word_timestamps=True,
             max_initial_timestamp=settings.PREVIEW_LENGTH_S,
             **opts
         )
-        segs = list(segs)
+        segs = list(segments)
         logger.info(f"[{correlation_id}] Preview segments: {len(segs)}")
     except Exception as e:
         logger.error(f"[{correlation_id}] Preview error: {e}")
@@ -149,31 +172,34 @@ def preview_transcribe(self, upload_id: str, correlation_id: str):
 
     preview = {
         "text": "".join(s.text for s in segs),
-        "timestamps": [
-            {"start": s.start, "end": s.end, "text": s.text}
-            for s in segs
-        ]
+        "timestamps": [{"start": s.start, "end": s.end, "text": s.text} for s in segs]
     }
 
-    out = Path(settings.RESULTS_FOLDER) / upload_id
-    out.mkdir(parents=True, exist_ok=True)
-    (out / "preview.json").write_text(
+    out_dir = Path(settings.RESULTS_FOLDER) / upload_id
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "preview.json").write_text(
         json.dumps(preview, ensure_ascii=False, indent=2),
         encoding="utf-8"
     )
     logger.info(f"[{correlation_id}] Preview saved")
 
-    # — publish the *full* preview object under key “preview”
+    # Публикуем статус и сам preview
     state = {"status": "preview_done", "preview": preview}
     r.set(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
     r.publish(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
-    logger.info(f"[{correlation_id}] <<< PREVIEW DONE >>> in {time.time()-t0:.2f}s")
+    logger.info(f"[{correlation_id}] <<< PREVIEW DONE >>> in {time.time() - t0:.2f}s")
 
+    # Запускаем полную транскрипцию
     from tasks import transcribe_segments
     transcribe_segments.delay(upload_id, correlation_id)
 
+
 @celery_app.task(bind=True, name="tasks.transcribe_segments", queue="transcribe_gpu")
 def transcribe_segments(self, upload_id: str, correlation_id: str):
+    """
+    Делает полную транскрипцию всего WAV-файла.
+    После успешного сохранения посылает статус transcript_done.
+    """
     if not _HF_AVAILABLE:
         logger.error(f"[{correlation_id}] faster_whisper unavailable — skip full transcript")
         return
@@ -186,12 +212,11 @@ def transcribe_segments(self, upload_id: str, correlation_id: str):
         wav = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
         model = get_whisper_model()
         opts = {"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {}
-        segs, _ = model.transcribe(str(wav), word_timestamps=True, **opts)
-        segs = list(segs)
+        segments, _ = model.transcribe(str(wav), word_timestamps=True, **opts)
+        segs = list(segments)
         logger.info(f"[{correlation_id}] Full segments count: {len(segs)}")
 
         out_dir = Path(settings.RESULTS_FOLDER) / upload_id
-        out_dir.mkdir(parents=True, exist_ok=True)
         transcript_file = out_dir / "transcript.json"
         transcript_file.write_text(
             json.dumps([
@@ -202,20 +227,27 @@ def transcribe_segments(self, upload_id: str, correlation_id: str):
         )
         logger.info(f"[{correlation_id}] Transcript JSON saved to {transcript_file}")
 
-        # — publish transcript_done
+        # Публикуем что транскрипция завершена
         state = {"status": "transcript_done", "preview": None}
         r.set(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
         r.publish(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
-        logger.info(f"[{correlation_id}] <<< TRANSCRIBE DONE >>> in {time.time()-t0:.2f}s")
+        logger.info(f"[{correlation_id}] <<< TRANSCRIBE DONE >>> in {time.time() - t0:.2f}s")
 
-        # auto‐trigger diarization if requested
+        # Автоматический запуск diarization, если пользователь уже просил
         if r.get(f"diarize_requested:{upload_id}") == "1":
+            from tasks import diarize_full
             diarize_full.delay(upload_id, correlation_id)
+
     except Exception as e:
         logger.error(f"[{correlation_id}] Error in full transcription: {e}", exc_info=True)
 
+
 @celery_app.task(bind=True, name="tasks.diarize_full", queue="diarize_gpu")
 def diarize_full(self, upload_id: str, correlation_id: str):
+    """
+    Диаризация спикеров по всему файлу.
+    Публикует статус diarization_done.
+    """
     if not _PN_AVAILABLE:
         logger.error(f"[{correlation_id}] pyannote.audio unavailable — skip diarization")
         return
@@ -234,7 +266,6 @@ def diarize_full(self, upload_id: str, correlation_id: str):
         ]
 
         out_dir = Path(settings.RESULTS_FOLDER) / upload_id
-        out_dir.mkdir(parents=True, exist_ok=True)
         diar_file = out_dir / "diarization.json"
         diar_file.write_text(
             json.dumps(segs, ensure_ascii=False, indent=2),
@@ -242,10 +273,11 @@ def diarize_full(self, upload_id: str, correlation_id: str):
         )
         logger.info(f"[{correlation_id}] Diarization JSON saved to {diar_file}")
 
-        # — publish diarization_done
+        # Публикуем что диаризация завершена
         state = {"status": "diarization_done", "preview": None}
         r.set(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
         r.publish(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
-        logger.info(f"[{correlation_id}] <<< DIARIZE DONE >>> in {time.time()-t0:.2f}s")
+        logger.info(f"[{correlation_id}] <<< DIARIZE DONE >>> in {time.time() - t0:.2f}s")
+
     except Exception as e:
         logger.error(f"[{correlation_id}] Diarization error: {e}", exc_info=True)
