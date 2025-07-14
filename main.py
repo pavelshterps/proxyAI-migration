@@ -7,7 +7,8 @@ from pathlib import Path
 import structlog
 import redis.asyncio as redis_async
 from fastapi import (
-    FastAPI, UploadFile, File, HTTPException,
+    FastAPI,
+    UploadFile, File, HTTPException,
     Header, Depends, Request, Body, Query
 )
 from fastapi.responses import JSONResponse, HTMLResponse
@@ -50,7 +51,7 @@ app.add_exception_handler(RateLimitExceeded, lambda request, exc: JSONResponse(
     {"detail": "Too Many Requests"}, status_code=429
 ))
 
-# --- CORS и host trust ---
+# --- CORS and Host trust ---
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.ALLOWED_ORIGINS_LIST,
@@ -63,12 +64,30 @@ app.add_middleware(
     allowed_hosts=["127.0.0.1", "localhost"] + settings.ALLOWED_ORIGINS_LIST,
 )
 
-# --- статические файлы (index.html + JS/CSS) ---
-app.mount("/", StaticFiles(directory="static", html=True), name="static")
+# --- serve your SPA ---
+# static JS/CSS under /static
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+# root -> index.html
+@app.get("/", response_class=HTMLResponse)
+async def serve_frontend():
+    index_path = Path("static/index.html")
+    if not index_path.exists():
+        raise HTTPException(404, "Not found")
+    return HTMLResponse(index_path.read_text(encoding="utf-8"))
+
+# optional favicon
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon():
+    maybe = Path("static/favicon.ico")
+    if maybe.exists():
+        return StaticFiles(directory="static").lookup_path("favicon.ico")
+    raise HTTPException(404)
+
 
 @app.on_event("startup")
 async def startup():
-    # Пробуем подключиться к БД с retry
+    # retry DB connect
     for attempt in range(5):
         try:
             await init_models(engine)
@@ -77,12 +96,12 @@ async def startup():
         except OSError as e:
             log.warning("DB init failed", attempt=attempt, error=str(e))
             await asyncio.sleep(2)
-    # Убеждаемся, что папки существуют
+    # ensure dirs
     for d in (settings.UPLOAD_FOLDER, settings.RESULTS_FOLDER, settings.DIARIZER_CACHE_DIR):
         Path(d).mkdir(parents=True, exist_ok=True)
         log.debug("Ensured dir", path=str(d))
 
-# Redis для SSE и Celery
+# Redis for SSE + Celery
 redis = redis_async.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
@@ -95,6 +114,7 @@ async def get_api_key(
         raise HTTPException(401, "Missing API Key")
     return key
 
+# SSE endpoint
 @app.get("/events/{upload_id}")
 async def progress_events(
     upload_id: str,
@@ -121,10 +141,11 @@ async def progress_events(
             await sub.unsubscribe(f"progress:{upload_id}")
     return EventSourceResponse(gen())
 
+# Upload endpoint
 @app.post("/upload")
 @limiter.limit("10/minute")
 async def upload(
-    request: Request,
+    request: Request,  # needed for slowapi
     file: UploadFile = File(...),
     x_correlation_id: str | None = Header(None),
     current_user=Depends(get_current_user),
@@ -148,6 +169,7 @@ async def upload(
     preview_transcribe.delay(upload_id, cid)
     return JSONResponse({"upload_id": upload_id}, headers={"X-Correlation-ID": cid})
 
+# Get results
 @app.get("/results/{upload_id}")
 async def get_results(
     upload_id: str,
@@ -158,10 +180,10 @@ async def get_results(
     tp = base / "transcript.json"
     if not tp.exists():
         raise HTTPException(404, "Not ready")
-    transcript = json.loads(tp.read_text())
+    transcript = json.loads(tp.read_text(encoding="utf-8"))
     dp = base / "diarization.json"
     if dp.exists():
-        raw = json.loads(dp.read_text())
+        raw = json.loads(dp.read_text(encoding="utf-8"))
         rec = await get_upload_for_user(db, current_user.id, upload_id)
         mapping = rec.label_mapping or {}
         merged = []
@@ -181,6 +203,7 @@ async def get_results(
         return {"results": merged}
     return {"results": transcript}
 
+# Diarization trigger
 @app.post("/diarize/{upload_id}")
 async def request_diarization(
     upload_id: str,
@@ -191,12 +214,13 @@ async def request_diarization(
     diarize_full.delay(upload_id, None)
     return {"message": "diarization started"}
 
+# Save labels
 @app.post("/labels/{upload_id}")
 async def save_labels(
     upload_id: str,
     mapping: dict = Body(...),
     current_user=Depends(get_current_user),
-    db=Depends(get_db),
+    db=Depends(get_db)
 ):
     rec = await get_upload_for_user(db, current_user.id, upload_id)
     if not rec:
@@ -223,10 +247,7 @@ async def save_labels(
         })
     return {"results": merged}
 
-# ----------------------------------------
-# Новый эндпоинт для создания Admin-пользователя
-# ----------------------------------------
-
+# --- Admin endpoint ---
 class AdminCreatePayload(BaseModel):
     name: str
 
@@ -247,4 +268,4 @@ async def create_admin_user(
     Требует заголовок X-Admin-Key==settings.ADMIN_KEY
     """
     new_user = await crud_create_admin_user(db, name=payload.name)
-    return {"id": new_user.id, "name": new_user.name, "is_admin": new_user.is_admin}
+    return {"id": new_user.id, "name": new_user.name, "is_admin": getattr(new_user, "is_admin", False)}

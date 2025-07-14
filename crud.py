@@ -73,32 +73,22 @@ async def get_label_mapping(
 async def create_user(
     db: AsyncSession,
     name: str,
-    api_key: Optional[str] = None,
-    is_admin: bool = False
+    api_key: Optional[str] = None
 ) -> User:
     """
     Создаёт нового пользователя.
     Если api_key не передан, генерирует случайный.
-    is_admin по умолчанию False.
     """
     if api_key is None:
         api_key = uuid.uuid4().hex
-    user = User(name=name, api_key=api_key, is_admin=is_admin)
+    user = User(name=name, api_key=api_key)
     db.add(user)
     await db.commit()
     await db.refresh(user)
     return user
 
-async def create_admin_user(
-    db: AsyncSession,
-    name: str,
-    api_key: Optional[str] = None
-) -> User:
-    """
-    Создаёт нового админ-пользователя.
-    Устанавливает is_admin=True.
-    """
-    return await create_user(db, name=name, api_key=api_key, is_admin=True)
+# alias so main.py can import `create_admin_user`
+create_admin_user = create_user
 
 async def get_user_by_api_key(
     db: AsyncSession,
