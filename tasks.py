@@ -1,6 +1,5 @@
 import json
 import logging
-import subprocess
 import time
 from pathlib import Path
 from celery.signals import worker_process_init
@@ -12,11 +11,10 @@ from utils.audio import convert_to_wav
 
 logger = logging.getLogger(__name__)
 
-# Флаги наличия тяжёлых библиотек
+# Проверяем доступность библиотек
 _HF_AVAILABLE = False
 _PN_AVAILABLE = False
 
-# Ленивый импорт faster_whisper
 try:
     from faster_whisper import WhisperModel, download_model
     _HF_AVAILABLE = True
@@ -24,15 +22,12 @@ try:
 except ImportError as e:
     logger.warning(f"[INIT] faster_whisper not available: {e}")
 
-# Ленивый импорт pyannote.audio
 try:
     from pyannote.audio.pipelines import VoiceActivityDetection, SpeakerDiarization
     _PN_AVAILABLE = True
     logger.info("[INIT] pyannote.audio available")
 except ImportError as e:
     logger.warning(f"[INIT] pyannote.audio not available: {e}")
-
-# === Lazy-инициализации ===
 
 _whisper_model = None
 _vad = None
@@ -43,28 +38,24 @@ def get_whisper_model():
         raise RuntimeError("WhisperModel unavailable")
     global _whisper_model
     if _whisper_model is None:
-        model_id   = settings.WHISPER_MODEL_PATH
-        cache_dir  = settings.HUGGINGFACE_CACHE_DIR
-        device     = settings.WHISPER_DEVICE.lower()
+        model_id  = settings.WHISPER_MODEL_PATH
+        cache_dir = settings.HUGGINGFACE_CACHE_DIR
+        device    = settings.WHISPER_DEVICE.lower()
         local_only = (device == "cpu")
 
         logger.info(f"[INIT] WhisperModel init: model={model_id}, device={device}, local_only={local_only}")
         try:
-            model_path = download_model(model_id, cache_dir=cache_dir, local_files_only=local_only)
-            logger.info(f"[INIT] Model cached at: {model_path}")
-        except Exception as e:
-            if local_only:
-                logger.error(f"[INIT] Model missing from cache: {e}")
-                raise
-            logger.warning(f"[INIT] Will download '{model_id}' online: {e}")
-            model_path = model_id
-
+            path = download_model(model_id, cache_dir=cache_dir, local_files_only=local_only)
+            logger.info(f"[INIT] Model cached at: {path}")
+        except Exception:
+            path = model_id
+            logger.info(f"[INIT] Will download '{model_id}' online")
         compute = getattr(settings, "WHISPER_COMPUTE_TYPE", "int8").lower()
-        if device == "cpu" and compute in ("float16","fp16"):
+        if device == "cpu" and compute in ("fp16","float16"):
             logger.warning("[INIT] FP16 unsupported on CPU, switching to int8")
             compute = "int8"
 
-        _whisper_model = WhisperModel(model_path, device=device, compute_type=compute)
+        _whisper_model = WhisperModel(path, device=device, compute_type=compute)
         logger.info("[INIT] WhisperModel loaded successfully")
     return _whisper_model
 
@@ -101,14 +92,15 @@ def get_clustering_diarizer():
 def preload_and_warmup(**kwargs):
     sample = Path(__file__).parent / "tests/fixtures/sample.wav"
     try:
-        logger.info("[WARMUP] Starting Whisper warm-up")
+        logger.info("[WARMUP] Whisper warm-up")
         get_whisper_model().transcribe(
             str(sample),
-            **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {})
+            **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {}),
+            max_initial_timestamp=settings.PREVIEW_LENGTH_S
         )
         logger.info("[WARMUP] Whisper warm-up completed")
         if settings.WHISPER_DEVICE.lower() != "cpu":
-            logger.info("[WARMUP] Starting VAD + Diarizer warm-up")
+            logger.info("[WARMUP] VAD + Diarizer warm-up")
             get_vad().apply({"audio": str(sample)})
             get_clustering_diarizer().apply({"audio": str(sample)})
             logger.info("[WARMUP] VAD + Diarizer warm-up completed")
@@ -117,21 +109,20 @@ def preload_and_warmup(**kwargs):
 
 @celery_app.task(bind=True, name="tasks.download_audio", queue="transcribe_gpu")
 def download_audio(self, upload_id: str, correlation_id: str):
-    """noop-заглушка, чтобы внешняя очередь не падала."""
     logger.info(f"[{correlation_id}] download_audio noop for {upload_id}")
 
 @celery_app.task(bind=True, name="tasks.preview_transcribe", queue="transcribe_gpu")
 def preview_transcribe(self, upload_id: str, correlation_id: str):
-    """Превью-транскрипция первых N секунд."""
+    """Превью-транскрипция без ffmpeg-обрезки, с max_initial_timestamp."""
     if not _HF_AVAILABLE:
-        logger.error(f"[{correlation_id}] faster_whisper unavailable — пропускаем preview")
+        logger.error(f"[{correlation_id}] faster_whisper unavailable — skip preview")
         return
 
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
     t0 = time.time()
     logger.info(f"[{correlation_id}] <<< PREVIEW START >>> for {upload_id}")
 
-    # 1) конверсия
+    # конверсия
     src = next(Path(settings.UPLOAD_FOLDER).glob(f"{upload_id}.*"), None)
     wav = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
     try:
@@ -141,24 +132,20 @@ def preview_transcribe(self, upload_id: str, correlation_id: str):
         logger.error(f"[{correlation_id}] Conversion error: {e}")
         return
 
-    # 2) обрезка
-    preview_wav = Path(settings.UPLOAD_FOLDER) / f"{upload_id}_preview.wav"
-    subprocess.run([
-        "ffmpeg", "-y", "-i", str(wav_path),
-        "-t", str(settings.PREVIEW_LENGTH_S),
-        str(preview_wav)
-    ], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    logger.info(f"[{correlation_id}] Preview WAV generated: {preview_wav}")
-
-    # 3) транскрипция
+    # транскрипция первых N секунд напрямую
     try:
         model = get_whisper_model()
-        opts  = {"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {}
-        segs, _ = model.transcribe(str(preview_wav), word_timestamps=True, **opts)
+        opts = {"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {}
+        segs, _ = model.transcribe(
+            str(wav_path),
+            word_timestamps=True,
+            max_initial_timestamp=settings.PREVIEW_LENGTH_S,
+            **opts
+        )
         segs = list(segs)
-        logger.info(f"[{correlation_id}] Preview segments count: {len(segs)}")
+        logger.info(f"[{correlation_id}] Preview segments: {len(segs)}")
     except Exception as e:
-        logger.error(f"[{correlation_id}] Preview transcription error: {e}")
+        logger.error(f"[{correlation_id}] Preview error: {e}")
         return
 
     preview = {
@@ -166,18 +153,17 @@ def preview_transcribe(self, upload_id: str, correlation_id: str):
         "timestamps": [{"start": s.start, "end": s.end, "text": s.text} for s in segs]
     }
 
-    out_dir = Path(settings.RESULTS_FOLDER) / upload_id
-    out_dir.mkdir(parents=True, exist_ok=True)
-    preview_file = out_dir / "preview.json"
-    preview_file.write_text(json.dumps(preview, ensure_ascii=False, indent=2), encoding="utf-8")
-    logger.info(f"[{correlation_id}] Preview JSON saved to {preview_file}")
+    out = Path(settings.RESULTS_FOLDER) / upload_id
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "preview.json").write_text(json.dumps(preview, ensure_ascii=False, indent=2), encoding="utf-8")
+    logger.info(f"[{correlation_id}] Preview saved")
 
     state = {"status": "preview_done", "preview": preview}
     r.set(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
     r.publish(f"progress:{upload_id}", json.dumps(state, ensure_ascii=False))
-    logger.info(f"[{correlation_id}] <<< PREVIEW DONE >>> for {upload_id} in {time.time()-t0:.2f}s")
+    logger.info(f"[{correlation_id}] <<< PREVIEW DONE >>> in {time.time()-t0:.2f}s")
 
-    # 4) продолжение — полная транскрипция
+    from tasks import transcribe_segments
     transcribe_segments.delay(upload_id, correlation_id)
 
 @celery_app.task(bind=True, name="tasks.transcribe_segments", queue="transcribe_gpu")

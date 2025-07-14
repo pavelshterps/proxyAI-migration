@@ -41,14 +41,14 @@ services:
       - UPLOAD_FOLDER=${UPLOAD_FOLDER}
       - RESULTS_FOLDER=${RESULTS_FOLDER}
       - DIARIZER_CACHE_DIR=${DIARIZER_CACHE_DIR}
-      - HUGGINGFACE_CACHE_DIR=/hf_cache      # общий каталог для Hugging Face cache
+      - HUGGINGFACE_CACHE_DIR=/hf_cache
       - WHISPER_MODEL_PATH=${WHISPER_MODEL_PATH}
     volumes:
       - ./:/app:delegated
       - upload_data:${UPLOAD_FOLDER}
       - results_data:${RESULTS_FOLDER}
       - diarizer_cache:${DIARIZER_CACHE_DIR}
-      - ./data/hf_cache:/hf_cache             # монтируем локальный cache сюда
+      - ./data/hf_cache:/hf_cache
     ports:
       - "8000:8000"
     depends_on:
@@ -64,7 +64,11 @@ services:
     container_name: proxyai_worker_cpu
     env_file: .env
     command: >
-      celery -A tasks worker --loglevel=info --concurrency ${CPU_CONCURRENCY} --queues split_cpu,dispatch_cpu,collect_cpu
+      celery -A config.celery:celery_app
+             worker
+             --loglevel=info
+             --concurrency=${CPU_CONCURRENCY}
+             --queues=default,split_cpu,dispatch_cpu,collect_cpu
     environment:
       - CELERY_BROKER_URL=${CELERY_BROKER_URL}
       - UPLOAD_FOLDER=${UPLOAD_FOLDER}
@@ -93,7 +97,11 @@ services:
     runtime: nvidia
     env_file: .env
     command: >
-      celery -A tasks worker --loglevel=info --concurrency ${GPU_CONCURRENCY} --queues transcribe_gpu,diarize_gpu
+      celery -A config.celery:celery_app
+             worker
+             --loglevel=info
+             --concurrency=${GPU_CONCURRENCY}
+             --queues=transcribe_gpu,diarize_gpu
     environment:
       - CELERY_BROKER_URL=${CELERY_BROKER_URL}
       - UPLOAD_FOLDER=${UPLOAD_FOLDER}
@@ -121,7 +129,7 @@ services:
       dockerfile: Dockerfile
     container_name: proxyai_beat
     env_file: .env
-    command: celery -A tasks beat --loglevel=info
+    command: celery -A config.celery:celery_app beat --loglevel=info
     environment:
       - CELERY_BROKER_URL=${CELERY_BROKER_URL}
     volumes:

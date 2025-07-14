@@ -25,10 +25,8 @@
     <input type="file" id="audioFile" accept="audio/*,video/*" />
   </label>
   <button id="uploadBtn">Загрузить и начать</button>
-
   <div id="status" style="margin-top:1rem;">Готово к загрузке</div>
   <div id="timings"></div>
-
   <button id="fetchPreviewBtn" disabled>Получить превью</button>
   <button id="fetchTranscriptBtn" disabled>Получить транскрипцию</button>
   <button id="requestDiarizeBtn" disabled>Запросить диаризацию</button>
@@ -47,15 +45,14 @@
     const uploadBtn     = document.getElementById('uploadBtn');
     const statusEl      = document.getElementById('status');
     const timingsEl     = document.getElementById('timings');
-    const previewBtn    = document.getElementById('fetchPreviewBtn');
-    const transcriptBtn = document.getElementById('fetchTranscriptBtn');
     const diarizeBtn    = document.getElementById('requestDiarizeBtn');
+    const saveBtn       = document.getElementById('saveLabelsBtn');
     const audioEl       = document.getElementById('audio');
     const container     = document.getElementById('transcriptContainer');
-    const saveBtn       = document.getElementById('saveLabelsBtn');
 
-    let uploadId, previewDone=false, transcriptDone=false, diarizeDone=false;
-    let mapping = {}, tUpload;
+    let uploadId;
+    let previewDone=false, transcriptDone=false, diarizeDone=false;
+    let mapping = {};
 
     function fmt(ms){
       const sec = Math.floor(ms/1000),
@@ -69,159 +66,142 @@
       if(!key){ alert("Введите API-Key"); return; }
       const file = fileEl.files[0];
       if(!file){ alert("Выберите файл"); return; }
-
-      tUpload = performance.now();
       statusEl.textContent = "Загружаем…";
-      timingsEl.textContent = "";
       audioEl.src = URL.createObjectURL(file);
+      timingsEl.textContent = "";
+      previewDone = transcriptDone = diarizeDone = false;
 
-      // Upload
+      let res;
       try {
         const form = new FormData();
-        form.append("file", file, file.name);
-        const res = await fetch("/upload/", {
+        form.append("file", file);
+        res = await fetch("/upload/", {
           method: "POST",
           headers: { "X-API-Key": key },
           body: form
         });
-        if(!res.ok) throw new Error("Upload error: " + res.status);
+        if(!res.ok) throw new Error(res.statusText);
         uploadId = (await res.json()).upload_id;
-      } catch(err) {
-        console.error(err);
-        alert("Ошибка загрузки: " + err.message);
-        statusEl.textContent = "Ошибка при загрузке";
+      } catch(e) {
+        alert("Ошибка загрузки: "+e);
+        statusEl.textContent="Ошибка";
         return;
       }
 
-      [previewBtn, transcriptBtn, diarizeBtn, saveBtn].forEach(b=>b.disabled=true);
-      container.innerHTML = "";
-
       const es = new EventSource(`/events/${uploadId}?api_key=${encodeURIComponent(key)}`);
       es.onmessage = e => {
-        let raw = e.data;
-        if(!raw||raw.trim()===""||raw.trim()===":") return;
-        if(raw.startsWith("data:")) raw = raw.replace(/^data:\s*/,"");
-        let st; try{ st = JSON.parse(raw) }catch{return}
+        let d = e.data.trim();
+        if(!d||d===":") return;
+        if(d.startsWith("data:")) d = d.replace(/^data:\s*/,"");
+        let st; try{ st = JSON.parse(d) }catch{return;}
         statusEl.textContent = `Статус: ${st.status}`;
 
         if(st.preview && !previewDone){
           previewDone = true;
-          timingsEl.innerHTML += `<div>Preview done in ${((performance.now()-tUpload)/1000).toFixed(2)}s</div>`;
-          previewBtn.disabled = false;
+          timingsEl.innerHTML += `<div>Preview: ${(performance.now()/1000).toFixed(2)}s</div>`;
           render(st.preview.timestamps);
         }
         if(st.status==="transcript_done" && !transcriptDone){
           transcriptDone = true;
-          timingsEl.innerHTML += `<div>Transcript done in ${((performance.now()-tUpload)/1000).toFixed(2)}s</div>`;
-          transcriptBtn.disabled = false;
+          timingsEl.innerHTML += `<div>Transcript: ${(performance.now()/1000).toFixed(2)}s</div>`;
           diarizeBtn.disabled = false;
-          loadTranscript();
+          loadResults();
         }
         if(st.status==="diarization_done" && !diarizeDone){
           diarizeDone = true;
-          timingsEl.innerHTML += `<div>Diarization done in ${((performance.now()-tUpload)/1000).toFixed(2)}s</div>`;
+          timingsEl.innerHTML += `<div>Diarization: ${(performance.now()/1000).toFixed(2)}s</div>`;
           saveBtn.disabled = false;
           es.close();
-          loadTranscript();
+          loadResults();
         }
       };
-
-      statusEl.textContent = "Файл загружен, ждём прогресса…";
+      statusEl.textContent = "Ждём результатов…";
     };
 
-    async function loadTranscript(){
-      container.innerHTML = "";
-      statusEl.textContent = "Загружаю результат…";
+    async function loadResults(){
+      statusEl.textContent = "Загружаю…";
       const key = apiKeyEl.value.trim();
       const res = await fetch(`/results/${uploadId}`, {
         headers: { "X-API-Key": key }
       });
-      if(!res.ok) throw new Error("results fetch failed: " + res.status);
+      if(!res.ok){ statusEl.textContent="Ошибка"; return; }
       const { results } = await res.json();
       render(results);
       statusEl.textContent = "Готово";
     }
-    transcriptBtn.onclick = () => loadTranscript();
 
     diarizeBtn.onclick = async () => {
-      statusEl.textContent = "Запрашиваем диаризацию…";
-      try {
-        const res = await fetch(`/diarize/${uploadId}`, {
-          method: "POST",
-          headers: { "X-API-Key": apiKeyEl.value.trim() }
-        });
-        if(!res.ok) throw new Error("Diarize request failed: " + res.status);
-        diarizeBtn.disabled = true;
-      } catch(err) {
-        console.error(err);
-        alert("Ошибка при запросе диаризации: " + err.message);
-        statusEl.textContent = "Ошибка при запросе диаризации";
-      }
+      statusEl.textContent = "Запрос диаризации…";
+      const key = apiKeyEl.value.trim();
+      const res = await fetch(`/diarize/${uploadId}`, {
+        method:"POST", headers:{"X-API-Key":key}
+      });
+      if(!res.ok) alert("Ошибка"); diarizeBtn.disabled = true;
     };
 
     saveBtn.onclick = async () => {
-      const key = apiKeyEl.value.trim(), payload={};
-      Object.entries(mapping).forEach(([o,n])=>{ if(o!==n) payload[o]=n; });
-      if(!Object.keys(payload).length){ alert("Нет изменений"); return; }
-      try {
-        const res = await fetch(`/labels/${uploadId}`, {
-          method:"POST",
-          headers:{
-            "Content-Type":"application/json",
-            "X-API-Key":key
-          },
-          body:JSON.stringify(payload)
-        });
-        if(!res.ok) throw new Error("Labels save failed: " + res.status);
-        await loadTranscript();
-        saveBtn.disabled = true;
-        alert("Метки сохранены");
-      } catch(err) {
-        console.error(err);
-        alert("Ошибка при сохранении меток: " + err.message);
+      const key = apiKeyEl.value.trim();
+      const payload = {};
+      for(const [orig,newName] of Object.entries(mapping)){
+        if(orig !== newName) payload[orig] = newName;
       }
+      if(!Object.keys(payload).length){ alert("Нет изменений"); return; }
+      const res = await fetch(`/labels/${uploadId}`, {
+        method:"POST",
+        headers:{"Content-Type":"application/json","X-API-Key":key},
+        body:JSON.stringify(payload)
+      });
+      if(!res.ok){ alert("Ошибка"); return; }
+      const { results } = await res.json();
+      render(results);
+      saveBtn.disabled = true;
+      statusEl.textContent = "Метки сохранены";
     };
 
-    function render(list){
+    function render(segments){
       container.innerHTML = "";
       mapping = {};
-      list.forEach(s=>mapping[s.speaker||""]=s.speaker||"");
       const frag = document.createDocumentFragment();
-      list.forEach(seg=>{
+      segments.forEach(seg=>{
+        const orig = seg.speaker||"";
+        mapping[orig] = orig;
+
         const div = document.createElement("div");
         div.className = "segment";
 
-        const t = document.createElement("span");
-        t.className = "time";
-        t.textContent = fmt(seg.start*1000);
+        const tspan = document.createElement("span");
+        tspan.className = "time";
+        tspan.textContent = fmt(seg.start*1000);
 
-        const btn = document.createElement("button");
-        btn.textContent = "▶️";
-        btn.onclick = ()=>{
+        const pbtn = document.createElement("button");
+        pbtn.textContent = "▶️";
+        pbtn.onclick = ()=>{
           audioEl.currentTime = seg.start;
           audioEl.play();
           setTimeout(()=>audioEl.pause(), (seg.end-seg.start)*1000);
         };
 
         const inp = document.createElement("input");
-        inp.value = seg.speaker||"";
+        inp.value = orig;
+        inp.dataset.orig = orig;
         inp.onchange = ()=>{
-          const old = seg.speaker||"", neu = inp.value.trim();
-          if(neu && neu.length<=50){
-            mapping[old] = neu;
-            frag.querySelectorAll("input").forEach(i=>{
-              if(i.value===old) i.value=neu;
-            });
-          } else {
+          const newName = inp.value.trim();
+          if(!newName||newName.length>50){
             alert("Имя 1–50 символов");
-            inp.value = mapping[old];
+            inp.value = mapping[orig];
+            return;
           }
+          mapping[orig] = newName;
+          container.querySelectorAll('input').forEach(i=>{
+            if(i.dataset.orig === orig) i.value = newName;
+          });
+          saveBtn.disabled = false;
         };
 
         const txt = document.createElement("span");
-        txt.textContent = seg.text || "";
+        txt.textContent = seg.text;
 
-        div.append(t, btn, inp, txt);
+        div.append(tspan, pbtn, inp, txt);
         frag.append(div);
       });
       container.append(frag);
