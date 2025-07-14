@@ -32,45 +32,12 @@ async def get_diarization(upload_id: str):
 
 @router.get("/transcription/{upload_id}/preview")
 async def get_preview(upload_id: str):
+    # теперь совпадает с tasks.py
     p = Path(settings.RESULTS_FOLDER) / upload_id / "preview_transcript.json"
     return {"preview": _read_json(p)}
 
-@router.get("/results/{upload_id}")
-async def get_results(
-    upload_id: str,
-    current=Depends(get_current_user),
-    db: AsyncSession = Depends(get_db)
-):
-    transcript = _read_json(Path(settings.RESULTS_FOLDER)/upload_id/"transcript.json")
-    diarization = _read_json(Path(settings.RESULTS_FOLDER)/upload_id/"diarization.json")
-
-    # применяем пользовательскую маппинг-таблицу, если есть
-    mapping = await crud.get_label_mapping(db, current.id, upload_id)
-    if mapping:
-        for seg in diarization:
-            key = str(seg["speaker"])
-            if key in mapping:
-                seg["speaker"] = mapping[key]
-
-    results = []
-    for seg in transcript:
-        spk = next(
-            (d["speaker"] for d in diarization
-             if d["start"] <= seg["start"] < d["end"]),
-            "unknown"
-        )
-        h, r = divmod(seg["start"], 3600)
-        m, s = divmod(r, 60)
-        time_str = f"{int(h):02d}:{int(m):02d}:{int(s):02d}"
-        results.append({
-            "start":   seg["start"],
-            "end":     seg["end"],
-            "text":    seg["text"],
-            "speaker": spk,
-            "time":    time_str,
-        })
-
-    return {"results": results}
+# Убрали дублирование /results — основной /results работает в main.py
+# Оставляем только узкоспециализированные маршруты
 
 @router.post("/labels/{upload_id}")
 async def save_labels(
@@ -79,7 +46,6 @@ async def save_labels(
     current=Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    # сохраняем в БД
     updated = await crud.update_label_mapping(db, current.id, upload_id, mapping)
     if not updated:
         raise HTTPException(404, "upload_id not found")

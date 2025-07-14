@@ -31,7 +31,11 @@ from crud import (
     create_admin_user as crud_create_admin_user
 )
 from dependencies import get_current_user
-from tasks import preview_transcribe, transcribe_segments, diarize_full
+# Импортируем preview_slice как preview_transcribe
+from tasks import preview_slice as preview_transcribe, transcribe_segments, diarize_full
+
+# Добавили подключение дополнительных маршрутов из routes.py
+from routes import router as api_router
 
 # --- structlog setup ---
 structlog.configure(processors=[
@@ -43,6 +47,9 @@ log = structlog.get_logger()
 
 app = FastAPI(title="proxyAI", version=settings.APP_VERSION)
 
+# Подключаем роуты из routes.py
+app.include_router(api_router)
+
 # --- rate limiter ---
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
@@ -51,7 +58,7 @@ app.add_exception_handler(RateLimitExceeded, lambda request, exc: JSONResponse(
     {"detail": "Too Many Requests"}, status_code=429
 ))
 
-# --- CORS and Host trust ---
+# --- CORS и TrustedHost ---
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.ALLOWED_ORIGINS_LIST,
@@ -64,7 +71,7 @@ app.add_middleware(
     allowed_hosts=["127.0.0.1", "localhost"] + settings.ALLOWED_ORIGINS_LIST,
 )
 
-# --- serve your SPA ---
+# --- SPA и статические файлы ---
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 @app.get("/", response_class=HTMLResponse)
