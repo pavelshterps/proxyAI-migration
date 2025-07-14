@@ -3,12 +3,14 @@ import uuid
 import json
 import asyncio
 from pathlib import Path
+from urllib.parse import urlparse
+from urllib.request import urlretrieve
 
 import structlog
 import redis.asyncio as redis_async
 from fastapi import (
     FastAPI,
-    UploadFile, File, HTTPException,
+    UploadFile, File, Form, HTTPException,
     Header, Depends, Request, Body, Query
 )
 from fastapi.responses import JSONResponse, HTMLResponse
@@ -145,28 +147,57 @@ async def progress_events(
 @limiter.limit("10/minute")
 async def upload(
     request: Request,
-    file: UploadFile = File(...),
+    file: UploadFile = File(None),
+    file_url: str = Form(None),
     x_correlation_id: str | None = Header(None),
     current_user=Depends(get_current_user),
     db=Depends(get_db),
 ):
-    data = await file.read()
-    if not data:
-        raise HTTPException(400, "File is empty")
-    ext = Path(file.filename).suffix or ""
-    upload_id = uuid.uuid4().hex
-    Path(settings.UPLOAD_FOLDER).joinpath(f"{upload_id}{ext}").write_bytes(data)
+    """
+    Принимает либо multipart-файл, либо ссылку на файл (file_url).
+    Сохраняет источник и запускает preview_transcribe таск.
+    """
+    if not file and not file_url:
+        raise HTTPException(400, "Нужно передать либо файл, либо file_url")
 
+    upload_id = uuid.uuid4().hex
+    ext = ""
+    dst_path = None
+    try:
+        # убедимся, что папка uploads существует
+        Path(settings.UPLOAD_FOLDER).mkdir(parents=True, exist_ok=True)
+
+        if file:
+            data = await file.read()
+            if not data:
+                raise HTTPException(400, "File is empty")
+            ext = Path(file.filename).suffix or ""
+            dst_path = Path(settings.UPLOAD_FOLDER) / f"{upload_id}{ext}"
+            dst_path.write_bytes(data)
+        else:
+            # скачиваем по URL
+            parsed = urlparse(file_url)
+            ext = Path(parsed.path).suffix or ""
+            dst_path = Path(settings.UPLOAD_FOLDER) / f"{upload_id}{ext}"
+            urlretrieve(file_url, str(dst_path))
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error("upload save error", error=str(e))
+        raise HTTPException(500, f"Cannot save source: {e}")
+
+    # Сохраняем запись в БД (если есть)
     try:
         await create_upload_record(db, current_user.id, upload_id)
     except Exception:
         log.warning("DB create failed", upload_id=upload_id)
 
     cid = x_correlation_id or uuid.uuid4().hex
+    # инициализация прогресса
     await redis.set(f"progress:{upload_id}", json.dumps({"status":"started"}))
     await redis.publish(f"progress:{upload_id}", json.dumps({"status":"started"}))
 
-    # Теперь всегда запускаем единый таск preview_transcribe на GPU
+    # Запуск единого таска на GPU
     preview_transcribe.delay(upload_id, cid)
 
     return JSONResponse({"upload_id": upload_id}, headers={"X-Correlation-ID": cid})
