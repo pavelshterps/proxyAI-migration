@@ -116,31 +116,19 @@ def preview_transcribe(self, upload_id, correlation_id):
     t0 = time.time()
 
     try:
-        # 1) Источник и директория результатов
         src     = next(Path(settings.UPLOAD_FOLDER).glob(f"{upload_id}.*"))
         out_dir = Path(settings.RESULTS_FOLDER) / upload_id
         out_dir.mkdir(exist_ok=True, parents=True)
 
-        # 2) FFmpeg → stdout (pipe), без промежуточного файла
-        cmd = [
-            "ffmpeg", "-y", "-i", str(src),
-            "-ss", "0", "-t", str(settings.PREVIEW_LENGTH_S),
-            "-acodec", "pcm_s16le", "-ac", "1", "-ar", "16k",
-            "-f", "wav", "pipe:1"
-        ]
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-
-        # 3) Whisper транскрипция из pipe
+        # нативный slice через Whisper
         segments, _ = get_whisper_model().transcribe(
-            proc.stdout,
+            str(src),
             word_timestamps=True,
+            max_initial_timestamp=settings.PREVIEW_LENGTH_S,
             **({"language": settings.WHISPER_LANGUAGE}
                if settings.WHISPER_LANGUAGE else {})
         )
-        proc.stdout.close()
-        proc.wait()
 
-        # 4) Публикация частичных результатов по мере появления сегментов
         segs = []
         for seg in segments:
             frag = {"start": seg.start, "end": seg.end, "text": seg.text}
@@ -158,7 +146,6 @@ def preview_transcribe(self, upload_id, correlation_id):
         )
         return
 
-    # 5) Финальный JSON превью
     preview = {
         "text": "".join(s["text"] for s in segs),
         "timestamps": segs
@@ -171,7 +158,6 @@ def preview_transcribe(self, upload_id, correlation_id):
         json.dumps({"status": "preview_done", "preview": preview})
     )
 
-    # 6) Запуск полного транскрипта
     transcribe_segments.delay(upload_id, correlation_id)
     logger.info(f"[{cid}] PREVIEW TRANSCRIBE done in {time.time()-t0:.2f}s")
 
@@ -192,6 +178,7 @@ def transcribe_segments(self, upload_id, correlation_id):
         segs, _ = get_whisper_model().transcribe(
             str(wav),
             word_timestamps=True,
+            chunk_length_s=getattr(settings, "CHUNK_LENGTH_S", None),
             **({"language": settings.WHISPER_LANGUAGE}
                if settings.WHISPER_LANGUAGE else {})
         )
@@ -209,7 +196,8 @@ def transcribe_segments(self, upload_id, correlation_id):
     (out / "transcript.json").write_text(
         json.dumps(
             [{"start": s.start, "end": s.end, "text": s.text} for s in segs],
-            ensure_ascii=False, indent=2
+            ensure_ascii=False,
+            indent=2
         )
     )
     r.publish(f"progress:{upload_id}", json.dumps({"status": "transcript_done"}))
@@ -234,9 +222,14 @@ def diarize_full(self, upload_id, correlation_id):
 
     try:
         wav = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
-        get_vad()
-        get_clustering_diarizer()
-        ann = get_clustering_diarizer().apply({"audio": str(wav)})
+
+        # сначала VAD
+        speech = get_vad().apply({"audio": str(wav)})
+        # затем диаризация только по речевым участкам
+        ann = get_clustering_diarizer().apply({
+            "audio": str(wav),
+            "speech": speech
+        })
     except Exception as e:
         logger.error(f"[{cid}] diarize_full error", exc_info=True)
         r.publish(
