@@ -268,8 +268,8 @@ async def create_admin_user(
     new_user = await crud_create_admin_user(db, payload.name, new_api_key)
 
     return {
-        "id": new_user.id,
-        "name": new_user.username,
-        "api_key": new_user.api_key,
-        "is_admin": getattr(new_user, "is_admin", False)
+                "id": new_user.id,
+                "name": new_user.name,
+                "api_key": new_user.api_key,
+                "is_admin": getattr(new_user, "is_admin", False)
     }
