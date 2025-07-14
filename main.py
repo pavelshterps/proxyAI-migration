@@ -6,10 +6,14 @@ from pathlib import Path
 
 import structlog
 import redis.asyncio as redis_async
-from fastapi import FastAPI, UploadFile, File, HTTPException, Header, Depends, Request, Body, Query
+from fastapi import (
+    FastAPI, UploadFile, File, HTTPException,
+    Header, Depends, Request, Body, Query
+)
 from fastapi.responses import JSONResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.security.api_key import APIKeyHeader
+from pydantic import BaseModel
 from slowapi import Limiter
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
@@ -20,11 +24,15 @@ from sse_starlette.sse import EventSourceResponse
 
 from config.settings import settings
 from database import init_models, engine, get_db
-from crud import create_upload_record, get_upload_for_user
+from crud import (
+    create_upload_record,
+    get_upload_for_user,
+    create_admin_user as crud_create_admin_user  # новый CRUD для админа
+)
 from dependencies import get_current_user
 from tasks import preview_transcribe, transcribe_segments, diarize_full
 
-# structlog
+# --- structlog setup ---
 structlog.configure(processors=[
     structlog.processors.add_log_level,
     structlog.processors.TimeStamper(fmt="iso"),
@@ -34,7 +42,7 @@ log = structlog.get_logger()
 
 app = FastAPI(title="proxyAI", version=settings.APP_VERSION)
 
-# rate limiter
+# --- rate limiter ---
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 app.add_middleware(SlowAPIMiddleware)
@@ -42,7 +50,7 @@ app.add_exception_handler(RateLimitExceeded, lambda request, exc: JSONResponse(
     {"detail": "Too Many Requests"}, status_code=429
 ))
 
-# CORS и host
+# --- CORS и host trust ---
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.ALLOWED_ORIGINS_LIST,
@@ -55,12 +63,12 @@ app.add_middleware(
     allowed_hosts=["127.0.0.1", "localhost"] + settings.ALLOWED_ORIGINS_LIST,
 )
 
-# статические файлы (index.html + JS/CSS)
+# --- статические файлы (index.html + JS/CSS) ---
 app.mount("/", StaticFiles(directory="static", html=True), name="static")
 
 @app.on_event("startup")
 async def startup():
-    # пробуем подключиться к БД
+    # Пробуем подключиться к БД с retry
     for attempt in range(5):
         try:
             await init_models(engine)
@@ -69,22 +77,30 @@ async def startup():
         except OSError as e:
             log.warning("DB init failed", attempt=attempt, error=str(e))
             await asyncio.sleep(2)
-    # директории
+    # Убеждаемся, что папки существуют
     for d in (settings.UPLOAD_FOLDER, settings.RESULTS_FOLDER, settings.DIARIZER_CACHE_DIR):
         Path(d).mkdir(parents=True, exist_ok=True)
         log.debug("Ensured dir", path=str(d))
 
+# Redis для SSE и Celery
 redis = redis_async.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
-async def get_api_key(x_api_key: str = Depends(api_key_header), api_key: str = Query(None)):
+async def get_api_key(
+    x_api_key: str = Depends(api_key_header),
+    api_key: str = Query(None),
+):
     key = x_api_key or api_key
     if not key:
         raise HTTPException(401, "Missing API Key")
     return key
 
 @app.get("/events/{upload_id}")
-async def progress_events(upload_id: str, request: Request, api_key: str = Depends(get_api_key)):
+async def progress_events(
+    upload_id: str,
+    request: Request,
+    api_key: str = Depends(get_api_key),
+):
     async def gen():
         sub = redis.pubsub()
         await sub.subscribe(f"progress:{upload_id}")
@@ -124,18 +140,20 @@ async def upload(
         await create_upload_record(db, current_user.id, upload_id)
     except Exception:
         log.warning("DB create failed", upload_id=upload_id)
-    cid = x_correlation_id or uuid.uuid4().hex
 
-    # стартовый статус
+    cid = x_correlation_id or uuid.uuid4().hex
     await redis.set(f"progress:{upload_id}", json.dumps({"status":"started"}))
     await redis.publish(f"progress:{upload_id}", json.dumps({"status":"started"}))
 
-    # запускаем цепочку
     preview_transcribe.delay(upload_id, cid)
     return JSONResponse({"upload_id": upload_id}, headers={"X-Correlation-ID": cid})
 
 @app.get("/results/{upload_id}")
-async def get_results(upload_id: str, current_user=Depends(get_current_user), db=Depends(get_db)):
+async def get_results(
+    upload_id: str,
+    current_user=Depends(get_current_user),
+    db=Depends(get_db),
+):
     base = Path(settings.RESULTS_FOLDER) / upload_id
     tp = base / "transcript.json"
     if not tp.exists():
@@ -148,34 +166,86 @@ async def get_results(upload_id: str, current_user=Depends(get_current_user), db
         mapping = rec.label_mapping or {}
         merged = []
         for seg in transcript:
-            orig = next((d["speaker"] for d in raw if d["start"] <= seg["start"] < d["end"]), None)
+            orig = next(
+                (d["speaker"] for d in raw if d["start"] <= seg["start"] < d["end"]),
+                None
+            )
             speaker = mapping.get(str(orig), orig)
-            merged.append({"start": seg["start"], "end": seg["end"], "text": seg["text"], "orig": orig, "speaker": speaker})
+            merged.append({
+                "start": seg["start"],
+                "end": seg["end"],
+                "text": seg["text"],
+                "orig": orig,
+                "speaker": speaker
+            })
         return {"results": merged}
     return {"results": transcript}
 
 @app.post("/diarize/{upload_id}")
-async def request_diarization(upload_id: str, current_user=Depends(get_current_user)):
+async def request_diarization(
+    upload_id: str,
+    current_user=Depends(get_current_user),
+):
     await redis.set(f"diarize_requested:{upload_id}", "1")
     await redis.publish(f"progress:{upload_id}", json.dumps({"status":"diarize_requested"}))
     diarize_full.delay(upload_id, None)
     return {"message": "diarization started"}
 
 @app.post("/labels/{upload_id}")
-async def save_labels(upload_id: str, mapping: dict = Body(...), current_user=Depends(get_current_user), db=Depends(get_db)):
+async def save_labels(
+    upload_id: str,
+    mapping: dict = Body(...),
+    current_user=Depends(get_current_user),
+    db=Depends(get_db),
+):
     rec = await get_upload_for_user(db, current_user.id, upload_id)
     if not rec:
         raise HTTPException(404, "upload_id not found")
     rec.label_mapping = mapping
     await db.commit()
 
-    # сразу возвращаем обновлённые результаты
     base = Path(settings.RESULTS_FOLDER) / upload_id
     transcript = json.loads((base/"transcript.json").read_text())
     raw = (base/"diarization.json").exists() and json.loads((base/"diarization.json").read_text()) or []
     merged = []
     for seg in transcript:
-        orig = next((d["speaker"] for d in raw if d["start"] <= seg["start"] < d["end"]), None)
+        orig = next(
+            (d["speaker"] for d in raw if d["start"] <= seg["start"] < d["end"]),
+            None
+        )
         speaker = mapping.get(str(orig), orig)
-        merged.append({"start": seg["start"], "end": seg["end"], "text": seg["text"], "orig": orig, "speaker": speaker})
+        merged.append({
+            "start": seg["start"],
+            "end": seg["end"],
+            "text": seg["text"],
+            "orig": orig,
+            "speaker": speaker
+        })
     return {"results": merged}
+
+# ----------------------------------------
+# Новый эндпоинт для создания Admin-пользователя
+# ----------------------------------------
+
+class AdminCreatePayload(BaseModel):
+    name: str
+
+admin_key_header = APIKeyHeader(name="X-Admin-Key", auto_error=False)
+
+async def verify_admin_key(key: str = Depends(admin_key_header)):
+    if key != settings.ADMIN_KEY:
+        raise HTTPException(403, "Invalid admin key")
+    return key
+
+@app.post("/admin/users", dependencies=[Depends(verify_admin_key)])
+async def create_admin_user(
+    payload: AdminCreatePayload,
+    db=Depends(get_db),
+):
+    """
+    Создать нового admin-пользователя.
+    Требует заголовок X-Admin-Key==settings.ADMIN_KEY
+    """
+    # В crud должен быть определён create_admin_user
+    new_user = await crud_create_admin_user(db, name=payload.name)
+    return {"id": new_user.id, "name": new_user.name, "is_admin": new_user.is_admin}
