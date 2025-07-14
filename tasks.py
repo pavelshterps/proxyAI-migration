@@ -1,3 +1,4 @@
+import io
 import json
 import logging
 import time
@@ -103,7 +104,10 @@ def preload_on_startup(**kwargs):
         except:
             logger.warning("[WARMUP] VAD/diarizer warmup failed")
 
+# --------------------------------------------------
 # Preview + full transcription on GPU queue
+# --------------------------------------------------
+
 @celery_app.task(bind=True, queue="transcribe_gpu")
 def preview_transcribe(self, upload_id, correlation_id):
     cid = correlation_id or "?"
@@ -112,34 +116,34 @@ def preview_transcribe(self, upload_id, correlation_id):
     t0 = time.time()
 
     try:
-        # 1) Обрезка превью
-        src     = next(Path(settings.UPLOAD_FOLDER).glob(f"{upload_id}.*"))
-        out_dir = Path(settings.RESULTS_FOLDER) / upload_id
-        out_dir.mkdir(exist_ok=True, parents=True)
-        preview_wav = out_dir / f"{upload_id}_preview.wav"
-        subprocess.run(
-            ["ffmpeg", "-y", "-i", str(src),
-             "-ss", "0", "-t", str(settings.PREVIEW_LENGTH_S),
-             "-acodec", "pcm_s16le", "-ac", "1", "-ar", "16k",
-             str(preview_wav)],
-            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-        )
+        # Чтение исходного файла целиком
+        src_path = next(Path(settings.UPLOAD_FOLDER).glob(f"{upload_id}.*"))
+        data = src_path.read_bytes()
 
-        # 2) Транскрипция превью и публикация частичных результатов
-        segments, info = get_whisper_model().transcribe(
-            str(preview_wav),
-            word_timestamps=True,
-            **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {})
+        # ffmpeg: стриминг из памяти для обрезки превью
+        ffmpeg = subprocess.Popen(
+            ["ffmpeg", "-hide_banner", "-loglevel", "error",
+             "-i", "pipe:0",
+             "-ss", "0", "-t", str(settings.PREVIEW_LENGTH_S),
+             "-acodec", "pcm_s16le", "-ac", "1", "-ar", "16k", "pipe:1"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE
         )
+        preview_wav, _ = ffmpeg.communicate(input=data)
+
+        # Асинхронная отправка частичных результатов
         segment_acc = []
-        for seg in segments:
-            frag = {"start": seg.start, "end": seg.end, "text": seg.text}
+        for segment in get_whisper_model().transcribe(
+            io.BytesIO(preview_wav),
+            word_timestamps=True,
+            max_initial_timestamp=settings.PREVIEW_LENGTH_S,
+            **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {})
+        ):
+            frag = {"start": segment.start, "end": segment.end, "text": segment.text}
             segment_acc.append(frag)
             r.publish(
                 f"progress:{upload_id}",
                 json.dumps({"status": "preview_partial", "fragment": frag})
             )
-        segs = segment_acc
 
     except Exception as e:
         logger.error(f"[{cid}] preview_transcribe error", exc_info=True)
@@ -149,10 +153,12 @@ def preview_transcribe(self, upload_id, correlation_id):
         )
         return
 
-    # Финальный результат превью
+    # Сохранение финального превью
+    out_dir = Path(settings.RESULTS_FOLDER) / upload_id
+    out_dir.mkdir(exist_ok=True, parents=True)
     preview = {
-        "text": "".join(s["text"] for s in segs),
-        "timestamps": segs
+        "text": "".join(f["text"] for f in segment_acc),
+        "timestamps": segment_acc
     }
     (out_dir / "preview_transcript.json").write_text(
         json.dumps(preview, ensure_ascii=False, indent=2)
@@ -166,6 +172,7 @@ def preview_transcribe(self, upload_id, correlation_id):
     transcribe_segments.delay(upload_id, correlation_id)
     logger.info(f"[{cid}] PREVIEW TRANSCRIBE done in {time.time()-t0:.2f}s")
 
+
 @celery_app.task(bind=True, queue="transcribe_gpu")
 def transcribe_segments(self, upload_id, correlation_id):
     cid = correlation_id or "?"
@@ -178,10 +185,11 @@ def transcribe_segments(self, upload_id, correlation_id):
     t0 = time.time()
 
     try:
-        wav = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
-        segs, _ = get_whisper_model().transcribe(
-            str(wav),
+        wav_path = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
+        segments, _ = get_whisper_model().transcribe(
+            str(wav_path),
             word_timestamps=True,
+            chunk_length_s=settings.CHUNK_LENGTH_S,
             **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {})
         )
     except Exception as e:
@@ -192,15 +200,11 @@ def transcribe_segments(self, upload_id, correlation_id):
         )
         return
 
-    segs = list(segs)
-    out = Path(settings.RESULTS_FOLDER) / upload_id
-    out.mkdir(exist_ok=True)
-    (out / "transcript.json").write_text(
-        json.dumps(
-            [{"start": s.start, "end": s.end, "text": s.text} for s in segs],
-            ensure_ascii=False,
-            indent=2
-        )
+    segs = [{"start": s.start, "end": s.end, "text": s.text} for s in segments]
+    out_dir = Path(settings.RESULTS_FOLDER) / upload_id
+    out_dir.mkdir(exist_ok=True)
+    (out_dir / "transcript.json").write_text(
+        json.dumps(segs, ensure_ascii=False, indent=2)
     )
     r.publish(f"progress:{upload_id}", json.dumps({"status": "transcript_done"}))
 
@@ -209,6 +213,7 @@ def transcribe_segments(self, upload_id, correlation_id):
         logger.info(f"[{cid}] auto-diarize queued")
 
     logger.info(f"[{cid}] TRANSCRIBE done in {time.time()-t0:.2f}s")
+
 
 @celery_app.task(bind=True, queue="diarize_gpu")
 def diarize_full(self, upload_id, correlation_id):
@@ -222,10 +227,15 @@ def diarize_full(self, upload_id, correlation_id):
     t0 = time.time()
 
     try:
-        wav = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
-        get_vad()
-        get_clustering_diarizer()
-        ann = get_clustering_diarizer().apply({"audio": str(wav)})
+        wav_path = str(Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav")
+
+        # 1) Voice Activity Detection
+        speech_regions = get_vad().apply(wav_path)
+
+        # 2) Clustering only on speech regions
+        diarizer = get_clustering_diarizer()
+        ann = diarizer.apply({"uri": upload_id, "audio": wav_path, "speech_region": speech_regions})
+
     except Exception as e:
         logger.error(f"[{cid}] diarize_full error", exc_info=True)
         r.publish(
@@ -238,13 +248,14 @@ def diarize_full(self, upload_id, correlation_id):
         {"start": float(s.start), "end": float(s.end), "speaker": spk}
         for s, _, spk in ann.itertracks(yield_label=True)
     ]
-    out = Path(settings.RESULTS_FOLDER) / upload_id
-    out.mkdir(exist_ok=True)
-    (out / "diarization.json").write_text(
+    out_dir = Path(settings.RESULTS_FOLDER) / upload_id
+    out_dir.mkdir(exist_ok=True)
+    (out_dir / "diarization.json").write_text(
         json.dumps(segs, ensure_ascii=False, indent=2)
     )
     r.publish(f"progress:{upload_id}", json.dumps({"status": "diarization_done"}))
     logger.info(f"[{cid}] DIARIZE done in {time.time()-t0:.2f}s")
+
 
 @celery_app.task(bind=True, queue="transcribe_cpu")
 def cleanup_old_files(self):
