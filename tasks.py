@@ -110,7 +110,9 @@ def preview_transcribe(self, upload_id, correlation_id):
     logger.info(f"[{cid}] PREVIEW TRANSCRIBE start {upload_id}")
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
     t0 = time.time()
+
     try:
+        # 1) Обрезка превью
         src     = next(Path(settings.UPLOAD_FOLDER).glob(f"{upload_id}.*"))
         out_dir = Path(settings.RESULTS_FOLDER) / upload_id
         out_dir.mkdir(exist_ok=True, parents=True)
@@ -122,27 +124,32 @@ def preview_transcribe(self, upload_id, correlation_id):
              str(preview_wav)],
             check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
-        # асинхронная отправка частичных результатов
-        segment_acc = []
-        for seg, _ in get_whisper_model().transcribe(
+
+        # 2) Транскрипция превью и публикация частичных результатов
+        segments, info = get_whisper_model().transcribe(
             str(preview_wav),
             word_timestamps=True,
             **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {})
-        ):
+        )
+        segment_acc = []
+        for seg in segments:
             frag = {"start": seg.start, "end": seg.end, "text": seg.text}
             segment_acc.append(frag)
-            r.publish(f"progress:{upload_id}", json.dumps({
-                "status": "preview_partial",
-                "fragment": frag
-            }))
+            r.publish(
+                f"progress:{upload_id}",
+                json.dumps({"status": "preview_partial", "fragment": frag})
+            )
         segs = segment_acc
+
     except Exception as e:
         logger.error(f"[{cid}] preview_transcribe error", exc_info=True)
-        r.publish(f"progress:{upload_id}", json.dumps({
-            "status": "error",
-            "error": str(e)
-        }))
+        r.publish(
+            f"progress:{upload_id}",
+            json.dumps({"status": "error", "error": str(e)})
+        )
         return
+
+    # Финальный результат превью
     preview = {
         "text": "".join(s["text"] for s in segs),
         "timestamps": segs
@@ -150,10 +157,12 @@ def preview_transcribe(self, upload_id, correlation_id):
     (out_dir / "preview_transcript.json").write_text(
         json.dumps(preview, ensure_ascii=False, indent=2)
     )
-    r.publish(f"progress:{upload_id}", json.dumps({
-        "status": "preview_done",
-        "preview": preview
-    }))
+    r.publish(
+        f"progress:{upload_id}",
+        json.dumps({"status": "preview_done", "preview": preview})
+    )
+
+    # Запуск полного транскрипта
     transcribe_segments.delay(upload_id, correlation_id)
     logger.info(f"[{cid}] PREVIEW TRANSCRIBE done in {time.time()-t0:.2f}s")
 
@@ -164,8 +173,10 @@ def transcribe_segments(self, upload_id, correlation_id):
     if not _HF_AVAILABLE:
         logger.error(f"[{cid}] no Whisper, skip transcribe")
         return
+
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
     t0 = time.time()
+
     try:
         wav = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
         segs, _ = get_whisper_model().transcribe(
@@ -175,22 +186,28 @@ def transcribe_segments(self, upload_id, correlation_id):
         )
     except Exception as e:
         logger.error(f"[{cid}] transcribe_segments error", exc_info=True)
-        r.publish(f"progress:{upload_id}", json.dumps({
-            "status": "error",
-            "error": str(e)
-        }))
+        r.publish(
+            f"progress:{upload_id}",
+            json.dumps({"status": "error", "error": str(e)})
+        )
         return
+
     segs = list(segs)
     out = Path(settings.RESULTS_FOLDER) / upload_id
     out.mkdir(exist_ok=True)
-    (out / "transcript.json").write_text(json.dumps(
-        [{"start": s.start, "end": s.end, "text": s.text} for s in segs],
-        ensure_ascii=False, indent=2
-    ))
+    (out / "transcript.json").write_text(
+        json.dumps(
+            [{"start": s.start, "end": s.end, "text": s.text} for s in segs],
+            ensure_ascii=False,
+            indent=2
+        )
+    )
     r.publish(f"progress:{upload_id}", json.dumps({"status": "transcript_done"}))
+
     if r.get(f"diarize_requested:{upload_id}") == "1":
         diarize_full.delay(upload_id, correlation_id)
         logger.info(f"[{cid}] auto-diarize queued")
+
     logger.info(f"[{cid}] TRANSCRIBE done in {time.time()-t0:.2f}s")
 
 @celery_app.task(bind=True, queue="diarize_gpu")
@@ -200,8 +217,10 @@ def diarize_full(self, upload_id, correlation_id):
     if not _PN_AVAILABLE:
         logger.error(f"[{cid}] no pyannote, skip diarize")
         return
+
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
     t0 = time.time()
+
     try:
         wav = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
         get_vad()
@@ -209,11 +228,12 @@ def diarize_full(self, upload_id, correlation_id):
         ann = get_clustering_diarizer().apply({"audio": str(wav)})
     except Exception as e:
         logger.error(f"[{cid}] diarize_full error", exc_info=True)
-        r.publish(f"progress:{upload_id}", json.dumps({
-            "status": "error",
-            "error": str(e)
-        }))
+        r.publish(
+            f"progress:{upload_id}",
+            json.dumps({"status": "error", "error": str(e)})
+        )
         return
+
     segs = [
         {"start": float(s.start), "end": float(s.end), "speaker": spk}
         for s, _, spk in ann.itertracks(yield_label=True)
