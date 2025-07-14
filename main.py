@@ -31,10 +31,7 @@ from crud import (
     create_admin_user as crud_create_admin_user
 )
 from dependencies import get_current_user
-# Импортируем preview_slice как preview_transcribe
-from tasks import preview_slice as preview_transcribe, transcribe_segments, diarize_full
-
-# Добавили подключение дополнительных маршрутов из routes.py
+from tasks import preview_transcribe, transcribe_segments, diarize_full
 from routes import router as api_router
 
 # --- structlog setup ---
@@ -164,6 +161,7 @@ async def upload(
     await redis.set(f"progress:{upload_id}", json.dumps({"status":"started"}))
     await redis.publish(f"progress:{upload_id}", json.dumps({"status":"started"}))
 
+    # Запускаем единый таск превью на GPU
     preview_transcribe.delay(upload_id, cid)
     return JSONResponse({"upload_id": upload_id}, headers={"X-Correlation-ID": cid})
 
@@ -262,14 +260,12 @@ async def create_admin_user(
     Создать нового admin-пользователя.
     Требует заголовок X-Admin-Key == settings.ADMIN_API_KEY
     """
-    # генерируем собственный API-ключ
     new_api_key = uuid.uuid4().hex
-    # create_user принимает (db, username, api_key)
     new_user = await crud_create_admin_user(db, payload.name, new_api_key)
 
     return {
-                "id": new_user.id,
-                "name": new_user.name,
-                "api_key": new_user.api_key,
-                "is_admin": getattr(new_user, "is_admin", False)
+        "id": new_user.id,
+        "name": new_user.name,
+        "api_key": new_user.api_key,
+        "is_admin": getattr(new_user, "is_admin", False)
     }

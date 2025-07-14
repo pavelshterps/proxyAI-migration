@@ -1,5 +1,3 @@
-# config/celery.py
-
 from celery import Celery
 from kombu import Queue
 from config.settings import settings
@@ -26,9 +24,10 @@ celery_app.conf.update(
         Queue('transcribe_gpu'),
         Queue('diarize_gpu'),
     ],
+    # Теперь у нас единый таск preview_transcribe → transcribe_gpu
     task_routes={
-        'tasks.preview_slice':      {'queue': 'transcribe_gpu'},
-        'tasks.transcribe_segments':{'queue': 'transcribe_gpu'},
-        'tasks.diarize_full':       {'queue': 'diarize_gpu'},
+        'tasks.preview_transcribe':    {'queue': 'transcribe_gpu'},
+        'tasks.transcribe_segments':   {'queue': 'transcribe_gpu'},
+        'tasks.diarize_full':          {'queue': 'diarize_gpu'},
     },
 )
