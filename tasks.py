@@ -95,7 +95,7 @@ def preload_on_startup(**kwargs):
 
 
 @celery_app.task(bind=True, queue="transcribe_cpu")
-def preview_slice(self, upload_id, correlation_id):
+def preview_transcribe(self, upload_id, correlation_id):
     """
     CPU-этап: конвертация + нарезка первых PREVIEW_LENGTH_S секунд
     """
