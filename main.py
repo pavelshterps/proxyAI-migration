@@ -31,7 +31,7 @@ from crud import (
     create_admin_user as crud_create_admin_user
 )
 from dependencies import get_current_user
-from tasks import preview_transcribe, transcribe_segments, diarize_full
+from tasks import preview_slice, transcribe_segments, diarize_full  # <-- здесь
 
 # --- structlog setup ---
 structlog.configure(processors=[
@@ -65,10 +65,8 @@ app.add_middleware(
 )
 
 # --- serve your SPA ---
-# static JS/CSS under /static
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
-# root -> index.html
 @app.get("/", response_class=HTMLResponse)
 async def serve_frontend():
     index_path = Path("static/index.html")
@@ -76,7 +74,6 @@ async def serve_frontend():
         raise HTTPException(404, "Not found")
     return HTMLResponse(index_path.read_text(encoding="utf-8"))
 
-# optional favicon
 @app.get("/favicon.ico", include_in_schema=False)
 async def favicon():
     maybe = Path("static/favicon.ico")
@@ -84,10 +81,8 @@ async def favicon():
         return StaticFiles(directory="static").lookup_path("favicon.ico")
     raise HTTPException(404)
 
-
 @app.on_event("startup")
 async def startup():
-    # retry DB connect
     for attempt in range(5):
         try:
             await init_models(engine)
@@ -96,12 +91,10 @@ async def startup():
         except OSError as e:
             log.warning("DB init failed", attempt=attempt, error=str(e))
             await asyncio.sleep(2)
-    # ensure dirs
     for d in (settings.UPLOAD_FOLDER, settings.RESULTS_FOLDER, settings.DIARIZER_CACHE_DIR):
         Path(d).mkdir(parents=True, exist_ok=True)
         log.debug("Ensured dir", path=str(d))
 
-# Redis for SSE + Celery
 redis = redis_async.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
@@ -114,7 +107,6 @@ async def get_api_key(
         raise HTTPException(401, "Missing API Key")
     return key
 
-# SSE endpoint
 @app.get("/events/{upload_id}")
 async def progress_events(
     upload_id: str,
@@ -141,11 +133,10 @@ async def progress_events(
             await sub.unsubscribe(f"progress:{upload_id}")
     return EventSourceResponse(gen())
 
-# Upload endpoint
 @app.post("/upload")
 @limiter.limit("10/minute")
 async def upload(
-    request: Request,  # needed for slowapi
+    request: Request,
     file: UploadFile = File(...),
     x_correlation_id: str | None = Header(None),
     current_user=Depends(get_current_user),
@@ -166,10 +157,10 @@ async def upload(
     await redis.set(f"progress:{upload_id}", json.dumps({"status":"started"}))
     await redis.publish(f"progress:{upload_id}", json.dumps({"status":"started"}))
 
-    preview_slice.delay(upload_id, cid)
+    preview_slice.delay(upload_id, cid)  # <-- здесь
+
     return JSONResponse({"upload_id": upload_id}, headers={"X-Correlation-ID": cid})
 
-# Get results
 @app.get("/results/{upload_id}")
 async def get_results(
     upload_id: str,
@@ -203,7 +194,6 @@ async def get_results(
         return {"results": merged}
     return {"results": transcript}
 
-# Diarization trigger
 @app.post("/diarize/{upload_id}")
 async def request_diarization(
     upload_id: str,
@@ -214,7 +204,6 @@ async def request_diarization(
     diarize_full.delay(upload_id, None)
     return {"message": "diarization started"}
 
-# Save labels
 @app.post("/labels/{upload_id}")
 async def save_labels(
     upload_id: str,
@@ -247,14 +236,12 @@ async def save_labels(
         })
     return {"results": merged}
 
-# --- Admin endpoint ---
 class AdminCreatePayload(BaseModel):
     name: str
 
 admin_key_header = APIKeyHeader(name="X-Admin-Key", auto_error=False)
 
 async def verify_admin_key(key: str = Depends(admin_key_header)):
-    # теперь проверяем правильный параметр из settings
     if key != settings.ADMIN_API_KEY:
         raise HTTPException(403, "Invalid admin key")
     return key
@@ -264,12 +251,7 @@ async def create_admin_user(
     payload: AdminCreatePayload,
     db=Depends(get_db),
 ):
-    """
-    Создать нового admin-пользователя.
-    Требует заголовок X-Admin-Key == settings.ADMIN_API_KEY
-    """
-    # создаём пользователя (api_key сгенерируется автоматически)
-    new_user = await crud_create_admin_user(db, payload.name)
+    new_user = await crud_create_admin_user(db, name=payload.name)
     return {
         "id": new_user.id,
         "name": new_user.name,
