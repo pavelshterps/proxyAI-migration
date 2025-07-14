@@ -28,7 +28,6 @@
 
   <div id="status" style="margin-top:1rem;">Готово к загрузке</div>
   <div id="timings"></div>
-
   <button id="requestDiarizeBtn" disabled>Запросить диаризацию</button>
 
   <h2>Плеер</h2>
@@ -69,6 +68,8 @@
       audioEl.src = URL.createObjectURL(file);
       timingsEl.textContent = "";
       previewDone = transcriptDone = diarizeDone = false;
+      saveBtn.disabled = true;
+      diarizeBtn.disabled = true;
 
       try {
         const form = new FormData();
@@ -98,6 +99,7 @@
         if(st.preview && !previewDone){
           previewDone = true;
           timingsEl.innerHTML += `<div>Preview: ${(performance.now()/1000).toFixed(2)}s</div>`;
+          render(st.preview.timestamps);                // <-- рендерим превью
         }
         if(st.status==="transcript_done" && !transcriptDone){
           transcriptDone = true;
@@ -108,7 +110,7 @@
         if(st.status==="diarization_done" && !diarizeDone){
           diarizeDone = true;
           timingsEl.innerHTML += `<div>Diarization: ${(performance.now()/1000).toFixed(2)}s</div>`;
-          saveBtn.disabled = false;
+          saveBtn.disabled = false;                     // активируем кнопку
           es.close();
           loadResults();
         }
@@ -144,14 +146,12 @@
 
     function render(segments){
       container.innerHTML = "";
-      // mapping orig→current
       const mapping = {};
       const frag = document.createDocumentFragment();
 
       segments.forEach(seg => {
-        const orig    = seg.orig ?? "";              // теперь на бэке присылается поле orig
+        const orig    = seg.orig ?? "";
         const current = seg.speaker ?? orig;
-
         mapping[orig] = current;
 
         const div   = document.createElement("div");
@@ -171,7 +171,7 @@
 
         const inp = document.createElement("input");
         inp.value = current;
-        inp.dataset.orig = orig;                     // храним неизменяемый ключ
+        inp.dataset.orig = orig;
         inp.onchange = () => {
           const newName = inp.value.trim();
           if(!newName || newName.length>50){
@@ -180,11 +180,10 @@
             return;
           }
           mapping[orig] = newName;
-          // обновляем все инпуты с тем же data-orig
           container.querySelectorAll('input').forEach(i => {
             if(i.dataset.orig === orig) i.value = newName;
           });
-          saveBtn.disabled = false;
+          saveBtn.disabled = false;                   // кнопка снова активируется при изменении
         };
 
         const txt = document.createElement("span");
@@ -194,7 +193,10 @@
         frag.append(div);
       });
 
-      // навешиваем обработчик «Сохранить» только после рендера
+      // всегда держим кнопку Save активной после рендера
+      saveBtn.disabled = false;
+
+      // навешиваем «Сохранить»
       saveBtn.onclick = async () => {
         const key = apiKeyEl.value.trim();
         const payload = {};
@@ -218,9 +220,9 @@
           return;
         }
         const { results } = await res.json();
-        render(results);    // перерендериваем с новым orig/speaker
-        saveBtn.disabled = true;
+        render(results);
         statusEl.textContent = "Метки сохранены";
+        // не отключаем кнопку, чтобы можно было править снова
       };
 
       container.append(frag);
