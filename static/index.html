@@ -49,6 +49,37 @@
     return `${m}:${s}`;
   }
 
+  // Добавляем фрагмент превью по мере поступления
+  function addFragment(seg) {
+    const div = document.createElement("div");
+    div.className = "segment";
+
+    const ts = document.createElement("span");
+    ts.className = "time";
+    ts.textContent = fmt(seg.start * 1000);
+    div.append(ts);
+
+    const pb = document.createElement("button");
+    pb.textContent = "▶️";
+    pb.onclick = () => {
+      audioEl.currentTime = seg.start;
+      audioEl.play();
+      setTimeout(() => audioEl.pause(), (seg.end - seg.start) * 1000);
+    };
+    div.append(pb);
+
+    const inp = document.createElement("input");
+    inp.value = "";
+    inp.disabled = true;  // пока что без спикера
+    div.append(inp);
+
+    const txt = document.createElement("span");
+    txt.textContent = seg.text;
+    div.append(txt);
+
+    container.append(div);
+  }
+
   uploadBtn.onclick = async () => {
     if (es) { es.close(); es = null; }
 
@@ -98,11 +129,23 @@
       const st = JSON.parse(msg.replace(/^data:\s*/,""));
       statusEl.textContent = `Статус: ${st.status}`;
 
+      // Частичные фрагменты превью
+      if (st.status === "preview_partial") {
+        if (!mapping.__initialized) {
+          mapping.__initialized = true;
+          timingsEl.innerHTML += `<div>Preview (partial): ${((performance.now()-startTs)/1000).toFixed(2)}s</div>`;
+        }
+        addFragment(st.fragment);
+        return;
+      }
+
+      // Финальное превью (единоразово)
       if (st.preview && !mapping.__initialized) {
         mapping.__initialized = true;
         render(st.preview.timestamps);
         timingsEl.innerHTML += `<div>Preview: ${((performance.now()-startTs)/1000).toFixed(2)}s</div>`;
       }
+
       if (st.status === "transcript_done") {
         timingsEl.innerHTML += `<div>Transcript: ${((performance.now()-startTs)/1000).toFixed(2)}s</div>`;
         diarizeBtn.disabled = false;
@@ -165,8 +208,6 @@
       body: JSON.stringify(payload)
     });
     if (!res.ok) { alert("Ошибка"); return; }
-
-    // Заменили локальный render на перезагрузку результатов
     await loadResults();
     statusEl.textContent = "Метки сохранены";
     savePending = false;
@@ -201,7 +242,11 @@
       inp.dataset.orig = orig;
       inp.onchange = () => {
         const v = inp.value.trim();
-        if (!v||v.length>50) { alert("Имя 1–50 символов"); inp.value=mapping[orig]; return; }
+        if (!v||v.length>50) {
+          alert("Имя 1–50 символов");
+          inp.value = mapping[orig];
+          return;
+        }
         mapping[orig]    = v;
         savePending      = true;
         saveBtn.disabled = false;
