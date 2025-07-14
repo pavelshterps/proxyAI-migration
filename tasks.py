@@ -35,6 +35,7 @@ _clustering_diarizer = None
 def get_whisper_model():
     global _whisper_model
     if _whisper_model is None:
+        logger.info("[WHISPER] initializing model")
         model_id = settings.WHISPER_MODEL_PATH
         cache = settings.HUGGINGFACE_CACHE_DIR
         device = settings.WHISPER_DEVICE.lower()
@@ -53,6 +54,7 @@ def get_whisper_model():
 def get_vad():
     global _vad
     if _vad is None:
+        logger.info("[VAD] loading VAD")
         _vad = VoiceActivityDetection.from_pretrained(
             settings.VAD_MODEL_PATH,
             cache_dir=settings.HUGGINGFACE_CACHE_DIR,
@@ -64,6 +66,7 @@ def get_vad():
 def get_clustering_diarizer():
     global _clustering_diarizer
     if _clustering_diarizer is None:
+        logger.info("[DIARIZER] loading diarizer")
         Path(settings.DIARIZER_CACHE_DIR).mkdir(parents=True, exist_ok=True)
         _clustering_diarizer = SpeakerDiarization.from_pretrained(
             settings.PYANNOTE_PIPELINE,
@@ -75,28 +78,29 @@ def get_clustering_diarizer():
 
 @worker_process_init.connect
 def preload_on_startup(**kwargs):
+    logger.info("[WARMUP] warming up models")
     if _HF_AVAILABLE:
         sample = Path(__file__).parent / "tests/fixtures/sample.wav"
         try:
             get_whisper_model().transcribe(str(sample), max_initial_timestamp=settings.PREVIEW_LENGTH_S)
-            logger.info("[WARMUP] Whisper warmup ok")
+            logger.info("[WARMUP] Whisper ok")
         except:
-            logger.warning("[WARMUP] Whisper warmup failed")
+            logger.warning("[WARMUP] Whisper failed")
     if _PN_AVAILABLE and settings.WHISPER_DEVICE.lower().startswith("cuda"):
         try:
             get_vad(); get_clustering_diarizer()
-            logger.info("[WARMUP] VAD/diarizer warmup ok")
+            logger.info("[WARMUP] VAD & diarizer ok")
         except:
-            logger.warning("[WARMUP] VAD/diarizer warmup failed")
+            logger.warning("[WARMUP] VAD/diarizer failed")
 
 
 @celery_app.task(bind=True, queue="transcribe_cpu")
 def preview_slice(self, upload_id, correlation_id):
+    """CPU: нарезка и базовая транскрипция первых PREVIEW_LENGTH_S секунд."""
     cid = correlation_id or "?"
     logger.info(f"[{cid}] PREVIEW SLICE start {upload_id}")
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
     t0 = time.time()
-
     try:
         src = next(Path(settings.UPLOAD_FOLDER).glob(f"{upload_id}.*"))
         wav_full = convert_to_wav(src, Path(settings.UPLOAD_FOLDER)/f"{upload_id}.wav")
@@ -104,7 +108,6 @@ def preview_slice(self, upload_id, correlation_id):
         preview_audio = audio[: int(settings.PREVIEW_LENGTH_S * 1000)]
         preview_path = Path(settings.UPLOAD_FOLDER)/f"{upload_id}_preview.wav"
         preview_audio.export(str(preview_path), format="wav")
-
         segs, _ = get_whisper_model().transcribe(
             str(preview_path),
             word_timestamps=True,
@@ -125,7 +128,7 @@ def preview_slice(self, upload_id, correlation_id):
     (out/"preview.json").write_text(json.dumps(preview, ensure_ascii=False, indent=2))
     r.publish(f"progress:{upload_id}", json.dumps({"status":"preview_done","preview":preview}))
 
-    # hand off to GPU for full transcription
+    # Передаём на GPU таск полной транскрипции
     transcribe_segments.delay(upload_id, correlation_id)
     logger.info(f"[{cid}] PREVIEW SLICE done in {time.time()-t0:.2f}s")
 
@@ -136,7 +139,6 @@ def transcribe_segments(self, upload_id, correlation_id):
     logger.info(f"[{cid}] TRANSCRIBE start {upload_id}")
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
     t0 = time.time()
-
     try:
         wav = Path(settings.UPLOAD_FOLDER)/f"{upload_id}.wav"
         segs, _ = get_whisper_model().transcribe(
@@ -160,6 +162,8 @@ def transcribe_segments(self, upload_id, correlation_id):
 
     if r.get(f"diarize_requested:{upload_id}") == "1":
         diarize_full.delay(upload_id, correlation_id)
+        logger.info(f"[{cid}] auto-diarize queued")
+
     logger.info(f"[{cid}] TRANSCRIBE done in {time.time()-t0:.2f}s")
 
 
@@ -169,20 +173,17 @@ def diarize_full(self, upload_id, correlation_id):
     logger.info(f"[{cid}] DIARIZE start {upload_id}")
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
     t0 = time.time()
-
     try:
         wav = Path(settings.UPLOAD_FOLDER)/f"{upload_id}.wav"
         get_vad(); get_clustering_diarizer()
         ann = get_clustering_diarizer().apply({"audio": str(wav)})
     except Exception as e:
-        logger.error(f"[{cid}] diarize error", exc_info=True)
+        logger.error(f"[{cid}] diarize_full error", exc_info=True)
         r.publish(f"progress:{upload_id}", json.dumps({"status":"error","error":str(e)}))
         return
 
-    segs = [
-        {"start": float(s.start), "end": float(s.end), "speaker": spk}
-        for s, _, spk in ann.itertracks(yield_label=True)
-    ]
+    segs = [{"start": float(s.start), "end": float(s.end), "speaker": spk}
+            for s, _, spk in ann.itertracks(yield_label=True)]
     out = Path(settings.RESULTS_FOLDER)/upload_id
     out.mkdir(exist_ok=True)
     (out/"diarization.json").write_text(json.dumps(segs, ensure_ascii=False, indent=2))
