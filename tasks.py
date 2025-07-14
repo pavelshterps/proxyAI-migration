@@ -20,7 +20,7 @@ try:
     logger.info("[INIT] faster_whisper available")
 except ImportError as e:
     _HF_AVAILABLE = False
-    logger.warning(f"[INIT] faster_whisper not available: {e}")
+    logger.warning(f"[INIT] faster-whisper not available: {e}")
 
 # --- Импорт Pyannote для VAD и диаризации ---
 try:
@@ -117,12 +117,12 @@ def preview_transcribe(self, upload_id, correlation_id):
     t0 = time.time()
 
     try:
-        # Исходник и результирующая папка
-        src     = next(Path(settings.UPLOAD_FOLDER).glob(f"{upload_id}.*"))
+        # Исходный файл с любым расширением
+        src = next(Path(settings.UPLOAD_FOLDER).glob(f"{upload_id}.*"))
         out_dir = Path(settings.RESULTS_FOLDER) / upload_id
         out_dir.mkdir(exist_ok=True, parents=True)
 
-        # ffmpeg → stdout (pipe), сразу подаём первые PREVIEW_LENGTH_S секунд
+        # ffmpeg → stdout (pipe), сразу первые PREVIEW_LENGTH_S секунд
         cmd = [
             "ffmpeg", "-y", "-i", str(src),
             "-ss", "0", "-t", str(settings.PREVIEW_LENGTH_S),
@@ -131,12 +131,11 @@ def preview_transcribe(self, upload_id, correlation_id):
         ]
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
 
-        # транскрипция по фрагментам из pipe
+        # транскрипция по мере поступления
         segments, _ = get_whisper_model().transcribe(
             proc.stdout,
             word_timestamps=True,
-            **({"language": settings.WHISPER_LANGUAGE}
-               if settings.WHISPER_LANGUAGE else {})
+            **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {})
         )
         proc.stdout.close()
         proc.wait()
@@ -145,12 +144,17 @@ def preview_transcribe(self, upload_id, correlation_id):
         for seg in segments:
             frag = {"start": seg.start, "end": seg.end, "text": seg.text}
             segs.append(frag)
-            r.publish(f"progress:{upload_id}",
-                      json.dumps({"status": "preview_partial", "fragment": frag}))
+            r.publish(
+                f"progress:{upload_id}",
+                json.dumps({"status": "preview_partial", "fragment": frag})
+            )
 
     except Exception as e:
         logger.error(f"[{cid}] preview_transcribe error", exc_info=True)
-        r.publish(f"progress:{upload_id}", json.dumps({"status": "error", "error": str(e)}))
+        r.publish(
+            f"progress:{upload_id}",
+            json.dumps({"status": "error", "error": str(e)})
+        )
         return
 
     # финальный JSON превью
@@ -158,7 +162,10 @@ def preview_transcribe(self, upload_id, correlation_id):
     (out_dir / "preview_transcript.json").write_text(
         json.dumps(preview, ensure_ascii=False, indent=2)
     )
-    r.publish(f"progress:{upload_id}", json.dumps({"status": "preview_done", "preview": preview}))
+    r.publish(
+        f"progress:{upload_id}",
+        json.dumps({"status": "preview_done", "preview": preview})
+    )
 
     # запускаем полный транскрипт
     transcribe_segments.delay(upload_id, correlation_id)
@@ -176,10 +183,21 @@ def transcribe_segments(self, upload_id, correlation_id):
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
     t0 = time.time()
 
-    src = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
+    # найдём исходник с любым расширением
+    try:
+        src = next(Path(settings.UPLOAD_FOLDER).glob(f"{upload_id}.*"))
+    except StopIteration:
+        err = "source file not found"
+        logger.error(f"[{cid}] {err} for {upload_id}")
+        r.publish(
+            f"progress:{upload_id}",
+            json.dumps({"status": "error", "error": err})
+        )
+        return
+
+    # узнаём длительность через ffprobe
     duration = None
     try:
-        # узнаём длительность через ffprobe
         cmd = [
             "ffprobe", "-v", "error",
             "-select_streams", "a:0",
@@ -189,18 +207,14 @@ def transcribe_segments(self, upload_id, correlation_id):
         ]
         out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL)
         duration = float(out.strip())
-    except:
+    except Exception:
         logger.warning(f"[{cid}] cannot probe duration, defaulting to full")
-    finally:
-        # если duration не узнали — транскрибируем целиком
-        pass
 
     segments_acc = []
-
-    # если длинный файл — режем на чанки
     chunk_s = getattr(settings, "CHUNK_LENGTH_S", None)
+
     if duration and chunk_s and duration > chunk_s:
-        # по чанкам
+        # длинный файл — режем на чанки
         for start in range(0, int(duration), int(chunk_s)):
             cmd = [
                 "ffmpeg", "-y", "-i", str(src),
@@ -212,12 +226,10 @@ def transcribe_segments(self, upload_id, correlation_id):
             segs, _ = get_whisper_model().transcribe(
                 proc.stdout,
                 word_timestamps=True,
-                **({"language": settings.WHISPER_LANGUAGE}
-                   if settings.WHISPER_LANGUAGE else {})
+                **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {})
             )
             proc.stdout.close()
             proc.wait()
-            # добавляем оффсет
             for seg in segs:
                 segments_acc.append({
                     "start": seg.start + start,
@@ -229,8 +241,7 @@ def transcribe_segments(self, upload_id, correlation_id):
         segs, _ = get_whisper_model().transcribe(
             str(src),
             word_timestamps=True,
-            **({"language": settings.WHISPER_LANGUAGE}
-               if settings.WHISPER_LANGUAGE else {})
+            **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {})
         )
         for seg in segs:
             segments_acc.append({"start": seg.start, "end": seg.end, "text": seg.text})
@@ -243,7 +254,7 @@ def transcribe_segments(self, upload_id, correlation_id):
     )
     r.publish(f"progress:{upload_id}", json.dumps({"status": "transcript_done"}))
 
-    # по запросу — диаризация
+    # по запросу — запускаем диаризацию
     if r.get(f"diarize_requested:{upload_id}") == "1":
         diarize_full.delay(upload_id, correlation_id)
         logger.info(f"[{cid}] auto-diarize queued")
@@ -263,14 +274,19 @@ def diarize_full(self, upload_id, correlation_id):
     t0 = time.time()
 
     try:
-        wav_path = str(Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav")
+        # найдём исходник
+        src = next(Path(settings.UPLOAD_FOLDER).glob(f"{upload_id}.*"))
+        wav_path = str(src)
         # сначала VAD
         speech = get_vad().apply({"audio": wav_path})
         # затем кластеризация только на активах речи
         ann = get_clustering_diarizer().apply({"audio": wav_path, "speech": speech})
     except Exception as e:
         logger.error(f"[{cid}] diarize_full error", exc_info=True)
-        r.publish(f"progress:{upload_id}", json.dumps({"status": "error", "error": str(e)}))
+        r.publish(
+            f"progress:{upload_id}",
+            json.dumps({"status": "error", "error": str(e)})
+        )
         return
 
     segs = [
@@ -298,7 +314,10 @@ def cleanup_old_files(self):
         for path in base.glob("**/*"):
             try:
                 if datetime.utcfromtimestamp(path.stat().st_mtime) < cutoff:
-                    path.rmdir() if path.is_dir() else path.unlink()
+                    if path.is_dir():
+                        path.rmdir()
+                    else:
+                        path.unlink()
                     deleted += 1
             except:
                 continue
