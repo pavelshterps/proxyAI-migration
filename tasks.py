@@ -1,4 +1,3 @@
-import io
 import json
 import logging
 import time
@@ -13,7 +12,7 @@ from config.celery import celery_app
 
 logger = logging.getLogger(__name__)
 
-# Импорт Whisper
+# --- Импорт Whisper ---
 try:
     from faster_whisper import WhisperModel, download_model
     _HF_AVAILABLE = True
@@ -22,7 +21,7 @@ except ImportError as e:
     _HF_AVAILABLE = False
     logger.warning(f"[INIT] faster_whisper not available: {e}")
 
-# Импорт Pyannote
+# --- Импорт Pyannote для VAD и диаризации ---
 try:
     from pyannote.audio.pipelines import VoiceActivityDetection, SpeakerDiarization
     _PN_AVAILABLE = True
@@ -104,6 +103,7 @@ def preload_on_startup(**kwargs):
         except:
             logger.warning("[WARMUP] VAD/diarizer warmup failed")
 
+
 # --------------------------------------------------
 # Preview + full transcription on GPU queue
 # --------------------------------------------------
@@ -116,30 +116,35 @@ def preview_transcribe(self, upload_id, correlation_id):
     t0 = time.time()
 
     try:
-        # Чтение исходного файла целиком
-        src_path = next(Path(settings.UPLOAD_FOLDER).glob(f"{upload_id}.*"))
-        data = src_path.read_bytes()
+        # 1) Источник и директория результатов
+        src     = next(Path(settings.UPLOAD_FOLDER).glob(f"{upload_id}.*"))
+        out_dir = Path(settings.RESULTS_FOLDER) / upload_id
+        out_dir.mkdir(exist_ok=True, parents=True)
 
-        # ffmpeg: стриминг из памяти для обрезки превью
-        ffmpeg = subprocess.Popen(
-            ["ffmpeg", "-hide_banner", "-loglevel", "error",
-             "-i", "pipe:0",
-             "-ss", "0", "-t", str(settings.PREVIEW_LENGTH_S),
-             "-acodec", "pcm_s16le", "-ac", "1", "-ar", "16k", "pipe:1"],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE
-        )
-        preview_wav, _ = ffmpeg.communicate(input=data)
+        # 2) FFmpeg → stdout (pipe), без промежуточного файла
+        cmd = [
+            "ffmpeg", "-y", "-i", str(src),
+            "-ss", "0", "-t", str(settings.PREVIEW_LENGTH_S),
+            "-acodec", "pcm_s16le", "-ac", "1", "-ar", "16k",
+            "-f", "wav", "pipe:1"
+        ]
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
 
-        # Асинхронная отправка частичных результатов
-        segment_acc = []
-        for segment in get_whisper_model().transcribe(
-            io.BytesIO(preview_wav),
+        # 3) Whisper транскрипция из pipe
+        segments, _ = get_whisper_model().transcribe(
+            proc.stdout,
             word_timestamps=True,
-            max_initial_timestamp=settings.PREVIEW_LENGTH_S,
-            **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {})
-        ):
-            frag = {"start": segment.start, "end": segment.end, "text": segment.text}
-            segment_acc.append(frag)
+            **({"language": settings.WHISPER_LANGUAGE}
+               if settings.WHISPER_LANGUAGE else {})
+        )
+        proc.stdout.close()
+        proc.wait()
+
+        # 4) Публикация частичных результатов по мере появления сегментов
+        segs = []
+        for seg in segments:
+            frag = {"start": seg.start, "end": seg.end, "text": seg.text}
+            segs.append(frag)
             r.publish(
                 f"progress:{upload_id}",
                 json.dumps({"status": "preview_partial", "fragment": frag})
@@ -153,12 +158,10 @@ def preview_transcribe(self, upload_id, correlation_id):
         )
         return
 
-    # Сохранение финального превью
-    out_dir = Path(settings.RESULTS_FOLDER) / upload_id
-    out_dir.mkdir(exist_ok=True, parents=True)
+    # 5) Финальный JSON превью
     preview = {
-        "text": "".join(f["text"] for f in segment_acc),
-        "timestamps": segment_acc
+        "text": "".join(s["text"] for s in segs),
+        "timestamps": segs
     }
     (out_dir / "preview_transcript.json").write_text(
         json.dumps(preview, ensure_ascii=False, indent=2)
@@ -168,7 +171,7 @@ def preview_transcribe(self, upload_id, correlation_id):
         json.dumps({"status": "preview_done", "preview": preview})
     )
 
-    # Запуск полного транскрипта
+    # 6) Запуск полного транскрипта
     transcribe_segments.delay(upload_id, correlation_id)
     logger.info(f"[{cid}] PREVIEW TRANSCRIBE done in {time.time()-t0:.2f}s")
 
@@ -185,12 +188,12 @@ def transcribe_segments(self, upload_id, correlation_id):
     t0 = time.time()
 
     try:
-        wav_path = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
-        segments, _ = get_whisper_model().transcribe(
-            str(wav_path),
+        wav = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
+        segs, _ = get_whisper_model().transcribe(
+            str(wav),
             word_timestamps=True,
-            chunk_length_s=settings.CHUNK_LENGTH_S,
-            **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {})
+            **({"language": settings.WHISPER_LANGUAGE}
+               if settings.WHISPER_LANGUAGE else {})
         )
     except Exception as e:
         logger.error(f"[{cid}] transcribe_segments error", exc_info=True)
@@ -200,11 +203,14 @@ def transcribe_segments(self, upload_id, correlation_id):
         )
         return
 
-    segs = [{"start": s.start, "end": s.end, "text": s.text} for s in segments]
-    out_dir = Path(settings.RESULTS_FOLDER) / upload_id
-    out_dir.mkdir(exist_ok=True)
-    (out_dir / "transcript.json").write_text(
-        json.dumps(segs, ensure_ascii=False, indent=2)
+    segs = list(segs)
+    out = Path(settings.RESULTS_FOLDER) / upload_id
+    out.mkdir(exist_ok=True)
+    (out / "transcript.json").write_text(
+        json.dumps(
+            [{"start": s.start, "end": s.end, "text": s.text} for s in segs],
+            ensure_ascii=False, indent=2
+        )
     )
     r.publish(f"progress:{upload_id}", json.dumps({"status": "transcript_done"}))
 
@@ -227,15 +233,10 @@ def diarize_full(self, upload_id, correlation_id):
     t0 = time.time()
 
     try:
-        wav_path = str(Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav")
-
-        # 1) Voice Activity Detection
-        speech_regions = get_vad().apply(wav_path)
-
-        # 2) Clustering only on speech regions
-        diarizer = get_clustering_diarizer()
-        ann = diarizer.apply({"uri": upload_id, "audio": wav_path, "speech_region": speech_regions})
-
+        wav = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
+        get_vad()
+        get_clustering_diarizer()
+        ann = get_clustering_diarizer().apply({"audio": str(wav)})
     except Exception as e:
         logger.error(f"[{cid}] diarize_full error", exc_info=True)
         r.publish(
@@ -248,9 +249,9 @@ def diarize_full(self, upload_id, correlation_id):
         {"start": float(s.start), "end": float(s.end), "speaker": spk}
         for s, _, spk in ann.itertracks(yield_label=True)
     ]
-    out_dir = Path(settings.RESULTS_FOLDER) / upload_id
-    out_dir.mkdir(exist_ok=True)
-    (out_dir / "diarization.json").write_text(
+    out = Path(settings.RESULTS_FOLDER) / upload_id
+    out.mkdir(exist_ok=True)
+    (out / "diarization.json").write_text(
         json.dumps(segs, ensure_ascii=False, indent=2)
     )
     r.publish(f"progress:{upload_id}", json.dumps({"status": "diarization_done"}))
