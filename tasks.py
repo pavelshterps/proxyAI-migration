@@ -124,8 +124,8 @@ def preview_transcribe(self, upload_id, correlation_id):
 
         # ffmpeg → stdout (pipe), первые PREVIEW_LENGTH_S секунд, 2 потока
         cmd = [
-            "ffmpeg", "-y", "-threads", "2", "-i", str(src),
-            "-ss", "0", "-t", str(settings.PREVIEW_LENGTH_S),
+            "ffmpeg", "-y", "-threads", "2", "-ss", "0",
+            "-i", str(src), "-t", str(settings.PREVIEW_LENGTH_S),
             "-acodec", "pcm_s16le", "-ac", "1", "-ar", "16k",
             "-f", "wav", "pipe:1"
         ]
