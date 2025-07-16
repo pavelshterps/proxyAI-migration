@@ -1,4 +1,3 @@
-# main.py
 import time
 import uuid
 import json
@@ -50,8 +49,6 @@ structlog.configure(processors=[
 log = structlog.get_logger()
 
 app = FastAPI(title="proxyAI", version=settings.APP_VERSION)
-
-# Подключаем роуты из routes.py
 app.include_router(api_router)
 
 # --- rate limiter ---
@@ -163,7 +160,6 @@ async def upload(
 
     upload_id = uuid.uuid4().hex
     ext = ""
-    dst_path = None
     try:
         Path(settings.UPLOAD_FOLDER).mkdir(parents=True, exist_ok=True)
 
@@ -185,17 +181,16 @@ async def upload(
         log.error("upload save error", error=str(e))
         raise HTTPException(500, f"Cannot save source: {e}")
 
-    # Сохраняем запись в БД
     try:
         await create_upload_record(db, current_user.id, upload_id)
-    except Exception:
+    except:
         log.warning("DB create failed", upload_id=upload_id)
 
     cid = x_correlation_id or uuid.uuid4().hex
     await redis.set(f"progress:{upload_id}", json.dumps({"status":"started"}))
     await redis.publish(f"progress:{upload_id}", json.dumps({"status":"started"}))
 
-    # Сразу ставим в очередь CPU-воркера на конвертацию и превью
+    # Ставим задачу на CPU: конвертацию + preview на GPU
     convert_to_wav_and_preview.delay(upload_id, cid)
 
     return JSONResponse({"upload_id": upload_id}, headers={"X-Correlation-ID": cid})
@@ -258,14 +253,10 @@ async def save_labels(
 
     base = Path(settings.RESULTS_FOLDER) / upload_id
     transcript = json.loads((base/"transcript.json").read_text())
-    raw = (base/"diarization.json").exists() \
-          and json.loads((base/"diarization.json").read_text()) or []
+    raw = (base/"diarization.json").exists() and json.loads((base/"diarization.json").read_text()) or []
     merged = []
     for seg in transcript:
-        orig = next(
-            (d["speaker"] for d in raw if d["start"] <= seg["start"] < d["end"]),
-            None
-        )
+        orig = next((d["speaker"] for d in raw if d["start"] <= seg["start"] < d["end"]), None)
         speaker = mapping.get(str(orig), orig)
         merged.append({
             "start": seg["start"],
