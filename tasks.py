@@ -1,3 +1,4 @@
+# tasks.py
 import json
 import logging
 import time
@@ -106,9 +107,34 @@ def preload_on_startup(**kwargs):
 
 
 # --------------------------------------------------
-# Preview + full transcription на GPU
+# 1) Конверсия в WAV на CPU → 2) Запуск превью на GPU
 # --------------------------------------------------
+@celery_app.task(bind=True, queue="transcribe_cpu")
+def convert_to_wav_and_preview(self, upload_id, correlation_id):
+    cid = correlation_id or "?"
+    logger.info(f"[{cid}] CONVERT start {upload_id}")
+    r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
+    try:
+        src = next(Path(settings.UPLOAD_FOLDER).glob(f"{upload_id}.*"))
+        wav_path = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
+        # ffmpeg конвертация в PCM-WAV (один раз)
+        subprocess.run([
+            "ffmpeg", "-y", "-threads", "2", "-i", str(src),
+            "-acodec", "pcm_s16le", "-ac", "1", "-ar", "16000",
+            str(wav_path)
+        ], check=True)
+    except Exception as e:
+        logger.error(f"[{cid}] convert_to_wav error", exc_info=True)
+        r.publish(f"progress:{upload_id}", json.dumps({"status": "error", "error": str(e)}))
+        return
 
+    logger.info(f"[{cid}] CONVERT done, launching preview_transcribe")
+    preview_transcribe.delay(upload_id, correlation_id)
+
+
+# --------------------------------------------------
+# Preview транскрипция сразу из готового WAV (GPU)
+# --------------------------------------------------
 @celery_app.task(bind=True, queue="transcribe_gpu")
 def preview_transcribe(self, upload_id, correlation_id):
     cid = correlation_id or "?"
@@ -117,28 +143,13 @@ def preview_transcribe(self, upload_id, correlation_id):
     t0 = time.time()
 
     try:
-        # исходный файл и директория результатов
-        src     = next(Path(settings.UPLOAD_FOLDER).glob(f"{upload_id}.*"))
-        out_dir = Path(settings.RESULTS_FOLDER) / upload_id
-        out_dir.mkdir(exist_ok=True, parents=True)
-
-        # ffmpeg → stdout (pipe), первые PREVIEW_LENGTH_S секунд, 2 потока
-        cmd = [
-            "ffmpeg", "-y", "-threads", "2", "-ss", "0",
-            "-i", str(src), "-t", str(settings.PREVIEW_LENGTH_S),
-            "-acodec", "pcm_s16le", "-ac", "1", "-ar", "16k",
-            "-f", "wav", "pipe:1"
-        ]
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-
-        # транскрипция по мере поступления
+        wav = str(Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav")
         segments, _ = get_whisper_model().transcribe(
-            proc.stdout,
+            wav,
+            max_initial_timestamp=settings.PREVIEW_LENGTH_S,
             word_timestamps=True,
             **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {})
         )
-        proc.stdout.close()
-        proc.wait()
 
         segs = []
         for seg in segments:
@@ -151,27 +162,28 @@ def preview_transcribe(self, upload_id, correlation_id):
 
     except Exception as e:
         logger.error(f"[{cid}] preview_transcribe error", exc_info=True)
-        r.publish(
-            f"progress:{upload_id}",
-            json.dumps({"status": "error", "error": str(e)})
-        )
+        r.publish(f"progress:{upload_id}", json.dumps({"status": "error", "error": str(e)}))
         return
 
-    # сохраняем превью
-    preview = {"text": "".join(s["text"] for s in segs), "timestamps": segs}
+    preview = {
+        "text": "".join(s["text"] for s in segs),
+        "timestamps": segs
+    }
+    out_dir = Path(settings.RESULTS_FOLDER) / upload_id
+    out_dir.mkdir(exist_ok=True, parents=True)
     (out_dir / "preview_transcript.json").write_text(
         json.dumps(preview, ensure_ascii=False, indent=2)
     )
-    r.publish(
-        f"progress:{upload_id}",
-        json.dumps({"status": "preview_done", "preview": preview})
-    )
+    r.publish(f"progress:{upload_id}", json.dumps({"status": "preview_done", "preview": preview}))
 
-    # запускаем полный транскрипт
+    # Запуск полного транскрипта
     transcribe_segments.delay(upload_id, correlation_id)
     logger.info(f"[{cid}] PREVIEW TRANSCRIBE done in {time.time()-t0:.2f}s")
 
 
+# --------------------------------------------------
+# Полная транскрипция сразу из готового WAV (GPU)
+# --------------------------------------------------
 @celery_app.task(bind=True, queue="transcribe_gpu")
 def transcribe_segments(self, upload_id, correlation_id):
     cid = correlation_id or "?"
@@ -183,80 +195,32 @@ def transcribe_segments(self, upload_id, correlation_id):
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
     t0 = time.time()
 
-    # ищем исходный файл
     try:
-        src = next(Path(settings.UPLOAD_FOLDER).glob(f"{upload_id}.*"))
-    except StopIteration:
-        err = "source file not found"
-        logger.error(f"[{cid}] {err} for {upload_id}")
-        r.publish(
-            f"progress:{upload_id}",
-            json.dumps({"status": "error", "error": err})
-        )
-        return
-
-    # пробуем узнать длительность
-    duration = None
-    try:
-        out = subprocess.check_output([
-            "ffprobe", "-v", "error",
-            "-select_streams", "a:0",
-            "-show_entries", "format=duration",
-            "-of", "default=noprint_wrappers=1:nokey=1",
-            str(src)
-        ], stderr=subprocess.DEVNULL)
-        duration = float(out.strip())
-    except Exception:
-        logger.warning(f"[{cid}] cannot probe duration, defaulting to full")
-
-    segments_acc = []
-    chunk_s = getattr(settings, "CHUNK_LENGTH_S", None)
-
-    if duration and chunk_s and duration > chunk_s:
-        # длинный файл — транскрибируем чанками
-        for start in range(0, int(duration), int(chunk_s)):
-            cmd = [
-                "ffmpeg", "-y", "-threads", "2", "-i", str(src),
-                "-ss", str(start), "-t", str(chunk_s),
-                "-acodec", "pcm_s16le", "-ac", "1", "-ar", "16k",
-                "-f", "wav", "pipe:1"
-            ]
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-            segs, _ = get_whisper_model().transcribe(
-                proc.stdout,
-                word_timestamps=True,
-                **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {})
-            )
-            proc.stdout.close()
-            proc.wait()
-            for seg in segs:
-                segments_acc.append({
-                    "start": seg.start + start,
-                    "end":   seg.end   + start,
-                    "text":  seg.text
-                })
-    else:
-        # короткий файл — одним куском
-        segs, _ = get_whisper_model().transcribe(
-            str(src),
+        wav = str(Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav")
+        segments, _ = get_whisper_model().transcribe(
+            wav,
             word_timestamps=True,
             **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {})
         )
-        for seg in segs:
-            segments_acc.append({"start": seg.start, "end": seg.end, "text": seg.text})
+        segments_acc = [{"start": s.start, "end": s.end, "text": s.text} for s in segments]
+    except Exception as e:
+        logger.error(f"[{cid}] transcribe_segments error", exc_info=True)
+        r.publish(f"progress:{upload_id}", json.dumps({"status": "error", "error": str(e)}))
+        return
 
-    # сохраняем полный транскрипт
     out_dir = Path(settings.RESULTS_FOLDER) / upload_id
-    out_dir.mkdir(exist_ok=True)
+    out_dir.mkdir(exist_ok=True, parents=True)
     (out_dir / "transcript.json").write_text(
         json.dumps(segments_acc, ensure_ascii=False, indent=2)
     )
     r.publish(f"progress:{upload_id}", json.dumps({"status": "transcript_done"}))
 
-    # автоматический триггер удалён — теперь диаризацию запускаем только через /diarize
     logger.info(f"[{cid}] TRANSCRIBE done in {time.time()-t0:.2f}s")
 
 
+# --------------------------------------------------
+# Диаризация (GPU) и очистка старых файлов (CPU) без изменений
+# --------------------------------------------------
 @celery_app.task(bind=True, queue="diarize_gpu")
 def diarize_full(self, upload_id, correlation_id):
     cid = correlation_id or "?"
@@ -269,21 +233,12 @@ def diarize_full(self, upload_id, correlation_id):
     t0 = time.time()
 
     try:
-        src = next(Path(settings.UPLOAD_FOLDER).glob(f"{upload_id}.*"))
-        wav_path = str(src)
-        # сначала VAD
+        wav_path = str(Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav")
         speech = get_vad().apply({"audio": wav_path})
-        # затем кластеризация на активах речи
-        ann = get_clustering_diarizer().apply({
-            "audio": wav_path,
-            "speech": speech
-        })
+        ann = get_clustering_diarizer().apply({"audio": wav_path, "speech": speech})
     except Exception as e:
         logger.error(f"[{cid}] diarize_full error", exc_info=True)
-        r.publish(
-            f"progress:{upload_id}",
-            json.dumps({"status": "error", "error": str(e)})
-        )
+        r.publish(f"progress:{upload_id}", json.dumps({"status": "error", "error": str(e)}))
         return
 
     segs = [
@@ -291,7 +246,7 @@ def diarize_full(self, upload_id, correlation_id):
         for s, _, spk in ann.itertracks(yield_label=True)
     ]
     out_dir = Path(settings.RESULTS_FOLDER) / upload_id
-    out_dir.mkdir(exist_ok=True)
+    out_dir.mkdir(exist_ok=True, parents=True)
     (out_dir / "diarization.json").write_text(
         json.dumps(segs, ensure_ascii=False, indent=2)
     )

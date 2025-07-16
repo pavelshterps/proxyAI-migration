@@ -1,3 +1,4 @@
+# main.py
 import time
 import uuid
 import json
@@ -34,8 +35,8 @@ from crud import (
 )
 from dependencies import get_current_user
 
-# Импортим единый таск превью и остальное
-from tasks import preview_transcribe, transcribe_segments, diarize_full
+# --- Импортируем задачи ---
+from tasks import convert_to_wav_and_preview, transcribe_segments, diarize_full
 
 # Подключаем дополнительные маршруты из routes.py (если есть)
 from routes import router as api_router
@@ -155,7 +156,7 @@ async def upload(
 ):
     """
     Принимает либо multipart-файл, либо ссылку на файл (file_url).
-    Сохраняет источник и запускает preview_transcribe таск.
+    Сохраняет источник и запускает CPU-воркер на конвертацию → GPU-воркер на превью.
     """
     if not file and not file_url:
         raise HTTPException(400, "Нужно передать либо файл, либо file_url")
@@ -164,7 +165,6 @@ async def upload(
     ext = ""
     dst_path = None
     try:
-        # убедимся, что папка uploads существует
         Path(settings.UPLOAD_FOLDER).mkdir(parents=True, exist_ok=True)
 
         if file:
@@ -175,7 +175,6 @@ async def upload(
             dst_path = Path(settings.UPLOAD_FOLDER) / f"{upload_id}{ext}"
             dst_path.write_bytes(data)
         else:
-            # скачиваем по URL
             parsed = urlparse(file_url)
             ext = Path(parsed.path).suffix or ""
             dst_path = Path(settings.UPLOAD_FOLDER) / f"{upload_id}{ext}"
@@ -186,19 +185,18 @@ async def upload(
         log.error("upload save error", error=str(e))
         raise HTTPException(500, f"Cannot save source: {e}")
 
-    # Сохраняем запись в БД (если есть)
+    # Сохраняем запись в БД
     try:
         await create_upload_record(db, current_user.id, upload_id)
     except Exception:
         log.warning("DB create failed", upload_id=upload_id)
 
     cid = x_correlation_id or uuid.uuid4().hex
-    # инициализация прогресса
     await redis.set(f"progress:{upload_id}", json.dumps({"status":"started"}))
     await redis.publish(f"progress:{upload_id}", json.dumps({"status":"started"}))
 
-    # Запуск единого таска на GPU
-    preview_transcribe.delay(upload_id, cid)
+    # Сразу ставим в очередь CPU-воркера на конвертацию и превью
+    convert_to_wav_and_preview.delay(upload_id, cid)
 
     return JSONResponse({"upload_id": upload_id}, headers={"X-Correlation-ID": cid})
 
@@ -294,13 +292,8 @@ async def create_admin_user(
     payload: AdminCreatePayload,
     db=Depends(get_db),
 ):
-    """
-    Создать нового admin-пользователя.
-    Требует заголовок X-Admin-Key == settings.ADMIN_API_KEY
-    """
     new_api_key = uuid.uuid4().hex
     new_user = await crud_create_admin_user(db, payload.name, new_api_key)
-
     return {
         "id": new_user.id,
         "name": new_user.name,
