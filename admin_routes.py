@@ -1,12 +1,13 @@
+import uuid
+
 from fastapi import APIRouter, HTTPException, Depends, status
 from fastapi.security.api_key import APIKeyHeader
 from sqlalchemy.ext.asyncio import AsyncSession
-import uuid
 from pydantic import BaseModel
 
+from config.settings import settings
 from database import get_db
 from crud import create_user, delete_user, list_users
-from config.settings import settings
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
@@ -20,8 +21,10 @@ async def require_admin(key: str = Depends(admin_key_header)):
         )
     return key
 
+
 class UserCreateRequest(BaseModel):
     name: str
+
 
 @router.post("/users", dependencies=[Depends(require_admin)])
 async def admin_create_user(
@@ -32,10 +35,12 @@ async def admin_create_user(
     user = await create_user(db, payload.name, key)
     return {"id": user.id, "name": user.name, "api_key": user.api_key}
 
+
 @router.get("/users", dependencies=[Depends(require_admin)])
 async def admin_list_users(db: AsyncSession = Depends(get_db)):
     users = await list_users(db)
     return [{"id": u.id, "name": u.name, "api_key": u.api_key} for u in users]
+
 
 @router.delete("/users/{user_id}", dependencies=[Depends(require_admin)])
 async def admin_delete_user(
