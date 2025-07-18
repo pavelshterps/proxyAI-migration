@@ -1,3 +1,4 @@
+import os
 import json
 import logging
 import subprocess
@@ -11,7 +12,7 @@ from redis import Redis
 from config.settings import settings
 from config.celery import celery_app
 
-logger = logging.getLogger(__name__)
+logger = logging.get_logger(__name__)
 
 # faster-whisper
 try:
@@ -43,7 +44,7 @@ def get_whisper_model():
         model_id = settings.WHISPER_MODEL_PATH
         cache    = settings.HUGGINGFACE_CACHE_DIR
         device   = settings.WHISPER_DEVICE.lower()
-        local    = device == "cpu"
+        local    = (device == "cpu")
         try:
             path = download_model(model_id, cache_dir=cache, local_files_only=local)
         except:
@@ -51,7 +52,7 @@ def get_whisper_model():
         compute = getattr(
             settings,
             "WHISPER_COMPUTE_TYPE",
-            "float16" if device.startswith("cuda") else "int8"
+            ("float16" if device.startswith("cuda") else "int8")
         ).lower()
         if device == "cpu" and compute in ("fp16", "float16"):
             compute = "int8"
@@ -115,10 +116,12 @@ def convert_to_wav_if_needed(src_path: Path) -> Path:
     """
     try:
         probe = subprocess.run(
-            ["ffprobe", "-v", "error",
-             "-show_entries", "stream=codec_name,sample_rate,channels",
-             "-of", "default=noprint_wrappers=1",
-             str(src_path)],
+            [
+                "ffprobe", "-v", "error",
+                "-show_entries", "stream=codec_name,sample_rate,channels",
+                "-of", "default=noprint_wrappers=1",
+                str(src_path)
+            ],
             capture_output=True, text=True, check=True
         )
         info = {l.split("=")[0]: l.split("=")[1] for l in probe.stdout.splitlines()}
@@ -132,16 +135,21 @@ def convert_to_wav_if_needed(src_path: Path) -> Path:
     except Exception:
         pass
 
-    fd, tmp = tempfile.mkstemp(suffix=".wav", dir=settings.UPLOAD_FOLDER)
-    Path(fd).close()
-    tmp = Path(tmp)
-    subprocess.run([
-        "ffmpeg", "-y", "-threads", "2",
-        "-i", str(src_path),
-        "-acodec", "pcm_s16le", "-ac", "1", "-ar", "16000",
-        str(tmp)
-    ], check=True)
-    return tmp
+    # create temp WAV with correct encoding
+    fd, tmp_path_str = tempfile.mkstemp(suffix=".wav", dir=settings.UPLOAD_FOLDER)
+    os.close(fd)
+    tmp_path = Path(tmp_path_str)
+    threads = getattr(settings, "FFMPEG_THREADS", 2)
+    subprocess.run(
+        [
+            "ffmpeg", "-y", f"-threads", str(threads),
+            "-i", str(src_path),
+            "-acodec", "pcm_s16le", "-ac", "1", "-ar", "16000",
+            str(tmp_path)
+        ],
+        check=True
+    )
+    return tmp_path
 
 
 @celery_app.task(bind=True, queue="transcribe_cpu")
@@ -162,6 +170,7 @@ def convert_to_wav_and_preview(self, upload_id, correlation_id):
         return
 
     # сразу на GPU-preview
+    from tasks import preview_transcribe
     preview_transcribe.delay(upload_id, correlation_id)
     logger.info(f"[{cid}] CONVERT done")
 
@@ -175,14 +184,18 @@ def preview_transcribe(self, upload_id, correlation_id):
         wav = next(Path(settings.UPLOAD_FOLDER).glob(f"{upload_id}.wav"))
         out_dir = Path(settings.RESULTS_FOLDER) / upload_id
         out_dir.mkdir(parents=True, exist_ok=True)
+
+        threads = getattr(settings, "FFMPEG_THREADS", 2)
         proc = subprocess.Popen(
             [
-                "ffmpeg", "-y", "-threads", "2", "-i", str(wav),
+                "ffmpeg", "-y", f"-threads", str(threads),
+                "-i", str(wav),
                 "-ss", "0", "-t", str(settings.PREVIEW_LENGTH_S),
                 "-f", "wav", "pipe:1"
             ],
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
         )
+
         segments, _ = get_whisper_model().transcribe(
             proc.stdout,
             word_timestamps=True,
@@ -219,6 +232,8 @@ def preview_transcribe(self, upload_id, correlation_id):
         f"progress:{upload_id}",
         json.dumps({"status": "preview_done", "preview": preview})
     )
+
+    from tasks import transcribe_segments
     transcribe_segments.delay(upload_id, correlation_id)
     logger.info(f"[{cid}] PREVIEW done")
 
@@ -244,12 +259,15 @@ def transcribe_segments(self, upload_id, correlation_id):
 
     # узнаём длительность
     try:
-        out = subprocess.check_output([
-            "ffprobe", "-v", "error", "-select_streams", "a:0",
-            "-show_entries", "format=duration",
-            "-of", "default=noprint_wrappers=1:nokey=1",
-            str(wav)
-        ], stderr=subprocess.DEVNULL)
+        out = subprocess.check_output(
+            [
+                "ffprobe", "-v", "error", "-select_streams", "a:0",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                str(wav)
+            ],
+            stderr=subprocess.DEVNULL
+        )
         duration = float(out.strip())
     except Exception:
         duration = None
@@ -257,11 +275,12 @@ def transcribe_segments(self, upload_id, correlation_id):
     segments_acc = []
     chunk = getattr(settings, "CHUNK_LENGTH_S", None)
     if duration and chunk and duration > chunk:
+        threads = getattr(settings, "FFMPEG_THREADS", 2)
         for start in range(0, int(duration), int(chunk)):
             proc = subprocess.Popen(
                 [
-                    "ffmpeg", "-y", "-threads", "2", "-i", str(wav),
-                    "-ss", str(start), "-t", str(chunk),
+                    "ffmpeg", "-y", f"-threads", str(threads),
+                    "-i", str(wav), "-ss", str(start), "-t", str(chunk),
                     "-f", "wav", "pipe:1"
                 ],
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
