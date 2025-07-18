@@ -37,7 +37,7 @@ from crud import (
 )
 from dependencies import get_current_user
 
-# --- Импорт фоновых задач ---
+# --- Фоновые задачи ---
 from tasks import convert_to_wav_and_preview, diarize_full
 
 app = FastAPI(title="proxyAI", version=settings.APP_VERSION)
@@ -251,7 +251,7 @@ async def get_results(
 
     return {"results": transcript}
 
-# --- Сырые эндпоинты (когда фронту нужно отдельно дергать) ---
+# --- «Сырые» эндпоинты (если фронту нужно дергать отдельно) ---
 @app.get("/transcription/{upload_id}", tags=["default"])
 async def get_full_transcript(
     upload_id: str,
@@ -309,10 +309,10 @@ async def save_labels_endpoint(
     await db.commit()
 
     base = Path(settings.RESULTS_FOLDER) / upload_id
-    transcript = json.loads((base / "transcript.json").read_text())
+    transcript = json.loads((base / "transcript.json").read_text(encoding="utf-8"))
     raw = []
     if (base / "diarization.json").exists():
-        raw = json.loads((base / "diarization.json").read_text())
+        raw = json.loads((base / "diarization.json").read_text(encoding="utf-8"))
     merged = []
     for seg in transcript:
         orig = next((d["speaker"] for d in raw if d["start"] <= seg["start"] < d["end"]), None)
@@ -341,12 +341,7 @@ async def verify_admin_key(key: str = Depends(admin_key_header)):
 async def list_admin_users(db=Depends(get_db)):
     users = await crud_list_users(db)
     return [
-        {
-            "id": u.id,
-            "name": u.name,
-            "api_key": u.api_key,
-            "is_admin": getattr(u, "is_admin", False)
-        }
+        {"id": u.id, "name": u.name, "api_key": u.api_key, "is_admin": getattr(u, "is_admin", False)}
         for u in users
     ]
 
@@ -357,12 +352,8 @@ async def create_admin_user(
 ):
     new_api_key = uuid.uuid4().hex
     new_user = await crud_create_admin_user(db, payload.name, new_api_key)
-    return {
-        "id": new_user.id,
-        "name": new_user.name,
-        "api_key": new_user.api_key,
-        "is_admin": getattr(new_user, "is_admin", False)
-    }
+    return {"id": new_user.id, "name": new_user.name, "api_key": new_user.api_key,
+            "is_admin": getattr(new_user, "is_admin", False)}
 
 @app.delete("/admin/users/{user_id}", tags=["admin"], dependencies=[Depends(verify_admin_key)])
 async def delete_admin_user(user_id: int, db=Depends(get_db)):

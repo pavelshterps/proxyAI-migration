@@ -152,7 +152,7 @@ def convert_to_wav_and_preview(self, upload_id, correlation_id):
         }))
         return
 
-    # Запускаем превью-транскрипт
+    # убрали некорректный "from .tasks" — просто вызываем задачу напрямую
     preview_transcribe.delay(upload_id, correlation_id)
     logger.info(f"[{cid}] CONVERT done")
 
@@ -220,12 +220,13 @@ def transcribe_segments(self, upload_id, correlation_id):
         r.publish(f"progress:{upload_id}", json.dumps({"status": "error", "error": err}))
         return
 
+    # узнаём длительность
     duration = None
     try:
         out = subprocess.check_output([
             "ffprobe", "-v", "error", "-select_streams", "a:0",
             "-show_entries", "format=duration",
-            "-of", "default<noprint_wrappers=1:nokey=1>",
+            "-of", "default=noprint_wrappers=1:nokey=1",
             str(wav_src)
         ], stderr=subprocess.DEVNULL)
         duration = float(out.strip())
