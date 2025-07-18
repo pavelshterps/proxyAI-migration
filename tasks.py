@@ -35,7 +35,6 @@ _whisper_model = None
 _vad = None
 _clustering_diarizer = None
 
-
 def get_whisper_model():
     global _whisper_model
     if _whisper_model is None:
@@ -59,7 +58,6 @@ def get_whisper_model():
         logger.info(f"[WHISPER] model ready on {device} ({compute})")
     return _whisper_model
 
-
 def get_vad():
     global _vad
     if _vad is None:
@@ -71,7 +69,6 @@ def get_vad():
         )
         logger.info("[VAD] ready")
     return _vad
-
 
 def get_clustering_diarizer():
     global _clustering_diarizer
@@ -85,7 +82,6 @@ def get_clustering_diarizer():
         )
         logger.info("[DIARIZER] ready")
     return _clustering_diarizer
-
 
 @worker_process_init.connect
 def preload_on_startup(**kwargs):
@@ -107,7 +103,6 @@ def preload_on_startup(**kwargs):
             logger.info("[WARMUP] VAD & diarizer warmup ok")
         except:
             logger.warning("[WARMUP] VAD/diarizer warmup failed")
-
 
 def convert_to_wav_if_needed(src_path: Path) -> Path:
     """
@@ -140,7 +135,6 @@ def convert_to_wav_if_needed(src_path: Path) -> Path:
     ], check=True)
     return tmp_path
 
-
 @celery_app.task(bind=True, queue="transcribe_cpu")
 def convert_to_wav_and_preview(self, upload_id, correlation_id):
     cid = correlation_id or "?"
@@ -158,10 +152,9 @@ def convert_to_wav_and_preview(self, upload_id, correlation_id):
         }))
         return
 
-    # теперь просто вызываем без некорректного импорта
+    # далее — preview → full → diarization
     preview_transcribe.delay(upload_id, correlation_id)
     logger.info(f"[{cid}] CONVERT done")
-
 
 @celery_app.task(bind=True, queue="transcribe_gpu")
 def preview_transcribe(self, upload_id, correlation_id):
@@ -208,7 +201,6 @@ def preview_transcribe(self, upload_id, correlation_id):
     r.publish(f"progress:{upload_id}", json.dumps({"status": "preview_done", "preview": preview}))
     transcribe_segments.delay(upload_id, correlation_id)
     logger.info(f"[{cid}] PREVIEW done")
-
 
 @celery_app.task(bind=True, queue="transcribe_gpu")
 def transcribe_segments(self, upload_id, correlation_id):
@@ -282,7 +274,6 @@ def transcribe_segments(self, upload_id, correlation_id):
     r.publish(f"progress:{upload_id}", json.dumps({"status": "transcript_done"}))
     logger.info(f"[{cid}] TRANSCRIBE done")
 
-
 @celery_app.task(bind=True, queue="diarize_gpu")
 def diarize_full(self, upload_id, correlation_id):
     cid = correlation_id or "?"
@@ -294,11 +285,11 @@ def diarize_full(self, upload_id, correlation_id):
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
 
     try:
-        wav_path = str(convert_to_wav_if_needed(
+        wavPath = str(convert_to_wav_if_needed(
             next(Path(settings.UPLOAD_FOLDER).glob(f"{upload_id}.*"))
         ))
-        speech = get_vad().apply({"audio": wav_path})
-        ann    = get_clustering_diarizer().apply({"audio": wav_path, "speech": speech})
+        speech = get_vad().apply({"audio": wavPath})
+        ann    = get_clustering_diarizer().apply({"audio": wavPath, "speech": speech})
     except Exception as e:
         logger.error(f"[{cid}] diarize_full error", exc_info=True)
         r.publish(f"progress:{upload_id}", json.dumps({"status": "error", "error": str(e)}))
@@ -316,11 +307,10 @@ def diarize_full(self, upload_id, correlation_id):
     r.publish(f"progress:{upload_id}", json.dumps({"status": "diarization_done"}))
     logger.info(f"[{cid}] DIARIZE done")
 
-
 @celery_app.task(bind=True, queue="transcribe_cpu")
 def cleanup_old_files(self):
     """
-    Удаляет файлы старше настроенного retention.
+    Удаляет устаревшие файлы старше FILE_RETENTION_DAYS.
     """
     age_limit = settings.FILE_RETENTION_DAYS
     cutoff = datetime.utcnow() - timedelta(days=age_limit)
@@ -336,4 +326,4 @@ def cleanup_old_files(self):
                     deleted += 1
             except:
                 continue
-    logger.info(f"[CLEANUP] удалено {deleted} устаревших файлов/папок")
+    logger.info(f"[CLEANUP] удалено {deleted} файлов/папок")
