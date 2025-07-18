@@ -1,3 +1,4 @@
+# tasks.py
 import os
 import json
 import logging
@@ -12,7 +13,7 @@ from redis import Redis
 from config.settings import settings
 from config.celery import celery_app
 
-logger = logging.get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 # faster-whisper
 try:
@@ -47,7 +48,7 @@ def get_whisper_model():
         local    = (device == "cpu")
         try:
             path = download_model(model_id, cache_dir=cache, local_files_only=local)
-        except:
+        except Exception:
             path = model_id
         compute = getattr(
             settings,
@@ -135,14 +136,14 @@ def convert_to_wav_if_needed(src_path: Path) -> Path:
     except Exception:
         pass
 
-    # create temp WAV with correct encoding
+    # создаём временный WAV с нужным кодеком
     fd, tmp_path_str = tempfile.mkstemp(suffix=".wav", dir=settings.UPLOAD_FOLDER)
     os.close(fd)
     tmp_path = Path(tmp_path_str)
     threads = getattr(settings, "FFMPEG_THREADS", 2)
     subprocess.run(
         [
-            "ffmpeg", "-y", f"-threads", str(threads),
+            "ffmpeg", "-y", "-threads", str(threads),
             "-i", str(src_path),
             "-acodec", "pcm_s16le", "-ac", "1", "-ar", "16000",
             str(tmp_path)
@@ -188,7 +189,7 @@ def preview_transcribe(self, upload_id, correlation_id):
         threads = getattr(settings, "FFMPEG_THREADS", 2)
         proc = subprocess.Popen(
             [
-                "ffmpeg", "-y", f"-threads", str(threads),
+                "ffmpeg", "-y", "-threads", str(threads),
                 "-i", str(wav),
                 "-ss", "0", "-t", str(settings.PREVIEW_LENGTH_S),
                 "-f", "wav", "pipe:1"
@@ -274,12 +275,12 @@ def transcribe_segments(self, upload_id, correlation_id):
 
     segments_acc = []
     chunk = getattr(settings, "CHUNK_LENGTH_S", None)
+    threads = getattr(settings, "FFMPEG_THREADS", 2)
     if duration and chunk and duration > chunk:
-        threads = getattr(settings, "FFMPEG_THREADS", 2)
         for start in range(0, int(duration), int(chunk)):
             proc = subprocess.Popen(
                 [
-                    "ffmpeg", "-y", f"-threads", str(threads),
+                    "ffmpeg", "-y", "-threads", str(threads),
                     "-i", str(wav), "-ss", str(start), "-t", str(chunk),
                     "-f", "wav", "pipe:1"
                 ],
@@ -371,7 +372,7 @@ def cleanup_old_files(self):
     for base in (Path(settings.UPLOAD_FOLDER), Path(settings.RESULTS_FOLDER)):
         for p in base.glob("**/*"):
             try:
-                if datetime.utcfromtimestamp(p.stat().st_mtime) < cutoff:
+                if datetime.utcnow() - datetime.fromtimestamp(p.stat().st_mtime) > timedelta(days=age):
                     if p.is_dir():
                         p.rmdir()
                     else:
