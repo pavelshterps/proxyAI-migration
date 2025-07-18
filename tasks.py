@@ -45,8 +45,12 @@ _whisper_model = None
 _vad = None
 _clustering_diarizer = None
 
+
 # --- Model loaders ---
 def get_whisper_model(model_override: str = None):
+    """
+    Return a WhisperModel; if model_override is provided, load that instead.
+    """
     device = settings.WHISPER_DEVICE.lower()
     compute = getattr(
         settings, "WHISPER_COMPUTE_TYPE",
@@ -75,7 +79,11 @@ def get_whisper_model(model_override: str = None):
         logger.info(f"[{datetime.utcnow().isoformat()}] [WHISPER] model ready on {device} ({compute})")
     return _whisper_model
 
+
 def get_vad():
+    """
+    Load the VoiceActivityDetection model on first use.
+    """
     global _vad
     if _vad is None:
         logger.info(f"[{datetime.utcnow().isoformat()}] [VAD] loading VAD model")
@@ -87,7 +95,11 @@ def get_vad():
         logger.info(f"[{datetime.utcnow().isoformat()}] [VAD] ready")
     return _vad
 
+
 def get_clustering_diarizer():
+    """
+    Load the SpeakerDiarization pipeline on first use.
+    """
     global _clustering_diarizer
     if _clustering_diarizer is None:
         logger.info(f"[{datetime.utcnow().isoformat()}] [DIARIZER] loading diarizer pipeline")
@@ -100,8 +112,12 @@ def get_clustering_diarizer():
         logger.info(f"[{datetime.utcnow().isoformat()}] [DIARIZER] ready")
     return _clustering_diarizer
 
+
 @worker_process_init.connect
 def preload_on_startup(**kwargs):
+    """
+    Warm up models on worker startup.
+    """
     device = settings.WHISPER_DEVICE.lower()
     logger.info(f"[{datetime.utcnow().isoformat()}] [WARMUP] starting (HF={_HF_AVAILABLE}, PN={_PN_AVAILABLE}, DEV={device})")
     if _HF_AVAILABLE:
@@ -121,15 +137,19 @@ def preload_on_startup(**kwargs):
         except Exception:
             logger.warning(f"[{datetime.utcnow().isoformat()}] [WARMUP] VAD/diarizer warmup failed")
 
-# --- Audio prep & metadata ---
+
+# --- Audio preparation & metadata ---
 def probe_audio(src: Path) -> dict:
+    """
+    Run ffprobe once; return dict with duration and first audio stream info.
+    """
     cmd = [
         "ffprobe", "-v", "error",
         "-print_format", "json",
         "-show_format", "-show_streams",
         str(src)
     ]
-    res = subprocess.run(cmd, capture_output=True, text=True)
+    res = subprocess.run(cmd, capture_output=True, text=True, timeout=getattr(settings, "FFMPEG_TIMEOUT", 30))
     data = {"duration": 0.0}
     try:
         j = json.loads(res.stdout)
@@ -146,13 +166,21 @@ def probe_audio(src: Path) -> dict:
         pass
     return data
 
+
 def prepare_wav(upload_id: str) -> (Path, float):
+    """
+    Convert any upload_id.* → upload_id.wav if needed.
+    Returns (wav_path, duration_s).
+    """
     start = time.perf_counter()
     logger.info(f"[{datetime.utcnow().isoformat()}] [PREPARE] start for {upload_id}")
     src = next(Path(settings.UPLOAD_FOLDER).glob(f"{upload_id}.*"))
     target = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
+
     info = probe_audio(src)
     duration = info["duration"]
+
+    # Already correct WAV?
     if src.suffix.lower() == ".wav" and \
        info.get("codec_name") == "pcm_s16le" and \
        info.get("sample_rate") == 16000 and \
@@ -162,6 +190,8 @@ def prepare_wav(upload_id: str) -> (Path, float):
         elapsed = time.perf_counter() - start
         logger.info(f"[{datetime.utcnow().isoformat()}] [PREPARE] WAV OK, renamed ({elapsed:.2f}s)")
         return target, duration
+
+    # Convert via ffmpeg
     threads = getattr(settings, "FFMPEG_THREADS", 2)
     subprocess.run([
         "ffmpeg", "-y",
@@ -169,14 +199,20 @@ def prepare_wav(upload_id: str) -> (Path, float):
         "-i", str(src),
         "-acodec", "pcm_s16le", "-ac", "1", "-ar", "16000",
         str(target)
-    ], check=True, stderr=subprocess.DEVNULL)
+    ], check=True, stderr=subprocess.DEVNULL,
+       timeout=getattr(settings, "FFMPEG_TIMEOUT", 60))
     elapsed = time.perf_counter() - start
     logger.info(f"[{datetime.utcnow().isoformat()}] [PREPARE] converted ({elapsed:.2f}s)")
     return target, duration
 
+
 # --- Tasks ---
 @celery_app.task(bind=True, queue="transcribe_cpu")
 def convert_to_wav_and_preview(self, upload_id, correlation_id):
+    """
+    Prepare WAV; if short audio, skip preview and publish full transcript as preview.
+    Otherwise, enqueue preview then full transcription.
+    """
     cid = correlation_id or "?"
     logger.info(f"[{datetime.utcnow().isoformat()}] [{cid}] CONVERT start for {upload_id}")
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
@@ -184,37 +220,60 @@ def convert_to_wav_and_preview(self, upload_id, correlation_id):
     try:
         wav_path, duration = prepare_wav(upload_id)
     except Exception as e:
-        r.publish(f"progress:{upload_id}", json.dumps({"status":"error","error":str(e)}))
+        r.publish(f"progress:{upload_id}", json.dumps({"status": "error", "error": str(e)}))
         return
 
     logger.info(f"[{datetime.utcnow().isoformat()}] [{cid}] duration={duration:.1f}s")
 
-    # For short audio (<= PREVIEW_LENGTH_S), skip preview and go straight to full transcription
+    # Short audio → immediate full transcription as preview
     if duration <= settings.PREVIEW_LENGTH_S:
-        logger.info(f"[{datetime.utcnow().isoformat()}] [{cid}] short audio, enqueue full transcription")
+        logger.info(f"[{datetime.utcnow().isoformat()}] [{cid}] short audio, generating full transcript as preview")
+        try:
+            segs, _ = get_whisper_model().transcribe(
+                str(wav_path),
+                word_timestamps=True,
+                **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {})
+            )
+            full = list(segs)
+            preview = {
+                "text": "".join(s.text for s in full),
+                "timestamps": [{"start": s.start, "end": s.end, "text": s.text} for s in full]
+            }
+            r.publish(f"progress:{upload_id}", json.dumps({"status": "preview_done", "preview": preview}))
+        except Exception as e:
+            logger.error(f"[{datetime.utcnow().isoformat()}] [{cid}] immediate-preview error", exc_info=True)
+            r.publish(f"progress:{upload_id}", json.dumps({"status": "error", "error": str(e)}))
+            return
+
+        # Then enqueue full transcription to produce transcript.json
         from tasks import transcribe_segments
-        transcribe_segments.delay(upload_id, correlation_id)
-        logger.info(f"[{datetime.utcnow().isoformat()}] [{cid}] CONVERT done")
+        transcribe_segments.delay(upload_id, cid)
+        logger.info(f"[{datetime.utcnow().isoformat()}] [{cid}] CONVERT done (short path)")
         return
 
-    # Otherwise, enqueue preview then full
+    # Long audio → enqueue preview then full
     logger.info(f"[{datetime.utcnow().isoformat()}] [{cid}] enqueue PREVIEW")
     from tasks import preview_transcribe
-    preview_transcribe.delay(upload_id, correlation_id)
+    preview_transcribe.delay(upload_id, cid)
     logger.info(f"[{datetime.utcnow().isoformat()}] [{cid}] CONVERT done")
+
 
 @celery_app.task(bind=True, queue="transcribe_gpu")
 def preview_transcribe(self, upload_id, correlation_id):
+    """
+    Fast preview: first N seconds via ffmpeg → Whisper.
+    """
     cid = correlation_id or "?"
     logger.info(f"[{datetime.utcnow().isoformat()}] [{cid}] PREVIEW start for {upload_id}")
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
 
     wav_path = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
     if not wav_path.exists():
-        r.publish(f"progress:{upload_id}", json.dumps({"status":"error","error":"WAV not found"}))
+        r.publish(f"progress:{upload_id}", json.dumps({"status": "error", "error": "WAV not found"}))
         return
 
-    threads = getattr(settings, "FFMPEG_THREADS", 2)
+    # Use single thread for preview to reduce overhead
+    threads = 1
     cmd = [
         "ffmpeg", "-y", "-threads", str(threads),
         "-i", str(wav_path),
@@ -234,10 +293,14 @@ def preview_transcribe(self, upload_id, correlation_id):
             **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {})
         )
         proc.stdout.close()
-        proc.wait()
+        proc.wait(timeout=getattr(settings, "FFMPEG_TIMEOUT", 30))
+    except subprocess.TimeoutExpired:
+        logger.error(f"[{datetime.utcnow().isoformat()}] [{cid}] PREVIEW ffmpeg timeout")
+        r.publish(f"progress:{upload_id}", json.dumps({"status": "error", "error": "preview ffmpeg timeout"}))
+        return
     except Exception as e:
         logger.error(f"[{datetime.utcnow().isoformat()}] [{cid}] PREVIEW error", exc_info=True)
-        r.publish(f"progress:{upload_id}", json.dumps({"status":"error","error":str(e)}))
+        r.publish(f"progress:{upload_id}", json.dumps({"status": "error", "error": str(e)}))
         return
 
     segments = list(segments_gen)
@@ -246,26 +309,31 @@ def preview_transcribe(self, upload_id, correlation_id):
 
     for seg in segments:
         r.publish(f"progress:{upload_id}", json.dumps({
-            "status":"preview_partial",
-            "fragment":{"start":seg.start,"end":seg.end,"text":seg.text}
+            "status": "preview_partial",
+            "fragment": {"start": seg.start, "end": seg.end, "text": seg.text}
         }))
 
     preview = {
         "text": "".join(s.text for s in segments),
-        "timestamps":[{"start":s.start,"end":s.end,"text":s.text} for s in segments]
+        "timestamps": [{"start": s.start, "end": s.end, "text": s.text} for s in segments]
     }
-    out_dir = Path(settings.RESULTS_FOLDER)/upload_id
+    out_dir = Path(settings.RESULTS_FOLDER) / upload_id
     out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir/"preview_transcript.json").write_text(
+    (out_dir / "preview_transcript.json").write_text(
         json.dumps(preview, ensure_ascii=False, indent=2)
     )
-    r.publish(f"progress:{upload_id}", json.dumps({"status":"preview_done","preview":preview}))
+    r.publish(f"progress:{upload_id}", json.dumps({"status": "preview_done", "preview": preview}))
+
     logger.info(f"[{datetime.utcnow().isoformat()}] [{cid}] PREVIEW done, enqueue full transcription")
     from tasks import transcribe_segments
-    transcribe_segments.delay(upload_id, correlation_id)
+    transcribe_segments.delay(upload_id, cid)
+
 
 @celery_app.task(bind=True, queue="transcribe_gpu")
 def transcribe_segments(self, upload_id, correlation_id):
+    """
+    Full transcription: if long, split into chunks.
+    """
     cid = correlation_id or "?"
     logger.info(f"[{datetime.utcnow().isoformat()}] [{cid}] TRANSCRIBE start for {upload_id}")
     if not _HF_AVAILABLE:
@@ -273,9 +341,9 @@ def transcribe_segments(self, upload_id, correlation_id):
         return
 
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
-    wav_path = Path(settings.UPLOAD_FOLDER)/f"{upload_id}.wav"
+    wav_path = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
     if not wav_path.exists():
-        r.publish(f"progress:{upload_id}", json.dumps({"status":"error","error":"WAV not found"}))
+        r.publish(f"progress:{upload_id}", json.dumps({"status": "error", "error": "WAV not found"}))
         return
 
     info = probe_audio(wav_path)
@@ -307,13 +375,18 @@ def transcribe_segments(self, upload_id, correlation_id):
                 "-f", "wav", "pipe:1"
             ]
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-            seg_gen, _ = model.transcribe(
-                proc.stdout,
-                word_timestamps=True,
-                **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {})
-            )
-            proc.stdout.close()
-            proc.wait()
+            try:
+                seg_gen, _ = model.transcribe(
+                    proc.stdout,
+                    word_timestamps=True,
+                    **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {})
+                )
+                proc.stdout.close()
+                proc.wait(timeout=getattr(settings, "FFMPEG_TIMEOUT", 60))
+            except subprocess.TimeoutExpired:
+                logger.error(f"[{datetime.utcnow().isoformat()}] [{cid}] chunk ffmpeg timeout at offset={offset}")
+                proc.kill()
+                break
             chunk_segs = list(seg_gen)
             for s in chunk_segs:
                 s.start += offset
@@ -324,21 +397,25 @@ def transcribe_segments(self, upload_id, correlation_id):
     elapsed = time.perf_counter() - start
     logger.info(f"[{datetime.utcnow().isoformat()}] [{cid}] got {len(all_segs)} segments ({elapsed:.2f}s)")
 
-    out_dir = Path(settings.RESULTS_FOLDER)/upload_id
+    out_dir = Path(settings.RESULTS_FOLDER) / upload_id
     out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir/"transcript.json").write_text(json.dumps(
-        [{"start":s.start,"end":s.end,"text":s.text} for s in all_segs],
+    (out_dir / "transcript.json").write_text(json.dumps(
+        [{"start": s.start, "end": s.end, "text": s.text} for s in all_segs],
         ensure_ascii=False, indent=2
     ))
-    r.publish(f"progress:{upload_id}", json.dumps({"status":"transcript_done"}))
+    r.publish(f"progress:{upload_id}", json.dumps({"status": "transcript_done"}))
     logger.info(f"[{datetime.utcnow().isoformat()}] [{cid}] TRANSCRIBE done")
+
 
 @celery_app.task(bind=True, queue="diarize_gpu")
 def diarize_full(self, upload_id, correlation_id):
+    """
+    Diarization via VAD + clustering on GPU.
+    """
     cid = correlation_id or "?"
     logger.info(f"[{datetime.utcnow().isoformat()}] [{cid}] DIARIZE start for {upload_id}")
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
-    r.publish(f"progress:{upload_id}", json.dumps({"status":"diarize_started"}))
+    r.publish(f"progress:{upload_id}", json.dumps({"status": "diarize_started"}))
 
     if not _PN_AVAILABLE or not settings.WHISPER_DEVICE.lower().startswith("cuda"):
         logger.error(f"[{datetime.utcnow().isoformat()}] [{cid}] pyannote unavailable or not CUDA, skipping")
@@ -347,30 +424,34 @@ def diarize_full(self, upload_id, correlation_id):
     try:
         wav_path, _ = prepare_wav(upload_id)
         logger.info(f"[{datetime.utcnow().isoformat()}] [{cid}] VAD apply")
-        speech = get_vad().apply({"audio":str(wav_path)})
+        speech = get_vad().apply({"audio": str(wav_path)})
         logger.info(f"[{datetime.utcnow().isoformat()}] [{cid}] SpeakerDiarization apply")
-        ann = get_clustering_diarizer().apply({"audio":str(wav_path),"speech":speech})
+        ann = get_clustering_diarizer().apply({"audio": str(wav_path), "speech": speech})
         segs = [
-            {"start":float(s.start),"end":float(s.end),"speaker":spk}
+            {"start": float(s.start), "end": float(s.end), "speaker": spk}
             for s, _, spk in ann.itertracks(yield_label=True)
         ]
         logger.info(f"[{datetime.utcnow().isoformat()}] [{cid}] got {len(segs)} diarization segments")
     except Exception as e:
         logger.error(f"[{datetime.utcnow().isoformat()}] [{cid}] DIARIZE error", exc_info=True)
-        r.publish(f"progress:{upload_id}", json.dumps({"status":"error","error":str(e)}))
+        r.publish(f"progress:{upload_id}", json.dumps({"status": "error", "error": str(e)}))
         return
 
-    out_dir = Path(settings.RESULTS_FOLDER)/upload_id
+    out_dir = Path(settings.RESULTS_FOLDER) / upload_id
     out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir/"diarization.json").write_text(json.dumps(segs, ensure_ascii=False, indent=2))
-    r.publish(f"progress:{upload_id}", json.dumps({"status":"diarization_done"}))
+    (out_dir / "diarization.json").write_text(json.dumps(segs, ensure_ascii=False, indent=2))
+    r.publish(f"progress:{upload_id}", json.dumps({"status": "diarization_done"}))
     logger.info(f"[{datetime.utcnow().isoformat()}] [{cid}] DIARIZE done")
+
 
 @celery_app.task(bind=True, queue="transcribe_cpu")
 def cleanup_old_files(self):
+    """
+    Cleanup files older than FILE_RETENTION_DAYS.
+    """
     age = settings.FILE_RETENTION_DAYS
-    cutoff = datetime.utcnow() - timedelta(days=age)
     deleted = 0
+    cutoff = datetime.utcnow() - timedelta(days=age)
     for base in (Path(settings.UPLOAD_FOLDER), Path(settings.RESULTS_FOLDER)):
         for p in base.glob("**/*"):
             try:
