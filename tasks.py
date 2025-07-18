@@ -1,4 +1,5 @@
 # tasks.py
+import os
 import json
 import logging
 import time
@@ -106,31 +107,39 @@ def preload_on_startup(**kwargs):
         except:
             logger.warning("[WARMUP] VAD/diarizer warmup failed")
 
-
 def convert_to_wav_if_needed(src_path: Path) -> Path:
     """
     Если файл НЕ в формате WAV PCM 16k mono, конвертирует его во временный файл.
     Возвращает Path на WAV-файл (оригинальный или сконвертированный).
     """
     try:
+        # обязательно передаём входной файл
         probe = subprocess.run(
-            ["ffprobe", "-v", "error",
-             "-show_entries", "stream=codec_name,sample_rate,channels",
-             "-of", "default=noprint_wrappers=1",
-             str(src_path)],
+            [
+                "ffprobe", "-v", "error",
+                "-show_entries", "stream=codec_name,sample_rate,channels",
+                "-of", "default=noprint_wrappers=1",
+                "-i", str(src_path)
+            ],
             capture_output=True, text=True, check=True
         )
-        info = {line.split('=')[0]: line.split('=')[1] for line in probe.stdout.splitlines()}
-        if (src_path.suffix.lower() == ".wav"
-                and info.get("codec_name") == "pcm_s16le"
-                and info.get("sample_rate") == "16000"
-                and info.get("channels") == "1"):
+        info = {
+            line.split('=')[0]: line.split('=')[1]
+            for line in probe.stdout.splitlines()
+        }
+        if (
+            src_path.suffix.lower() == ".wav"
+            and info.get("codec_name") == "pcm_s16le"
+            and info.get("sample_rate") == "16000"
+            and info.get("channels") == "1"
+        ):
             return src_path
     except Exception:
         pass
 
+    # mkstemp возвращает (fd, path)
     tmp_fd, tmp_file = tempfile.mkstemp(suffix=".wav", dir=settings.UPLOAD_FOLDER)
-    Path(tmp_fd).close()
+    os.close(tmp_fd)
     tmp_path = Path(tmp_file)
     subprocess.run([
         "ffmpeg", "-y", "-threads", "2",
@@ -140,12 +149,8 @@ def convert_to_wav_if_needed(src_path: Path) -> Path:
     ], check=True)
     return tmp_path
 
-
 @celery_app.task(bind=True, queue="transcribe_cpu")
 def convert_to_wav_and_preview(self, upload_id, correlation_id):
-    """
-    CPU-воркер: конвертирует файл (если нужно) и запускает preview на GPU.
-    """
     cid = correlation_id or "?"
     logger.info(f"[{cid}] CONVERT start {upload_id}")
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
@@ -156,14 +161,14 @@ def convert_to_wav_and_preview(self, upload_id, correlation_id):
         logger.info(f"[{cid}] converted to WAV: {wav_src.name}")
     except Exception as e:
         logger.error(f"[{cid}] convert_to_wav failed", exc_info=True)
-        r.publish(f"progress:{upload_id}", json.dumps({
-            "status": "error", "error": str(e)
-        }))
+        r.publish(
+            f"progress:{upload_id}",
+            json.dumps({"status": "error", "error": str(e)})
+        )
         return
 
     preview_transcribe.delay(upload_id, correlation_id)
     logger.info(f"[{cid}] CONVERT done")
-
 
 @celery_app.task(bind=True, queue="transcribe_gpu")
 def preview_transcribe(self, upload_id, correlation_id):
@@ -181,11 +186,17 @@ def preview_transcribe(self, upload_id, correlation_id):
             "-ss", "0", "-t", str(settings.PREVIEW_LENGTH_S),
             "-f", "wav", "pipe:1"
         ]
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+        )
         segments, _ = get_whisper_model().transcribe(
             proc.stdout,
             word_timestamps=True,
-            **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {})
+            **(
+                {"language": settings.WHISPER_LANGUAGE}
+                if settings.WHISPER_LANGUAGE
+                else {}
+            )
         )
         proc.stdout.close()
         proc.wait()
@@ -203,14 +214,19 @@ def preview_transcribe(self, upload_id, correlation_id):
         r.publish(f"progress:{upload_id}", json.dumps({"status": "error", "error": str(e)}))
         return
 
-    preview = {"text": "".join(s["text"] for s in segs), "timestamps": segs}
+    preview = {
+        "text": "".join(s["text"] for s in segs),
+        "timestamps": segs
+    }
     (out_dir / "preview_transcript.json").write_text(
         json.dumps(preview, ensure_ascii=False, indent=2)
     )
-    r.publish(f"progress:{upload_id}", json.dumps({"status": "preview_done", "preview": preview}))
+    r.publish(
+        f"progress:{upload_id}",
+        json.dumps({"status": "preview_done", "preview": preview})
+    )
     transcribe_segments.delay(upload_id, correlation_id)
     logger.info(f"[{cid}] PREVIEW done")
-
 
 @celery_app.task(bind=True, queue="transcribe_gpu")
 def transcribe_segments(self, upload_id, correlation_id):
@@ -230,6 +246,7 @@ def transcribe_segments(self, upload_id, correlation_id):
         r.publish(f"progress:{upload_id}", json.dumps({"status": "error", "error": err}))
         return
 
+    # узнаём длительность
     duration = None
     try:
         out = subprocess.check_output([
@@ -256,24 +273,36 @@ def transcribe_segments(self, upload_id, correlation_id):
             segs, _ = get_whisper_model().transcribe(
                 proc.stdout,
                 word_timestamps=True,
-                **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {})
+                **(
+                    {"language": settings.WHISPER_LANGUAGE}
+                    if settings.WHISPER_LANGUAGE
+                    else {}
+                )
             )
             proc.stdout.close()
             proc.wait()
             for seg in segs:
                 segments_acc.append({
                     "start": seg.start + start,
-                    "end":   seg.end   + start,
-                    "text":  seg.text
+                    "end": seg.end + start,
+                    "text": seg.text
                 })
     else:
         segs, _ = get_whisper_model().transcribe(
             str(wav_src),
             word_timestamps=True,
-            **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {})
+            **(
+                {"language": settings.WHISPER_LANGUAGE}
+                if settings.WHISPER_LANGUAGE
+                else {}
+            )
         )
         for seg in segs:
-            segments_acc.append({"start": seg.start, "end": seg.end, "text": seg.text})
+            segments_acc.append({
+                "start": seg.start,
+                "end": seg.end,
+                "text": seg.text
+            })
 
     out_dir = Path(settings.RESULTS_FOLDER) / upload_id
     out_dir.mkdir(exist_ok=True)
@@ -282,41 +311,6 @@ def transcribe_segments(self, upload_id, correlation_id):
     )
     r.publish(f"progress:{upload_id}", json.dumps({"status": "transcript_done"}))
     logger.info(f"[{cid}] TRANSCRIBE done")
-
-
-@celery_app.task(bind=True, queue="diarize_gpu")
-def diarize_full(self, upload_id, correlation_id):
-    cid = correlation_id or "?"
-    logger.info(f"[{cid}] DIARIZE start {upload_id}")
-    if not _PN_AVAILABLE:
-        logger.error(f"[{cid}] no pyannote, skip diarize")
-        return
-
-    r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
-
-    try:
-        wav_path = str(convert_to_wav_if_needed(
-            next(Path(settings.UPLOAD_FOLDER).glob(f"{upload_id}.*"))
-        ))
-        speech = get_vad().apply({"audio": wav_path})
-        ann    = get_clustering_diarizer().apply({"audio": wav_path, "speech": speech})
-    except Exception as e:
-        logger.error(f"[{cid}] diarize_full error", exc_info=True)
-        r.publish(f"progress:{upload_id}", json.dumps({"status": "error", "error": str(e)}))
-        return
-
-    segs = [
-        {"start": float(s.start), "end": float(s.end), "speaker": spk}
-        for s, _, spk in ann.itertracks(yield_label=True)
-    ]
-    out_dir = Path(settings.RESULTS_FOLDER) / upload_id
-    out_dir.mkdir(exist_ok=True)
-    (out_dir / "diarization.json").write_text(
-        json.dumps(segs, ensure_ascii=False, indent=2)
-    )
-    r.publish(f"progress:{upload_id}", json.dumps({"status": "diarization_done"}))
-    logger.info(f"[{cid}] DIARIZE done")
-
 
 @celery_app.task(bind=True, queue="transcribe_cpu")
 def cleanup_old_files(self):
