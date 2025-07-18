@@ -169,6 +169,10 @@ def convert_to_wav_and_preview(self, upload_id, correlation_id):
 
 @celery_app.task(bind=True, queue="transcribe_gpu")
 def preview_transcribe(self, upload_id, correlation_id):
+    """
+    Быстрый PREVIEW: один вызов Whisper с max_initial_timestamp,
+    без FFmpeg-пайпов, напрямую по файлу upload_id.wav.
+    """
     cid = correlation_id or "?"
     logger.info(f"[{cid}] PREVIEW start {upload_id}")
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
@@ -181,7 +185,12 @@ def preview_transcribe(self, upload_id, correlation_id):
         return
 
     try:
-        segments, _ = get_whisper_model().transcribe(
+        # выбираем для PREVIEW лёгкую модель, если нужно:
+        model = get_whisper_model(settings.PREVIEW_WHISPER_MODEL) \
+                if getattr(settings, "PREVIEW_WHISPER_MODEL", None) \
+                else get_whisper_model()
+
+        segments, _ = model.transcribe(
             str(wav),
             word_timestamps=True,
             max_initial_timestamp=settings.PREVIEW_LENGTH_S,
@@ -190,8 +199,10 @@ def preview_transcribe(self, upload_id, correlation_id):
         for seg in segments:
             r.publish(
                 f"progress:{upload_id}",
-                json.dumps({"status":"preview_partial",
-                            "fragment":{"start":seg.start,"end":seg.end,"text":seg.text}})
+                json.dumps({
+                    "status":        "preview_partial",
+                    "fragment":      {"start": seg.start, "end": seg.end, "text": seg.text}
+                })
             )
     except Exception as e:
         logger.error(f"[{cid}] preview error", exc_info=True)
@@ -199,14 +210,17 @@ def preview_transcribe(self, upload_id, correlation_id):
         return
 
     preview = {
-        "text":"".join(s.text for s in segments),
-        "timestamps":[{"start":s.start,"end":s.end,"text":s.text} for s in segments]
+        "text":       "".join(s.text for s in segments),
+        "timestamps": [{"start":s.start, "end":s.end, "text":s.text} for s in segments]
     }
-    out_dir = Path(settings.RESULTS_FOLDER)/upload_id
+    out_dir = Path(settings.RESULTS_FOLDER) / upload_id
     out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir/"preview_transcript.json").write_text(json.dumps(preview,ensure_ascii=False,indent=2))
+    (out_dir / "preview_transcript.json").write_text(
+        json.dumps(preview, ensure_ascii=False, indent=2)
+    )
     r.publish(f"progress:{upload_id}", json.dumps({"status":"preview_done","preview":preview}))
 
+    # запускаем полный транскрипт
     from tasks import transcribe_segments
     transcribe_segments.delay(upload_id, correlation_id)
     logger.info(f"[{cid}] PREVIEW done")
