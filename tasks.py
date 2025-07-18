@@ -165,17 +165,13 @@ def prepare_wav(upload_id: str) -> (Path, float):
         return target, duration
 
     threads = getattr(settings, "FFMPEG_THREADS", 4)
-    try:
-        subprocess.run([
-            "ffmpeg", "-y",
-            "-threads", str(threads),
-            "-i", str(src),
-            "-acodec", "pcm_s16le", "-ac", "1", "-ar", "16000",
-            str(target)
-        ], check=True, stderr=subprocess.DEVNULL)
-    except subprocess.CalledProcessError:
-        logger.error(f"[{datetime.utcnow().isoformat()}] [PREPARE] ffmpeg failed", exc_info=True)
-        raise
+    subprocess.run([
+        "ffmpeg", "-y",
+        "-threads", str(threads),
+        "-i", str(src),
+        "-acodec", "pcm_s16le", "-ac", "1", "-ar", "16000",
+        str(target)
+    ], check=True, stderr=subprocess.DEVNULL)
     logger.info(f"[{datetime.utcnow().isoformat()}] [PREPARE] converted ({time.perf_counter()-start:.2f}s)")
     return target, duration
 
@@ -186,15 +182,16 @@ def convert_to_wav_and_preview(self, upload_id, correlation_id):
     logger.info(f"[{datetime.utcnow().isoformat()}] [{cid}] CONVERT start for {upload_id}")
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
     try:
-        wav_path, duration = prepare_wav(upload_id)
+        wav_path, _ = prepare_wav(upload_id)
     except Exception as e:
-        r.publish(f"progress:{upload_id}", json.dumps({"status":"error","error":str(e)}))
+        r.publish(f"progress:{upload_id}", json.dumps({"status":"error", "error":str(e)}))
         return
-    logger.info(f"[{datetime.utcnow().isoformat()}] [{cid}] duration={duration:.1f}s")
-    # always schedule preview first for fastest first-60s result
+
+    # 1) Fire off the fast 60s preview
     logger.info(f"[{datetime.utcnow().isoformat()}] [{cid}] enqueue PREVIEW")
     from tasks import preview_transcribe
     preview_transcribe.delay(upload_id, correlation_id)
+
     logger.info(f"[{datetime.utcnow().isoformat()}] [{cid}] CONVERT done")
 
 @celery_app.task(bind=True, queue="transcribe_gpu")
@@ -208,23 +205,29 @@ def preview_transcribe(self, upload_id, correlation_id):
         r.publish(f"progress:{upload_id}", json.dumps({"status":"error","error":"WAV not found"}))
         return
 
-    # choose lightweight model for preview if configured
+    # slice first PREVIEW_LENGTH_S seconds via ffmpeg
+    threads = getattr(settings, "FFMPEG_THREADS", 2)
+    preview_secs = settings.PREVIEW_LENGTH_S
+    cmd = [
+        "ffmpeg", "-y", "-threads", str(threads),
+        "-i", str(wav),
+        "-ss", "0", "-t", str(preview_secs),
+        "-f", "wav", "pipe:1"
+    ]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
     model = (get_whisper_model(settings.PREVIEW_WHISPER_MODEL)
              if getattr(settings, "PREVIEW_WHISPER_MODEL", None)
              else get_whisper_model())
 
     start = time.perf_counter()
-    try:
-        segments_gen, _ = model.transcribe(
-            str(wav),
-            max_initial_timestamp=settings.PREVIEW_LENGTH_S,
-            word_timestamps=True,
-            **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {})
-        )
-    except Exception as e:
-        logger.error(f"[{datetime.utcnow().isoformat()}] [{cid}] PREVIEW error", exc_info=True)
-        r.publish(f"progress:{upload_id}", json.dumps({"status":"error","error":str(e)}))
-        return
+    segments_gen, _ = model.transcribe(
+        proc.stdout,
+        word_timestamps=True,
+        **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {})
+    )
+    proc.stdout.close()
+    proc.wait()
 
     segments = list(segments_gen)
     logger.info(f"[{datetime.utcnow().isoformat()}] [{cid}] got {len(segments)} preview segments ({time.perf_counter()-start:.2f}s)")
@@ -242,10 +245,10 @@ def preview_transcribe(self, upload_id, correlation_id):
     out_dir = Path(settings.RESULTS_FOLDER) / upload_id
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "preview_transcript.json").write_text(json.dumps(preview, ensure_ascii=False, indent=2))
-    r.publish(f"progress:{upload_id}", json.dumps({"status":"preview_done", "preview": preview}))
+    r.publish(f"progress:{upload_id}", json.dumps({"status":"preview_done","preview":preview}))
     logger.info(f"[{datetime.utcnow().isoformat()}] [{cid}] PREVIEW done")
 
-    # enqueue full transcription
+    # 2) Enqueue the full transcription
     logger.info(f"[{datetime.utcnow().isoformat()}] [{cid}] enqueue full transcription")
     from tasks import transcribe_segments
     transcribe_segments.delay(upload_id, correlation_id)
@@ -302,7 +305,7 @@ def transcribe_segments(self, upload_id, correlation_id):
             chunk_segs = list(seg_gen)
             for s in chunk_segs:
                 s.start += offset
-                s.end += offset
+                s.end   += offset
             all_segs.extend(chunk_segs)
             offset += this_len
 
@@ -312,7 +315,7 @@ def transcribe_segments(self, upload_id, correlation_id):
     out = Path(settings.RESULTS_FOLDER) / upload_id
     out.mkdir(parents=True, exist_ok=True)
     (out / "transcript.json").write_text(json.dumps(
-        [{"start": s.start, "end": s.end, "text": s.text} for s in all_segs],
+        [{"start":s.start,"end":s.end,"text":s.text} for s in all_segs],
         ensure_ascii=False, indent=2
     ))
     r.publish(f"progress:{upload_id}", json.dumps({"status":"transcript_done"}))
