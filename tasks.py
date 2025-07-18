@@ -1,6 +1,5 @@
 import json
 import logging
-import time
 import subprocess
 import tempfile
 from datetime import datetime, timedelta
@@ -136,7 +135,6 @@ def convert_to_wav_if_needed(src_path: Path) -> Path:
     ], check=True)
     return tmp_path
 
-
 @celery_app.task(bind=True, queue="transcribe_cpu")
 def convert_to_wav_and_preview(self, upload_id, correlation_id):
     cid = correlation_id or "?"
@@ -154,9 +152,9 @@ def convert_to_wav_and_preview(self, upload_id, correlation_id):
         }))
         return
 
+    # Запускаем превью-транскрипт
     preview_transcribe.delay(upload_id, correlation_id)
     logger.info(f"[{cid}] CONVERT done")
-
 
 @celery_app.task(bind=True, queue="transcribe_gpu")
 def preview_transcribe(self, upload_id, correlation_id):
@@ -204,7 +202,6 @@ def preview_transcribe(self, upload_id, correlation_id):
     transcribe_segments.delay(upload_id, correlation_id)
     logger.info(f"[{cid}] PREVIEW done")
 
-
 @celery_app.task(bind=True, queue="transcribe_gpu")
 def transcribe_segments(self, upload_id, correlation_id):
     cid = correlation_id or "?"
@@ -223,13 +220,12 @@ def transcribe_segments(self, upload_id, correlation_id):
         r.publish(f"progress:{upload_id}", json.dumps({"status": "error", "error": err}))
         return
 
-    # длительность
     duration = None
     try:
         out = subprocess.check_output([
             "ffprobe", "-v", "error", "-select_streams", "a:0",
             "-show_entries", "format=duration",
-            "-of", "default=noprint_wrappers=1:nokey=1",
+            "-of", "default<noprint_wrappers=1:nokey=1>",
             str(wav_src)
         ], stderr=subprocess.DEVNULL)
         duration = float(out.strip())
@@ -277,7 +273,6 @@ def transcribe_segments(self, upload_id, correlation_id):
     r.publish(f"progress:{upload_id}", json.dumps({"status": "transcript_done"}))
     logger.info(f"[{cid}] TRANSCRIBE done")
 
-
 @celery_app.task(bind=True, queue="diarize_gpu")
 def diarize_full(self, upload_id, correlation_id):
     cid = correlation_id or "?"
@@ -310,7 +305,6 @@ def diarize_full(self, upload_id, correlation_id):
     )
     r.publish(f"progress:{upload_id}", json.dumps({"status": "diarization_done"}))
     logger.info(f"[{cid}] DIARIZE done")
-
 
 @celery_app.task(bind=True, queue="transcribe_cpu")
 def cleanup_old_files(self):
