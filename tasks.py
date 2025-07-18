@@ -1,3 +1,4 @@
+# tasks.py
 import json
 import logging
 import time
@@ -119,7 +120,7 @@ def convert_to_wav_if_needed(src_path: Path) -> Path:
              str(src_path)],
             capture_output=True, text=True, check=True
         )
-        info = dict(line.split('=') for line in probe.stdout.splitlines())
+        info = {line.split('=')[0]: line.split('=')[1] for line in probe.stdout.splitlines()}
         if (src_path.suffix.lower() == ".wav"
                 and info.get("codec_name") == "pcm_s16le"
                 and info.get("sample_rate") == "16000"
@@ -148,7 +149,6 @@ def convert_to_wav_and_preview(self, upload_id, correlation_id):
     cid = correlation_id or "?"
     logger.info(f"[{cid}] CONVERT start {upload_id}")
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
-    t0 = time.time()
 
     try:
         original = next(Path(settings.UPLOAD_FOLDER).glob(f"{upload_id}.*"))
@@ -161,9 +161,8 @@ def convert_to_wav_and_preview(self, upload_id, correlation_id):
         }))
         return
 
-    # передаём задачу превью на GPU
     preview_transcribe.delay(upload_id, correlation_id)
-    logger.info(f"[{cid}] CONVERT done in {time.time()-t0:.2f}s")
+    logger.info(f"[{cid}] CONVERT done")
 
 
 @celery_app.task(bind=True, queue="transcribe_gpu")
@@ -171,7 +170,6 @@ def preview_transcribe(self, upload_id, correlation_id):
     cid = correlation_id or "?"
     logger.info(f"[{cid}] PREVIEW TRANSCRIBE start {upload_id}")
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
-    t0 = time.time()
 
     try:
         wav_src = next(Path(settings.UPLOAD_FOLDER).glob(f"{upload_id}.wav"))
@@ -196,27 +194,22 @@ def preview_transcribe(self, upload_id, correlation_id):
         for seg in segments:
             frag = {"start": seg.start, "end": seg.end, "text": seg.text}
             segs.append(frag)
-            r.publish(f"progress:{upload_id}", json.dumps({
-                "status": "preview_partial", "fragment": frag
-            }))
-
+            r.publish(
+                f"progress:{upload_id}",
+                json.dumps({"status": "preview_partial", "fragment": frag})
+            )
     except Exception as e:
         logger.error(f"[{cid}] preview_transcribe error", exc_info=True)
-        r.publish(f"progress:{upload_id}", json.dumps({
-            "status": "error", "error": str(e)
-        }))
+        r.publish(f"progress:{upload_id}", json.dumps({"status": "error", "error": str(e)}))
         return
 
     preview = {"text": "".join(s["text"] for s in segs), "timestamps": segs}
     (out_dir / "preview_transcript.json").write_text(
         json.dumps(preview, ensure_ascii=False, indent=2)
     )
-    r.publish(f"progress:{upload_id}", json.dumps({
-        "status": "preview_done", "preview": preview
-    }))
-
+    r.publish(f"progress:{upload_id}", json.dumps({"status": "preview_done", "preview": preview}))
     transcribe_segments.delay(upload_id, correlation_id)
-    logger.info(f"[{cid}] PREVIEW done in {time.time()-t0:.2f}s")
+    logger.info(f"[{cid}] PREVIEW done")
 
 
 @celery_app.task(bind=True, queue="transcribe_gpu")
@@ -228,19 +221,15 @@ def transcribe_segments(self, upload_id, correlation_id):
         return
 
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
-    t0 = time.time()
 
     try:
         wav_src = next(Path(settings.UPLOAD_FOLDER).glob(f"{upload_id}.wav"))
     except StopIteration:
         err = "source WAV not found"
         logger.error(f"[{cid}] {err}")
-        r.publish(f"progress:{upload_id}", json.dumps({
-            "status": "error", "error": err
-        }))
+        r.publish(f"progress:{upload_id}", json.dumps({"status": "error", "error": err}))
         return
 
-    # пробуем узнать длительность
     duration = None
     try:
         out = subprocess.check_output([
@@ -292,7 +281,7 @@ def transcribe_segments(self, upload_id, correlation_id):
         json.dumps(segments_acc, ensure_ascii=False, indent=2)
     )
     r.publish(f"progress:{upload_id}", json.dumps({"status": "transcript_done"}))
-    logger.info(f"[{cid}] TRANSCRIBE done in {time.time()-t0:.2f}s")
+    logger.info(f"[{cid}] TRANSCRIBE done")
 
 
 @celery_app.task(bind=True, queue="diarize_gpu")
@@ -304,7 +293,6 @@ def diarize_full(self, upload_id, correlation_id):
         return
 
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
-    t0 = time.time()
 
     try:
         wav_path = str(convert_to_wav_if_needed(
@@ -314,9 +302,7 @@ def diarize_full(self, upload_id, correlation_id):
         ann    = get_clustering_diarizer().apply({"audio": wav_path, "speech": speech})
     except Exception as e:
         logger.error(f"[{cid}] diarize_full error", exc_info=True)
-        r.publish(f"progress:{upload_id}", json.dumps({
-            "status": "error", "error": str(e)
-        }))
+        r.publish(f"progress:{upload_id}", json.dumps({"status": "error", "error": str(e)}))
         return
 
     segs = [
@@ -329,7 +315,7 @@ def diarize_full(self, upload_id, correlation_id):
         json.dumps(segs, ensure_ascii=False, indent=2)
     )
     r.publish(f"progress:{upload_id}", json.dumps({"status": "diarization_done"}))
-    logger.info(f"[{cid}] DIARIZE done in {time.time()-t0:.2f}s")
+    logger.info(f"[{cid}] DIARIZE done")
 
 
 @celery_app.task(bind=True, queue="transcribe_cpu")

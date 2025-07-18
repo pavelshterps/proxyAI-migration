@@ -1,3 +1,4 @@
+# main.py
 import time
 import uuid
 import json
@@ -75,6 +76,7 @@ app.add_middleware(
 # --- SPA и статические файлы ---
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
+
 @app.get("/", response_class=HTMLResponse)
 async def serve_frontend():
     index_path = Path("static/index.html")
@@ -82,12 +84,14 @@ async def serve_frontend():
         raise HTTPException(404, "Not found")
     return HTMLResponse(index_path.read_text(encoding="utf-8"))
 
+
 @app.get("/favicon.ico", include_in_schema=False)
 async def favicon():
     maybe = Path("static/favicon.ico")
     if maybe.exists():
         return StaticFiles(directory="static").lookup_path("favicon.ico")
     raise HTTPException(404)
+
 
 @app.on_event("startup")
 async def startup():
@@ -103,8 +107,10 @@ async def startup():
         Path(d).mkdir(parents=True, exist_ok=True)
         log.debug("Ensured dir", path=str(d))
 
+
 redis = redis_async.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
 
 async def get_api_key(
     x_api_key: str = Depends(api_key_header),
@@ -115,11 +121,11 @@ async def get_api_key(
         raise HTTPException(401, "Missing API Key")
     return key
 
-@app.get("/events/{upload_id}")
+
+@app.get("/events/{upload_id}", dependencies=[Depends(get_api_key)])
 async def progress_events(
     upload_id: str,
     request: Request,
-    api_key: str = Depends(get_api_key),
 ):
     async def gen():
         sub = redis.pubsub()
@@ -141,7 +147,8 @@ async def progress_events(
             await sub.unsubscribe(f"progress:{upload_id}")
     return EventSourceResponse(gen())
 
-@app.post("/upload")
+
+@app.post("/upload", dependencies=[Depends(get_api_key)])
 @limiter.limit("10/minute")
 async def upload(
     request: Request,
@@ -159,10 +166,8 @@ async def upload(
         raise HTTPException(400, "Нужно передать либо файл, либо file_url")
 
     upload_id = uuid.uuid4().hex
-    ext = ""
     try:
         Path(settings.UPLOAD_FOLDER).mkdir(parents=True, exist_ok=True)
-
         if file:
             data = await file.read()
             if not data:
@@ -187,15 +192,15 @@ async def upload(
         log.warning("DB create failed", upload_id=upload_id)
 
     cid = x_correlation_id or uuid.uuid4().hex
-    await redis.set(f"progress:{upload_id}", json.dumps({"status":"started"}))
-    await redis.publish(f"progress:{upload_id}", json.dumps({"status":"started"}))
+    await redis.set(f"progress:{upload_id}", json.dumps({"status": "started"}))
+    await redis.publish(f"progress:{upload_id}", json.dumps({"status": "started"}))
 
-    # Ставим задачу на CPU: конвертацию + preview на GPU
     convert_to_wav_and_preview.delay(upload_id, cid)
 
     return JSONResponse({"upload_id": upload_id}, headers={"X-Correlation-ID": cid})
 
-@app.get("/results/{upload_id}")
+
+@app.get("/results/{upload_id}", dependencies=[Depends(get_api_key)])
 async def get_results(
     upload_id: str,
     current_user=Depends(get_current_user),
@@ -228,7 +233,8 @@ async def get_results(
         return {"results": merged}
     return {"results": transcript}
 
-@app.post("/diarize/{upload_id}")
+
+@app.post("/diarize/{upload_id}", dependencies=[Depends(get_api_key)])
 async def request_diarization(
     upload_id: str,
     current_user=Depends(get_current_user),
@@ -238,7 +244,8 @@ async def request_diarization(
     diarize_full.delay(upload_id, None)
     return {"message": "diarization started"}
 
-@app.post("/labels/{upload_id}")
+
+@app.post("/labels/{upload_id}", dependencies=[Depends(get_api_key)])
 async def save_labels(
     upload_id: str,
     mapping: dict = Body(...),
@@ -252,8 +259,8 @@ async def save_labels(
     await db.commit()
 
     base = Path(settings.RESULTS_FOLDER) / upload_id
-    transcript = json.loads((base/"transcript.json").read_text())
-    raw = (base/"diarization.json").exists() and json.loads((base/"diarization.json").read_text()) or []
+    transcript = json.loads((base / "transcript.json").read_text())
+    raw = (base / "diarization.json").exists() and json.loads((base / "diarization.json").read_text()) or []
     merged = []
     for seg in transcript:
         orig = next((d["speaker"] for d in raw if d["start"] <= seg["start"] < d["end"]), None)
@@ -266,6 +273,41 @@ async def save_labels(
             "speaker": speaker
         })
     return {"results": merged}
+
+
+# ——— НОВЫЕ ЭНДПОИНТЫ ———
+
+@app.get("/status/{upload_id}", dependencies=[Depends(get_api_key)])
+async def get_status(upload_id: str):
+    data = await redis.get(f"progress:{upload_id}")
+    if not data:
+        raise HTTPException(404, "No status for that upload_id")
+    return JSONResponse(json.loads(data))
+
+
+@app.get("/transcription/{upload_id}/preview", dependencies=[Depends(get_api_key)])
+async def get_preview_transcript(upload_id: str):
+    preview_file = Path(settings.RESULTS_FOLDER) / upload_id / "preview_transcript.json"
+    if not preview_file.exists():
+        raise HTTPException(404, "preview_transcript.json not found")
+    return JSONResponse(json.loads(preview_file.read_text(encoding="utf-8")))
+
+
+@app.get("/transcription/{upload_id}", dependencies=[Depends(get_api_key)])
+async def get_full_transcript(upload_id: str):
+    transcript_file = Path(settings.RESULTS_FOLDER) / upload_id / "transcript.json"
+    if not transcript_file.exists():
+        raise HTTPException(404, "transcript.json not found")
+    return JSONResponse(json.loads(transcript_file.read_text(encoding="utf-8")))
+
+
+@app.get("/diarization/{upload_id}", dependencies=[Depends(get_api_key)])
+async def get_diarization(upload_id: str):
+    diarization_file = Path(settings.RESULTS_FOLDER) / upload_id / "diarization.json"
+    if not diarization_file.exists():
+        raise HTTPException(404, "diarization.json not found")
+    return JSONResponse(json.loads(diarization_file.read_text(encoding="utf-8")))
+
 
 # --- Admin endpoint ---
 class AdminCreatePayload(BaseModel):
