@@ -1,3 +1,4 @@
+# tasks.py
 import os
 import json
 import logging
@@ -195,24 +196,25 @@ def preview_transcribe(self, upload_id, correlation_id):
 
     try:
         logger.info(f"[{datetime.utcnow().isoformat()}] [{cid}] PREVIEW calling WhisperModel.transcribe")
-        # выбор модели для preview (опционально)
         model = (get_whisper_model(settings.PREVIEW_WHISPER_MODEL)
                  if getattr(settings, "PREVIEW_WHISPER_MODEL", None)
                  else get_whisper_model())
 
-        segments, _ = model.transcribe(
+        segments_gen, _ = model.transcribe(
             str(wav),
             word_timestamps=True,
             max_initial_timestamp=settings.PREVIEW_LENGTH_S,
             **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {})
         )
+        # приводим генератор к списку, чтобы len() работал корректно
+        segments = list(segments_gen)
         logger.info(f"[{datetime.utcnow().isoformat()}] [{cid}] PREVIEW Whisper returned {len(segments)} segments")
         for seg in segments:
             r.publish(
                 f"progress:{upload_id}",
                 json.dumps({
-                    "status":        "preview_partial",
-                    "fragment":      {"start": seg.start, "end": seg.end, "text": seg.text}
+                    "status":   "preview_partial",
+                    "fragment": {"start": seg.start, "end": seg.end, "text": seg.text}
                 })
             )
     except Exception as e:
@@ -222,13 +224,11 @@ def preview_transcribe(self, upload_id, correlation_id):
 
     preview = {
         "text":       "".join(s.text for s in segments),
-        "timestamps": [{"start":s.start, "end":s.end, "text":s.text} for s in segments]
+        "timestamps": [{"start": s.start, "end": s.end, "text": s.text} for s in segments]
     }
     out_dir = Path(settings.RESULTS_FOLDER) / upload_id
     out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / "preview_transcript.json").write_text(
-        json.dumps(preview, ensure_ascii=False, indent=2)
-    )
+    (out_dir / "preview_transcript.json").write_text(json.dumps(preview, ensure_ascii=False, indent=2))
     r.publish(f"progress:{upload_id}", json.dumps({"status":"preview_done","preview":preview}))
     logger.info(f"[{datetime.utcnow().isoformat()}] [{cid}] PREVIEW done, enqueued full transcription")
 
@@ -238,7 +238,7 @@ def preview_transcribe(self, upload_id, correlation_id):
 
 @celery_app.task(bind=True, queue="transcribe_gpu")
 def transcribe_segments(self, upload_id, correlation_id):
-    cid = correlation_id or "?"
+    cid = correlationation_id or "?"
     logger.info(f"[{datetime.utcnow().isoformat()}] [{cid}] TRANSCRIBE task received for {upload_id}")
     if not _HF_AVAILABLE:
         logger.error(f"[{datetime.utcnow().isoformat()}] [{cid}] no Whisper available, skipping")
@@ -254,11 +254,12 @@ def transcribe_segments(self, upload_id, correlation_id):
 
     try:
         logger.info(f"[{datetime.utcnow().isoformat()}] [{cid}] TRANSCRIBE calling WhisperModel.transcribe")
-        segments, _ = get_whisper_model().transcribe(
+        segments_gen, _ = get_whisper_model().transcribe(
             str(wav),
             word_timestamps=True,
             **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {})
         )
+        segments = list(segments_gen)
         logger.info(f"[{datetime.utcnow().isoformat()}] [{cid}] TRANSCRIBE Whisper returned {len(segments)} segments")
     except Exception as e:
         logger.error(f"[{datetime.utcnow().isoformat()}] [{cid}] transcribe error", exc_info=True)
@@ -268,7 +269,7 @@ def transcribe_segments(self, upload_id, correlation_id):
     out_dir = Path(settings.RESULTS_FOLDER) / upload_id
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "transcript.json").write_text(
-        json.dumps([{"start":s.start,"end":s.end,"text":s.text} for s in segments],
+        json.dumps([{"start": s.start, "end": s.end, "text": s.text} for s in segments],
                    ensure_ascii=False, indent=2)
     )
     r.publish(f"progress:{upload_id}", json.dumps({"status":"transcript_done"}))
@@ -288,10 +289,10 @@ def diarize_full(self, upload_id, correlation_id):
     try:
         wav = prepare_wav(upload_id)
         logger.info(f"[{datetime.utcnow().isoformat()}] [{cid}] DIARIZE calling VAD and diarizer")
-        speech = get_vad().apply({"audio":str(wav)})
-        ann    = get_clustering_diarizer().apply({"audio":str(wav),"speech":speech})
-        segs   = [{"start":float(s.start),"end":float(s.end),"speaker":spk}
-                  for s,_,spk in ann.itertracks(yield_label=True)]
+        speech = get_vad().apply({"audio": str(wav)})
+        ann    = get_clustering_diarizer().apply({"audio": str(wav), "speech": speech})
+        segs   = [{"start": float(s.start), "end": float(s.end), "speaker": spk}
+                  for s, _, spk in ann.itertracks(yield_label=True)]
         logger.info(f"[{datetime.utcnow().isoformat()}] [{cid}] DIARIZE ready {len(segs)} segments")
     except Exception as e:
         logger.error(f"[{datetime.utcnow().isoformat()}] [{cid}] diarize error", exc_info=True)
@@ -308,7 +309,6 @@ def diarize_full(self, upload_id, correlation_id):
 @celery_app.task(bind=True, queue="transcribe_cpu")
 def cleanup_old_files(self):
     age = settings.FILE_RETENTION_DAYS
-    cutoff = datetime.utcnow() - timedelta(days=age)
     deleted = 0
     for base in (Path(settings.UPLOAD_FOLDER), Path(settings.RESULTS_FOLDER)):
         for p in base.glob("**/*"):
