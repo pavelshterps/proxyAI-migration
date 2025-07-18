@@ -27,7 +27,7 @@ class Settings(BaseSettings):
     API_WORKERS: int = Field(1, env="API_WORKERS")
     CPU_CONCURRENCY: int = Field(1, env="CPU_CONCURRENCY")
     GPU_CONCURRENCY: int = Field(1, env="GPU_CONCURRENCY")
-
+    FFMPEG_THREADS: int = 4
     # пути
     UPLOAD_FOLDER: str = Field(..., env="UPLOAD_FOLDER")
     RESULTS_FOLDER: str = Field(..., env="RESULTS_FOLDER")
