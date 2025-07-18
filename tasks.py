@@ -1,7 +1,6 @@
 # tasks.py
 import json
 import logging
-import time
 import subprocess
 import tempfile
 from datetime import datetime, timedelta
@@ -106,18 +105,15 @@ def preload_on_startup(**kwargs):
         except:
             logger.warning("[WARMUP] VAD/diarizer warmup failed")
 
-
 def convert_to_wav_if_needed(src_path: Path) -> Path:
     """
     Если файл НЕ в формате WAV PCM 16k mono, конвертирует его во временный файл.
-    Возвращает Path на WAV-файл (оригинальный или сконвертированный).
     """
     try:
         probe = subprocess.run(
             ["ffprobe", "-v", "error",
              "-show_entries", "stream=codec_name,sample_rate,channels",
-             "-of", "default=noprint_wrappers=1",
-             str(src_path)],
+             "-of", "default=noprint_wrappers=1"],
             capture_output=True, text=True, check=True
         )
         info = {line.split('=')[0]: line.split('=')[1] for line in probe.stdout.splitlines()}
@@ -139,7 +135,6 @@ def convert_to_wav_if_needed(src_path: Path) -> Path:
         str(tmp_path)
     ], check=True)
     return tmp_path
-
 
 @celery_app.task(bind=True, queue="transcribe_cpu")
 def convert_to_wav_and_preview(self, upload_id, correlation_id):
@@ -163,7 +158,6 @@ def convert_to_wav_and_preview(self, upload_id, correlation_id):
 
     preview_transcribe.delay(upload_id, correlation_id)
     logger.info(f"[{cid}] CONVERT done")
-
 
 @celery_app.task(bind=True, queue="transcribe_gpu")
 def preview_transcribe(self, upload_id, correlation_id):
@@ -210,7 +204,6 @@ def preview_transcribe(self, upload_id, correlation_id):
     r.publish(f"progress:{upload_id}", json.dumps({"status": "preview_done", "preview": preview}))
     transcribe_segments.delay(upload_id, correlation_id)
     logger.info(f"[{cid}] PREVIEW done")
-
 
 @celery_app.task(bind=True, queue="transcribe_gpu")
 def transcribe_segments(self, upload_id, correlation_id):
@@ -283,7 +276,6 @@ def transcribe_segments(self, upload_id, correlation_id):
     r.publish(f"progress:{upload_id}", json.dumps({"status": "transcript_done"}))
     logger.info(f"[{cid}] TRANSCRIBE done")
 
-
 @celery_app.task(bind=True, queue="diarize_gpu")
 def diarize_full(self, upload_id, correlation_id):
     cid = correlation_id or "?"
@@ -316,7 +308,6 @@ def diarize_full(self, upload_id, correlation_id):
     )
     r.publish(f"progress:{upload_id}", json.dumps({"status": "diarization_done"}))
     logger.info(f"[{cid}] DIARIZE done")
-
 
 @celery_app.task(bind=True, queue="transcribe_cpu")
 def cleanup_old_files(self):

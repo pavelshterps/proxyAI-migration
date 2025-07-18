@@ -12,7 +12,7 @@ import redis.asyncio as redis_async
 from fastapi import (
     FastAPI,
     UploadFile, File, Form, HTTPException,
-    Header, Depends, Request, Body, Query
+    Header, Depends, Request, Body, Query, Response
 )
 from fastapi.responses import JSONResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
@@ -25,21 +25,22 @@ from slowapi.util import get_remote_address
 from starlette.middleware.cors import CORSMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from sse_starlette.sse import EventSourceResponse
+# Если у вас есть Prometheus-интеграция, можно раскомментировать:
+# from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 
 from config.settings import settings
 from database import init_models, engine, get_db
 from crud import (
     create_upload_record,
     get_upload_for_user,
-    create_admin_user as crud_create_admin_user
+    create_admin_user as crud_create_admin_user,
+    list_users as crud_list_users,
+    delete_user as crud_delete_user
 )
 from dependencies import get_current_user
 
-# --- Импортируем задачи ---
+# --- Импорт Celery-задач ---
 from tasks import convert_to_wav_and_preview, transcribe_segments, diarize_full
-
-# Подключаем дополнительные маршруты из routes.py (если есть)
-from routes import router as api_router
 
 # --- structlog setup ---
 structlog.configure(processors=[
@@ -50,7 +51,6 @@ structlog.configure(processors=[
 log = structlog.get_logger()
 
 app = FastAPI(title="proxyAI", version=settings.APP_VERSION)
-app.include_router(api_router)
 
 # --- rate limiter ---
 limiter = Limiter(key_func=get_remote_address)
@@ -122,10 +122,43 @@ async def get_api_key(
     return key
 
 
-@app.get("/events/{upload_id}", dependencies=[Depends(get_api_key)])
+# -----------------------------------------------------------------------------
+#  Health / readiness / metrics
+# -----------------------------------------------------------------------------
+@app.get("/health", tags=["default"])
+async def health():
+    return {"status": "ok"}
+
+
+@app.get("/ready", tags=["default"])
+async def ready():
+    # здесь можно добавить проверку зависимостей
+    return {"status": "ready"}
+
+
+@app.get("/metrics", tags=["default"])
+async def metrics():
+    """
+    Metrics Endpoint.
+    Если подключён Prometheus, можно вернуть generate_latest().
+    """
+    # from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
+    # return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+    return JSONResponse({"metrics": "not implemented"})
+
+
+# -----------------------------------------------------------------------------
+#  User-facing API
+# -----------------------------------------------------------------------------
+@app.get(
+    "/events/{upload_id}",
+    dependencies=[Depends(get_api_key)],
+    tags=["default"]
+)
 async def progress_events(
     upload_id: str,
     request: Request,
+    api_key: str = Depends(get_api_key),
 ):
     async def gen():
         sub = redis.pubsub()
@@ -148,7 +181,12 @@ async def progress_events(
     return EventSourceResponse(gen())
 
 
-@app.post("/upload", dependencies=[Depends(get_api_key)])
+@app.post(
+    "/upload/",
+    dependencies=[Depends(get_api_key)],
+    tags=["default"],
+    operation_id="upload_audio"
+)
 @limiter.limit("10/minute")
 async def upload(
     request: Request,
@@ -160,7 +198,7 @@ async def upload(
 ):
     """
     Принимает либо multipart-файл, либо ссылку на файл (file_url).
-    Сохраняет источник и запускает CPU-воркер на конвертацию → GPU-воркер на превью.
+    Сохраняет исходник и запускает задачи конвертации и превью.
     """
     if not file and not file_url:
         raise HTTPException(400, "Нужно передать либо файл, либо file_url")
@@ -196,11 +234,77 @@ async def upload(
     await redis.publish(f"progress:{upload_id}", json.dumps({"status": "started"}))
 
     convert_to_wav_and_preview.delay(upload_id, cid)
-
     return JSONResponse({"upload_id": upload_id}, headers={"X-Correlation-ID": cid})
 
 
-@app.get("/results/{upload_id}", dependencies=[Depends(get_api_key)])
+@app.get(
+    "/status/{upload_id}",
+    dependencies=[Depends(get_api_key)],
+    tags=["default"]
+)
+async def get_status(upload_id: str):
+    data = await redis.get(f"progress:{upload_id}")
+    if not data:
+        raise HTTPException(404, "No status for that upload_id")
+    return JSONResponse(json.loads(data))
+
+
+@app.post(
+    "/diarize/{upload_id}",
+    dependencies=[Depends(get_api_key)],
+    tags=["default"],
+    operation_id="request_diarization"
+)
+async def request_diarization(
+    upload_id: str,
+    current_user=Depends(get_current_user),
+):
+    await redis.set(f"diarize_requested:{upload_id}", "1")
+    await redis.publish(f"progress:{upload_id}", json.dumps({"status":"diarize_requested"}))
+    diarize_full.delay(upload_id, None)
+    return {"message": "diarization started"}
+
+
+@app.post(
+    "/labels/{upload_id}",
+    dependencies=[Depends(get_api_key)],
+    tags=["default"],
+    operation_id="save_labels_main"
+)
+async def save_labels(
+    upload_id: str,
+    mapping: dict = Body(...),
+    current_user=Depends(get_current_user),
+    db=Depends(get_db)
+):
+    rec = await get_upload_for_user(db, current_user.id, upload_id)
+    if not rec:
+        raise HTTPException(404, "upload_id not found")
+    rec.label_mapping = mapping
+    await db.commit()
+
+    base = Path(settings.RESULTS_FOLDER) / upload_id
+    transcript = json.loads((base / "transcript.json").read_text())
+    raw = (base / "diarization.json").exists() and json.loads((base / "diarization.json").read_text()) or []
+    merged = []
+    for seg in transcript:
+        orig = next((d["speaker"] for d in raw if d["start"] <= seg["start"] < d["end"]), None)
+        speaker = mapping.get(str(orig), orig)
+        merged.append({
+            "start": seg["start"],
+            "end": seg["end"],
+            "text": seg["text"],
+            "orig": orig,
+            "speaker": speaker
+        })
+    return {"results": merged}
+
+
+@app.get(
+    "/results/{upload_id}",
+    dependencies=[Depends(get_api_key)],
+    tags=["proxyAI"]
+)
 async def get_results(
     upload_id: str,
     current_user=Depends(get_current_user),
@@ -234,58 +338,11 @@ async def get_results(
     return {"results": transcript}
 
 
-@app.post("/diarize/{upload_id}", dependencies=[Depends(get_api_key)])
-async def request_diarization(
-    upload_id: str,
-    current_user=Depends(get_current_user),
-):
-    await redis.set(f"diarize_requested:{upload_id}", "1")
-    await redis.publish(f"progress:{upload_id}", json.dumps({"status":"diarize_requested"}))
-    diarize_full.delay(upload_id, None)
-    return {"message": "diarization started"}
-
-
-@app.post("/labels/{upload_id}", dependencies=[Depends(get_api_key)])
-async def save_labels(
-    upload_id: str,
-    mapping: dict = Body(...),
-    current_user=Depends(get_current_user),
-    db=Depends(get_db)
-):
-    rec = await get_upload_for_user(db, current_user.id, upload_id)
-    if not rec:
-        raise HTTPException(404, "upload_id not found")
-    rec.label_mapping = mapping
-    await db.commit()
-
-    base = Path(settings.RESULTS_FOLDER) / upload_id
-    transcript = json.loads((base / "transcript.json").read_text())
-    raw = (base / "diarization.json").exists() and json.loads((base / "diarization.json").read_text()) or []
-    merged = []
-    for seg in transcript:
-        orig = next((d["speaker"] for d in raw if d["start"] <= seg["start"] < d["end"]), None)
-        speaker = mapping.get(str(orig), orig)
-        merged.append({
-            "start": seg["start"],
-            "end": seg["end"],
-            "text": seg["text"],
-            "orig": orig,
-            "speaker": speaker
-        })
-    return {"results": merged}
-
-
-# ——— НОВЫЕ ЭНДПОИНТЫ ———
-
-@app.get("/status/{upload_id}", dependencies=[Depends(get_api_key)])
-async def get_status(upload_id: str):
-    data = await redis.get(f"progress:{upload_id}")
-    if not data:
-        raise HTTPException(404, "No status for that upload_id")
-    return JSONResponse(json.loads(data))
-
-
-@app.get("/transcription/{upload_id}/preview", dependencies=[Depends(get_api_key)])
+@app.get(
+    "/transcription/{upload_id}/preview",
+    dependencies=[Depends(get_api_key)],
+    tags=["proxyAI"]
+)
 async def get_preview_transcript(upload_id: str):
     preview_file = Path(settings.RESULTS_FOLDER) / upload_id / "preview_transcript.json"
     if not preview_file.exists():
@@ -293,7 +350,11 @@ async def get_preview_transcript(upload_id: str):
     return JSONResponse(json.loads(preview_file.read_text(encoding="utf-8")))
 
 
-@app.get("/transcription/{upload_id}", dependencies=[Depends(get_api_key)])
+@app.get(
+    "/transcription/{upload_id}",
+    dependencies=[Depends(get_api_key)],
+    tags=["proxyAI"]
+)
 async def get_full_transcript(upload_id: str):
     transcript_file = Path(settings.RESULTS_FOLDER) / upload_id / "transcript.json"
     if not transcript_file.exists():
@@ -301,7 +362,12 @@ async def get_full_transcript(upload_id: str):
     return JSONResponse(json.loads(transcript_file.read_text(encoding="utf-8")))
 
 
-@app.get("/diarization/{upload_id}", dependencies=[Depends(get_api_key)])
+@app.get(
+    "/diarization/{upload_id}",
+    dependencies=[Depends(get_api_key)],
+    tags=["proxyAI"],
+    operation_id="get_diarization_main"
+)
 async def get_diarization(upload_id: str):
     diarization_file = Path(settings.RESULTS_FOLDER) / upload_id / "diarization.json"
     if not diarization_file.exists():
@@ -309,18 +375,39 @@ async def get_diarization(upload_id: str):
     return JSONResponse(json.loads(diarization_file.read_text(encoding="utf-8")))
 
 
-# --- Admin endpoint ---
+# -----------------------------------------------------------------------------
+#  Admin API
+# -----------------------------------------------------------------------------
 class AdminCreatePayload(BaseModel):
     name: str
 
+
 admin_key_header = APIKeyHeader(name="X-Admin-Key", auto_error=False)
+
 
 async def verify_admin_key(key: str = Depends(admin_key_header)):
     if key != settings.ADMIN_API_KEY:
         raise HTTPException(403, "Invalid admin key")
     return key
 
-@app.post("/admin/users", dependencies=[Depends(verify_admin_key)])
+
+@app.get(
+    "/admin/users",
+    dependencies=[Depends(verify_admin_key)],
+    tags=["admin"],
+    operation_id="list_admin_users"
+)
+async def list_users(db=Depends(get_db)):
+    users = await crud_list_users(db)
+    return {"users": users}
+
+
+@app.post(
+    "/admin/users",
+    dependencies=[Depends(verify_admin_key)],
+    tags=["admin"],
+    operation_id="create_admin_user"
+)
 async def create_admin_user(
     payload: AdminCreatePayload,
     db=Depends(get_db),
@@ -333,3 +420,14 @@ async def create_admin_user(
         "api_key": new_user.api_key,
         "is_admin": getattr(new_user, "is_admin", False)
     }
+
+
+@app.delete(
+    "/admin/users/{user_id}",
+    dependencies=[Depends(verify_admin_key)],
+    tags=["admin"],
+    operation_id="delete_admin_user"
+)
+async def delete_admin_user(user_id: int, db=Depends(get_db)):
+    await crud_delete_user(db, user_id)
+    return JSONResponse(status_code=204, content=None)
