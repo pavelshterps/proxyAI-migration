@@ -104,56 +104,47 @@ def preload_on_startup(**kwargs):
             logger.warning("[WARMUP] Whisper warmup failed")
     if _PN_AVAILABLE and settings.WHISPER_DEVICE.lower().startswith("cuda"):
         try:
-            get_vad()
-            get_clustering_diarizer()
+            get_vad(); get_clustering_diarizer()
             logger.info("[WARMUP] VAD & diarizer warmup ok")
         except Exception:
             logger.warning("[WARMUP] VAD/diarizer warmup failed")
 
 
-def convert_to_wav_if_needed(src_path: Path) -> Path:
+def prepare_wav(upload_id: str) -> Path:
     """
-    Всегда возвращает WAV с названием <upload_id>.wav в UPLOAD_FOLDER.
-    Если исходник уже WAV нужного формата, просто переименовывает его.
+    Забираем любой файл upload_id.* из каталога загрузок и
+    конвертируем (или переименовываем) его в UPLOAD_FOLDER/<upload_id>.wav.
     """
-    upload_id = src_path.stem
+    src = next(Path(settings.UPLOAD_FOLDER).glob(f"{upload_id}.*"))
     target = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
 
-    # проверить, может ли исходник сразу пойти в работу
     try:
         probe = subprocess.run(
-            [
-                "ffprobe", "-v", "error",
-                "-show_entries", "stream=codec_name,sample_rate,channels",
-                "-of", "default=noprint_wrappers=1",
-                str(src_path)
-            ],
+            ["ffprobe", "-v", "error",
+             "-show_entries", "stream=codec_name,sample_rate,channels",
+             "-of", "default=noprint_wrappers=1",
+             str(src)],
             capture_output=True, text=True, check=True
         )
         info = {l.split("=")[0]: l.split("=")[1] for l in probe.stdout.splitlines()}
-        if (
-            src_path.suffix.lower() == ".wav"
+        if (src.suffix.lower() == ".wav"
             and info.get("codec_name") == "pcm_s16le"
             and info.get("sample_rate") == "16000"
-            and info.get("channels") == "1"
-        ):
-            if src_path != target:
-                src_path.rename(target)
+            and info.get("channels") == "1"):
+            if src != target:
+                src.rename(target)
             return target
     except Exception:
         pass
 
-    # иначе переконвертировать в нужный WAV
+    # конвертация
     threads = getattr(settings, "FFMPEG_THREADS", 2)
-    subprocess.run(
-        [
-            "ffmpeg", "-y", "-threads", str(threads),
-            "-i", str(src_path),
-            "-acodec", "pcm_s16le", "-ac", "1", "-ar", "16000",
-            str(target)
-        ],
-        check=True
-    )
+    subprocess.run([
+        "ffmpeg", "-y", "-threads", str(threads),
+        "-i", str(src),
+        "-acodec", "pcm_s16le", "-ac", "1", "-ar", "16000",
+        str(target)
+    ], check=True)
     return target
 
 
@@ -162,13 +153,13 @@ def convert_to_wav_and_preview(self, upload_id, correlation_id):
     cid = correlation_id or "?"
     logger.info(f"[{cid}] CONVERT start {upload_id}")
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
+
     try:
-        orig = next(Path(settings.UPLOAD_FOLDER).glob(f"{upload_id}.*"))
-        wav = convert_to_wav_if_needed(orig)
-        logger.info(f"[{cid}] converted to WAV: {wav.name}")
+        wav = prepare_wav(upload_id)
+        logger.info(f"[{cid}] WAV ready: {wav.name}")
     except Exception as e:
         logger.error(f"[{cid}] convert_to_wav failed", exc_info=True)
-        r.publish(f"progress:{upload_id}", json.dumps({"status": "error", "error": str(e)}))
+        r.publish(f"progress:{upload_id}", json.dumps({"status":"error","error":str(e)}))
         return
 
     from tasks import preview_transcribe
@@ -181,46 +172,40 @@ def preview_transcribe(self, upload_id, correlation_id):
     cid = correlation_id or "?"
     logger.info(f"[{cid}] PREVIEW start {upload_id}")
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
+
+    wav = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
+    if not wav.exists():
+        err = "preview source WAV not found"
+        logger.error(f"[{cid}] {err}")
+        r.publish(f"progress:{upload_id}", json.dumps({"status":"error","error":err}))
+        return
+
     try:
-        wav = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
-        if not wav.exists():
-            raise FileNotFoundError(f"{wav} not found")
-        out_dir = Path(settings.RESULTS_FOLDER) / upload_id
-        out_dir.mkdir(parents=True, exist_ok=True)
-
-        threads = getattr(settings, "FFMPEG_THREADS", 2)
-        proc = subprocess.Popen(
-            [
-                "ffmpeg", "-y", "-threads", str(threads),
-                "-i", str(wav),
-                "-ss", "0", "-t", str(settings.PREVIEW_LENGTH_S),
-                "-f", "wav", "pipe:1"
-            ],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
-        )
-
         segments, _ = get_whisper_model().transcribe(
-            proc.stdout,
+            str(wav),
             word_timestamps=True,
+            max_initial_timestamp=settings.PREVIEW_LENGTH_S,
             **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {})
         )
-        proc.stdout.close()
-        proc.wait()
-
         for seg in segments:
-            frag = {"start": seg.start, "end": seg.end, "text": seg.text}
-            r.publish(f"progress:{upload_id}", json.dumps({"status": "preview_partial", "fragment": frag}))
+            r.publish(
+                f"progress:{upload_id}",
+                json.dumps({"status":"preview_partial",
+                            "fragment":{"start":seg.start,"end":seg.end,"text":seg.text}})
+            )
     except Exception as e:
         logger.error(f"[{cid}] preview error", exc_info=True)
-        r.publish(f"progress:{upload_id}", json.dumps({"status": "error", "error": str(e)}))
+        r.publish(f"progress:{upload_id}", json.dumps({"status":"error","error":str(e)}))
         return
 
     preview = {
-        "text": "".join(s.text for s in segments),
-        "timestamps": [{"start": s.start, "end": s.end, "text": s.text} for s in segments]
+        "text":"".join(s.text for s in segments),
+        "timestamps":[{"start":s.start,"end":s.end,"text":s.text} for s in segments]
     }
-    (out_dir / "preview_transcript.json").write_text(json.dumps(preview, ensure_ascii=False, indent=2))
-    r.publish(f"progress:{upload_id}", json.dumps({"status": "preview_done", "preview": preview}))
+    out_dir = Path(settings.RESULTS_FOLDER)/upload_id
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir/"preview_transcript.json").write_text(json.dumps(preview,ensure_ascii=False,indent=2))
+    r.publish(f"progress:{upload_id}", json.dumps({"status":"preview_done","preview":preview}))
 
     from tasks import transcribe_segments
     transcribe_segments.delay(upload_id, correlation_id)
@@ -232,66 +217,35 @@ def transcribe_segments(self, upload_id, correlation_id):
     cid = correlation_id or "?"
     logger.info(f"[{cid}] TRANSCRIBE start {upload_id}")
     if not _HF_AVAILABLE:
-        logger.error(f"[{cid}] no Whisper, skip transcribe")
+        logger.error(f"[{cid}] no Whisper, skip")
         return
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
 
     wav = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
     if not wav.exists():
-        err = "source WAV not found"
+        err = "transcribe source WAV not found"
         logger.error(f"[{cid}] {err}")
-        r.publish(f"progress:{upload_id}", json.dumps({"status": "error", "error": err}))
+        r.publish(f"progress:{upload_id}", json.dumps({"status":"error","error":err}))
         return
 
     try:
-        out = subprocess.check_output(
-            [
-                "ffprobe", "-v", "error", "-select_streams", "a:0",
-                "-show_entries", "format=duration",
-                "-of", "default=noprint_wrappers=1:nokey=1",
-                str(wav)
-            ],
-            stderr=subprocess.DEVNULL
-        )
-        duration = float(out.strip())
-    except Exception:
-        duration = None
-
-    segments_acc = []
-    chunk = getattr(settings, "CHUNK_LENGTH_S", None)
-    threads = getattr(settings, "FFMPEG_THREADS", 2)
-    if duration and chunk and duration > chunk:
-        for start in range(0, int(duration), int(chunk)):
-            proc = subprocess.Popen(
-                [
-                    "ffmpeg", "-y", "-threads", str(threads),
-                    "-i", str(wav), "-ss", str(start), "-t", str(chunk),
-                    "-f", "wav", "pipe:1"
-                ],
-                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
-            )
-            segs, _ = get_whisper_model().transcribe(
-                proc.stdout,
-                word_timestamps=True,
-                **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {})
-            )
-            proc.stdout.close()
-            proc.wait()
-            for s in segs:
-                segments_acc.append({"start": s.start + start, "end": s.end + start, "text": s.text})
-    else:
-        segs, _ = get_whisper_model().transcribe(
+        segments, _ = get_whisper_model().transcribe(
             str(wav),
             word_timestamps=True,
             **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {})
         )
-        for s in segs:
-            segments_acc.append({"start": s.start, "end": s.end, "text": s.text})
+    except Exception as e:
+        logger.error(f"[{cid}] transcribe error", exc_info=True)
+        r.publish(f"progress:{upload_id}", json.dumps({"status":"error","error":str(e)}))
+        return
 
-    out_dir = Path(settings.RESULTS_FOLDER) / upload_id
+    out_dir = Path(settings.RESULTS_FOLDER)/upload_id
     out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / "transcript.json").write_text(json.dumps(segments_acc, ensure_ascii=False, indent=2))
-    r.publish(f"progress:{upload_id}", json.dumps({"status": "transcript_done"}))
+    (out_dir/"transcript.json").write_text(
+        json.dumps([{"start":s.start,"end":s.end,"text":s.text} for s in segments],
+                   ensure_ascii=False,indent=2)
+    )
+    r.publish(f"progress:{upload_id}", json.dumps({"status":"transcript_done"}))
     logger.info(f"[{cid}] TRANSCRIBE done")
 
 
@@ -300,27 +254,26 @@ def diarize_full(self, upload_id, correlation_id):
     cid = correlation_id or "?"
     logger.info(f"[{cid}] DIARIZE start {upload_id}")
     if not _PN_AVAILABLE:
-        logger.error(f"[{cid}] no pyannote, skip diarization")
+        logger.error(f"[{cid}] no pyannote, skip")
         return
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
-
-    r.publish(f"progress:{upload_id}", json.dumps({"status": "diarize_started"}))
+    r.publish(f"progress:{upload_id}", json.dumps({"status":"diarize_started"}))
 
     try:
-        src = next(Path(settings.UPLOAD_FOLDER).glob(f"{upload_id}.*"))
-        wav = str(convert_to_wav_if_needed(src))
-        speech = get_vad().apply({"audio": wav})
-        ann = get_clustering_diarizer().apply({"audio": wav, "speech": speech})
+        wav = prepare_wav(upload_id)
+        speech = get_vad().apply({"audio":str(wav)})
+        ann    = get_clustering_diarizer().apply({"audio":str(wav),"speech":speech})
+        segs   = [{"start":float(s.start),"end":float(s.end),"speaker":spk}
+                  for s,_,spk in ann.itertracks(yield_label=True)]
     except Exception as e:
         logger.error(f"[{cid}] diarize error", exc_info=True)
-        r.publish(f"progress:{upload_id}", json.dumps({"status": "error", "error": str(e)}))
+        r.publish(f"progress:{upload_id}", json.dumps({"status":"error","error":str(e)}))
         return
 
-    segs = [{"start": float(s.start), "end": float(s.end), "speaker": spk} for s, _, spk in ann.itertracks(yield_label=True)]
-    out_dir = Path(settings.RESULTS_FOLDER) / upload_id
+    out_dir = Path(settings.RESULTS_FOLDER)/upload_id
     out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / "diarization.json").write_text(json.dumps(segs, ensure_ascii=False, indent=2))
-    r.publish(f"progress:{upload_id}", json.dumps({"status": "diarization_done"}))
+    (out_dir/"diarization.json").write_text(json.dumps(segs,ensure_ascii=False,indent=2))
+    r.publish(f"progress:{upload_id}", json.dumps({"status":"diarization_done"}))
     logger.info(f"[{cid}] DIARIZE done")
 
 
@@ -333,10 +286,8 @@ def cleanup_old_files(self):
         for p in base.glob("**/*"):
             try:
                 if datetime.utcnow() - datetime.fromtimestamp(p.stat().st_mtime) > timedelta(days=age):
-                    if p.is_dir():
-                        p.rmdir()
-                    else:
-                        p.unlink()
+                    if p.is_dir(): p.rmdir()
+                    else: p.unlink()
                     deleted += 1
             except Exception:
                 continue
