@@ -1,4 +1,3 @@
-# main.py
 import time
 import uuid
 import json
@@ -12,9 +11,9 @@ import redis.asyncio as redis_async
 from fastapi import (
     FastAPI,
     UploadFile, File, Form, HTTPException,
-    Header, Depends, Request, Body, Query, Response
+    Header, Depends, Request, Body, Query
 )
-from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi.responses import JSONResponse, HTMLResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.security.api_key import APIKeyHeader
 from pydantic import BaseModel
@@ -25,30 +24,19 @@ from slowapi.util import get_remote_address
 from starlette.middleware.cors import CORSMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from sse_starlette.sse import EventSourceResponse
-# Если у вас есть Prometheus-интеграция, можно раскомментировать:
-# from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
+from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 
 from config.settings import settings
 from database import init_models, engine, get_db
 from crud import (
     create_upload_record,
     get_upload_for_user,
-    create_admin_user as crud_create_admin_user,
-    list_users as crud_list_users,
-    delete_user as crud_delete_user
+    create_admin_user as crud_create_admin_user
 )
 from dependencies import get_current_user
 
-# --- Импорт Celery-задач ---
+# --- Импортируем фоновые задачи ---
 from tasks import convert_to_wav_and_preview, transcribe_segments, diarize_full
-
-# --- structlog setup ---
-structlog.configure(processors=[
-    structlog.processors.add_log_level,
-    structlog.processors.TimeStamper(fmt="iso"),
-    structlog.processors.JSONRenderer(),
-])
-log = structlog.get_logger()
 
 app = FastAPI(title="proxyAI", version=settings.APP_VERSION)
 
@@ -76,38 +64,15 @@ app.add_middleware(
 # --- SPA и статические файлы ---
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
+# --- StructLog ---
+structlog.configure(processors=[
+    structlog.processors.add_log_level,
+    structlog.processors.TimeStamper(fmt="iso"),
+    structlog.processors.JSONRenderer(),
+])
+log = structlog.get_logger()
 
-@app.get("/", response_class=HTMLResponse)
-async def serve_frontend():
-    index_path = Path("static/index.html")
-    if not index_path.exists():
-        raise HTTPException(404, "Not found")
-    return HTMLResponse(index_path.read_text(encoding="utf-8"))
-
-
-@app.get("/favicon.ico", include_in_schema=False)
-async def favicon():
-    maybe = Path("static/favicon.ico")
-    if maybe.exists():
-        return StaticFiles(directory="static").lookup_path("favicon.ico")
-    raise HTTPException(404)
-
-
-@app.on_event("startup")
-async def startup():
-    for attempt in range(5):
-        try:
-            await init_models(engine)
-            log.info("DB connected", attempt=attempt)
-            break
-        except OSError as e:
-            log.warning("DB init failed", attempt=attempt, error=str(e))
-            await asyncio.sleep(2)
-    for d in (settings.UPLOAD_FOLDER, settings.RESULTS_FOLDER, settings.DIARIZER_CACHE_DIR):
-        Path(d).mkdir(parents=True, exist_ok=True)
-        log.debug("Ensured dir", path=str(d))
-
-
+# --- Redis для прогресса ---
 redis = redis_async.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
@@ -122,9 +87,24 @@ async def get_api_key(
     return key
 
 
-# -----------------------------------------------------------------------------
-#  Health / readiness / metrics
-# -----------------------------------------------------------------------------
+@app.on_event("startup")
+async def on_startup():
+    # Инициализация БД и директорий
+    for attempt in range(5):
+        try:
+            await init_models(engine)
+            log.info("DB connected", attempt=attempt)
+            break
+        except OSError as e:
+            log.warning("DB init failed", attempt=attempt, error=str(e))
+            await asyncio.sleep(2)
+    for d in (settings.UPLOAD_FOLDER, settings.RESULTS_FOLDER, settings.DIARIZER_CACHE_DIR):
+        Path(d).mkdir(parents=True, exist_ok=True)
+        log.debug("Ensured dir", path=str(d))
+
+
+# --- Метрики и статус сервиса для k8s/etc ---
+
 @app.get("/health", tags=["default"])
 async def health():
     return {"status": "ok"}
@@ -132,35 +112,24 @@ async def health():
 
 @app.get("/ready", tags=["default"])
 async def ready():
-    # здесь можно добавить проверку зависимостей
     return {"status": "ready"}
 
 
 @app.get("/metrics", tags=["default"])
 async def metrics():
-    """
-    Metrics Endpoint.
-    Если подключён Prometheus, можно вернуть generate_latest().
-    """
-    # from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
-    # return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
-    return JSONResponse({"metrics": "not implemented"})
+    data = generate_latest()
+    return PlainTextResponse(data, media_type=CONTENT_TYPE_LATEST)
 
 
-# -----------------------------------------------------------------------------
-#  User-facing API
-# -----------------------------------------------------------------------------
-@app.get(
-    "/events/{upload_id}",
-    dependencies=[Depends(get_api_key)],
-    tags=["default"]
-)
+# --- SSE для прогресса транскрипции/диаризации ---
+
+@app.get("/events/{upload_id}", tags=["default"])
 async def progress_events(
     upload_id: str,
     request: Request,
     api_key: str = Depends(get_api_key),
 ):
-    async def gen():
+    async def event_generator():
         sub = redis.pubsub()
         await sub.subscribe(f"progress:{upload_id}")
         last_hb = time.time()
@@ -173,20 +142,29 @@ async def progress_events(
                 if msg and msg["type"] == "message":
                     yield f"data: {msg['data']}\n\n"
                 elif now - last_hb > 1.0:
+                    # heartbeat to keep connection alive
                     yield ":\n\n"
                     last_hb = now
                 await asyncio.sleep(0.1)
         finally:
             await sub.unsubscribe(f"progress:{upload_id}")
-    return EventSourceResponse(gen())
+
+    return EventSourceResponse(event_generator())
 
 
-@app.post(
-    "/upload/",
-    dependencies=[Depends(get_api_key)],
-    tags=["default"],
-    operation_id="upload_audio"
-)
+# --- Проверка статуса обработки (быстрый опрос без SSE) ---
+
+@app.get("/status/{upload_id}", tags=["default"])
+async def get_status(upload_id: str, api_key: str = Depends(get_api_key)):
+    raw = await redis.get(f"progress:{upload_id}")
+    if not raw:
+        raise HTTPException(404, "status not found")
+    return json.loads(raw)
+
+
+# --- Загрузка файла для транскрипции ---
+
+@app.post("/upload/", tags=["default"])
 @limiter.limit("10/minute")
 async def upload(
     request: Request,
@@ -196,14 +174,11 @@ async def upload(
     current_user=Depends(get_current_user),
     db=Depends(get_db),
 ):
-    """
-    Принимает либо multipart-файл, либо ссылку на файл (file_url).
-    Сохраняет исходник и запускает задачи конвертации и превью.
-    """
     if not file and not file_url:
         raise HTTPException(400, "Нужно передать либо файл, либо file_url")
 
     upload_id = uuid.uuid4().hex
+    ext = ""
     try:
         Path(settings.UPLOAD_FOLDER).mkdir(parents=True, exist_ok=True)
         if file:
@@ -211,13 +186,13 @@ async def upload(
             if not data:
                 raise HTTPException(400, "File is empty")
             ext = Path(file.filename).suffix or ""
-            dst_path = Path(settings.UPLOAD_FOLDER) / f"{upload_id}{ext}"
-            dst_path.write_bytes(data)
+            dst = Path(settings.UPLOAD_FOLDER) / f"{upload_id}{ext}"
+            dst.write_bytes(data)
         else:
             parsed = urlparse(file_url)
             ext = Path(parsed.path).suffix or ""
-            dst_path = Path(settings.UPLOAD_FOLDER) / f"{upload_id}{ext}"
-            urlretrieve(file_url, str(dst_path))
+            dst = Path(settings.UPLOAD_FOLDER) / f"{upload_id}{ext}"
+            urlretrieve(file_url, str(dst))
     except HTTPException:
         raise
     except Exception as e:
@@ -230,91 +205,26 @@ async def upload(
         log.warning("DB create failed", upload_id=upload_id)
 
     cid = x_correlation_id or uuid.uuid4().hex
+    # начальный статус
     await redis.set(f"progress:{upload_id}", json.dumps({"status": "started"}))
     await redis.publish(f"progress:{upload_id}", json.dumps({"status": "started"}))
 
+    # запустить цепочку задач
     convert_to_wav_and_preview.delay(upload_id, cid)
+
     return JSONResponse({"upload_id": upload_id}, headers={"X-Correlation-ID": cid})
 
 
-@app.get(
-    "/status/{upload_id}",
-    dependencies=[Depends(get_api_key)],
-    tags=["default"]
-)
-async def get_status(upload_id: str):
-    data = await redis.get(f"progress:{upload_id}")
-    if not data:
-        raise HTTPException(404, "No status for that upload_id")
-    return JSONResponse(json.loads(data))
+# --- Итоговый объединённый результат для UI ---
 
-
-@app.post(
-    "/diarize/{upload_id}",
-    dependencies=[Depends(get_api_key)],
-    tags=["default"],
-    operation_id="request_diarization"
-)
-async def request_diarization(
-    upload_id: str,
-    current_user=Depends(get_current_user),
-):
-    await redis.set(f"diarize_requested:{upload_id}", "1")
-    await redis.publish(f"progress:{upload_id}", json.dumps({"status":"diarize_requested"}))
-    diarize_full.delay(upload_id, None)
-    return {"message": "diarization started"}
-
-
-@app.post(
-    "/labels/{upload_id}",
-    dependencies=[Depends(get_api_key)],
-    tags=["default"],
-    operation_id="save_labels_main"
-)
-async def save_labels(
-    upload_id: str,
-    mapping: dict = Body(...),
-    current_user=Depends(get_current_user),
-    db=Depends(get_db)
-):
-    rec = await get_upload_for_user(db, current_user.id, upload_id)
-    if not rec:
-        raise HTTPException(404, "upload_id not found")
-    rec.label_mapping = mapping
-    await db.commit()
-
-    base = Path(settings.RESULTS_FOLDER) / upload_id
-    transcript = json.loads((base / "transcript.json").read_text())
-    raw = (base / "diarization.json").exists() and json.loads((base / "diarization.json").read_text()) or []
-    merged = []
-    for seg in transcript:
-        orig = next((d["speaker"] for d in raw if d["start"] <= seg["start"] < d["end"]), None)
-        speaker = mapping.get(str(orig), orig)
-        merged.append({
-            "start": seg["start"],
-            "end": seg["end"],
-            "text": seg["text"],
-            "orig": orig,
-            "speaker": speaker
-        })
-    return {"results": merged}
-
-
-@app.get(
-    "/results/{upload_id}",
-    dependencies=[Depends(get_api_key)],
-    tags=["proxyAI"]
-)
-async def get_results(
-    upload_id: str,
-    current_user=Depends(get_current_user),
-    db=Depends(get_db),
-):
+@app.get("/results/{upload_id}", tags=["default"])
+async def get_results(upload_id: str, api_key: str = Depends(get_api_key), db=Depends(get_db)):
     base = Path(settings.RESULTS_FOLDER) / upload_id
     tp = base / "transcript.json"
     if not tp.exists():
         raise HTTPException(404, "Not ready")
     transcript = json.loads(tp.read_text(encoding="utf-8"))
+
     dp = base / "diarization.json"
     if dp.exists():
         raw = json.loads(dp.read_text(encoding="utf-8"))
@@ -335,79 +245,92 @@ async def get_results(
                 "speaker": speaker
             })
         return {"results": merged}
+
     return {"results": transcript}
 
 
-@app.get(
-    "/transcription/{upload_id}/preview",
-    dependencies=[Depends(get_api_key)],
-    tags=["proxyAI"]
-)
-async def get_preview_transcript(upload_id: str):
-    preview_file = Path(settings.RESULTS_FOLDER) / upload_id / "preview_transcript.json"
-    if not preview_file.exists():
-        raise HTTPException(404, "preview_transcript.json not found")
-    return JSONResponse(json.loads(preview_file.read_text(encoding="utf-8")))
+# --- Сырые эндпоинты для фронта при необходимости ---
 
-
-@app.get(
-    "/transcription/{upload_id}",
-    dependencies=[Depends(get_api_key)],
-    tags=["proxyAI"]
-)
-async def get_full_transcript(upload_id: str):
-    transcript_file = Path(settings.RESULTS_FOLDER) / upload_id / "transcript.json"
-    if not transcript_file.exists():
+@app.get("/transcription/{upload_id}", tags=["default"])
+async def get_full_transcript(upload_id: str, api_key: str = Depends(get_api_key)):
+    p = Path(settings.RESULTS_FOLDER) / upload_id / "transcript.json"
+    if not p.exists():
         raise HTTPException(404, "transcript.json not found")
-    return JSONResponse(json.loads(transcript_file.read_text(encoding="utf-8")))
+    return json.loads(p.read_text(encoding="utf-8"))
 
 
-@app.get(
-    "/diarization/{upload_id}",
-    dependencies=[Depends(get_api_key)],
-    tags=["proxyAI"],
-    operation_id="get_diarization_main"
-)
-async def get_diarization(upload_id: str):
-    diarization_file = Path(settings.RESULTS_FOLDER) / upload_id / "diarization.json"
-    if not diarization_file.exists():
+@app.get("/transcription/{upload_id}/preview", tags=["default"])
+async def get_preview_transcript(upload_id: str, api_key: str = Depends(get_api_key)):
+    p = Path(settings.RESULTS_FOLDER) / upload_id / "preview_transcript.json"
+    if not p.exists():
+        raise HTTPException(404, "preview_transcript.json not found")
+    return json.loads(p.read_text(encoding="utf-8"))
+
+
+@app.get("/diarization/{upload_id}", tags=["default"])
+async def get_diarization(upload_id: str, api_key: str = Depends(get_api_key)):
+    p = Path(settings.RESULTS_FOLDER) / upload_id / "diarization.json"
+    if not p.exists():
         raise HTTPException(404, "diarization.json not found")
-    return JSONResponse(json.loads(diarization_file.read_text(encoding="utf-8")))
+    return json.loads(p.read_text(encoding="utf-8"))
 
 
-# -----------------------------------------------------------------------------
-#  Admin API
-# -----------------------------------------------------------------------------
+# --- Запуск полной диаризации по запросу клиента ---
+
+@app.post("/diarize/{upload_id}", tags=["default"])
+async def request_diarization(upload_id: str, api_key: str = Depends(get_api_key)):
+    await redis.set(f"diarize_requested:{upload_id}", "1")
+    await redis.publish(f"progress:{upload_id}", json.dumps({"status": "diarize_requested"}))
+    diarize_full.delay(upload_id, None)
+    return {"message": "diarization started"}
+
+
+# --- Сохранение пользовательских меток спикеров ---
+
+@app.post("/labels/{upload_id}", tags=["default"])
+async def save_labels_endpoint(
+    upload_id: str,
+    mapping: dict = Body(...),
+    api_key: str = Depends(get_api_key),
+    db=Depends(get_db)
+):
+    rec = await get_upload_for_user(db, current_user.id, upload_id)
+    if not rec:
+        raise HTTPException(404, "upload_id not found")
+    rec.label_mapping = mapping
+    await db.commit()
+
+    # вернуть сразу обновлённый результат
+    base = Path(settings.RESULTS_FOLDER) / upload_id
+    transcript = json.loads((base / "transcript.json").read_text(encoding="utf-8"))
+    raw = json.loads((base / "diarization.json").read_text(encoding="utf-8")) if (base / "diarization.json").exists() else []
+    merged = []
+    for seg in transcript:
+        orig = next((d["speaker"] for d in raw if d["start"] <= seg["start"] < d["end"]), None)
+        speaker = mapping.get(str(orig), orig)
+        merged.append({
+            "start": seg["start"],
+            "end": seg["end"],
+            "text": seg["text"],
+            "orig": orig,
+            "speaker": speaker
+        })
+    return {"results": merged}
+
+
+# --- Админ: создание пользователей ---
+
 class AdminCreatePayload(BaseModel):
     name: str
 
-
 admin_key_header = APIKeyHeader(name="X-Admin-Key", auto_error=False)
-
 
 async def verify_admin_key(key: str = Depends(admin_key_header)):
     if key != settings.ADMIN_API_KEY:
         raise HTTPException(403, "Invalid admin key")
     return key
 
-
-@app.get(
-    "/admin/users",
-    dependencies=[Depends(verify_admin_key)],
-    tags=["admin"],
-    operation_id="list_admin_users"
-)
-async def list_users(db=Depends(get_db)):
-    users = await crud_list_users(db)
-    return {"users": users}
-
-
-@app.post(
-    "/admin/users",
-    dependencies=[Depends(verify_admin_key)],
-    tags=["admin"],
-    operation_id="create_admin_user"
-)
+@app.post("/admin/users", dependencies=[Depends(verify_admin_key)], tags=["admin"])
 async def create_admin_user(
     payload: AdminCreatePayload,
     db=Depends(get_db),
@@ -420,14 +343,3 @@ async def create_admin_user(
         "api_key": new_user.api_key,
         "is_admin": getattr(new_user, "is_admin", False)
     }
-
-
-@app.delete(
-    "/admin/users/{user_id}",
-    dependencies=[Depends(verify_admin_key)],
-    tags=["admin"],
-    operation_id="delete_admin_user"
-)
-async def delete_admin_user(user_id: int, db=Depends(get_db)):
-    await crud_delete_user(db, user_id)
-    return JSONResponse(status_code=204, content=None)

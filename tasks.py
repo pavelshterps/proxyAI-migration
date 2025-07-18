@@ -1,6 +1,6 @@
-# tasks.py
 import json
 import logging
+import time
 import subprocess
 import tempfile
 from datetime import datetime, timedelta
@@ -14,7 +14,7 @@ from config.celery import celery_app
 
 logger = logging.getLogger(__name__)
 
-# --- Импорт Whisper ---
+# --- Whisper ---
 try:
     from faster_whisper import WhisperModel, download_model
     _HF_AVAILABLE = True
@@ -23,7 +23,7 @@ except ImportError as e:
     _HF_AVAILABLE = False
     logger.warning(f"[INIT] faster-whisper not available: {e}")
 
-# --- Импорт Pyannote для VAD и диаризации ---
+# --- Pyannote (VAD + Diarization) ---
 try:
     from pyannote.audio.pipelines import VoiceActivityDetection, SpeakerDiarization
     _PN_AVAILABLE = True
@@ -136,11 +136,9 @@ def convert_to_wav_if_needed(src_path: Path) -> Path:
     ], check=True)
     return tmp_path
 
+
 @celery_app.task(bind=True, queue="transcribe_cpu")
 def convert_to_wav_and_preview(self, upload_id, correlation_id):
-    """
-    CPU-воркер: конвертирует файл (если нужно) и запускает preview на GPU.
-    """
     cid = correlation_id or "?"
     logger.info(f"[{cid}] CONVERT start {upload_id}")
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
@@ -158,6 +156,7 @@ def convert_to_wav_and_preview(self, upload_id, correlation_id):
 
     preview_transcribe.delay(upload_id, correlation_id)
     logger.info(f"[{cid}] CONVERT done")
+
 
 @celery_app.task(bind=True, queue="transcribe_gpu")
 def preview_transcribe(self, upload_id, correlation_id):
@@ -205,6 +204,7 @@ def preview_transcribe(self, upload_id, correlation_id):
     transcribe_segments.delay(upload_id, correlation_id)
     logger.info(f"[{cid}] PREVIEW done")
 
+
 @celery_app.task(bind=True, queue="transcribe_gpu")
 def transcribe_segments(self, upload_id, correlation_id):
     cid = correlation_id or "?"
@@ -223,6 +223,7 @@ def transcribe_segments(self, upload_id, correlation_id):
         r.publish(f"progress:{upload_id}", json.dumps({"status": "error", "error": err}))
         return
 
+    # длительность
     duration = None
     try:
         out = subprocess.check_output([
@@ -276,6 +277,7 @@ def transcribe_segments(self, upload_id, correlation_id):
     r.publish(f"progress:{upload_id}", json.dumps({"status": "transcript_done"}))
     logger.info(f"[{cid}] TRANSCRIBE done")
 
+
 @celery_app.task(bind=True, queue="diarize_gpu")
 def diarize_full(self, upload_id, correlation_id):
     cid = correlation_id or "?"
@@ -309,10 +311,11 @@ def diarize_full(self, upload_id, correlation_id):
     r.publish(f"progress:{upload_id}", json.dumps({"status": "diarization_done"}))
     logger.info(f"[{cid}] DIARIZE done")
 
+
 @celery_app.task(bind=True, queue="transcribe_cpu")
 def cleanup_old_files(self):
     """
-    Удаляет файлы старше settings.FILE_RETENTION_DAYS.
+    Удаляет файлы старше настроенного retention.
     """
     age_limit = settings.FILE_RETENTION_DAYS
     cutoff = datetime.utcnow() - timedelta(days=age_limit)
