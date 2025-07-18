@@ -53,7 +53,7 @@ def get_whisper_model():
         compute = getattr(
             settings,
             "WHISPER_COMPUTE_TYPE",
-            ("float16" if device.startswith("cuda") else "int8")
+            "float16" if device.startswith("cuda") else "int8"
         ).lower()
         if device == "cpu" and compute in ("fp16", "float16"):
             compute = "int8"
@@ -113,8 +113,13 @@ def preload_on_startup(**kwargs):
 
 def convert_to_wav_if_needed(src_path: Path) -> Path:
     """
-    Конвертирует в WAV pcm_s16le@16k mono, если нужно.
+    Всегда возвращает WAV с названием <upload_id>.wav в UPLOAD_FOLDER.
+    Если исходник уже WAV нужного формата, просто переименовывает его.
     """
+    upload_id = src_path.stem
+    target = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
+
+    # проверить, может ли исходник сразу пойти в работу
     try:
         probe = subprocess.run(
             [
@@ -132,25 +137,24 @@ def convert_to_wav_if_needed(src_path: Path) -> Path:
             and info.get("sample_rate") == "16000"
             and info.get("channels") == "1"
         ):
-            return src_path
+            if src_path != target:
+                src_path.rename(target)
+            return target
     except Exception:
         pass
 
-    # создаём временный WAV с нужным кодеком
-    fd, tmp_path_str = tempfile.mkstemp(suffix=".wav", dir=settings.UPLOAD_FOLDER)
-    os.close(fd)
-    tmp_path = Path(tmp_path_str)
+    # иначе переконвертировать в нужный WAV
     threads = getattr(settings, "FFMPEG_THREADS", 2)
     subprocess.run(
         [
             "ffmpeg", "-y", "-threads", str(threads),
             "-i", str(src_path),
             "-acodec", "pcm_s16le", "-ac", "1", "-ar", "16000",
-            str(tmp_path)
+            str(target)
         ],
         check=True
     )
-    return tmp_path
+    return target
 
 
 @celery_app.task(bind=True, queue="transcribe_cpu")
@@ -164,13 +168,9 @@ def convert_to_wav_and_preview(self, upload_id, correlation_id):
         logger.info(f"[{cid}] converted to WAV: {wav.name}")
     except Exception as e:
         logger.error(f"[{cid}] convert_to_wav failed", exc_info=True)
-        r.publish(
-            f"progress:{upload_id}",
-            json.dumps({"status": "error", "error": str(e)})
-        )
+        r.publish(f"progress:{upload_id}", json.dumps({"status": "error", "error": str(e)}))
         return
 
-    # сразу на GPU-preview
     from tasks import preview_transcribe
     preview_transcribe.delay(upload_id, correlation_id)
     logger.info(f"[{cid}] CONVERT done")
@@ -182,7 +182,9 @@ def preview_transcribe(self, upload_id, correlation_id):
     logger.info(f"[{cid}] PREVIEW start {upload_id}")
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
     try:
-        wav = next(Path(settings.UPLOAD_FOLDER).glob(f"{upload_id}.wav"))
+        wav = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
+        if not wav.exists():
+            raise FileNotFoundError(f"{wav} not found")
         out_dir = Path(settings.RESULTS_FOLDER) / upload_id
         out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -207,32 +209,18 @@ def preview_transcribe(self, upload_id, correlation_id):
 
         for seg in segments:
             frag = {"start": seg.start, "end": seg.end, "text": seg.text}
-            r.publish(
-                f"progress:{upload_id}",
-                json.dumps({"status": "preview_partial", "fragment": frag})
-            )
+            r.publish(f"progress:{upload_id}", json.dumps({"status": "preview_partial", "fragment": frag}))
     except Exception as e:
         logger.error(f"[{cid}] preview error", exc_info=True)
-        r.publish(
-            f"progress:{upload_id}",
-            json.dumps({"status": "error", "error": str(e)})
-        )
+        r.publish(f"progress:{upload_id}", json.dumps({"status": "error", "error": str(e)}))
         return
 
     preview = {
         "text": "".join(s.text for s in segments),
-        "timestamps": [
-            {"start": s.start, "end": s.end, "text": s.text}
-            for s in segments
-        ]
+        "timestamps": [{"start": s.start, "end": s.end, "text": s.text} for s in segments]
     }
-    (out_dir / "preview_transcript.json").write_text(
-        json.dumps(preview, ensure_ascii=False, indent=2)
-    )
-    r.publish(
-        f"progress:{upload_id}",
-        json.dumps({"status": "preview_done", "preview": preview})
-    )
+    (out_dir / "preview_transcript.json").write_text(json.dumps(preview, ensure_ascii=False, indent=2))
+    r.publish(f"progress:{upload_id}", json.dumps({"status": "preview_done", "preview": preview}))
 
     from tasks import transcribe_segments
     transcribe_segments.delay(upload_id, correlation_id)
@@ -247,18 +235,14 @@ def transcribe_segments(self, upload_id, correlation_id):
         logger.error(f"[{cid}] no Whisper, skip transcribe")
         return
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
-    try:
-        wav = next(Path(settings.UPLOAD_FOLDER).glob(f"{upload_id}.wav"))
-    except StopIteration:
+
+    wav = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
+    if not wav.exists():
         err = "source WAV not found"
         logger.error(f"[{cid}] {err}")
-        r.publish(
-            f"progress:{upload_id}",
-            json.dumps({"status": "error", "error": err})
-        )
+        r.publish(f"progress:{upload_id}", json.dumps({"status": "error", "error": err}))
         return
 
-    # узнаём длительность
     try:
         out = subprocess.check_output(
             [
@@ -294,11 +278,7 @@ def transcribe_segments(self, upload_id, correlation_id):
             proc.stdout.close()
             proc.wait()
             for s in segs:
-                segments_acc.append({
-                    "start": s.start + start,
-                    "end":   s.end + start,
-                    "text":  s.text
-                })
+                segments_acc.append({"start": s.start + start, "end": s.end + start, "text": s.text})
     else:
         segs, _ = get_whisper_model().transcribe(
             str(wav),
@@ -310,13 +290,8 @@ def transcribe_segments(self, upload_id, correlation_id):
 
     out_dir = Path(settings.RESULTS_FOLDER) / upload_id
     out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / "transcript.json").write_text(
-        json.dumps(segments_acc, ensure_ascii=False, indent=2)
-    )
-    r.publish(
-        f"progress:{upload_id}",
-        json.dumps({"status": "transcript_done"})
-    )
+    (out_dir / "transcript.json").write_text(json.dumps(segments_acc, ensure_ascii=False, indent=2))
+    r.publish(f"progress:{upload_id}", json.dumps({"status": "transcript_done"}))
     logger.info(f"[{cid}] TRANSCRIBE done")
 
 
@@ -329,38 +304,23 @@ def diarize_full(self, upload_id, correlation_id):
         return
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
 
-    # сразу отправим статус, чтобы фронтенд не «завис»
-    r.publish(
-        f"progress:{upload_id}",
-        json.dumps({"status": "diarize_started"})
-    )
+    r.publish(f"progress:{upload_id}", json.dumps({"status": "diarize_started"}))
 
     try:
         src = next(Path(settings.UPLOAD_FOLDER).glob(f"{upload_id}.*"))
         wav = str(convert_to_wav_if_needed(src))
         speech = get_vad().apply({"audio": wav})
-        ann    = get_clustering_diarizer().apply({"audio": wav, "speech": speech})
+        ann = get_clustering_diarizer().apply({"audio": wav, "speech": speech})
     except Exception as e:
         logger.error(f"[{cid}] diarize error", exc_info=True)
-        r.publish(
-            f"progress:{upload_id}",
-            json.dumps({"status": "error", "error": str(e)})
-        )
+        r.publish(f"progress:{upload_id}", json.dumps({"status": "error", "error": str(e)}))
         return
 
-    segs = [
-        {"start": float(s.start), "end": float(s.end), "speaker": spk}
-        for s, _, spk in ann.itertracks(yield_label=True)
-    ]
+    segs = [{"start": float(s.start), "end": float(s.end), "speaker": spk} for s, _, spk in ann.itertracks(yield_label=True)]
     out_dir = Path(settings.RESULTS_FOLDER) / upload_id
     out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / "diarization.json").write_text(
-        json.dumps(segs, ensure_ascii=False, indent=2)
-    )
-    r.publish(
-        f"progress:{upload_id}",
-        json.dumps({"status": "diarization_done"})
-    )
+    (out_dir / "diarization.json").write_text(json.dumps(segs, ensure_ascii=False, indent=2))
+    r.publish(f"progress:{upload_id}", json.dumps({"status": "diarization_done"}))
     logger.info(f"[{cid}] DIARIZE done")
 
 
