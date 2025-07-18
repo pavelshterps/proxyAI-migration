@@ -155,10 +155,12 @@ def prepare_wav(upload_id: str) -> (Path, float):
     info = probe_audio(src)
     duration = info["duration"]
 
-    if (src.suffix.lower() == ".wav"
-            and info.get("codec_name") == "pcm_s16le"
-            and info.get("sample_rate") == 16000
-            and info.get("channels") == 1):
+    if (
+        src.suffix.lower() == ".wav" and
+        info.get("codec_name") == "pcm_s16le" and
+        info.get("sample_rate") == 16000 and
+        info.get("channels") == 1
+    ):
         if src != target:
             src.rename(target)
         logger.info(f"[{datetime.utcnow().isoformat()}] [PREPARE] WAV OK ({time.perf_counter()-start:.2f}s)")
@@ -184,10 +186,9 @@ def convert_to_wav_and_preview(self, upload_id, correlation_id):
     try:
         wav_path, _ = prepare_wav(upload_id)
     except Exception as e:
-        r.publish(f"progress:{upload_id}", json.dumps({"status":"error", "error":str(e)}))
+        r.publish(f"progress:{upload_id}", json.dumps({"status":"error", "error": str(e)}))
         return
 
-    # 1) Fire off the fast 60s preview
     logger.info(f"[{datetime.utcnow().isoformat()}] [{cid}] enqueue PREVIEW")
     from tasks import preview_transcribe
     preview_transcribe.delay(upload_id, correlation_id)
@@ -208,29 +209,29 @@ def preview_transcribe(self, upload_id, correlation_id):
     # slice first PREVIEW_LENGTH_S seconds via ffmpeg
     threads = getattr(settings, "FFMPEG_THREADS", 2)
     preview_secs = settings.PREVIEW_LENGTH_S
-    cmd = [
+    proc = subprocess.Popen([
         "ffmpeg", "-y", "-threads", str(threads),
         "-i", str(wav),
         "-ss", "0", "-t", str(preview_secs),
         "-f", "wav", "pipe:1"
-    ]
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    ], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
 
-    model = (get_whisper_model(settings.PREVIEW_WHISPER_MODEL)
-             if getattr(settings, "PREVIEW_WHISPER_MODEL", None)
-             else get_whisper_model())
+    # lightweight model for preview
+    model_name = getattr(settings, "PREVIEW_WHISPER_MODEL", None)
+    model = get_whisper_model(model_name) if model_name else get_whisper_model("tiny")
 
     start = time.perf_counter()
     segments_gen, _ = model.transcribe(
         proc.stdout,
         word_timestamps=True,
-        **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {})
+        language=settings.WHISPER_LANGUAGE
     )
     proc.stdout.close()
     proc.wait()
+    took = time.perf_counter() - start
 
     segments = list(segments_gen)
-    logger.info(f"[{datetime.utcnow().isoformat()}] [{cid}] got {len(segments)} preview segments ({time.perf_counter()-start:.2f}s)")
+    logger.info(f"[{datetime.utcnow().isoformat()}] [{cid}] got {len(segments)} preview segments ({took:.2f}s)")
 
     for seg in segments:
         r.publish(f"progress:{upload_id}", json.dumps({
@@ -244,11 +245,12 @@ def preview_transcribe(self, upload_id, correlation_id):
     }
     out_dir = Path(settings.RESULTS_FOLDER) / upload_id
     out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / "preview_transcript.json").write_text(json.dumps(preview, ensure_ascii=False, indent=2))
-    r.publish(f"progress:{upload_id}", json.dumps({"status":"preview_done","preview":preview}))
+    (out_dir / "preview_transcript.json").write_text(
+        json.dumps(preview, ensure_ascii=False, indent=2)
+    )
+    r.publish(f"progress:{upload_id}", json.dumps({"status":"preview_done", "preview": preview}))
     logger.info(f"[{datetime.utcnow().isoformat()}] [{cid}] PREVIEW done")
 
-    # 2) Enqueue the full transcription
     logger.info(f"[{datetime.utcnow().isoformat()}] [{cid}] enqueue full transcription")
     from tasks import transcribe_segments
     transcribe_segments.delay(upload_id, correlation_id)
@@ -281,7 +283,7 @@ def transcribe_segments(self, upload_id, correlation_id):
         segs, _ = model.transcribe(
             str(wav),
             word_timestamps=True,
-            **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {})
+            language=settings.WHISPER_LANGUAGE
         )
         all_segs = list(segs)
     else:
@@ -298,7 +300,7 @@ def transcribe_segments(self, upload_id, correlation_id):
             seg_gen, _ = model.transcribe(
                 proc.stdout,
                 word_timestamps=True,
-                **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {})
+                language=settings.WHISPER_LANGUAGE
             )
             proc.stdout.close()
             proc.wait()
@@ -312,10 +314,10 @@ def transcribe_segments(self, upload_id, correlation_id):
     elapsed = time.perf_counter() - start
     logger.info(f"[{datetime.utcnow().isoformat()}] [{cid}] got {len(all_segs)} segments ({elapsed:.2f}s)")
 
-    out = Path(settings.RESULTS_FOLDER) / upload_id
-    out.mkdir(parents=True, exist_ok=True)
-    (out / "transcript.json").write_text(json.dumps(
-        [{"start":s.start,"end":s.end,"text":s.text} for s in all_segs],
+    out_dir = Path(settings.RESULTS_FOLDER) / upload_id
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "transcript.json").write_text(json.dumps(
+        [{"start": s.start, "end": s.end, "text": s.text} for s in all_segs],
         ensure_ascii=False, indent=2
     ))
     r.publish(f"progress:{upload_id}", json.dumps({"status":"transcript_done"}))
@@ -345,12 +347,12 @@ def diarize_full(self, upload_id, correlation_id):
         logger.info(f"[{datetime.utcnow().isoformat()}] [{cid}] got {len(segs)} diarization segments")
     except Exception as e:
         logger.error(f"[{datetime.utcnow().isoformat()}] [{cid}] DIARIZE error", exc_info=True)
-        r.publish(f"progress:{upload_id}", json.dumps({"status":"error","error":str(e)}))
+        r.publish(f"progress:{upload_id}", json.dumps({"status":"error","error": str(e)}))
         return
 
-    out = Path(settings.RESULTS_FOLDER) / upload_id
-    out.mkdir(parents=True, exist_ok=True)
-    (out / "diarization.json").write_text(json.dumps(segs, ensure_ascii=False, indent=2))
+    out_dir = Path(settings.RESULTS_FOLDER) / upload_id
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "diarization.json").write_text(json.dumps(segs, ensure_ascii=False, indent=2))
     r.publish(f"progress:{upload_id}", json.dumps({"status":"diarization_done"}))
     logger.info(f"[{datetime.utcnow().isoformat()}] [{cid}] DIARIZE done")
 
