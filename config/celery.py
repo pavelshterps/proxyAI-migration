@@ -4,16 +4,14 @@ from kombu import Queue
 
 from config.settings import settings
 
-# 1) Create the Celery app
 celery_app = Celery(
     "proxyai",
-    broker=settings.CELERY_BROKER_URL,
+    broker=settings.CELERY_BROKER_URL,            # now starts with sentinel://
     backend=settings.CELERY_RESULT_BACKEND,
     timezone=settings.CELERY_TIMEZONE,
     include=["tasks"],
 )
 
-# 2) Configure it
 celery_app.conf.update(
     task_serializer="json",
     accept_content=["json"],
@@ -25,12 +23,11 @@ celery_app.conf.update(
         Queue("diarize_gpu"),
     ],
     task_routes={
-        "tasks.preview_transcribe":    {"queue": "transcribe_gpu"},
-        "tasks.transcribe_segments":   {"queue": "transcribe_gpu"},
-        "tasks.diarize_full":          {"queue": "diarize_gpu"},
+        "tasks.preview_transcribe":  {"queue": "transcribe_gpu"},
+        "tasks.transcribe_segments": {"queue": "transcribe_gpu"},
+        "tasks.diarize_full":        {"queue": "diarize_gpu"},
     },
 
-    # Redis Sentinel transport options for failover handling
     broker_transport_options={
         "sentinels": settings.CELERY_SENTINELS,
         "service_name": settings.CELERY_SENTINEL_MASTER_NAME,
@@ -39,7 +36,6 @@ celery_app.conf.update(
         "preload_reconnect": True,
     },
 
-    # Daily cleanup
     beat_schedule={
         "daily-cleanup-old-files": {
             "task": "tasks.cleanup_old_files",
