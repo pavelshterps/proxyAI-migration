@@ -6,7 +6,7 @@ from config.settings import settings
 
 celery_app = Celery(
     "proxyai",
-    broker=settings.CELERY_BROKER_URL,            # now starts with sentinel://
+    broker=settings.CELERY_BROKER_URL,
     backend=settings.CELERY_RESULT_BACKEND,
     timezone=settings.CELERY_TIMEZONE,
     include=["tasks"],
@@ -17,25 +17,32 @@ celery_app.conf.update(
     accept_content=["json"],
     result_serializer="json",
 
+    # теперь у нас четыре очереди
     task_queues=[
         Queue("transcribe_cpu"),
+        Queue("preview_gpu"),      # новая очередь для превью
         Queue("transcribe_gpu"),
         Queue("diarize_gpu"),
     ],
+
+    # маршрутизация задач
     task_routes={
-        "tasks.preview_transcribe":  {"queue": "transcribe_gpu"},
-        "tasks.transcribe_segments": {"queue": "transcribe_gpu"},
-        "tasks.diarize_full":        {"queue": "diarize_gpu"},
+        "tasks.convert_to_wav_and_preview": {"queue": "transcribe_cpu"},
+        "tasks.preview_transcribe":         {"queue": "preview_gpu"},
+        "tasks.transcribe_segments":        {"queue": "transcribe_gpu"},
+        "tasks.diarize_full":               {"queue": "diarize_gpu"},
     },
 
+    # Sentinel / Redis
     broker_transport_options={
         "sentinels": settings.CELERY_SENTINELS,
-        'master_name': settings.CELERY_SENTINEL_MASTER_NAME,
+        "master_name": settings.CELERY_SENTINEL_MASTER_NAME,
         "socket_timeout": settings.CELERY_SENTINEL_SOCKET_TIMEOUT,
         "retry_on_timeout": True,
         "preload_reconnect": True,
     },
 
+    # расписание
     beat_schedule={
         "daily-cleanup-old-files": {
             "task": "tasks.cleanup_old_files",

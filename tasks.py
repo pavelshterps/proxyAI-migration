@@ -26,16 +26,6 @@ logger.setLevel(logging.INFO)
 
 # --- Webhook helper ---
 def send_webhook_event(event_type: str, upload_id: str, data: Optional[Any]):
-    """
-    POST -> settings.WEBHOOK_URL:
-      {
-        "event_type": "...",
-        "upload_id": "...",
-        "timestamp": "2025-07-19T10:30:00Z",
-        "data": { … }  // или null
-      }
-    заголовок X-WebHook-Secret
-    """
     url = settings.WEBHOOK_URL
     secret = settings.WEBHOOK_SECRET
     if not url or not secret:
@@ -145,7 +135,6 @@ def preload_on_startup(**kwargs):
             logger.info(f"[{datetime.utcnow().isoformat()}] [WARMUP] Whisper warmup ok")
         except Exception:
             logger.warning(f"[{datetime.utcnow().isoformat()}] [WARMUP] Whisper warmup failed")
-
     if _PN_AVAILABLE and device.startswith("cuda"):
         try:
             get_vad()
@@ -205,8 +194,6 @@ def prepare_wav(upload_id: str) -> (Path, float):
 def convert_to_wav_and_preview(self, upload_id, correlation_id):
     cid = correlation_id or "?"
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
-
-    # webhook: запустилась обработка
     send_webhook_event("processing_started", upload_id, None)
 
     try:
@@ -222,7 +209,7 @@ def convert_to_wav_and_preview(self, upload_id, correlation_id):
     from tasks import preview_transcribe
     preview_transcribe.delay(upload_id, correlation_id)
 
-@celery_app.task(bind=True, queue="transcribe_gpu")
+@celery_app.task(bind=True, queue="preview_gpu")
 def preview_transcribe(self, upload_id, correlation_id):
     cid = correlation_id or "?"
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
@@ -267,8 +254,6 @@ def preview_transcribe(self, upload_id, correlation_id):
             json.dumps(preview, ensure_ascii=False, indent=2)
         )
         r.publish(f"progress:{upload_id}", json.dumps({"status":"preview_done","preview":preview}))
-
-        # webhook: превью готово
         send_webhook_event("preview_completed", upload_id, {"preview": preview})
 
     except Exception as e:
@@ -336,8 +321,6 @@ def transcribe_segments(self, upload_id, correlation_id):
             json.dumps(transcript_data, ensure_ascii=False, indent=2)
         )
         r.publish(f"progress:{upload_id}", json.dumps({"status":"transcript_done"}))
-
-        # webhook: транскрипция готова
         send_webhook_event("transcription_completed", upload_id, {"transcript": transcript_data})
 
     except Exception as e:
@@ -349,8 +332,6 @@ def transcribe_segments(self, upload_id, correlation_id):
 def diarize_full(self, upload_id, correlation_id):
     cid = correlation_id or "?"
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
-
-    # webhook: диаризация запущена
     send_webhook_event("diarization_started", upload_id, None)
     r.publish(f"progress:{upload_id}", json.dumps({"status":"diarize_started"}))
 
@@ -380,8 +361,6 @@ def diarize_full(self, upload_id, correlation_id):
         json.dumps(segs, ensure_ascii=False, indent=2)
     )
     r.publish(f"progress:{upload_id}", json.dumps({"status":"diarization_done"}))
-
-    # webhook: диаризация готова
     send_webhook_event("diarization_completed", upload_id, {"diarization": segs})
 
 @celery_app.task(bind=True, queue="transcribe_cpu")
