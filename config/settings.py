@@ -1,10 +1,17 @@
+# config/settings.py
+
 import json
 from typing import List, Optional, Any
 from pydantic import Field, HttpUrl
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
+    # Подгружаем переменные из .env и игнорируем лишние
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
 
     # версия приложения
     APP_VERSION: str = Field("0.0.0", env="APP_VERSION")
@@ -22,13 +29,15 @@ class Settings(BaseSettings):
     CELERY_BROKER_URL: str = Field(..., env="CELERY_BROKER_URL")
     CELERY_RESULT_BACKEND: str = Field(..., env="CELERY_RESULT_BACKEND")
     CELERY_TIMEZONE: str = Field("UTC", env="CELERY_TIMEZONE")
-
     CELERY_SENTINELS: List[tuple[str, int]] = Field(
         default=[("sentinel1", 26379), ("sentinel2", 26379)],
         env="CELERY_SENTINELS",
     )
     CELERY_SENTINEL_MASTER_NAME: str = Field("mymaster", env="CELERY_SENTINEL_MASTER_NAME")
     CELERY_SENTINEL_SOCKET_TIMEOUT: float = Field(0.1, env="CELERY_SENTINEL_SOCKET_TIMEOUT")
+
+    # URL Redis для FastAPI и SSE
+    REDIS_URL: HttpUrl = Field(..., env="REDIS_URL")
 
     # concurrency
     API_WORKERS: int = Field(1, env="API_WORKERS")
@@ -48,9 +57,10 @@ class Settings(BaseSettings):
     WHISPER_BATCH_SIZE: int = Field(1, env="WHISPER_BATCH_SIZE")
     WHISPER_LANGUAGE: Optional[str] = Field(None, env="WHISPER_LANGUAGE")
 
-    # FS-EEND settings
+    # FS‐EEND settings
     USE_FS_EEND: bool = Field(False, env="USE_FS_EEND")
     FS_EEND_MODEL_PATH: Optional[str] = Field(None, env="FS_EEND_MODEL_PATH")
+    FS_EEND_PIPELINE: Optional[str] = Field(None, env="FS_EEND_PIPELINE")
     FS_EEND_DEVICE: str = Field("cuda", env="FS_EEND_DEVICE")
     FRAME_SHIFT: float = Field(0.01, env="FRAME_SHIFT")
 
@@ -89,11 +99,20 @@ class Settings(BaseSettings):
     EXTERNAL_POLL_INTERVAL_S: int = Field(5, env="EXTERNAL_POLL_INTERVAL_S")
     DEFAULT_TRANSCRIBE_MODE: str = Field("local", env="DEFAULT_TRANSCRIBE_MODE")
 
+    # Webhook настройки (нужно для отправки событий)
+    WEBHOOK_URL: Optional[HttpUrl] = Field(None, env="WEBHOOK_URL")
+    WEBHOOK_SECRET: Optional[str] = Field(None, env="WEBHOOK_SECRET")
+
     @property
     def ALLOWED_ORIGINS_LIST(self) -> List[str]:
+        """
+        Возвращает список разрешённых origin'ов,
+        распарсив JSON или CSV-строку.
+        """
         try:
             return json.loads(self.ALLOWED_ORIGINS)
         except Exception:
             return [o.strip() for o in self.ALLOWED_ORIGINS.split(",") if o.strip()]
 
+# единый источник конфига
 settings = Settings()
