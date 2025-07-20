@@ -2,7 +2,7 @@ import json
 import logging
 import subprocess
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
@@ -24,13 +24,21 @@ handler.setFormatter(formatter)
 logger.addHandler(handler)
 logger.setLevel(logging.INFO)
 
-# Initialize Redis client for webhook state
+# Redis client for webhook state
 _redis_for_webhook = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
 
-def send_webhook_event(event_type: str, upload_id: str, data: Optional[Any]):
+@celery_app.task(
+    bind=True,
+    name="tasks.send_webhook",
+    default_retry_delay=30,  # seconds
+    autoretry_for=(Exception,),
+    retry_backoff=False,     # fixed delay
+    retry_kwargs={"max_retries": None},  # retry indefinitely
+)
+def send_webhook(self, event_type: str, upload_id: str, data: Optional[Any]):
     """
-    Отправляет единичный вебхук: после первого успешного (2xx) ответа
-    повторная отправка того же event_type/upload_id не выполняется.
+    Celery task: send one‐off webhook, retrying every 30s until a 2xx response.
+    Once a 2xx is seen, marks it in Redis so duplicates are skipped.
     """
     url = settings.WEBHOOK_URL
     secret = settings.WEBHOOK_SECRET
@@ -38,8 +46,8 @@ def send_webhook_event(event_type: str, upload_id: str, data: Optional[Any]):
         return
 
     key = f"webhook:{upload_id}:{event_type}"
-    # если уже отправляли и получили 2xx — пропускаем
     if _redis_for_webhook.get(key):
+        # already succeeded once
         return
 
     payload = {
@@ -56,12 +64,21 @@ def send_webhook_event(event_type: str, upload_id: str, data: Optional[Any]):
     try:
         resp = requests.post(url, json=payload, headers=headers, timeout=5)
         if 200 <= resp.status_code < 300:
-            # помечаем в Redis, чтобы больше не отправлять
+            # mark as done
             _redis_for_webhook.set(key, "1")
+            logger.info(f"[WEBHOOK] succeeded for {upload_id}:{event_type}")
         else:
-            logger.warning(f"[{datetime.utcnow().isoformat()}] [WEBHOOK] non-2xx response {resp.status_code} for {upload_id}:{event_type}")
-    except Exception as e:
-        logger.warning(f"[{datetime.utcnow().isoformat()}] [WEBHOOK] {event_type} failed for {upload_id}: {e}")
+            logger.warning(f"[WEBHOOK] non-2xx ({resp.status_code}) for {upload_id}:{event_type}, retrying")
+            raise Exception(f"non-2xx: {resp.status_code}")
+    except Exception as exc:
+        # will retry after default_retry_delay
+        raise self.retry(exc=exc)
+
+
+def enqueue_webhook(event_type: str, upload_id: str, data: Optional[Any]):
+    """Helper: fire off the Celery webhook task."""
+    send_webhook.delay(event_type, upload_id, data)
+
 
 # Model flags
 try:
@@ -212,18 +229,20 @@ def prepare_wav(upload_id: str) -> (Path, float):
 def convert_to_wav_and_preview(self, upload_id, correlation_id):
     cid = correlation_id or "?"
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
-    # webhook: start
-    send_webhook_event("processing_started", upload_id, None)
+
+    # 1) notify start
+    r.publish(f"progress:{upload_id}", json.dumps({"status":"started"}))
+    enqueue_webhook("processing_started", upload_id, None)
 
     try:
         prepare_wav(upload_id)
     except Exception as e:
         logger.error(f"[{cid}] PREPARE ERROR: {e}", exc_info=True)
         r.publish(f"progress:{upload_id}", json.dumps({"status":"error","error":str(e)}))
-        send_webhook_event("processing_failed", upload_id, None)
+        enqueue_webhook("processing_failed", upload_id, None)
         return
 
-    # enqueue preview
+    # 2) enqueue GPU‐based preview
     from tasks import preview_transcribe
     preview_transcribe.apply_async((upload_id, correlation_id), queue="preview_gpu")
 
@@ -239,23 +258,23 @@ def preview_transcribe(self, upload_id, correlation_id):
              "-i",str(wav),"-f","wav","pipe:1"],
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
         )
-        segments_gen, _ = get_whisper_model().transcribe(
+        model = get_whisper_model()
+        segments_gen, _ = model.transcribe(
             proc.stdout, word_timestamps=True,
             **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {}),
         )
         proc.stdout.close(); proc.wait()
         segments = list(segments_gen)
+
         for seg in segments:
-            r.publish(
-                f"progress:{upload_id}",
-                json.dumps({
-                    "status": "preview_partial",
-                    "fragment": {"start": seg.start, "end": seg.end, "text": seg.text}
-                })
-            )
+            r.publish(f"progress:{upload_id}", json.dumps({
+                "status":"preview_partial",
+                "fragment":{"start":seg.start,"end":seg.end,"text":seg.text}
+            }))
+
         preview = {
-            "text": "".join(s.text for s in segments),
-            "timestamps": [{"start":s.start,"end":s.end,"text":s.text} for s in segments],
+            "text":"".join(s.text for s in segments),
+            "timestamps":[{"start":s.start,"end":s.end,"text":s.text} for s in segments],
         }
         out_dir = Path(settings.RESULTS_FOLDER) / upload_id
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -263,13 +282,12 @@ def preview_transcribe(self, upload_id, correlation_id):
             json.dumps(preview, ensure_ascii=False, indent=2)
         )
         r.publish(f"progress:{upload_id}", json.dumps({"status":"preview_done","preview":preview}))
-        # webhook: preview
-        send_webhook_event("preview_completed", upload_id, {"preview": preview})
+        enqueue_webhook("preview_completed", upload_id, {"preview": preview})
 
     except Exception as e:
         logger.error(f"[{cid}] PREVIEW ERROR: {e}", exc_info=True)
         r.publish(f"progress:{upload_id}", json.dumps({"status":"error","error":str(e)}))
-        send_webhook_event("processing_failed", upload_id, None)
+        enqueue_webhook("processing_failed", upload_id, None)
         return
 
     from tasks import transcribe_segments
@@ -285,9 +303,8 @@ def transcribe_segments(self, upload_id, correlation_id):
         duration = info["duration"]
         model = get_whisper_model()
         all_segs = []
-        chunk_len = settings.CHUNK_LENGTH_S
 
-        if duration <= chunk_len:
+        if duration <= settings.CHUNK_LENGTH_S:
             segs, _ = model.transcribe(
                 str(wav), word_timestamps=True,
                 **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {}),
@@ -296,14 +313,15 @@ def transcribe_segments(self, upload_id, correlation_id):
         else:
             offset = 0.0
             while offset < duration:
-                this_len = min(chunk_len, duration - offset)
+                this_len = min(settings.CHUNK_LENGTH_S, duration - offset)
                 proc = subprocess.Popen(
                     ["ffmpeg","-y","-threads",str(settings.FFMPEG_THREADS),
                      "-ss",str(offset),"-t",str(this_len),
                      "-i",str(wav),"-f","wav","pipe:1"],
                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                 )
-                seg_gen, _ = model.transcribe( proc.stdout, word_timestamps=True,
+                seg_gen, _ = model.transcribe(
+                    proc.stdout, word_timestamps=True,
                     **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {}),
                 )
                 proc.stdout.close(); proc.wait()
@@ -320,23 +338,23 @@ def transcribe_segments(self, upload_id, correlation_id):
             json.dumps(transcript_data, ensure_ascii=False, indent=2)
         )
         r.publish(f"progress:{upload_id}", json.dumps({"status":"transcript_done"}))
-        send_webhook_event("transcription_completed", upload_id, {"transcript": transcript_data})
+        enqueue_webhook("transcription_completed", upload_id, {"transcript": transcript_data})
 
     except Exception as e:
         logger.error(f"[{cid}] TRANSCRIBE ERROR: {e}", exc_info=True)
         r.publish(f"progress:{upload_id}", json.dumps({"status":"error","error":str(e)}))
-        send_webhook_event("processing_failed", upload_id, None)
+        enqueue_webhook("processing_failed", upload_id, None)
 
 @celery_app.task(bind=True, queue="diarize_gpu")
 def diarize_full(self, upload_id, correlation_id):
     cid = correlation_id or "?"
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
-    send_webhook_event("diarization_started", upload_id, None)
+    enqueue_webhook("diarization_started", upload_id, None)
     r.publish(f"progress:{upload_id}", json.dumps({"status":"diarize_started"}))
 
     if not _PN_AVAILABLE or not settings.WHISPER_DEVICE.lower().startswith("cuda"):
         logger.error(f"[{cid}] pyannote unavailable or not CUDA")
-        send_webhook_event("processing_failed", upload_id, None)
+        enqueue_webhook("processing_failed", upload_id, None)
         return
 
     try:
@@ -353,12 +371,12 @@ def diarize_full(self, upload_id, correlation_id):
             json.dumps(segs, ensure_ascii=False, indent=2)
         )
         r.publish(f"progress:{upload_id}", json.dumps({"status":"diarization_done"}))
-        send_webhook_event("diarization_completed", upload_id, {"diarization": segs})
+        enqueue_webhook("diarization_completed", upload_id, {"diarization": segs})
 
     except Exception as e:
         logger.error(f"[{cid}] DIARIZE ERROR: {e}", exc_info=True)
         r.publish(f"progress:{upload_id}", json.dumps({"status":"error","error":str(e)}))
-        send_webhook_event("processing_failed", upload_id, None)
+        enqueue_webhook("processing_failed", upload_id, None)
 
 @celery_app.task(bind=True, queue="transcribe_cpu")
 def cleanup_old_files(self):
