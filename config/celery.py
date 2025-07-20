@@ -1,21 +1,19 @@
+# config/celery.py
+
 from celery.schedules import crontab
 from kombu import Queue
 from config.settings import settings
 
-# Основные подключения
 broker_url = settings.CELERY_BROKER_URL
 result_backend = settings.CELERY_RESULT_BACKEND
 timezone = settings.CELERY_TIMEZONE
 
-# Какие модули импортировать в воркер
-imports = ["tasks"]
-
-# Сериализация
 task_serializer = "json"
 accept_content = ["json"]
 result_serializer = "json"
 
-# Очереди и маршрутизация задач
+imports = ["tasks"]
+
 task_queues = [
     Queue("transcribe_cpu"),
     Queue("transcribe_gpu"),
@@ -27,7 +25,6 @@ task_routes = {
     "tasks.diarize_full":        {"queue": "diarize_gpu"},
 }
 
-# Sentinel / Redis опции
 broker_transport_options = {
     "sentinels": settings.CELERY_SENTINELS,
     "master_name": settings.CELERY_SENTINEL_MASTER_NAME,
@@ -36,7 +33,6 @@ broker_transport_options = {
     "preload_reconnect": True,
 }
 
-# Периодические задачи
 beat_schedule = {
     "daily-cleanup-old-files": {
         "task": "tasks.cleanup_old_files",

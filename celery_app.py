@@ -1,8 +1,10 @@
+# celery_app.py
+
 from celery import Celery, signals
 from config.settings import settings
 from tasks import get_whisper_model, get_clustering_diarizer
 
-# Создаём экземпляр Celery и подгружаем все настройки из config/celery.py
+# Создаём Celery и грузим настройки из config/celery.py
 app = Celery("proxyai")
 app.config_from_object("config.celery")
 

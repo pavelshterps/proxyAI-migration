@@ -92,15 +92,22 @@ _clustering_diarizer = None
 # --- Model loaders ---
 def get_whisper_model(model_override: str = None):
     device = settings.WHISPER_DEVICE.lower()
-    compute = getattr(settings, "WHISPER_COMPUTE_TYPE",
-                      "float16" if device.startswith("cuda") else "int8").lower()
+    compute = getattr(
+        settings,
+        "WHISPER_COMPUTE_TYPE",
+        "float16" if device.startswith("cuda") else "int8",
+    ).lower()
 
     if model_override:
+        logger.info(f"[{datetime.utcnow().isoformat()}] [WHISPER] override model "
+                    f"{model_override} on {device} ({compute})")
         return WhisperModel(model_override, device=device, compute_type=compute)
 
     global _whisper_model
     if _whisper_model is None:
         model_id = settings.WHISPER_MODEL_PATH
+        logger.info(f"[{datetime.utcnow().isoformat()}] [WHISPER] initializing "
+                    f"model {model_id} on {device} ({compute})")
         try:
             path = download_model(
                 model_id,
@@ -114,17 +121,21 @@ def get_whisper_model(model_override: str = None):
             compute = "int8"
 
         _whisper_model = WhisperModel(path, device=device, compute_type=compute)
+        logger.info(f"[{datetime.utcnow().isoformat()}] [WHISPER] model ready on "
+                    f"{device} ({compute})")
     return _whisper_model
 
 def get_clustering_diarizer():
     global _clustering_diarizer
     if _clustering_diarizer is None:
+        logger.info(f"[{datetime.utcnow().isoformat()}] [DIARIZER] loading diarizer pipeline")
         Path(settings.DIARIZER_CACHE_DIR).mkdir(parents=True, exist_ok=True)
         _clustering_diarizer = SpeakerDiarization.from_pretrained(
             settings.PYANNOTE_PIPELINE,
             cache_dir=settings.DIARIZER_CACHE_DIR,
             use_auth_token=settings.HUGGINGFACE_TOKEN,
         )
+        logger.info(f"[{datetime.utcnow().isoformat()}] [DIARIZER] ready")
     return _clustering_diarizer
 
 @worker_process_init.connect
@@ -142,7 +153,7 @@ def preload_on_startup(**kwargs):
 # --- Audio utils ---
 def probe_audio(src: Path) -> dict:
     res = subprocess.run(
-        ["ffprobe","-v","error","-print_format","json","-show_format","-show_streams", str(src)],
+        ["ffprobe", "-v", "error", "-print_format", "json", "-show_format", "-show_streams", str(src)],
         capture_output=True, text=True
     )
     info = {"duration": 0.0}
@@ -163,24 +174,26 @@ def probe_audio(src: Path) -> dict:
 
 def prepare_wav(upload_id: str) -> (Path, float):
     start = time.perf_counter()
+    logger.info(f"[{datetime.utcnow().isoformat()}] [PREPARE] start for {upload_id}")
     src = next(Path(settings.UPLOAD_FOLDER).glob(f"{upload_id}.*"))
     target = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
     info = probe_audio(src)
     duration = info["duration"]
-
     if (src.suffix.lower() == ".wav"
         and info.get("codec_name") == "pcm_s16le"
         and info.get("sample_rate") == 16000
         and info.get("channels") == 1):
         if src != target:
             src.rename(target)
+        logger.info(f"[{datetime.utcnow().isoformat()}] [PREPARE] WAV OK ({time.perf_counter()-start:.2f}s)")
         return target, duration
 
     subprocess.run(
-        ["ffmpeg","-y","-threads",str(settings.FFMPEG_THREADS),
-         "-i",str(src),"-acodec","pcm_s16le","-ac","1","-ar","16000",str(target)],
+        ["ffmpeg", "-y", "-threads", str(settings.FFMPEG_THREADS),
+         "-i", str(src), "-acodec", "pcm_s16le", "-ac", "1", "-ar", "16000", str(target)],
         check=True, stderr=subprocess.DEVNULL
     )
+    logger.info(f"[{datetime.utcnow().isoformat()}] [PREPARE] converted ({time.perf_counter()-start:.2f}s)")
     return target, duration
 
 # --- Celery tasks ---
@@ -192,19 +205,21 @@ def convert_to_wav_and_preview(self, upload_id, correlation_id):
     send_webhook_event("processing_started", upload_id, None)
 
     try:
+        logger.info(f"[{datetime.utcnow().isoformat()}] [{cid}] CONVERT start for {upload_id}")
         prepare_wav(upload_id)
     except Exception as e:
+        logger.error(f"[{datetime.utcnow().isoformat()}] [{cid}] PREPARE ERROR: {e}", exc_info=True)
         r.publish(f"progress:{upload_id}", json.dumps({"status":"error","error":str(e)}))
         send_webhook_event("processing_failed", upload_id, None)
         return
 
+    logger.info(f"[{datetime.utcnow().isoformat()}] [{cid}] enqueue PREVIEW")
     from tasks import preview_transcribe
     preview_transcribe.delay(upload_id, correlation_id)
 
 @app.task(bind=True, queue="transcribe_gpu")
 def preview_transcribe(self, upload_id, correlation_id):
-    # (оставляем вашу существующую логику без изменений,
-    # но с новым send_webhook_event при успехе/ошибке)
+    # ваша существующая логика здесь, с вызовами send_webhook_event
     ...
 
 @app.task(bind=True, queue="transcribe_gpu")
@@ -224,8 +239,11 @@ def cleanup_old_files(self):
         for p in base.glob("**/*"):
             try:
                 if datetime.utcnow() - datetime.fromtimestamp(p.stat().st_mtime) > timedelta(days=age):
-                    (p.rmdir() if p.is_dir() else p.unlink())
+                    if p.is_dir():
+                        p.rmdir()
+                    else:
+                        p.unlink()
                     deleted += 1
             except Exception:
                 continue
-    logger.info(f"[{datetime.utcnow().isoformat()}] [CLEANUP] deleted {deleted} files")
+    logger.info(f"[{datetime.utcnow().isoformat()}] [CLEANUP] deleted {deleted} old files")

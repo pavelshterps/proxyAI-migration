@@ -67,7 +67,7 @@ services:
     command:
       - celery
       - -A
-      - config.celery:celery_app
+      - celery_app:app
       - worker
       - --loglevel=info
       - --concurrency=${CPU_CONCURRENCY}
@@ -104,7 +104,7 @@ services:
     command:
       - celery
       - -A
-      - config.celery:celery_app
+      - celery_app:app
       - worker
       - --loglevel=info
       - --concurrency=1
@@ -142,7 +142,7 @@ services:
     command:
       - celery
       - -A
-      - config.celery:celery_app
+      - celery_app:app
       - worker
       - --loglevel=info
       - --concurrency=1
@@ -155,7 +155,7 @@ services:
       - HUGGINGFACE_CACHE_DIR=/hf_cache
       - WHISPER_MODEL_PATH=${WHISPER_MODEL_PATH}
       - WHISPER_DEVICE=cuda
-      - NVIDIA_VISIBLE_DEVICES=0
+      - NVIDIA_VISIBLE_DEVICES=1
     volumes:
       - ./:/app:delegated
       - upload_data:${UPLOAD_FOLDER}
@@ -174,7 +174,12 @@ services:
       dockerfile: Dockerfile
     container_name: proxyai_beat
     env_file: .env
-    command: celery -A config.celery:celery_app beat --loglevel=info
+    command:
+      - celery
+      - -A
+      - celery_app:app
+      - beat
+      - --loglevel=info
     environment:
       - CELERY_BROKER_URL=${CELERY_BROKER_URL}
     volumes:
