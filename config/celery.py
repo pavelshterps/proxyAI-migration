@@ -1,5 +1,3 @@
-# config/celery.py
-
 from celery.schedules import crontab
 from kombu import Queue
 from config.settings import settings

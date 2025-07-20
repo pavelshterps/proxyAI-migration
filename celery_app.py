@@ -1,8 +1,5 @@
-# celery_app.py
-
 from celery import Celery, signals
 from config.settings import settings
-from tasks import get_whisper_model, get_clustering_diarizer
 
 # Создаём Celery и грузим настройки из config/celery.py
 app = Celery("proxyai")
@@ -17,6 +14,8 @@ def preload_models(**kwargs):
     """
     device = settings.WHISPER_DEVICE.lower()
     if device == "cpu":
+        from tasks import get_clustering_diarizer
         get_clustering_diarizer()
     else:
+        from tasks import get_whisper_model
         get_whisper_model()
