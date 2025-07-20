@@ -4,7 +4,7 @@ from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
-    # Загружаем переменные из .env и игнорируем лишние
+    # Подгружаем переменные из .env и игнорируем лишние
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
@@ -35,7 +35,7 @@ class Settings(BaseSettings):
     CELERY_SENTINEL_SOCKET_TIMEOUT: float = Field(0.1, env="CELERY_SENTINEL_SOCKET_TIMEOUT")
 
     # URL Redis для FastAPI и SSE
-    REDIS_URL: str = Field(..., env="REDIS_URL"))
+    REDIS_URL: str = Field(..., env="REDIS_URL")
 
     # concurrency
     API_WORKERS: int = Field(1, env="API_WORKERS")
