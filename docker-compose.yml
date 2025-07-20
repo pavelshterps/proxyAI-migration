@@ -109,7 +109,7 @@ services:
       - worker
       - --loglevel=info
       - --concurrency=${GPU_CONCURRENCY}
-      - --queues=transcribe_gpu
+      - --queues=preview_gpu,transcribe_gpu
     environment:
       - CELERY_BROKER_URL=${CELERY_BROKER_URL}
       - UPLOAD_FOLDER=${UPLOAD_FOLDER}

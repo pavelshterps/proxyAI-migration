@@ -119,27 +119,27 @@ def get_clustering_diarizer():
 
 @worker_process_init.connect
 def preload_on_startup(**kwargs):
-    # Выполняем warmup только в master-процессе
-    if kwargs.get("hostname", "").endswith("@master"):
-        device = settings.WHISPER_DEVICE.lower()
-        logger.info(f"[WARMUP] HF={_HF_AVAILABLE}, PN={_PN_AVAILABLE}, DEV={device}")
-        if _HF_AVAILABLE:
-            sample = Path(__file__).parent / "tests/fixtures/sample.wav"
-            try:
-                get_whisper_model().transcribe(
-                    str(sample),
-                    max_initial_timestamp=settings.PREVIEW_LENGTH_S
-                )
-                logger.info("[WARMUP] Whisper warmup ok")
-            except Exception:
-                logger.warning("[WARMUP] Whisper warmup failed")
-        if _PN_AVAILABLE and device.startswith("cuda"):
-            try:
-                get_vad()
-                get_clustering_diarizer()
-                logger.info("[WARMUP] VAD & diarizer warmup ok")
-            except Exception:
-                logger.warning("[WARMUP] VAD/diarizer warmup failed")
+    # Прогреваем модели в каждом форк-воркере
+    device = settings.WHISPER_DEVICE.lower()
+    logger.info(f"[WARMUP] HF={_HF_AVAILABLE}, PN={_PN_AVAILABLE}, DEV={device}")
+    if _HF_AVAILABLE:
+        sample = Path(__file__).parent / "tests/fixtures/sample.wav"
+        try:
+            # используем max_initial_timestamp для быстрого preview
+            get_whisper_model().transcribe(
+                str(sample),
+                max_initial_timestamp=settings.PREVIEW_LENGTH_S
+            )
+            logger.info("[WARMUP] Whisper warmup ok")
+        except Exception:
+            logger.warning("[WARMUP] Whisper warmup failed")
+    if _PN_AVAILABLE and device.startswith("cuda"):
+        try:
+            get_vad()
+            get_clustering_diarizer()
+            logger.info("[WARMUP] VAD & diarizer warmup ok")
+        except Exception:
+            logger.warning("[WARMUP] VAD/diarizer warmup failed")
 
 # Audio utils
 def probe_audio(src: Path) -> dict:
@@ -203,32 +203,28 @@ def convert_to_wav_and_preview(self, upload_id, correlation_id):
         send_webhook_event("processing_failed", upload_id, None)
         return
 
-    # enqueue preview always на CPU
-    logger.info(f"[{cid}] enqueue PREVIEW -> transcribe_cpu")
+    # enqueue preview сразу в GPU-очередь
+    logger.info(f"[{cid}] enqueue PREVIEW -> preview_gpu")
     from tasks import preview_transcribe
-    preview_transcribe.apply_async((upload_id, correlation_id), queue="transcribe_cpu")
+    preview_transcribe.apply_async((upload_id, correlation_id), queue="preview_gpu")
 
-@celery_app.task(bind=True, queue="transcribe_cpu")
+@celery_app.task(bind=True, queue="preview_gpu")
 def preview_transcribe(self, upload_id, correlation_id):
     cid = correlation_id or "?"
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
     try:
         logger.info(f"[{cid}] PREVIEW start for {upload_id}")
-        wav = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
-        if not wav.exists():
+        wav_path = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
+        if not wav_path.exists():
             raise FileNotFoundError("WAV not found")
 
-        proc = subprocess.Popen(
-            ["ffmpeg","-y","-threads","1",
-             "-ss","0","-t",str(settings.PREVIEW_LENGTH_S),
-             "-i",str(wav),"-f","wav","pipe:1"],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
-        )
+        # Прямой fast-whisper preview первых N секунд
         segments_gen, _ = get_whisper_model().transcribe(
-            proc.stdout, word_timestamps=True,
+            str(wav_path),
+            max_initial_timestamp=settings.PREVIEW_LENGTH_S,
+            word_timestamps=True,
             **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {}),
         )
-        proc.stdout.close(); proc.wait()
         segments = list(segments_gen)
         logger.info(f"[{cid}] got {len(segments)} segs")
 
