@@ -1,14 +1,14 @@
-# docker-compose.yml
 version: '3.8'
+
 services:
   db:
     image: postgres:14-alpine
     container_name: proxyai_db
     env_file: .env
     environment:
-      POSTGRES_DB: ${POSTGRES_DB}
-      POSTGRES_USER: ${POSTGRES_USER}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      - POSTGRES_DB=${POSTGRES_DB}
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
     volumes:
       - postgres_data:/var/lib/postgresql/data
     ports:
@@ -19,7 +19,10 @@ services:
   redis:
     image: redis:7-alpine
     container_name: proxyai_redis
-    env_file: .env
+    # убрали env_file, если пароль не используется
+    environment:
+      # раскомментируйте, если нужен пароль:
+      # - REDIS_PASSWORD=${REDIS_PASSWORD}
     volumes:
       - redis_data:/data
     ports:
@@ -98,7 +101,8 @@ services:
       context: .
       dockerfile: Dockerfile.gpu
     container_name: proxyai_worker_gpu_1
-    runtime: nvidia
+    # modern Compose-CLI way:
+    gpus: '"device=0"'
     mem_limit: 8g
     env_file: .env
     command:
@@ -117,7 +121,6 @@ services:
       - HUGGINGFACE_CACHE_DIR=/hf_cache
       - WHISPER_MODEL_PATH=${WHISPER_MODEL_PATH}
       - WHISPER_DEVICE=cuda
-      - NVIDIA_VISIBLE_DEVICES=0
     volumes:
       - ./:/app:delegated
       - upload_data:${UPLOAD_FOLDER}
@@ -135,7 +138,8 @@ services:
       context: .
       dockerfile: Dockerfile.gpu
     container_name: proxyai_worker_gpu_2
-    runtime: nvidia
+    # если у вас две реальных GPU, замените device=0 на device=1
+    gpus: '"device=0"'
     mem_limit: 8g
     env_file: .env
     command:
@@ -154,7 +158,6 @@ services:
       - HUGGINGFACE_CACHE_DIR=/hf_cache
       - WHISPER_MODEL_PATH=${WHISPER_MODEL_PATH}
       - WHISPER_DEVICE=cuda
-      - NVIDIA_VISIBLE_DEVICES=1
     volumes:
       - ./:/app:delegated
       - upload_data:${UPLOAD_FOLDER}
