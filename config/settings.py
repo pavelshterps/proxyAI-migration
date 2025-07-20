@@ -33,7 +33,7 @@ class Settings(BaseSettings):
     )
     CELERY_SENTINEL_MASTER_NAME: str = Field("mymaster", env="CELERY_SENTINEL_MASTER_NAME")
     CELERY_SENTINEL_SOCKET_TIMEOUT: float = Field(0.1, env="CELERY_SENTINEL_SOCKET_TIMEOUT")
-
+    REDIS_URL: str = Field(..., env="REDIS_URL")
     # concurrency tuning
     API_WORKERS: int = Field(1, env="API_WORKERS")
     CPU_CONCURRENCY: int = Field(1, env="CPU_CONCURRENCY")

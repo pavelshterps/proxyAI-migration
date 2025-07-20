@@ -82,7 +82,7 @@ structlog.configure(processors=[
 ])
 log = structlog.get_logger()
 
-redis = redis_async.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
+redis = redis_async.from_url(settings.REDIS_URL, decode_responses=True)
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 async def get_api_key(x_api_key: str = Depends(api_key_header), api_key: str = Query(None)):
