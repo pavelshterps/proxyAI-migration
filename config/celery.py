@@ -4,37 +4,41 @@ from kombu import Queue
 
 from config.settings import settings
 
+# instantiate our one Celery app
 celery_app = Celery(
     "proxyai",
     broker=settings.CELERY_BROKER_URL,
     backend=settings.CELERY_RESULT_BACKEND,
     timezone=settings.CELERY_TIMEZONE,
-    include=["tasks"],
+    include=["tasks"],   # auto-discover our tasks.py
 )
 
 celery_app.conf.update(
-    # serialization
     task_serializer="json",
     accept_content=["json"],
     result_serializer="json",
 
-    # queues & routes
+    # honest prefetch & late acks
+    worker_prefetch_multiplier=1,
+    task_acks_late=True,
+
+    # define all queues (including preview_gpu)
     task_queues=[
         Queue("transcribe_cpu"),
         Queue("preview_gpu"),
         Queue("transcribe_gpu"),
         Queue("diarize_gpu"),
     ],
+
+    # route each task to its queue
     task_routes={
         "tasks.convert_to_wav_and_preview": {"queue": "transcribe_cpu"},
-        "tasks.cleanup_old_files":            {"queue": "transcribe_cpu"},
-        "tasks.preview_transcribe":           {"queue": "preview_gpu"},
-        "tasks.transcribe_segments":          {"queue": "transcribe_gpu"},
-        "tasks.diarize_full":                 {"queue": "diarize_gpu"},
-        "tasks.send_webhook":                 {"queue": "transcribe_cpu"},  # light task
+        "tasks.preview_transcribe":         {"queue": "preview_gpu"},
+        "tasks.transcribe_segments":        {"queue": "transcribe_gpu"},
+        "tasks.diarize_full":               {"queue": "diarize_gpu"},
     },
 
-    # sentinel / redis failover
+    # sentinel support, reconnect on fail
     broker_transport_options={
         "sentinels": settings.CELERY_SENTINELS,
         "master_name": settings.CELERY_SENTINEL_MASTER_NAME,
@@ -43,15 +47,11 @@ celery_app.conf.update(
         "preload_reconnect": True,
     },
 
-    # retention cleanup schedule
+    # daily cleanup
     beat_schedule={
         "daily-cleanup-old-files": {
             "task": "tasks.cleanup_old_files",
             "schedule": crontab(hour=3, minute=0),
         },
     },
-
-    # honesty in prefetch
-    worker_prefetch_multiplier=1,
-    task_acks_late=True,
 )
