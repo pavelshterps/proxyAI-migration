@@ -30,7 +30,7 @@ celery_app.conf.update(
 
     broker_transport_options={
         "sentinels": settings.CELERY_SENTINELS,
-        "service_name": settings.CELERY_SENTINEL_MASTER_NAME,
+        'master_name': settings.CELERY_SENTINEL_MASTER_NAME,
         "socket_timeout": settings.CELERY_SENTINEL_SOCKET_TIMEOUT,
         "retry_on_timeout": True,
         "preload_reconnect": True,
