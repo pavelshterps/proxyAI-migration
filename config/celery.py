@@ -17,7 +17,7 @@ celery_app.conf.update(
     accept_content=["json"],
     result_serializer="json",
 
-    # четыре очереди: CPU транскод/preview, GPU preview, GPU full, GPU diarize
+    # четыре очереди
     task_queues=[
         Queue("transcribe_cpu"),
         Queue("preview_gpu"),

@@ -71,7 +71,7 @@ services:
       - worker
       - --loglevel=info
       - --concurrency=${CPU_CONCURRENCY}
-      - --queues=transcribe_cpu
+      - --queues=transcribe_cpu,preview_gpu
     environment:
       - CELERY_BROKER_URL=${CELERY_BROKER_URL}
       - UPLOAD_FOLDER=${UPLOAD_FOLDER}
@@ -92,7 +92,6 @@ services:
     networks:
       - proxyai_net
 
-  # первый GPU-воркер
   worker_gpu_1:
     build:
       context: .
@@ -130,7 +129,6 @@ services:
     networks:
       - proxyai_net
 
-  # второй GPU-воркер
   worker_gpu_2:
     build:
       context: .
@@ -189,7 +187,9 @@ services:
     container_name: proxyai_flower
     env_file: .env
     command: >
-      flower --broker=${CELERY_BROKER_URL} --basic_auth=${FLOWER_USER}:${FLOWER_PASS} --port=5555
+      flower --broker=${CELERY_BROKER_URL}
+             --basic_auth=${FLOWER_USER}:${FLOWER_PASS}
+             --port=5555
     ports:
       - "5555:5555"
     depends_on:
