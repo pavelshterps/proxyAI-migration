@@ -1,3 +1,4 @@
+# config/celery.py
 from celery import Celery
 from celery.schedules import crontab
 from kombu import Queue
@@ -9,7 +10,7 @@ celery_app = Celery(
     broker=settings.CELERY_BROKER_URL,
     backend=settings.CELERY_RESULT_BACKEND,
     timezone=settings.CELERY_TIMEZONE,
-    include=["tasks"],  # чтобы таски из tasks.py автоматически регистрировались
+    include=["tasks"],
 )
 
 celery_app.conf.update(
@@ -17,11 +18,9 @@ celery_app.conf.update(
     accept_content=["json"],
     result_serializer="json",
 
-    # честный prefetch: только 1 задача одновременно, поздние подтверждения
     worker_prefetch_multiplier=1,
     task_acks_late=True,
 
-    # очереди
     task_queues=[
         Queue("transcribe_cpu"),
         Queue("preview_gpu"),
@@ -33,9 +32,10 @@ celery_app.conf.update(
         "tasks.preview_transcribe":         {"queue": "preview_gpu"},
         "tasks.transcribe_segments":        {"queue": "transcribe_gpu"},
         "tasks.diarize_full":               {"queue": "diarize_gpu"},
+        "tasks.send_webhook_event":         {"queue": "transcribe_cpu"},
+        "tasks.cleanup_old_files":          {"queue": "transcribe_cpu"},
     },
 
-    # для Sentinel
     broker_transport_options={
         "sentinels": settings.CELERY_SENTINELS,
         "master_name": settings.CELERY_SENTINEL_MASTER_NAME,

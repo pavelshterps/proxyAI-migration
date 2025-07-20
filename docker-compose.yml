@@ -1,3 +1,4 @@
+# docker-compose.yml
 version: '3.8'
 services:
   db:
@@ -92,7 +93,6 @@ services:
     networks:
       - proxyai_net
 
-  # первый GPU-воркер
   worker_gpu_1:
     build:
       context: .
@@ -130,7 +130,6 @@ services:
     networks:
       - proxyai_net
 
-  # второй GPU-воркер
   worker_gpu_2:
     build:
       context: .
@@ -155,7 +154,7 @@ services:
       - HUGGINGFACE_CACHE_DIR=/hf_cache
       - WHISPER_MODEL_PATH=${WHISPER_MODEL_PATH}
       - WHISPER_DEVICE=cuda
-      - NVIDIA_VISIBLE_DEVICES=0
+      - NVIDIA_VISIBLE_DEVICES=1
     volumes:
       - ./:/app:delegated
       - upload_data:${UPLOAD_FOLDER}
