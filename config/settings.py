@@ -1,6 +1,6 @@
 import json
 from typing import List, Optional
-from pydantic import Field
+from pydantic import Field, HttpUrl
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
@@ -89,10 +89,15 @@ class Settings(BaseSettings):
     DEFAULT_TRANSCRIBE_MODE: str = Field("local", env="DEFAULT_TRANSCRIBE_MODE")
 
     WEBHOOK_URL: Optional[HttpUrl] = Field(
-        None, env="WEBHOOK_URL"
+        None,
+        env="WEBHOOK_URL",
+        description="URL для POST-запросов вебхука"
     )
-    WEBHOOK_SECRET: Optional[str] = Field(
-        None, env="WEBHOOK_SECRET"
+    # секрет для заголовка X-WebHook-Secret
+    WEBHOOK_SECRET: str = Field(
+        "",
+        env="WEBHOOK_SECRET",
+        description="Shared secret for X-WebHook-Secret header"
     )
 
     @property
