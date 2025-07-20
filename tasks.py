@@ -119,25 +119,27 @@ def get_clustering_diarizer():
 
 @worker_process_init.connect
 def preload_on_startup(**kwargs):
-    device = settings.WHISPER_DEVICE.lower()
-    logger.info(f"[WARMUP] HF={_HF_AVAILABLE}, PN={_PN_AVAILABLE}, DEV={device}")
-    if _HF_AVAILABLE:
-        sample = Path(__file__).parent / "tests/fixtures/sample.wav"
-        try:
-            get_whisper_model().transcribe(
-                str(sample),
-                max_initial_timestamp=settings.PREVIEW_LENGTH_S
-            )
-            logger.info("[WARMUP] Whisper warmup ok")
-        except Exception:
-            logger.warning("[WARMUP] Whisper warmup failed")
-    if _PN_AVAILABLE and device.startswith("cuda"):
-        try:
-            get_vad()
-            get_clustering_diarizer()
-            logger.info("[WARMUP] VAD & diarizer warmup ok")
-        except Exception:
-            logger.warning("[WARMUP] VAD/diarizer warmup failed")
+    # Выполняем warmup только в master-процессе
+    if kwargs.get("hostname", "").endswith("@master"):
+        device = settings.WHISPER_DEVICE.lower()
+        logger.info(f"[WARMUP] HF={_HF_AVAILABLE}, PN={_PN_AVAILABLE}, DEV={device}")
+        if _HF_AVAILABLE:
+            sample = Path(__file__).parent / "tests/fixtures/sample.wav"
+            try:
+                get_whisper_model().transcribe(
+                    str(sample),
+                    max_initial_timestamp=settings.PREVIEW_LENGTH_S
+                )
+                logger.info("[WARMUP] Whisper warmup ok")
+            except Exception:
+                logger.warning("[WARMUP] Whisper warmup failed")
+        if _PN_AVAILABLE and device.startswith("cuda"):
+            try:
+                get_vad()
+                get_clustering_diarizer()
+                logger.info("[WARMUP] VAD & diarizer warmup ok")
+            except Exception:
+                logger.warning("[WARMUP] VAD/diarizer warmup failed")
 
 # Audio utils
 def probe_audio(src: Path) -> dict:
@@ -201,22 +203,12 @@ def convert_to_wav_and_preview(self, upload_id, correlation_id):
         send_webhook_event("processing_failed", upload_id, None)
         return
 
-    # fallback: если очередь preview_gpu длиннее threshold — на CPU, иначе на GPU-превью
-    try:
-        gpu_len = r.llen("preview_gpu") or 0
-    except Exception:
-        gpu_len = 0
-
-    queue_name = (
-        "transcribe_cpu"
-        if gpu_len > settings.PREVIEW_GPU_QUEUE_THRESHOLD
-        else "preview_gpu"
-    )
-    logger.info(f"[{cid}] enqueue PREVIEW -> {queue_name} (len={gpu_len})")
+    # enqueue preview always на CPU
+    logger.info(f"[{cid}] enqueue PREVIEW -> transcribe_cpu")
     from tasks import preview_transcribe
-    preview_transcribe.apply_async((upload_id, correlation_id), queue=queue_name)
+    preview_transcribe.apply_async((upload_id, correlation_id), queue="transcribe_cpu")
 
-@celery_app.task(bind=True, queue="preview_gpu")
+@celery_app.task(bind=True, queue="transcribe_cpu")
 def preview_transcribe(self, upload_id, correlation_id):
     cid = correlation_id or "?"
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
@@ -227,7 +219,7 @@ def preview_transcribe(self, upload_id, correlation_id):
             raise FileNotFoundError("WAV not found")
 
         proc = subprocess.Popen(
-            ["ffmpeg","-y","-threads",str(settings.FFMPEG_THREADS//2 or 1),
+            ["ffmpeg","-y","-threads","1",
              "-ss","0","-t",str(settings.PREVIEW_LENGTH_S),
              "-i",str(wav),"-f","wav","pipe:1"],
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
@@ -286,7 +278,6 @@ def transcribe_segments(self, upload_id, correlation_id):
         model = get_whisper_model()
         all_segs = []
         chunk_len = settings.CHUNK_LENGTH_S
-        threads = settings.FFMPEG_THREADS
 
         if duration <= chunk_len:
             segs, _ = model.transcribe(
@@ -299,7 +290,7 @@ def transcribe_segments(self, upload_id, correlation_id):
             while offset < duration:
                 this_len = min(chunk_len, duration - offset)
                 proc = subprocess.Popen(
-                    ["ffmpeg","-y","-threads",str(threads),
+                    ["ffmpeg","-y","-threads","1",
                      "-ss",str(offset),"-t",str(this_len),
                      "-i",str(wav),"-f","wav","pipe:1"],
                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
@@ -380,58 +371,3 @@ def cleanup_old_files(self):
             except Exception:
                 continue
     logger.info(f"[CLEANUP] deleted {deleted} old files")
-
-
-from celery import Celery
-from celery.schedules import crontab
-from kombu import Queue
-
-from config.settings import settings
-
-celery_app = Celery(
-    "proxyai",
-    broker=settings.CELERY_BROKER_URL,
-    backend=settings.CELERY_RESULT_BACKEND,
-    timezone=settings.CELERY_TIMEZONE,
-    include=["tasks"],
-)
-
-celery_app.conf.update(
-    # сериализация
-    task_serializer="json",
-    accept_content=["json"],
-    result_serializer="json",
-
-    # честный prefetch: только 1 задача в работу и поздние подтверждения
-    worker_prefetch_multiplier=1,
-    task_acks_late=True,
-
-    # очереди
-    task_queues=[
-        Queue("transcribe_cpu"),
-        Queue("preview_gpu"),
-        Queue("transcribe_gpu"),
-        Queue("diarize_gpu"),
-    ],
-    task_routes={
-        "tasks.convert_to_wav_and_preview": {"queue": "transcribe_cpu"},
-        "tasks.preview_transcribe":         {"queue": "preview_gpu"},
-        "tasks.transcribe_segments":        {"queue": "transcribe_gpu"},
-        "tasks.diarize_full":               {"queue": "diarize_gpu"},
-    },
-
-    broker_transport_options={
-        "sentinels": settings.CELERY_SENTINELS,
-        "master_name": settings.CELERY_SENTINEL_MASTER_NAME,
-        "socket_timeout": settings.CELERY_SENTINEL_SOCKET_TIMEOUT,
-        "retry_on_timeout": True,
-        "preload_reconnect": True,
-    },
-
-    beat_schedule={
-        "daily-cleanup-old-files": {
-            "task": "tasks.cleanup_old_files",
-            "schedule": crontab(hour=3, minute=0),
-        },
-    },
-)

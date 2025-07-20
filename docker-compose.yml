@@ -81,6 +81,7 @@ services:
       - WHISPER_MODEL_PATH=${WHISPER_MODEL_PATH}
       - WHISPER_DEVICE=cpu
       - FFMPEG_THREADS=${CPU_CONCURRENCY}
+      - CELERY_WORKER_PREFETCH_MULTIPLIER=1
     volumes:
       - ./:/app:delegated
       - upload_data:${UPLOAD_FOLDER}
@@ -108,7 +109,7 @@ services:
       - worker
       - --loglevel=info
       - --concurrency=${GPU_CONCURRENCY}
-      - --queues=preview_gpu,transcribe_gpu
+      - --queues=transcribe_gpu
     environment:
       - CELERY_BROKER_URL=${CELERY_BROKER_URL}
       - UPLOAD_FOLDER=${UPLOAD_FOLDER}
@@ -118,6 +119,9 @@ services:
       - WHISPER_MODEL_PATH=${WHISPER_MODEL_PATH}
       - WHISPER_DEVICE=cuda
       - NVIDIA_VISIBLE_DEVICES=0
+      - FFMPEG_THREADS=1
+      - CELERY_WORKER_PREFETCH_MULTIPLIER=1
+      - task_reject_on_worker_lost=True
     volumes:
       - ./:/app:delegated
       - upload_data:${UPLOAD_FOLDER}
@@ -155,6 +159,9 @@ services:
       - WHISPER_MODEL_PATH=${WHISPER_MODEL_PATH}
       - WHISPER_DEVICE=cuda
       - NVIDIA_VISIBLE_DEVICES=0
+      - FFMPEG_THREADS=1
+      - CELERY_WORKER_PREFETCH_MULTIPLIER=1
+      - task_reject_on_worker_lost=True
     volumes:
       - ./:/app:delegated
       - upload_data:${UPLOAD_FOLDER}
