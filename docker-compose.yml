@@ -155,7 +155,7 @@ services:
       - HUGGINGFACE_CACHE_DIR=/hf_cache
       - WHISPER_MODEL_PATH=${WHISPER_MODEL_PATH}
       - WHISPER_DEVICE=cuda
-      - NVIDIA_VISIBLE_DEVICES=1
+      - NVIDIA_VISIBLE_DEVICES=0
     volumes:
       - ./:/app:delegated
       - upload_data:${UPLOAD_FOLDER}
