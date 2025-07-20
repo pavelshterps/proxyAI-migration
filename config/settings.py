@@ -1,12 +1,10 @@
-# config/settings.py
-
 import json
-from typing import List, Optional, Any
-from pydantic import Field, HttpUrl
+from typing import List, Optional, Any, Tuple
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
-    # Подгружаем переменные из .env и игнорируем лишние
+    # Загружаем переменные из .env и игнорируем лишние
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
@@ -29,7 +27,7 @@ class Settings(BaseSettings):
     CELERY_BROKER_URL: str = Field(..., env="CELERY_BROKER_URL")
     CELERY_RESULT_BACKEND: str = Field(..., env="CELERY_RESULT_BACKEND")
     CELERY_TIMEZONE: str = Field("UTC", env="CELERY_TIMEZONE")
-    CELERY_SENTINELS: List[tuple[str, int]] = Field(
+    CELERY_SENTINELS: List[Tuple[str, int]] = Field(
         default=[("sentinel1", 26379), ("sentinel2", 26379)],
         env="CELERY_SENTINELS",
     )
@@ -37,7 +35,7 @@ class Settings(BaseSettings):
     CELERY_SENTINEL_SOCKET_TIMEOUT: float = Field(0.1, env="CELERY_SENTINEL_SOCKET_TIMEOUT")
 
     # URL Redis для FastAPI и SSE
-    REDIS_URL: HttpUrl = Field(..., env="REDIS_URL")
+    REDIS_URL: str = Field(..., env="REDIS_URL"))
 
     # concurrency
     API_WORKERS: int = Field(1, env="API_WORKERS")
@@ -100,7 +98,7 @@ class Settings(BaseSettings):
     DEFAULT_TRANSCRIBE_MODE: str = Field("local", env="DEFAULT_TRANSCRIBE_MODE")
 
     # Webhook настройки (нужно для отправки событий)
-    WEBHOOK_URL: Optional[HttpUrl] = Field(None, env="WEBHOOK_URL")
+    WEBHOOK_URL: Optional[str] = Field(None, env="WEBHOOK_URL")
     WEBHOOK_SECRET: Optional[str] = Field(None, env="WEBHOOK_SECRET")
 
     @property
