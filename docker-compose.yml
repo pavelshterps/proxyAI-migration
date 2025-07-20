@@ -80,6 +80,7 @@ services:
       - HUGGINGFACE_CACHE_DIR=/hf_cache
       - WHISPER_MODEL_PATH=${WHISPER_MODEL_PATH}
       - WHISPER_DEVICE=cpu
+      - FFMPEG_THREADS=${CPU_CONCURRENCY}
     volumes:
       - ./:/app:delegated
       - upload_data:${UPLOAD_FOLDER}
@@ -92,11 +93,11 @@ services:
     networks:
       - proxyai_net
 
-  worker_gpu_1:
+  worker_gpu_transcribe:
     build:
       context: .
       dockerfile: Dockerfile.gpu
-    container_name: proxyai_worker_gpu_1
+    container_name: proxyai_worker_gpu_transcribe
     runtime: nvidia
     mem_limit: 8g
     env_file: .env
@@ -106,8 +107,8 @@ services:
       - config.celery:celery_app
       - worker
       - --loglevel=info
-      - --concurrency=1
-      - --queues=transcribe_gpu,diarize_gpu
+      - --concurrency=${GPU_CONCURRENCY}
+      - --queues=transcribe_gpu
     environment:
       - CELERY_BROKER_URL=${CELERY_BROKER_URL}
       - UPLOAD_FOLDER=${UPLOAD_FOLDER}
@@ -129,11 +130,11 @@ services:
     networks:
       - proxyai_net
 
-  worker_gpu_2:
+  worker_gpu_diarize:
     build:
       context: .
       dockerfile: Dockerfile.gpu
-    container_name: proxyai_worker_gpu_2
+    container_name: proxyai_worker_gpu_diarize
     runtime: nvidia
     mem_limit: 8g
     env_file: .env
@@ -144,7 +145,7 @@ services:
       - worker
       - --loglevel=info
       - --concurrency=1
-      - --queues=transcribe_gpu,diarize_gpu
+      - --queues=diarize_gpu
     environment:
       - CELERY_BROKER_URL=${CELERY_BROKER_URL}
       - UPLOAD_FOLDER=${UPLOAD_FOLDER}

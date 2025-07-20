@@ -22,7 +22,7 @@ celery_app.conf.update(
     worker_prefetch_multiplier=1,
     task_acks_late=True,
 
-    # четыре очереди
+    # очереди
     task_queues=[
         Queue("transcribe_cpu"),
         Queue("preview_gpu"),

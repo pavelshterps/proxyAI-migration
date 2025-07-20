@@ -124,7 +124,10 @@ def preload_on_startup(**kwargs):
     if _HF_AVAILABLE:
         sample = Path(__file__).parent / "tests/fixtures/sample.wav"
         try:
-            get_whisper_model().transcribe(str(sample), max_initial_timestamp=settings.PREVIEW_LENGTH_S)
+            get_whisper_model().transcribe(
+                str(sample),
+                max_initial_timestamp=settings.PREVIEW_LENGTH_S
+            )
             logger.info("[WARMUP] Whisper warmup ok")
         except Exception:
             logger.warning("[WARMUP] Whisper warmup failed")
