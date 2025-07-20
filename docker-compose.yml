@@ -80,6 +80,7 @@ services:
       - HUGGINGFACE_CACHE_DIR=/hf_cache
       - WHISPER_MODEL_PATH=${WHISPER_MODEL_PATH}
       - WHISPER_DEVICE=cpu
+      - CPU_CONCURRENCY=${CPU_CONCURRENCY}
       - FFMPEG_THREADS=${CPU_CONCURRENCY}
       - CELERY_WORKER_PREFETCH_MULTIPLIER=1
     volumes:
@@ -100,7 +101,7 @@ services:
       dockerfile: Dockerfile.gpu
     container_name: proxyai_worker_gpu_transcribe
     runtime: nvidia
-    mem_limit: 8g
+    mem_limit: 16g
     env_file: .env
     command:
       - celery
@@ -119,9 +120,10 @@ services:
       - WHISPER_MODEL_PATH=${WHISPER_MODEL_PATH}
       - WHISPER_DEVICE=cuda
       - NVIDIA_VISIBLE_DEVICES=0
+      - GPU_CONCURRENCY=${GPU_CONCURRENCY}
       - FFMPEG_THREADS=1
       - CELERY_WORKER_PREFETCH_MULTIPLIER=1
-      - task_reject_on_worker_lost=True
+      - TASK_REJECT_ON_WORKER_LOST=True
     volumes:
       - ./:/app:delegated
       - upload_data:${UPLOAD_FOLDER}
@@ -161,7 +163,7 @@ services:
       - NVIDIA_VISIBLE_DEVICES=0
       - FFMPEG_THREADS=1
       - CELERY_WORKER_PREFETCH_MULTIPLIER=1
-      - task_reject_on_worker_lost=True
+      - TASK_REJECT_ON_WORKER_LOST=True
     volumes:
       - ./:/app:delegated
       - upload_data:${UPLOAD_FOLDER}
