@@ -1,5 +1,3 @@
-# tasks.py
-
 import json
 import logging
 import subprocess
@@ -167,22 +165,18 @@ def prepare_wav(upload_id: str) -> (Path, float):
     target = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
     info = probe_audio(src)
     duration = info["duration"]
-    if (
-        src.suffix.lower() == ".wav"
+    if (src.suffix.lower() == ".wav"
         and info.get("codec_name") == "pcm_s16le"
         and info.get("sample_rate") == 16000
-        and info.get("channels") == 1
-    ):
+        and info.get("channels") == 1):
         if src != target:
             src.rename(target)
         logger.info(f"[PREPARE] WAV OK ({time.perf_counter()-start:.2f}s)")
         return target, duration
 
     subprocess.run(
-        [
-            "ffmpeg","-y","-threads",str(settings.FFMPEG_THREADS),
-            "-i",str(src),"-acodec","pcm_s16le","-ac","1","-ar","16000",str(target)
-        ],
+        ["ffmpeg","-y","-threads",str(settings.FFMPEG_THREADS),
+         "-i",str(src),"-acodec","pcm_s16le","-ac","1","-ar","16000",str(target)],
         check=True, stderr=subprocess.DEVNULL
     )
     logger.info(f"[PREPARE] converted ({time.perf_counter()-start:.2f}s)")
@@ -204,10 +198,20 @@ def convert_to_wav_and_preview(self, upload_id, correlation_id):
         send_webhook_event("processing_failed", upload_id, None)
         return
 
-    # всегда шлём preview в GPU-очередь
-    logger.info(f"[{cid}] enqueue PREVIEW -> preview_gpu")
+    # fallback: если очередь preview_gpu длиннее threshold — на CPU, иначе на GPU-превью
+    try:
+        gpu_len = r.llen("preview_gpu") or 0
+    except Exception:
+        gpu_len = 0
+
+    queue_name = (
+        "transcribe_cpu"
+        if gpu_len > settings.PREVIEW_GPU_QUEUE_THRESHOLD
+        else "preview_gpu"
+    )
+    logger.info(f"[{cid}] enqueue PREVIEW -> {queue_name} (len={gpu_len})")
     from tasks import preview_transcribe
-    preview_transcribe.delay(upload_id, correlation_id)
+    preview_transcribe.apply_async((upload_id, correlation_id), queue=queue_name)
 
 @celery_app.task(bind=True, queue="preview_gpu")
 def preview_transcribe(self, upload_id, correlation_id):
@@ -220,11 +224,9 @@ def preview_transcribe(self, upload_id, correlation_id):
             raise FileNotFoundError("WAV not found")
 
         proc = subprocess.Popen(
-            [
-                "ffmpeg","-y","-threads",str(settings.FFMPEG_THREADS//2 or 1),
-                "-ss","0","-t",str(settings.PREVIEW_LENGTH_S),
-                "-i",str(wav),"-f","wav","pipe:1"
-            ],
+            ["ffmpeg","-y","-threads",str(settings.FFMPEG_THREADS//2 or 1),
+             "-ss","0","-t",str(settings.PREVIEW_LENGTH_S),
+             "-i",str(wav),"-f","wav","pipe:1"],
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
         )
         segments_gen, _ = get_whisper_model().transcribe(
@@ -234,14 +236,6 @@ def preview_transcribe(self, upload_id, correlation_id):
         proc.stdout.close(); proc.wait()
         segments = list(segments_gen)
         logger.info(f"[{cid}] got {len(segments)} segs")
-
-        # если нет сегментов, не запускать полную транскрипцию
-        if not segments:
-            logger.info(f"[{cid}] no preview segments, skipping transcription")
-            preview = {"text": "", "timestamps": []}
-            r.publish(f"progress:{upload_id}", json.dumps({"status":"preview_done","preview":preview}))
-            send_webhook_event("preview_completed", upload_id, {"preview": preview})
-            return
 
         for seg in segments:
             r.publish(
@@ -288,7 +282,6 @@ def transcribe_segments(self, upload_id, correlation_id):
         duration = info["duration"]
         model = get_whisper_model()
         all_segs = []
-        start_time = time.perf_counter()
         chunk_len = settings.CHUNK_LENGTH_S
         threads = settings.FFMPEG_THREADS
 
@@ -303,11 +296,9 @@ def transcribe_segments(self, upload_id, correlation_id):
             while offset < duration:
                 this_len = min(chunk_len, duration - offset)
                 proc = subprocess.Popen(
-                    [
-                        "ffmpeg","-y","-threads",str(threads),
-                        "-ss",str(offset),"-t",str(this_len),
-                        "-i",str(wav),"-f","wav","pipe:1"
-                    ],
+                    ["ffmpeg","-y","-threads",str(threads),
+                     "-ss",str(offset),"-t",str(this_len),
+                     "-i",str(wav),"-f","wav","pipe:1"],
                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                 )
                 seg_gen, _ = model.transcribe(

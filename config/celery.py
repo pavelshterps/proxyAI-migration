@@ -13,9 +13,14 @@ celery_app = Celery(
 )
 
 celery_app.conf.update(
+    # сериализация
     task_serializer="json",
     accept_content=["json"],
     result_serializer="json",
+
+    # честный prefetch: только 1 задача в работу и поздние подтверждения
+    worker_prefetch_multiplier=1,
+    task_acks_late=True,
 
     # четыре очереди
     task_queues=[
