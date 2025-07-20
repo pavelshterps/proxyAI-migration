@@ -88,6 +88,13 @@ class Settings(BaseSettings):
     EXTERNAL_POLL_INTERVAL_S: int = Field(5, env="EXTERNAL_POLL_INTERVAL_S")
     DEFAULT_TRANSCRIBE_MODE: str = Field("local", env="DEFAULT_TRANSCRIBE_MODE")
 
+    WEBHOOK_URL: Optional[HttpUrl] = Field(
+        None, env="WEBHOOK_URL"
+    )
+    WEBHOOK_SECRET: Optional[str] = Field(
+        None, env="WEBHOOK_SECRET"
+    )
+
     @property
     def ALLOWED_ORIGINS_LIST(self) -> List[str]:
         try:
