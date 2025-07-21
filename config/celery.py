@@ -29,6 +29,7 @@ broker_transport_options = {
     "socket_timeout": settings.CELERY_SENTINEL_SOCKET_TIMEOUT,
     "retry_on_timeout": True,
     "preload_reconnect": True,
+    "role": "master",  # принудительно использовать только мастер для блокирующих операций
 }
 
 beat_schedule = {
