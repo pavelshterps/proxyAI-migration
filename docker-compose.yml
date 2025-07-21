@@ -1,5 +1,4 @@
 version: '3.8'
-
 services:
   db:
     image: postgres:14-alpine
@@ -79,7 +78,8 @@ services:
     env_file: .env
     command:
       - celery
-      - -A celery_app:app
+      - -A
+      - celery_app:app
       - worker
       - --loglevel=info
       - --concurrency=${CPU_CONCURRENCY}
@@ -109,7 +109,6 @@ services:
       - proxyai_net
     restart: unless-stopped
 
-  # первый GPU-воркер
   worker_gpu_1:
     build:
       context: .
@@ -120,7 +119,8 @@ services:
     env_file: .env
     command:
       - celery
-      - -A celery_app:app
+      - -A
+      - celery_app:app
       - worker
       - --loglevel=info
       - --concurrency=${GPU_CONCURRENCY}
@@ -151,7 +151,6 @@ services:
       - proxyai_net
     restart: unless-stopped
 
-  # второй GPU-воркер
   worker_gpu_2:
     build:
       context: .
@@ -162,7 +161,8 @@ services:
     env_file: .env
     command:
       - celery
-      - -A celery_app:app
+      - -A
+      - celery_app:app
       - worker
       - --loglevel=info
       - --concurrency=${GPU_CONCURRENCY}
@@ -201,7 +201,8 @@ services:
     env_file: .env
     command:
       - celery
-      - -A celery_app:app
+      - -A
+      - celery_app:app
       - beat
       - --loglevel=info
     environment:
