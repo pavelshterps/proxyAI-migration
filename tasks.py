@@ -24,9 +24,34 @@ handler.setFormatter(formatter)
 logger.addHandler(handler)
 logger.setLevel(logging.INFO)
 
+# --- Model availability flags ---
+try:
+    from faster_whisper import WhisperModel, download_model
+    _HF_AVAILABLE = True
+    logger.info("[INIT] faster-whisper available")
+except ImportError as e:
+    _HF_AVAILABLE = False
+    logger.warning(f"[INIT] faster-whisper not available: {e}")
+
+try:
+    from pyannote.audio.pipelines import VoiceActivityDetection, SpeakerDiarization
+    _PN_AVAILABLE = True
+    logger.info("[INIT] pyannote.audio available")
+except ImportError as e:
+    _PN_AVAILABLE = False
+    logger.warning(f"[INIT] pyannote.audio not available: {e}")
+
+_whisper_model = None
+_vad = None
+_clustering_diarizer = None
+
 
 # --- Webhook helper ---
 def send_webhook_event(event_type: str, upload_id: str, data: Optional[Any]):
+    """
+    POST → settings.WEBHOOK_URL с заголовком X-WebHook-Secret.
+    405 считаем успехом (игнорируем), ретраи только при сетевых ошибках или 5xx.
+    """
     url = settings.WEBHOOK_URL
     secret = settings.WEBHOOK_SECRET
     if not url or not secret:
@@ -87,8 +112,11 @@ def send_webhook_event(event_type: str, upload_id: str, data: Optional[Any]):
 # --- Model loaders ---
 def get_whisper_model(model_override: str = None):
     device = settings.WHISPER_DEVICE.lower()
-    compute = getattr(settings, "WHISPER_COMPUTE_TYPE",
-                      "float16" if device.startswith("cuda") else "int8").lower()
+    compute = getattr(
+        settings,
+        "WHISPER_COMPUTE_TYPE",
+        "float16" if device.startswith("cuda") else "int8",
+    ).lower()
 
     if model_override:
         logger.info(f"[{datetime.utcnow().isoformat()}] [WHISPER] override {model_override}")
@@ -145,13 +173,13 @@ def get_clustering_diarizer():
 @worker_process_init.connect
 def preload_on_startup(**kwargs):
     """
-    Прогрев моделей внутри воркера.
+    Прогрев моделей внутри каждого процесса воркера.
+    Whisper — на всех воркерах (CPU/GPU),
+    Диаризация — только если устройство GPU.
     """
-    # Whisper хотим везде (GPU и CPU), если библиотека доступна
+    device = settings.WHISPER_DEVICE.lower()
     if _HF_AVAILABLE:
         get_whisper_model()
-
-    # Диаризацию (VAD + clustering) прогреваем только на GPU
     if _PN_AVAILABLE and device.startswith("cuda"):
         get_vad()
         get_clustering_diarizer()
@@ -161,7 +189,8 @@ def preload_on_startup(**kwargs):
 def probe_audio(src: Path) -> dict:
     res = subprocess.run(
         ["ffprobe", "-v", "error", "-print_format", "json", "-show_format", "-show_streams", str(src)],
-        capture_output=True, text=True
+        capture_output=True,
+        text=True,
     )
     info = {"duration": 0.0}
     try:
@@ -169,11 +198,13 @@ def probe_audio(src: Path) -> dict:
         info["duration"] = float(j["format"].get("duration", 0.0))
         for s in j.get("streams", []):
             if s.get("codec_type") == "audio":
-                info.update({
-                    "codec_name": s.get("codec_name"),
-                    "sample_rate": int(s.get("sample_rate", 0)),
-                    "channels": int(s.get("channels", 0)),
-                })
+                info.update(
+                    {
+                        "codec_name": s.get("codec_name"),
+                        "sample_rate": int(s.get("sample_rate", 0)),
+                        "channels": int(s.get("channels", 0)),
+                    }
+                )
                 break
     except Exception:
         pass
@@ -182,7 +213,7 @@ def probe_audio(src: Path) -> dict:
 
 def prepare_wav(upload_id: str) -> (Path, float):
     """
-    Полная конвертация всего файла в WAV.
+    Полная конвертация исходного файла в WAV 16kHz mono.
     """
     start = time.perf_counter()
     logger.info(f"[{datetime.utcnow().isoformat()}] [PREPARE] start for {upload_id}")
@@ -192,38 +223,65 @@ def prepare_wav(upload_id: str) -> (Path, float):
     info = probe_audio(src)
     duration = info["duration"]
 
-    if (src.suffix.lower() == ".wav"
+    if (
+        src.suffix.lower() == ".wav"
         and info.get("codec_name") == "pcm_s16le"
         and info.get("sample_rate") == 16000
-        and info.get("channels") == 1):
+        and info.get("channels") == 1
+    ):
         if src != target:
             src.rename(target)
-        logger.info(f"[{datetime.utcnow().isoformat()}] [PREPARE] WAV OK ({time.perf_counter()-start:.2f}s)")
+        logger.info(f"[{datetime.utcnow().isoformat()}] [PREPARE] WAV OK ({time.perf_counter() - start:.2f}s)")
         return target, duration
 
     subprocess.run(
-        ["ffmpeg", "-y", "-threads", str(settings.FFMPEG_THREADS),
-         "-i", str(src), "-acodec", "pcm_s16le", "-ac", "1", "-ar", "16000", str(target)],
-        check=True, stderr=subprocess.DEVNULL
+        [
+            "ffmpeg",
+            "-y",
+            "-threads",
+            str(settings.FFMPEG_THREADS),
+            "-i",
+            str(src),
+            "-acodec",
+            "pcm_s16le",
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            str(target),
+        ],
+        check=True,
+        stderr=subprocess.DEVNULL,
     )
-    logger.info(f"[{datetime.utcnow().isoformat()}] [PREPARE] converted ({time.perf_counter()-start:.2f}s)")
+    logger.info(f"[{datetime.utcnow().isoformat()}] [PREPARE] converted ({time.perf_counter() - start:.2f}s)")
     return target, duration
 
 
 def prepare_preview_segment(upload_id: str) -> subprocess.Popen:
     """
-    Берём исходный файл ЛЮБОГО формата и
-    через FFmpeg сразу выдаём первые PREVIEW_LENGTH_S секунд в WAV-пайп.
+    Отдаёт первые PREVIEW_LENGTH_S секунд через stdout (pipe) в виде WAV.
     """
     src = next(Path(settings.UPLOAD_FOLDER).glob(f"{upload_id}.*"))
     cmd = [
-        "ffmpeg", "-y",
-        "-threads", str(settings.FFMPEG_THREADS // 2 or 1),
-        "-ss", "0",
-        "-t", str(settings.PREVIEW_LENGTH_S),
-        "-i", str(src),
-        "-acodec", "pcm_s16le", "-ac", "1", "-ar", "16000",
-        "-f", "wav", "pipe:1",
+        "ffmpeg",
+        "-y",
+        "-threads",
+        str(settings.FFMPEG_THREADS // 2 or 1),
+        "-ss",
+        "0",
+        "-t",
+        str(settings.PREVIEW_LENGTH_S),
+        "-i",
+        str(src),
+        "-acodec",
+        "pcm_s16le",
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        "-f",
+        "wav",
+        "pipe:1",
     ]
     return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
 
@@ -273,10 +331,12 @@ def preview_transcribe(self, upload_id, correlation_id):
         for seg in segments:
             r.publish(
                 f"progress:{upload_id}",
-                json.dumps({
-                    "status": "preview_partial",
-                    "fragment": {"start": seg.start, "end": seg.end, "text": seg.text}
-                })
+                json.dumps(
+                    {
+                        "status": "preview_partial",
+                        "fragment": {"start": seg.start, "end": seg.end, "text": seg.text},
+                    }
+                ),
             )
 
         preview = {
@@ -309,7 +369,6 @@ def transcribe_segments(self, upload_id, correlation_id):
 
     logger.info(f"[{datetime.utcnow().isoformat()}] [{cid}] transcribe_segments start for {upload_id}")
 
-    # --- Полная транскрипция ---
     wav = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
     if not wav.exists():
         error = "WAV not found"
@@ -345,10 +404,23 @@ def transcribe_segments(self, upload_id, correlation_id):
         while offset < duration:
             this_len = min(chunk_len, duration - offset)
             proc = subprocess.Popen(
-                ["ffmpeg", "-y", "-threads", str(threads),
-                 "-ss", str(offset), "-t", str(this_len),
-                 "-i", str(wav), "-f", "wav", "pipe:1"],
-                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-threads",
+                    str(threads),
+                    "-ss",
+                    str(offset),
+                    "-t",
+                    str(this_len),
+                    "-i",
+                    str(wav),
+                    "-f",
+                    "wav",
+                    "pipe:1",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
             )
             seg_gen, _ = model.transcribe(
                 proc.stdout,
@@ -404,9 +476,7 @@ def diarize_full(self, upload_id, correlation_id):
 
     out_dir = Path(settings.RESULTS_FOLDER) / upload_id
     out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / "diarization.json").write_text(
-        json.dumps(segs, ensure_ascii=False, indent=2)
-    )
+    (out_dir / "diarization.json").write_text(json.dumps(segs, ensure_ascii=False, indent=2))
     r.publish(f"progress:{upload_id}", json.dumps({"status": "diarization_done"}))
     send_webhook_event("diarization_completed", upload_id, {"diarization": segs})
 
