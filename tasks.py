@@ -27,17 +27,6 @@ logger.setLevel(logging.INFO)
 
 # --- Webhook helper ---
 def send_webhook_event(event_type: str, upload_id: str, data: Optional[Any]):
-    """
-    POST → settings.WEBHOOK_URL:
-      {
-        "event_type": "...",
-        "upload_id": "...",
-        "timestamp": "2025-07-19T10:30:00Z",
-        "data": { … }  // или null
-      }
-    Заголовок X-WebHook-Secret.
-    Ретраи только при 5xx или сетевых ошибках, 4xx — прекращают.
-    """
     url = settings.WEBHOOK_URL
     secret = settings.WEBHOOK_SECRET
     if not url or not secret:
@@ -58,48 +47,41 @@ def send_webhook_event(event_type: str, upload_id: str, data: Optional[Any]):
         try:
             resp = requests.post(url, json=payload, headers=headers, timeout=5)
         except requests.RequestException as e:
-            logger.warning(f"[{datetime.utcnow().isoformat()}] [WEBHOOK] "
-                           f"{event_type} network error for {upload_id}: {e}, retrying in 30s")
+            logger.warning(
+                f"[{datetime.utcnow().isoformat()}] [WEBHOOK] "
+                f"{event_type} network error for {upload_id}: {e}, retrying in 30s"
+            )
             time.sleep(30)
             continue
 
         code = resp.status_code
-        if 200 <= code < 300:
-            logger.info(f"[{datetime.utcnow().isoformat()}] [WEBHOOK] "
-                        f"{event_type} succeeded for {upload_id}")
+        # Успех
+        if 200 <= code < 300 or code == 405:  # 405 трактуем как успех
+            if code == 405:
+                logger.info(
+                    f"[{datetime.utcnow().isoformat()}] [WEBHOOK] "
+                    f"{event_type} got 405 (treated as success) for {upload_id}"
+                )
+            else:
+                logger.info(
+                    f"[{datetime.utcnow().isoformat()}] [WEBHOOK] "
+                    f"{event_type} succeeded for {upload_id}"
+                )
             return
 
         if 400 <= code < 500:
-            logger.error(f"[{datetime.utcnow().isoformat()}] [WEBHOOK] "
-                         f"{event_type} returned {code} for {upload_id}, aborting retries")
+            logger.error(
+                f"[{datetime.utcnow().isoformat()}] [WEBHOOK] "
+                f"{event_type} returned {code} for {upload_id}, aborting retries"
+            )
             return
 
-        # 5xx
-        logger.warning(f"[{datetime.utcnow().isoformat()}] [WEBHOOK] "
-                       f"{event_type} returned {code} for {upload_id}, retrying in 30s")
+        # 5xx → повторяем
+        logger.warning(
+            f"[{datetime.utcnow().isoformat()}] [WEBHOOK] "
+            f"{event_type} returned {code} for {upload_id}, retrying in 30s"
+        )
         time.sleep(30)
-
-
-# --- Model availability flags ---
-try:
-    from faster_whisper import WhisperModel, download_model
-    _HF_AVAILABLE = True
-    logger.info("[INIT] faster-whisper available")
-except ImportError as e:
-    _HF_AVAILABLE = False
-    logger.warning(f"[INIT] faster-whisper not available: {e}")
-
-try:
-    from pyannote.audio.pipelines import VoiceActivityDetection, SpeakerDiarization
-    _PN_AVAILABLE = True
-    logger.info("[INIT] pyannote.audio available")
-except ImportError as e:
-    _PN_AVAILABLE = False
-    logger.warning(f"[INIT] pyannote.audio not available: {e}")
-
-_whisper_model = None
-_vad = None
-_clustering_diarizer = None
 
 
 # --- Model loaders ---
@@ -165,10 +147,13 @@ def preload_on_startup(**kwargs):
     """
     Прогрев моделей внутри воркера.
     """
-    device = settings.WHISPER_DEVICE.lower()
-    if _HF_AVAILABLE and not device.startswith("cpu"):
+    # Whisper хотим везде (GPU и CPU), если библиотека доступна
+    if _HF_AVAILABLE:
         get_whisper_model()
-    if _PN_AVAILABLE and device == "cpu":
+
+    # Диаризацию (VAD + clustering) прогреваем только на GPU
+    if _PN_AVAILABLE and device.startswith("cuda"):
+        get_vad()
         get_clustering_diarizer()
 
 
