@@ -31,7 +31,7 @@ def send_webhook_event(event_type: str, upload_id: str, data: Optional[Any]):
       {
         "event_type": "...",
         "upload_id": "...",
-        "timestamp": "2025-07-19T10:30:00Z",
+        "timestamp": "...",
         "data": { … }  // или null
       }
     Заголовок X-WebHook-Secret.
@@ -166,7 +166,7 @@ def preload_on_startup(**kwargs):
 # --- Audio utils ---
 def probe_audio(src: Path) -> dict:
     res = subprocess.run(
-        ["ffprobe","-v","error","-print_format","json","-show_format","-show_streams", str(src)],
+        ["ffprobe", "-v", "error", "-print_format", "json", "-show_format", "-show_streams", str(src)],
         capture_output=True, text=True
     )
     info = {"duration": 0.0}
@@ -201,8 +201,8 @@ def prepare_wav(upload_id: str) -> (Path, float):
         return target, duration
 
     subprocess.run(
-        ["ffmpeg","-y","-threads",str(settings.FFMPEG_THREADS),
-         "-i",str(src),"-acodec","pcm_s16le","-ac","1","-ar","16000",str(target)],
+        ["ffmpeg", "-y", "-threads", str(settings.FFMPEG_THREADS),
+         "-i", str(src), "-acodec", "pcm_s16le", "-ac", "1", "-ar", "16000", str(target)],
         check=True, stderr=subprocess.DEVNULL
     )
     return target, duration
@@ -235,10 +235,16 @@ def preview_transcribe(self, upload_id, correlation_id):
             raise FileNotFoundError("WAV not found")
 
         proc = subprocess.Popen(
-            ["ffmpeg","-y","-threads",str(settings.FFMPEG_THREADS//2 or 1),
-             "-ss","0","-t",str(settings.PREVIEW_LENGTH_S),
-             "-i",str(wav),"-f","wav","pipe:1"],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+            [
+              "ffmpeg", "-y",
+              "-threads", str(settings.FFMPEG_THREADS // 2 or 1),
+              "-ss", "0",                    # перенесли перед -i
+              "-i", str(wav),
+              "-t", str(settings.PREVIEW_LENGTH_S),
+              "-f", "wav", "pipe:1"
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL
         )
         model = get_whisper_model()
         segments_gen, _ = model.transcribe(
@@ -254,14 +260,14 @@ def preview_transcribe(self, upload_id, correlation_id):
             r.publish(
                 f"progress:{upload_id}",
                 json.dumps({
-                    "status": "preview_partial",
-                    "fragment": {"start": seg.start, "end": seg.end, "text": seg.text}
+                    "status":"preview_partial",
+                    "fragment":{"start":seg.start,"end":seg.end,"text":seg.text}
                 })
             )
 
         preview = {
             "text": "".join(s.text for s in segments),
-            "timestamps": [{"start":s.start,"end":s.end,"text":s.text} for s in segments],
+            "timestamps":[{"start":s.start,"end":s.end,"text":s.text} for s in segments],
         }
         out_dir = Path(settings.RESULTS_FOLDER) / upload_id
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -270,7 +276,7 @@ def preview_transcribe(self, upload_id, correlation_id):
         )
         r.publish(f"progress:{upload_id}", json.dumps({"status":"preview_done","preview":preview}))
 
-        send_webhook_event("preview_completed", upload_id, {"preview": preview})
+        send_webhook_event("preview_completed", upload_id, {"preview":preview})
 
     except Exception as e:
         r.publish(f"progress:{upload_id}", json.dumps({"status":"error","error":str(e)}))
@@ -308,10 +314,14 @@ def transcribe_segments(self, upload_id, correlation_id):
             while offset < duration:
                 this_len = min(chunk_len, duration - offset)
                 proc = subprocess.Popen(
-                    ["ffmpeg","-y","-threads",str(threads),
-                     "-ss",str(offset),"-t",str(this_len),
-                     "-i",str(wav),"-f","wav","pipe:1"],
-                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                    [
+                      "ffmpeg", "-y", "-threads", str(threads),
+                      "-ss", str(offset),
+                      "-t", str(this_len),
+                      "-i", str(wav), "-f", "wav", "pipe:1"
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
                 )
                 seg_gen, _ = model.transcribe(
                     proc.stdout,
@@ -335,7 +345,7 @@ def transcribe_segments(self, upload_id, correlation_id):
         )
         r.publish(f"progress:{upload_id}", json.dumps({"status":"transcript_done"}))
 
-        send_webhook_event("transcription_completed", upload_id, {"transcript": transcript_data})
+        send_webhook_event("transcription_completed", upload_id, {"transcript":transcript_data})
 
     except Exception as e:
         r.publish(f"progress:{upload_id}", json.dumps({"status":"error","error":str(e)}))
@@ -355,11 +365,11 @@ def diarize_full(self, upload_id, correlation_id):
 
     try:
         wav_path, _ = prepare_wav(upload_id)
-        speech = get_vad().apply({"audio": str(wav_path)})
-        ann = get_clustering_diarizer().apply({"audio": str(wav_path), "speech": speech})
+        speech = get_vad().apply({"audio":str(wav_path)})
+        ann = get_clustering_diarizer().apply({"audio":str(wav_path),"speech":speech})
         segs = [
-            {"start": float(s.start), "end": float(s.end), "speaker": spk}
-            for s, _, spk in ann.itertracks(yield_label=True)
+            {"start":float(s.start),"end":float(s.end),"speaker":spk}
+            for s,_,spk in ann.itertracks(yield_label=True)
         ]
     except Exception as e:
         r.publish(f"progress:{upload_id}", json.dumps({"status":"error","error":str(e)}))
@@ -373,7 +383,7 @@ def diarize_full(self, upload_id, correlation_id):
     )
     r.publish(f"progress:{upload_id}", json.dumps({"status":"diarization_done"}))
 
-    send_webhook_event("diarization_completed", upload_id, {"diarization": segs})
+    send_webhook_event("diarization_completed", upload_id, {"diarization":segs})
 
 @app.task(bind=True, queue="transcribe_cpu")
 def cleanup_old_files(self):
