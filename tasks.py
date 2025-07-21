@@ -34,16 +34,17 @@ except ImportError as e:
     logger.warning(f"[INIT] faster-whisper not available: {e}")
 
 try:
-    from pyannote.audio.pipelines import VoiceActivityDetection, SpeakerDiarization
+    # Новый unified pipeline 3.1
+    from pyannote.audio import Pipeline as PyannotePipeline
     _PN_AVAILABLE = True
-    logger.info("[INIT] pyannote.audio available")
+    logger.info("[INIT] pyannote.audio Pipeline available")
 except ImportError as e:
     _PN_AVAILABLE = False
     logger.warning(f"[INIT] pyannote.audio not available: {e}")
 
+# --- Global model holders ---
 _whisper_model = None
-_vad = None
-_clustering_diarizer = None
+_diarization_pipeline = None  # speaker-diarization-3.1
 
 
 # --- Webhook helper ---
@@ -126,6 +127,7 @@ def get_whisper_model(model_override: str = None):
     if _whisper_model is None:
         model_id = settings.WHISPER_MODEL_PATH
         logger.info(f"[{datetime.utcnow().isoformat()}] [WHISPER] init {model_id} on {device}")
+        t0 = time.perf_counter()
         try:
             path = download_model(
                 model_id,
@@ -139,35 +141,33 @@ def get_whisper_model(model_override: str = None):
             compute = "int8"
 
         _whisper_model = WhisperModel(path, device=device, compute_type=compute)
-        logger.info(f"[{datetime.utcnow().isoformat()}] [WHISPER] ready on {device}")
+        logger.info(
+            f"[{datetime.utcnow().isoformat()}] [WHISPER] ready on {device} "
+            f"({time.perf_counter() - t0:.2f}s)"
+        )
     return _whisper_model
 
 
-def get_vad():
-    global _vad
-    if _vad is None:
-        logger.info(f"[{datetime.utcnow().isoformat()}] [VAD] loading")
-        _vad = VoiceActivityDetection.from_pretrained(
-            settings.VAD_MODEL_PATH,
-            cache_dir=settings.HUGGINGFACE_CACHE_DIR,
+def get_diarization_pipeline():
+    """
+    Unified pipeline pyannote/speaker-diarization-3.1.
+    Прогреваем только на GPU воркерах.
+    """
+    global _diarization_pipeline
+    if _diarization_pipeline is None:
+        logger.info(f"[{datetime.utcnow().isoformat()}] [DIARIZER] loading pipeline")
+        t0 = time.perf_counter()
+        model_id = getattr(settings, "PYANNOTE_PIPELINE", "pyannote/speaker-diarization-3.1")
+        _diarization_pipeline = PyannotePipeline.from_pretrained(
+            model_id,
             use_auth_token=settings.HUGGINGFACE_TOKEN,
-        )
-        logger.info(f"[{datetime.utcnow().isoformat()}] [VAD] ready")
-    return _vad
-
-
-def get_clustering_diarizer():
-    global _clustering_diarizer
-    if _clustering_diarizer is None:
-        logger.info(f"[{datetime.utcnow().isoformat()}] [DIARIZER] loading")
-        Path(settings.DIARIZER_CACHE_DIR).mkdir(parents=True, exist_ok=True)
-        _clustering_diarizer = SpeakerDiarization.from_pretrained(
-            settings.PYANNOTE_PIPELINE,
             cache_dir=settings.DIARIZER_CACHE_DIR,
-            use_auth_token=settings.HUGGINGFACE_TOKEN,
         )
-        logger.info(f"[{datetime.utcnow().isoformat()}] [DIARIZER] ready")
-    return _clustering_diarizer
+        logger.info(
+            f"[{datetime.utcnow().isoformat()}] [DIARIZER] pipeline ready "
+            f"({time.perf_counter() - t0:.2f}s)"
+        )
+    return _diarization_pipeline
 
 
 @worker_process_init.connect
@@ -178,11 +178,13 @@ def preload_on_startup(**kwargs):
     Диаризация — только если устройство GPU.
     """
     device = settings.WHISPER_DEVICE.lower()
-    if _HF_AVAILABLE:
-        get_whisper_model()
-    if _PN_AVAILABLE and device.startswith("cuda"):
-        get_vad()
-        get_clustering_diarizer()
+    try:
+        if _HF_AVAILABLE:
+            get_whisper_model()
+        if _PN_AVAILABLE and device.startswith("cuda"):
+            get_diarization_pipeline()
+    except Exception as e:
+        logger.error(f"[{datetime.utcnow().isoformat()}] [PRELOAD] error: {e}", exc_info=True)
 
 
 # --- Audio utils ---
@@ -316,6 +318,7 @@ def preview_transcribe(self, upload_id, correlation_id):
 
     try:
         logger.info(f"[{datetime.utcnow().isoformat()}] [{cid}] preview_transcribe start for {upload_id}")
+        stage_t0 = time.perf_counter()
         proc = prepare_preview_segment(upload_id)
 
         model = get_whisper_model()
@@ -350,6 +353,10 @@ def preview_transcribe(self, upload_id, correlation_id):
         )
         r.publish(f"progress:{upload_id}", json.dumps({"status": "preview_done", "preview": preview}))
         send_webhook_event("preview_completed", upload_id, {"preview": preview})
+        logger.info(
+            f"[{datetime.utcnow().isoformat()}] [{cid}] preview_transcribe done in "
+            f"{time.perf_counter() - stage_t0:.2f}s for {upload_id}"
+        )
 
     except Exception as e:
         logger.error(f"[{datetime.utcnow().isoformat()}] [{cid}] preview_error: {e}", exc_info=True)
@@ -368,6 +375,7 @@ def transcribe_segments(self, upload_id, correlation_id):
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
 
     logger.info(f"[{datetime.utcnow().isoformat()}] [{cid}] transcribe_segments start for {upload_id}")
+    stage_t0 = time.perf_counter()
 
     wav = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
     if not wav.exists():
@@ -401,8 +409,13 @@ def transcribe_segments(self, upload_id, correlation_id):
         all_segs = list(segs)
     else:
         offset = 0.0
+        i = 0
         while offset < duration:
             this_len = min(chunk_len, duration - offset)
+            logger.info(
+                f"[{datetime.utcnow().isoformat()}] [{cid}] transcribe chunk {i} "
+                f"offset={offset:.2f}s len={this_len:.2f}s"
+            )
             proc = subprocess.Popen(
                 [
                     "ffmpeg",
@@ -435,6 +448,7 @@ def transcribe_segments(self, upload_id, correlation_id):
                 s.end += offset
             all_segs.extend(chunk_segs)
             offset += this_len
+            i += 1
 
     transcript_data = [{"start": s.start, "end": s.end, "text": s.text} for s in all_segs]
     out_dir = Path(settings.RESULTS_FOLDER) / upload_id
@@ -444,6 +458,10 @@ def transcribe_segments(self, upload_id, correlation_id):
     )
     r.publish(f"progress:{upload_id}", json.dumps({"status": "transcript_done"}))
     send_webhook_event("transcription_completed", upload_id, {"transcript": transcript_data})
+    logger.info(
+        f"[{datetime.utcnow().isoformat()}] [{cid}] transcribe_segments done in "
+        f"{time.perf_counter() - stage_t0:.2f}s for {upload_id}"
+    )
 
 
 @app.task(bind=True, queue="diarize_gpu")
@@ -452,22 +470,86 @@ def diarize_full(self, upload_id, correlation_id):
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
 
     logger.info(f"[{datetime.utcnow().isoformat()}] [{cid}] diarize_full start for {upload_id}")
+    stage_t0 = time.perf_counter()
     send_webhook_event("diarization_started", upload_id, None)
     r.publish(f"progress:{upload_id}", json.dumps({"status": "diarize_started"}))
 
-    if not _PN_AVAILABLE or not settings.WHISPER_DEVICE.lower().startswith("cuda"):
+    device = settings.WHISPER_DEVICE.lower()
+    if not _PN_AVAILABLE or not device.startswith("cuda"):
         logger.error(f"[{datetime.utcnow().isoformat()}] [{cid}] diarize_unavailable")
         send_webhook_event("processing_failed", upload_id, None)
         return
 
     try:
-        wav_path, _ = prepare_wav(upload_id)
-        speech = get_vad().apply({"audio": str(wav_path)})
-        ann = get_clustering_diarizer().apply({"audio": str(wav_path), "speech": speech})
-        segs = [
-            {"start": float(s.start), "end": float(s.end), "speaker": spk}
-            for s, _, spk in ann.itertracks(yield_label=True)
-        ]
+        wav_path, duration = prepare_wav(upload_id)
+        pipeline = get_diarization_pipeline()
+
+        chunk_limit = getattr(settings, "DIARIZATION_CHUNK_LENGTH_S", 0) or 0
+        segs = []
+
+        if chunk_limit and duration > chunk_limit:
+            # Чанкуем длинный файл
+            logger.info(
+                f"[{datetime.utcnow().isoformat()}] [{cid}] diarization chunking enabled "
+                f"(chunk={chunk_limit}s, duration={duration:.2f}s)"
+            )
+            offset = 0.0
+            i = 0
+            while offset < duration:
+                this_len = min(chunk_limit, duration - offset)
+                tmp_wav = Path(settings.DIARIZER_CACHE_DIR) / f"{upload_id}_diar_chunk_{i}.wav"
+                # вырезаем chunk
+                subprocess.run(
+                    [
+                        "ffmpeg",
+                        "-y",
+                        "-threads",
+                        str(settings.FFMPEG_THREADS // 2 or 1),
+                        "-ss",
+                        str(offset),
+                        "-t",
+                        str(this_len),
+                        "-i",
+                        str(wav_path),
+                        str(tmp_wav),
+                    ],
+                    check=True,
+                    stderr=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                )
+                t_chunk = time.perf_counter()
+                ann = pipeline(str(tmp_wav))
+                logger.info(
+                    f"[{datetime.utcnow().isoformat()}] [{cid}] diarization chunk {i} "
+                    f"offset={offset:.2f}s len={this_len:.2f}s "
+                    f"({time.perf_counter() - t_chunk:.2f}s)"
+                )
+                for s, _, spk in ann.itertracks(yield_label=True):
+                    segs.append(
+                        {
+                            "start": float(s.start) + offset,
+                            "end": float(s.end) + offset,
+                            "speaker": spk,
+                        }
+                    )
+                try:
+                    tmp_wav.unlink()
+                except Exception:
+                    pass
+                offset += this_len
+                i += 1
+        else:
+            # Без чанкинга — простая обработка целиком
+            t_infer = time.perf_counter()
+            ann = pipeline(str(wav_path))
+            logger.info(
+                f"[{datetime.utcnow().isoformat()}] [{cid}] diarization inference "
+                f"({time.perf_counter() - t_infer:.2f}s)"
+            )
+            segs = [
+                {"start": float(s.start), "end": float(s.end), "speaker": spk}
+                for s, _, spk in ann.itertracks(yield_label=True)
+            ]
     except Exception as e:
         logger.error(f"[{datetime.utcnow().isoformat()}] [{cid}] diarize_error: {e}", exc_info=True)
         r.publish(f"progress:{upload_id}", json.dumps({"status": "error", "error": str(e)}))
@@ -479,6 +561,10 @@ def diarize_full(self, upload_id, correlation_id):
     (out_dir / "diarization.json").write_text(json.dumps(segs, ensure_ascii=False, indent=2))
     r.publish(f"progress:{upload_id}", json.dumps({"status": "diarization_done"}))
     send_webhook_event("diarization_completed", upload_id, {"diarization": segs})
+    logger.info(
+        f"[{datetime.utcnow().isoformat()}] [{cid}] diarize_full done in "
+        f"{time.perf_counter() - stage_t0:.2f}s for {upload_id}"
+    )
 
 
 @app.task(bind=True, queue="transcribe_cpu")
