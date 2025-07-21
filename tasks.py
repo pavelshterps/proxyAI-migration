@@ -24,6 +24,7 @@ handler.setFormatter(formatter)
 logger.addHandler(handler)
 logger.setLevel(logging.INFO)
 
+
 # --- Webhook helper ---
 def send_webhook_event(event_type: str, upload_id: str, data: Optional[Any]):
     """
@@ -35,7 +36,6 @@ def send_webhook_event(event_type: str, upload_id: str, data: Optional[Any]):
         "data": { … }  // или null
       }
     Заголовок X-WebHook-Secret.
-
     Ретраи только при 5xx или сетевых ошибках, 4xx — прекращают.
     """
     url = settings.WEBHOOK_URL
@@ -79,6 +79,7 @@ def send_webhook_event(event_type: str, upload_id: str, data: Optional[Any]):
                        f"{event_type} returned {code} for {upload_id}, retrying in 30s")
         time.sleep(30)
 
+
 # --- Model availability flags ---
 try:
     from faster_whisper import WhisperModel, download_model
@@ -99,6 +100,7 @@ except ImportError as e:
 _whisper_model = None
 _vad = None
 _clustering_diarizer = None
+
 
 # --- Model loaders ---
 def get_whisper_model(model_override: str = None):
@@ -130,6 +132,7 @@ def get_whisper_model(model_override: str = None):
         logger.info(f"[{datetime.utcnow().isoformat()}] [WHISPER] ready on {device}")
     return _whisper_model
 
+
 def get_vad():
     global _vad
     if _vad is None:
@@ -141,6 +144,7 @@ def get_vad():
         )
         logger.info(f"[{datetime.utcnow().isoformat()}] [VAD] ready")
     return _vad
+
 
 def get_clustering_diarizer():
     global _clustering_diarizer
@@ -155,6 +159,7 @@ def get_clustering_diarizer():
         logger.info(f"[{datetime.utcnow().isoformat()}] [DIARIZER] ready")
     return _clustering_diarizer
 
+
 @worker_process_init.connect
 def preload_on_startup(**kwargs):
     """
@@ -166,10 +171,11 @@ def preload_on_startup(**kwargs):
     if _PN_AVAILABLE and device == "cpu":
         get_clustering_diarizer()
 
+
 # --- Audio utils ---
 def probe_audio(src: Path) -> dict:
     res = subprocess.run(
-        ["ffprobe","-v","error","-print_format","json","-show_format","-show_streams", str(src)],
+        ["ffprobe", "-v", "error", "-print_format", "json", "-show_format", "-show_streams", str(src)],
         capture_output=True, text=True
     )
     info = {"duration": 0.0}
@@ -187,6 +193,7 @@ def probe_audio(src: Path) -> dict:
     except Exception:
         pass
     return info
+
 
 def prepare_wav(upload_id: str) -> (Path, float):
     """
@@ -210,12 +217,13 @@ def prepare_wav(upload_id: str) -> (Path, float):
         return target, duration
 
     subprocess.run(
-        ["ffmpeg","-y","-threads",str(settings.FFMPEG_THREADS),
-         "-i",str(src),"-acodec","pcm_s16le","-ac","1","-ar","16000",str(target)],
+        ["ffmpeg", "-y", "-threads", str(settings.FFMPEG_THREADS),
+         "-i", str(src), "-acodec", "pcm_s16le", "-ac", "1", "-ar", "16000", str(target)],
         check=True, stderr=subprocess.DEVNULL
     )
     logger.info(f"[{datetime.utcnow().isoformat()}] [PREPARE] converted ({time.perf_counter()-start:.2f}s)")
     return target, duration
+
 
 def prepare_preview_segment(upload_id: str) -> subprocess.Popen:
     """
@@ -225,7 +233,7 @@ def prepare_preview_segment(upload_id: str) -> subprocess.Popen:
     src = next(Path(settings.UPLOAD_FOLDER).glob(f"{upload_id}.*"))
     cmd = [
         "ffmpeg", "-y",
-        "-threads", str(settings.FFMPEG_THREADS//2 or 1),
+        "-threads", str(settings.FFMPEG_THREADS // 2 or 1),
         "-ss", "0",
         "-t", str(settings.PREVIEW_LENGTH_S),
         "-i", str(src),
@@ -233,6 +241,7 @@ def prepare_preview_segment(upload_id: str) -> subprocess.Popen:
         "-f", "wav", "pipe:1",
     ]
     return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
 
 # --- Celery tasks ---
 
@@ -248,7 +257,7 @@ def convert_to_wav_and_preview(self, upload_id, correlation_id):
         prepare_wav(upload_id)
     except Exception as e:
         logger.error(f"[{datetime.utcnow().isoformat()}] [{cid}] prepare_error: {e}", exc_info=True)
-        r.publish(f"progress:{upload_id}", json.dumps({"status":"error","error":str(e)}))
+        r.publish(f"progress:{upload_id}", json.dumps({"status": "error", "error": str(e)}))
         send_webhook_event("processing_failed", upload_id, None)
         return
 
@@ -256,120 +265,138 @@ def convert_to_wav_and_preview(self, upload_id, correlation_id):
     from tasks import preview_transcribe
     preview_transcribe.delay(upload_id, correlation_id)
 
+
 @app.task(bind=True, queue="transcribe_gpu")
 def preview_transcribe(self, upload_id, correlation_id):
-    cid = correlationation_id or "?"
+    cid = correlation_id or "?"
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
 
-    logger.info(f"[{datetime.utcnow().isoformat()}] [{cid}] preview_transcribe start for {upload_id}")
-    proc = prepare_preview_segment(upload_id)
+    try:
+        logger.info(f"[{datetime.utcnow().isoformat()}] [{cid}] preview_transcribe start for {upload_id}")
+        proc = prepare_preview_segment(upload_id)
 
-    model = get_whisper_model()
-    segments_gen, _ = model.transcribe(
-        proc.stdout,
-        word_timestamps=True,
-        **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {}),
-    )
-    proc.stdout.close()
-    proc.wait()
-    segments = list(segments_gen)
-
-    for seg in segments:
-        r.publish(
-            f"progress:{upload_id}",
-            json.dumps({
-                "status": "preview_partial",
-                "fragment": {"start": seg.start, "end": seg.end, "text": seg.text}
-            })
+        model = get_whisper_model()
+        segments_gen, _ = model.transcribe(
+            proc.stdout,
+            word_timestamps=True,
+            **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {}),
         )
+        proc.stdout.close()
+        proc.wait()
+        segments = list(segments_gen)
 
-    preview = {
-        "text": "".join(s.text for s in segments),
-        "timestamps": [{"start":s.start,"end":s.end,"text":s.text} for s in segments],
-    }
-    out_dir = Path(settings.RESULTS_FOLDER) / upload_id
-    out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / "preview_transcript.json").write_text(
-        json.dumps(preview, ensure_ascii=False, indent=2)
-    )
-    r.publish(f"progress:{upload_id}", json.dumps({"status":"preview_done","preview":preview}))
-    send_webhook_event("preview_completed", upload_id, {"preview": preview})
+        for seg in segments:
+            r.publish(
+                f"progress:{upload_id}",
+                json.dumps({
+                    "status": "preview_partial",
+                    "fragment": {"start": seg.start, "end": seg.end, "text": seg.text}
+                })
+            )
+
+        preview = {
+            "text": "".join(s.text for s in segments),
+            "timestamps": [{"start": s.start, "end": s.end, "text": s.text} for s in segments],
+        }
+        out_dir = Path(settings.RESULTS_FOLDER) / upload_id
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "preview_transcript.json").write_text(
+            json.dumps(preview, ensure_ascii=False, indent=2)
+        )
+        r.publish(f"progress:{upload_id}", json.dumps({"status": "preview_done", "preview": preview}))
+        send_webhook_event("preview_completed", upload_id, {"preview": preview})
+
+    except Exception as e:
+        logger.error(f"[{datetime.utcnow().isoformat()}] [{cid}] preview_error: {e}", exc_info=True)
+        r.publish(f"progress:{upload_id}", json.dumps({"status": "error", "error": str(e)}))
+        send_webhook_event("processing_failed", upload_id, None)
+        return
 
     logger.info(f"[{datetime.utcnow().isoformat()}] [{cid}] enqueue transcribe_segments")
     from tasks import transcribe_segments
     transcribe_segments.delay(upload_id, correlation_id)
 
+
 @app.task(bind=True, queue="transcribe_gpu")
 def transcribe_segments(self, upload_id, correlation_id):
-    cid = correlationation_id or "?"
+    cid = correlation_id or "?"
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
 
     logger.info(f"[{datetime.utcnow().isoformat()}] [{cid}] transcribe_segments start for {upload_id}")
-    try:
-        wav = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
-        if not wav.exists():
-            raise FileNotFoundError("WAV not found")
 
-        info = probe_audio(wav)
-        duration = info["duration"]
-        model = get_whisper_model()
-        all_segs = []
-        chunk_len = settings.CHUNK_LENGTH_S
-        threads = settings.FFMPEG_THREADS
+    # --- Полная транскрипция ---
+    wav = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
+    if not wav.exists():
+        error = "WAV not found"
+        logger.error(f"[{datetime.utcnow().isoformat()}] [{cid}] {error}")
+        r.publish(f"progress:{upload_id}", json.dumps({"status": "error", "error": error}))
+        send_webhook_event("processing_failed", upload_id, None)
+        return
 
-        if duration <= chunk_len:
-            segs, _ = model.transcribe(
-                str(wav),
+    info = probe_audio(wav)
+    duration = info["duration"]
+
+    if not _HF_AVAILABLE:
+        error = "Whisper unavailable"
+        logger.error(f"[{datetime.utcnow().isoformat()}] [{cid}] {error}")
+        r.publish(f"progress:{upload_id}", json.dumps({"status": "error", "error": error}))
+        send_webhook_event("processing_failed", upload_id, None)
+        return
+
+    model = get_whisper_model()
+    all_segs = []
+    chunk_len = settings.CHUNK_LENGTH_S
+    threads = settings.FFMPEG_THREADS
+
+    if duration <= chunk_len:
+        segs, _ = model.transcribe(
+            str(wav),
+            word_timestamps=True,
+            **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {}),
+        )
+        all_segs = list(segs)
+    else:
+        offset = 0.0
+        while offset < duration:
+            this_len = min(chunk_len, duration - offset)
+            proc = subprocess.Popen(
+                ["ffmpeg", "-y", "-threads", str(threads),
+                 "-ss", str(offset), "-t", str(this_len),
+                 "-i", str(wav), "-f", "wav", "pipe:1"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            )
+            seg_gen, _ = model.transcribe(
+                proc.stdout,
                 word_timestamps=True,
                 **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {}),
             )
-            all_segs = list(segs)
-        else:
-            offset = 0.0
-            while offset < duration:
-                this_len = min(chunk_len, duration - offset)
-                proc = subprocess.Popen(
-                    ["ffmpeg","-y","-threads",str(threads),
-                     "-ss",str(offset),"-t",str(this_len),
-                     "-i",str(wav),"-f","wav","pipe:1"],
-                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                )
-                seg_gen, _ = model.transcribe(
-                    proc.stdout,
-                    word_timestamps=True,
-                    **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {}),
-                )
-                proc.stdout.close()
-                proc.wait()
-                chunk_segs = list(seg_gen)
-                for s in chunk_segs:
-                    s.start += offset
-                    s.end += offset
-                all_segs.extend(chunk_segs)
-                offset += this_len
+            proc.stdout.close()
+            proc.wait()
+            chunk_segs = list(seg_gen)
+            for s in chunk_segs:
+                s.start += offset
+                s.end += offset
+            all_segs.extend(chunk_segs)
+            offset += this_len
 
-        transcript_data = [{"start":s.start,"end":s.end,"text":s.text} for s in all_segs]
-        out_dir = Path(settings.RESULTS_FOLDER) / upload_id
-        out_dir.mkdir(parents=True, exist_ok=True)
-        (out_dir / "transcript.json").write_text(
-            json.dumps(transcript_data, ensure_ascii=False, indent=2)
-        )
-        r.publish(f"progress:{upload_id}", json.dumps({"status":"transcript_done"}))
-        send_webhook_event("transcription_completed", upload_id, {"transcript": transcript_data})
+    transcript_data = [{"start": s.start, "end": s.end, "text": s.text} for s in all_segs]
+    out_dir = Path(settings.RESULTS_FOLDER) / upload_id
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "transcript.json").write_text(
+        json.dumps(transcript_data, ensure_ascii=False, indent=2)
+    )
+    r.publish(f"progress:{upload_id}", json.dumps({"status": "transcript_done"}))
+    send_webhook_event("transcription_completed", upload_id, {"transcript": transcript_data})
 
-    except Exception as e:
-        logger.error(f"[{datetime.utcnow().isoformat()}] [{cid}] transcribe_error: {e}", exc_info=True)
-        r.publish(f"progress:{upload_id}", json.dumps({"status":"error","error":str(e)}))
-        send_webhook_event("processing_failed", upload_id, None)
 
 @app.task(bind=True, queue="diarize_gpu")
 def diarize_full(self, upload_id, correlation_id):
-    cid = correlationation_id or "?"
+    cid = correlationlation_id or "?"
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
 
     logger.info(f"[{datetime.utcnow().isoformat()}] [{cid}] diarize_full start for {upload_id}")
     send_webhook_event("diarization_started", upload_id, None)
-    r.publish(f"progress:{upload_id}", json.dumps({"status":"diarize_started"}))
+    r.publish(f"progress:{upload_id}", json.dumps({"status": "diarize_started"}))
 
     if not _PN_AVAILABLE or not settings.WHISPER_DEVICE.lower().startswith("cuda"):
         logger.error(f"[{datetime.utcnow().isoformat()}] [{cid}] diarize_unavailable")
@@ -386,7 +413,7 @@ def diarize_full(self, upload_id, correlation_id):
         ]
     except Exception as e:
         logger.error(f"[{datetime.utcnow().isoformat()}] [{cid}] diarize_error: {e}", exc_info=True)
-        r.publish(f"progress:{upload_id}", json.dumps({"status":"error","error":str(e)}))
+        r.publish(f"progress:{upload_id}", json.dumps({"status": "error", "error": str(e)}))
         send_webhook_event("processing_failed", upload_id, None)
         return
 
@@ -395,8 +422,9 @@ def diarize_full(self, upload_id, correlation_id):
     (out_dir / "diarization.json").write_text(
         json.dumps(segs, ensure_ascii=False, indent=2)
     )
-    r.publish(f"progress:{upload_id}", json.dumps({"status":"diarization_done"}))
+    r.publish(f"progress:{upload_id}", json.dumps({"status": "diarization_done"}))
     send_webhook_event("diarization_completed", upload_id, {"diarization": segs})
+
 
 @app.task(bind=True, queue="transcribe_cpu")
 def cleanup_old_files(self):
@@ -407,7 +435,10 @@ def cleanup_old_files(self):
         for p in base.glob("**/*"):
             try:
                 if datetime.utcnow() - datetime.fromtimestamp(p.stat().st_mtime) > timedelta(days=age):
-                    (p.rmdir() if p.is_dir() else p.unlink())
+                    if p.is_dir():
+                        p.rmdir()
+                    else:
+                        p.unlink()
                     deleted += 1
             except Exception:
                 continue
