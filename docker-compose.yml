@@ -19,7 +19,12 @@ services:
     image: redis:7-alpine
     container_name: proxyai_redis
     env_file: .env
-    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD}", "--masterauth", "${REDIS_PASSWORD}"]
+    command:
+      - redis-server
+      - --requirepass
+      - "${REDIS_PASSWORD}"
+      - --masterauth
+      - "${REDIS_PASSWORD}"
     volumes:
       - redis_data:/data
     ports:
@@ -39,12 +44,16 @@ services:
     environment:
       - DATABASE_URL=${DATABASE_URL}
       - CELERY_BROKER_URL=${CELERY_BROKER_URL}
+      - CELERY_RESULT_BACKEND=${CELERY_RESULT_BACKEND}
+      - REDIS_URL=${REDIS_URL}
       - UPLOAD_FOLDER=${UPLOAD_FOLDER}
       - RESULTS_FOLDER=${RESULTS_FOLDER}
       - DIARIZER_CACHE_DIR=${DIARIZER_CACHE_DIR}
       - HUGGINGFACE_CACHE_DIR=/hf_cache
       - WHISPER_MODEL_PATH=${WHISPER_MODEL_PATH}
-      - WHISPER_DEVICE=cuda
+      - WHISPER_DEVICE=${WHISPER_DEVICE}
+      - WEBHOOK_URL=${WEBHOOK_URL}
+      - WEBHOOK_SECRET=${WEBHOOK_SECRET}
     volumes:
       - ./:/app:delegated
       - upload_data:${UPLOAD_FOLDER}
@@ -75,12 +84,16 @@ services:
       - --queues=transcribe_cpu
     environment:
       - CELERY_BROKER_URL=${CELERY_BROKER_URL}
+      - CELERY_RESULT_BACKEND=${CELERY_RESULT_BACKEND}
+      - REDIS_URL=${REDIS_URL}
       - UPLOAD_FOLDER=${UPLOAD_FOLDER}
       - RESULTS_FOLDER=${RESULTS_FOLDER}
       - DIARIZER_CACHE_DIR=${DIARIZER_CACHE_DIR}
       - HUGGINGFACE_CACHE_DIR=/hf_cache
       - WHISPER_MODEL_PATH=${WHISPER_MODEL_PATH}
       - WHISPER_DEVICE=cpu
+      - WEBHOOK_URL=${WEBHOOK_URL}
+      - WEBHOOK_SECRET=${WEBHOOK_SECRET}
     volumes:
       - ./:/app:delegated
       - upload_data:${UPLOAD_FOLDER}
@@ -93,7 +106,7 @@ services:
     networks:
       - proxyai_net
     restart: unless-stopped
-  # первый GPU-воркер
+
   worker_gpu_1:
     build:
       context: .
@@ -108,10 +121,12 @@ services:
       - celery_app:app
       - worker
       - --loglevel=info
-      - --concurrency=1
+      - --concurrency=${GPU_CONCURRENCY}
       - --queues=transcribe_gpu,diarize_gpu
     environment:
       - CELERY_BROKER_URL=${CELERY_BROKER_URL}
+      - CELERY_RESULT_BACKEND=${CELERY_RESULT_BACKEND}
+      - REDIS_URL=${REDIS_URL}
       - UPLOAD_FOLDER=${UPLOAD_FOLDER}
       - RESULTS_FOLDER=${RESULTS_FOLDER}
       - DIARIZER_CACHE_DIR=${DIARIZER_CACHE_DIR}
@@ -119,6 +134,8 @@ services:
       - WHISPER_MODEL_PATH=${WHISPER_MODEL_PATH}
       - WHISPER_DEVICE=cuda
       - NVIDIA_VISIBLE_DEVICES=0
+      - WEBHOOK_URL=${WEBHOOK_URL}
+      - WEBHOOK_SECRET=${WEBHOOK_SECRET}
     volumes:
       - ./:/app:delegated
       - upload_data:${UPLOAD_FOLDER}
@@ -132,44 +149,11 @@ services:
       - proxyai_net
     restart: unless-stopped
 
-  # второй GPU-воркер
   worker_gpu_2:
-    build:
-      context: .
-      dockerfile: Dockerfile.gpu
+    <<: *worker_gpu_1
     container_name: proxyai_worker_gpu_2
-    runtime: nvidia
-    mem_limit: 8g
-    env_file: .env
-    command:
-      - celery
-      - -A
-      - celery_app:app
-      - worker
-      - --loglevel=info
-      - --concurrency=1
-      - --queues=transcribe_gpu,diarize_gpu
     environment:
-      - CELERY_BROKER_URL=${CELERY_BROKER_URL}
-      - UPLOAD_FOLDER=${UPLOAD_FOLDER}
-      - RESULTS_FOLDER=${RESULTS_FOLDER}
-      - DIARIZER_CACHE_DIR=${DIARIZER_CACHE_DIR}
-      - HUGGINGFACE_CACHE_DIR=/hf_cache
-      - WHISPER_MODEL_PATH=${WHISPER_MODEL_PATH}
-      - WHISPER_DEVICE=cuda
-      - NVIDIA_VISIBLE_DEVICES=0
-    volumes:
-      - ./:/app:delegated
-      - upload_data:${UPLOAD_FOLDER}
-      - results_data:${RESULTS_FOLDER}
-      - diarizer_cache:${DIARIZER_CACHE_DIR}
-      - ./data/hf_cache:/hf_cache
-    depends_on:
-      - api
-      - redis
-    networks:
-      - proxyai_net
-    restart: unless-stopped
+      - NVIDIA_VISIBLE_DEVICES=1
 
   beat:
     build:
@@ -185,6 +169,8 @@ services:
       - --loglevel=info
     environment:
       - CELERY_BROKER_URL=${CELERY_BROKER_URL}
+      - CELERY_RESULT_BACKEND=${CELERY_RESULT_BACKEND}
+      - REDIS_URL=${REDIS_URL}
     volumes:
       - ./:/app:delegated
     depends_on:
@@ -197,7 +183,12 @@ services:
     container_name: proxyai_flower
     env_file: .env
     command: >
-      flower --broker=${CELERY_BROKER_URL} --basic_auth=${FLOWER_USER}:${FLOWER_PASS} --port=5555
+      flower --broker=${CELERY_BROKER_URL}
+             --basic_auth=${FLOWER_USER}:${FLOWER_PASS}
+             --port=5555
+    environment:
+      - CELERY_BROKER_URL=${CELERY_BROKER_URL}
+      - REDIS_URL=${REDIS_URL}
     ports:
       - "5555:5555"
     depends_on:
