@@ -19,6 +19,7 @@ services:
     image: redis:7-alpine
     container_name: proxyai_redis
     env_file: .env
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD}", "--masterauth", "${REDIS_PASSWORD}"]
     volumes:
       - redis_data:/data
     ports:
@@ -91,7 +92,7 @@ services:
       - redis
     networks:
       - proxyai_net
-
+    restart: unless-stopped
   # первый GPU-воркер
   worker_gpu_1:
     build:
@@ -129,6 +130,7 @@ services:
       - redis
     networks:
       - proxyai_net
+    restart: unless-stopped
 
   # второй GPU-воркер
   worker_gpu_2:
@@ -167,6 +169,7 @@ services:
       - redis
     networks:
       - proxyai_net
+    restart: unless-stopped
 
   beat:
     build:
