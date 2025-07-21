@@ -109,11 +109,11 @@ services:
       - proxyai_net
     restart: unless-stopped
 
-  worker_gpu_1:
+  worker_gpu_transcribe:
     build:
       context: .
       dockerfile: Dockerfile.gpu
-    container_name: proxyai_worker_gpu_1
+    container_name: proxyai_worker_gpu_transcribe
     runtime: nvidia
     mem_limit: 8g
     env_file: .env
@@ -123,8 +123,8 @@ services:
       - celery_app:app
       - worker
       - --loglevel=info
-      - --concurrency=${GPU_CONCURRENCY}
-      - --queues=transcribe_gpu,diarize_gpu
+      - --concurrency=${GPU_CONCURRENCY_TRANSCRIBE}
+      - --queues=transcribe_gpu
     environment:
       - CELERY_BROKER_URL=${CELERY_BROKER_URL}
       - CELERY_RESULT_BACKEND=${CELERY_RESULT_BACKEND}
@@ -151,11 +151,11 @@ services:
       - proxyai_net
     restart: unless-stopped
 
-  worker_gpu_2:
+  worker_gpu_diarize:
     build:
       context: .
       dockerfile: Dockerfile.gpu
-    container_name: proxyai_worker_gpu_2
+    container_name: proxyai_worker_gpu_diarize
     runtime: nvidia
     mem_limit: 8g
     env_file: .env
@@ -165,8 +165,8 @@ services:
       - celery_app:app
       - worker
       - --loglevel=info
-      - --concurrency=${GPU_CONCURRENCY}
-      - --queues=transcribe_gpu,diarize_gpu
+      - --concurrency=${GPU_CONCURRENCY_DIARIZE}
+      - --queues=diarize_gpu
     environment:
       - CELERY_BROKER_URL=${CELERY_BROKER_URL}
       - CELERY_RESULT_BACKEND=${CELERY_RESULT_BACKEND}
