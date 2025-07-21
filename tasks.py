@@ -230,23 +230,28 @@ def preview_transcribe(self, upload_id, correlation_id):
     cid = correlation_id or "?"
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
     try:
+        # Проверяем, что WAV уже подготовлен
         wav = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
         if not wav.exists():
             raise FileNotFoundError("WAV not found")
 
+        # Обрезаем первые PREVIEW_LENGTH_S секунд и подаём на вход Whisper
         proc = subprocess.Popen(
             [
-              "ffmpeg", "-y",
-              "-threads", str(settings.FFMPEG_THREADS // 2 or 1),
-              "-ss", "0",                    # перенесли перед -i
-              "-i", str(wav),
-              "-t", str(settings.PREVIEW_LENGTH_S),
-              "-f", "wav", "pipe:1"
+                "ffmpeg", "-y",
+                "-threads", str(settings.FFMPEG_THREADS // 2 or 1),
+                "-i", str(wav),
+                "-ss", "0",
+                "-t", str(settings.PREVIEW_LENGTH_S),
+                "-f", "wav", "pipe:1"
             ],
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL
         )
-        model = get_whisper_model()
+
+        # Используем лёгкую модель tiny для быстрого превью
+        model = get_whisper_model(model_override="openai/whisper-tiny")
+
         segments_gen, _ = model.transcribe(
             proc.stdout,
             word_timestamps=True,
@@ -256,33 +261,38 @@ def preview_transcribe(self, upload_id, correlation_id):
         proc.wait()
         segments = list(segments_gen)
 
+        # Публикуем частичные превью-фрагменты
         for seg in segments:
             r.publish(
                 f"progress:{upload_id}",
                 json.dumps({
-                    "status":"preview_partial",
-                    "fragment":{"start":seg.start,"end":seg.end,"text":seg.text}
+                    "status": "preview_partial",
+                    "fragment": {"start": seg.start, "end": seg.end, "text": seg.text}
                 })
             )
 
+        # Сохраняем финальное превью
         preview = {
             "text": "".join(s.text for s in segments),
-            "timestamps":[{"start":s.start,"end":s.end,"text":s.text} for s in segments],
+            "timestamps": [{"start": s.start, "end": s.end, "text": s.text} for s in segments],
         }
         out_dir = Path(settings.RESULTS_FOLDER) / upload_id
         out_dir.mkdir(parents=True, exist_ok=True)
         (out_dir / "preview_transcript.json").write_text(
             json.dumps(preview, ensure_ascii=False, indent=2)
         )
-        r.publish(f"progress:{upload_id}", json.dumps({"status":"preview_done","preview":preview}))
+        r.publish(f"progress:{upload_id}", json.dumps({"status": "preview_done", "preview": preview}))
 
-        send_webhook_event("preview_completed", upload_id, {"preview":preview})
+        # Вебхук о завершении превью
+        send_webhook_event("preview_completed", upload_id, {"preview": preview})
 
     except Exception as e:
-        r.publish(f"progress:{upload_id}", json.dumps({"status":"error","error":str(e)}))
+        # При ошибке публикуем статус и шлём вебхук о провале
+        r.publish(f"progress:{upload_id}", json.dumps({"status": "error", "error": str(e)}))
         send_webhook_event("processing_failed", upload_id, None)
         return
 
+    # Запускаем полную транскрипцию
     from tasks import transcribe_segments
     transcribe_segments.delay(upload_id, correlation_id)
 
