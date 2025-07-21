@@ -1,4 +1,79 @@
 version: '3.8'
+
+# Общие блоки для переиспользования
+x-common-worker-cpu: &common_worker_cpu
+  build:
+    context: .
+    dockerfile: Dockerfile
+  env_file: .env
+  environment:
+    - CELERY_BROKER_URL=${CELERY_BROKER_URL}
+    - CELERY_RESULT_BACKEND=${CELERY_RESULT_BACKEND}
+    - REDIS_URL=${REDIS_URL}
+    - UPLOAD_FOLDER=${UPLOAD_FOLDER}
+    - RESULTS_FOLDER=${RESULTS_FOLDER}
+    - DIARIZER_CACHE_DIR=${DIARIZER_CACHE_DIR}
+    - HUGGINGFACE_CACHE_DIR=/hf_cache
+    - WHISPER_MODEL_PATH=${WHISPER_MODEL_PATH}
+    - WHISPER_DEVICE=cpu
+    - WEBHOOK_URL=${WEBHOOK_URL}
+    - WEBHOOK_SECRET=${WEBHOOK_SECRET}
+  volumes:
+    - ./:/app:delegated
+    - upload_data:${UPLOAD_FOLDER}
+    - results_data:${RESULTS_FOLDER}
+    - diarizer_cache:${DIARIZER_CACHE_DIR}
+    - ./data/hf_cache:/hf_cache
+  depends_on:
+    - api
+    - redis
+  networks:
+    - proxyai_net
+  restart: unless-stopped
+  healthcheck:
+    test: ["CMD-SHELL", "celery inspect ping -b ${CELERY_BROKER_URL} || exit 1"]
+    interval: 30s
+    timeout: 10s
+    retries: 3
+
+x-common-worker-gpu: &common_worker_gpu
+  build:
+    context: .
+    dockerfile: Dockerfile.gpu
+  env_file: .env
+  runtime: nvidia
+  mem_limit: 8g
+  environment:
+    - CELERY_BROKER_URL=${CELERY_BROKER_URL}
+    - CELERY_RESULT_BACKEND=${CELERY_RESULT_BACKEND}
+    - REDIS_URL=${REDIS_URL}
+    - UPLOAD_FOLDER=${UPLOAD_FOLDER}
+    - RESULTS_FOLDER=${RESULTS_FOLDER}
+    - DIARIZER_CACHE_DIR=${DIARIZER_CACHE_DIR}
+    - HUGGINGFACE_CACHE_DIR=/hf_cache
+    - WHISPER_MODEL_PATH=${WHISPER_MODEL_PATH}
+    - WHISPER_DEVICE=cuda
+    - NVIDIA_VISIBLE_DEVICES=0
+    - WEBHOOK_URL=${WEBHOOK_URL}
+    - WEBHOOK_SECRET=${WEBHOOK_SECRET}
+  volumes:
+    - ./:/app:delegated
+    - upload_data:${UPLOAD_FOLDER}
+    - results_data:${RESULTS_FOLDER}
+    - diarizer_cache:${DIARIZER_CACHE_DIR}
+    - ./data/hf_cache:/hf_cache
+  depends_on:
+    - api
+    - redis
+  networks:
+    - proxyai_net
+  restart: unless-stopped
+  healthcheck:
+    test: ["CMD-SHELL", "celery inspect ping -b ${CELERY_BROKER_URL} || exit 1"]
+    interval: 30s
+    timeout: 10s
+    retries: 3
+
 services:
   db:
     image: postgres:14-alpine
@@ -39,6 +114,8 @@ services:
       dockerfile: Dockerfile
     container_name: proxyai_api
     env_file: .env
+    # Можно заменить на entrypoint с wait-for-it.sh, если хочется ждать готовности БД:
+    # entrypoint: ["./wait-for-it.sh", "db:5432", "--", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "${API_WORKERS}"]
     command: >-
       sh -c "until nc -z db 5432; do sleep 1; done;
              uvicorn main:app --host 0.0.0.0 --port 8000 --workers ${API_WORKERS}"
@@ -71,127 +148,37 @@ services:
     restart: unless-stopped
 
   worker_cpu:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    <<: *common_worker_cpu
     container_name: proxyai_worker_cpu
-    env_file: .env
     command:
       - celery
-      - -A
-      - celery_app:app
+      - -A celery_app:app
       - worker
       - --loglevel=info
-      - --concurrency=${CPU_CONCURRENCY}
+      - --concurrency=${CPU_CONCURRENCY:-4}
       - --queues=transcribe_cpu
-    environment:
-      - CELERY_BROKER_URL=${CELERY_BROKER_URL}
-      - CELERY_RESULT_BACKEND=${CELERY_RESULT_BACKEND}
-      - REDIS_URL=${REDIS_URL}
-      - UPLOAD_FOLDER=${UPLOAD_FOLDER}
-      - RESULTS_FOLDER=${RESULTS_FOLDER}
-      - DIARIZER_CACHE_DIR=${DIARIZER_CACHE_DIR}
-      - HUGGINGFACE_CACHE_DIR=/hf_cache
-      - WHISPER_MODEL_PATH=${WHISPER_MODEL_PATH}
-      - WHISPER_DEVICE=cpu
-      - WEBHOOK_URL=${WEBHOOK_URL}
-      - WEBHOOK_SECRET=${WEBHOOK_SECRET}
-    volumes:
-      - ./:/app:delegated
-      - upload_data:${UPLOAD_FOLDER}
-      - results_data:${RESULTS_FOLDER}
-      - diarizer_cache:${DIARIZER_CACHE_DIR}
-      - ./data/hf_cache:/hf_cache
-    depends_on:
-      - api
-      - redis
-    networks:
-      - proxyai_net
-    restart: unless-stopped
 
   worker_gpu_transcribe:
-    build:
-      context: .
-      dockerfile: Dockerfile.gpu
+    <<: *common_worker_gpu
     container_name: proxyai_worker_gpu_transcribe
-    runtime: nvidia
-    mem_limit: 8g
-    env_file: .env
     command:
       - celery
-      - -A
-      - celery_app:app
+      - -A celery_app:app
       - worker
       - --loglevel=info
-      - --concurrency=${GPU_CONCURRENCY_TRANSCRIBE}
+      - --concurrency=${GPU_CONCURRENCY_TRANSCRIBE:-1}
       - --queues=transcribe_gpu
-    environment:
-      - CELERY_BROKER_URL=${CELERY_BROKER_URL}
-      - CELERY_RESULT_BACKEND=${CELERY_RESULT_BACKEND}
-      - REDIS_URL=${REDIS_URL}
-      - UPLOAD_FOLDER=${UPLOAD_FOLDER}
-      - RESULTS_FOLDER=${RESULTS_FOLDER}
-      - DIARIZER_CACHE_DIR=${DIARIZER_CACHE_DIR}
-      - HUGGINGFACE_CACHE_DIR=/hf_cache
-      - WHISPER_MODEL_PATH=${WHISPER_MODEL_PATH}
-      - WHISPER_DEVICE=cuda
-      - NVIDIA_VISIBLE_DEVICES=0
-      - WEBHOOK_URL=${WEBHOOK_URL}
-      - WEBHOOK_SECRET=${WEBHOOK_SECRET}
-    volumes:
-      - ./:/app:delegated
-      - upload_data:${UPLOAD_FOLDER}
-      - results_data:${RESULTS_FOLDER}
-      - diarizer_cache:${DIARIZER_CACHE_DIR}
-      - ./data/hf_cache:/hf_cache
-    depends_on:
-      - api
-      - redis
-    networks:
-      - proxyai_net
-    restart: unless-stopped
 
   worker_gpu_diarize:
-    build:
-      context: .
-      dockerfile: Dockerfile.gpu
+    <<: *common_worker_gpu
     container_name: proxyai_worker_gpu_diarize
-    runtime: nvidia
-    mem_limit: 8g
-    env_file: .env
     command:
       - celery
-      - -A
-      - celery_app:app
+      - -A celery_app:app
       - worker
       - --loglevel=info
-      - --concurrency=${GPU_CONCURRENCY_DIARIZE}
+      - --concurrency=${GPU_CONCURRENCY_DIARIZE:-1}
       - --queues=diarize_gpu
-    environment:
-      - CELERY_BROKER_URL=${CELERY_BROKER_URL}
-      - CELERY_RESULT_BACKEND=${CELERY_RESULT_BACKEND}
-      - REDIS_URL=${REDIS_URL}
-      - UPLOAD_FOLDER=${UPLOAD_FOLDER}
-      - RESULTS_FOLDER=${RESULTS_FOLDER}
-      - DIARIZER_CACHE_DIR=${DIARIZER_CACHE_DIR}
-      - HUGGINGFACE_CACHE_DIR=/hf_cache
-      - WHISPER_MODEL_PATH=${WHISPER_MODEL_PATH}
-      - WHISPER_DEVICE=cuda
-      - NVIDIA_VISIBLE_DEVICES=0
-      - WEBHOOK_URL=${WEBHOOK_URL}
-      - WEBHOOK_SECRET=${WEBHOOK_SECRET}
-    volumes:
-      - ./:/app:delegated
-      - upload_data:${UPLOAD_FOLDER}
-      - results_data:${RESULTS_FOLDER}
-      - diarizer_cache:${DIARIZER_CACHE_DIR}
-      - ./data/hf_cache:/hf_cache
-    depends_on:
-      - api
-      - redis
-    networks:
-      - proxyai_net
-    restart: unless-stopped
 
   beat:
     build:
@@ -201,8 +188,7 @@ services:
     env_file: .env
     command:
       - celery
-      - -A
-      - celery_app:app
+      - -A celery_app:app
       - beat
       - --loglevel=info
     environment:
