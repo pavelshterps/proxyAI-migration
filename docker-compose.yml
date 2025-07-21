@@ -31,6 +31,7 @@ services:
       - "6379:6379"
     networks:
       - proxyai_net
+    restart: unless-stopped
 
   api:
     build:
@@ -38,7 +39,7 @@ services:
       dockerfile: Dockerfile
     container_name: proxyai_api
     env_file: .env
-    command: >
+    command: >-
       sh -c "until nc -z db 5432; do sleep 1; done;
              uvicorn main:app --host 0.0.0.0 --port 8000 --workers ${API_WORKERS}"
     environment:
@@ -67,6 +68,7 @@ services:
       - redis
     networks:
       - proxyai_net
+    restart: unless-stopped
 
   worker_cpu:
     build:
@@ -76,7 +78,8 @@ services:
     env_file: .env
     command:
       - celery
-      - -A celery_app:app
+      - -A
+      - celery_app:app
       - worker
       - --loglevel=info
       - --concurrency=${CPU_CONCURRENCY}
@@ -116,7 +119,8 @@ services:
     env_file: .env
     command:
       - celery
-      - -A celery_app:app
+      - -A
+      - celery_app:app
       - worker
       - --loglevel=info
       - --concurrency=${GPU_CONCURRENCY}
@@ -157,7 +161,8 @@ services:
     env_file: .env
     command:
       - celery
-      - -A celery_app:app
+      - -A
+      - celery_app:app
       - worker
       - --loglevel=info
       - --concurrency=${GPU_CONCURRENCY}
@@ -172,7 +177,7 @@ services:
       - HUGGINGFACE_CACHE_DIR=/hf_cache
       - WHISPER_MODEL_PATH=${WHISPER_MODEL_PATH}
       - WHISPER_DEVICE=cuda
-      - NVIDIA_VISIBLE_DEVICES=1   # ← именно 1
+      - NVIDIA_VISIBLE_DEVICES=1
       - WEBHOOK_URL=${WEBHOOK_URL}
       - WEBHOOK_SECRET=${WEBHOOK_SECRET}
     volumes:
@@ -196,7 +201,8 @@ services:
     env_file: .env
     command:
       - celery
-      - -A celery_app:app
+      - -A
+      - celery_app:app
       - beat
       - --loglevel=info
     environment:
@@ -209,12 +215,13 @@ services:
       - redis
     networks:
       - proxyai_net
+    restart: unless-stopped
 
   flower:
     image: mher/flower:0.9.7
     container_name: proxyai_flower
     env_file: .env
-    command: >
+    command: >-
       flower --broker=${CELERY_BROKER_URL}
              --basic_auth=${FLOWER_USER}:${FLOWER_PASS}
              --port=5555
@@ -227,6 +234,7 @@ services:
       - redis
     networks:
       - proxyai_net
+    restart: unless-stopped
 
   nginx:
     image: nginx:stable-alpine
@@ -242,6 +250,7 @@ services:
       - /etc/letsencrypt/live/tonage.io/privkey.pem:/etc/nginx/certs/privkey.pem:ro
     networks:
       - proxyai_net
+    restart: unless-stopped
 
 volumes:
   postgres_data:
