@@ -1,6 +1,5 @@
 version: '3.8'
 
-# Общие блоки для переиспользования
 x-common-worker-cpu: &common_worker_cpu
   build:
     context: .
@@ -30,11 +29,6 @@ x-common-worker-cpu: &common_worker_cpu
   networks:
     - proxyai_net
   restart: unless-stopped
-  healthcheck:
-    test: ["CMD-SHELL", "celery inspect ping -b ${CELERY_BROKER_URL} || exit 1"]
-    interval: 30s
-    timeout: 10s
-    retries: 3
 
 x-common-worker-gpu: &common_worker_gpu
   build:
@@ -68,11 +62,6 @@ x-common-worker-gpu: &common_worker_gpu
   networks:
     - proxyai_net
   restart: unless-stopped
-  healthcheck:
-    test: ["CMD-SHELL", "celery inspect ping -b ${CELERY_BROKER_URL} || exit 1"]
-    interval: 30s
-    timeout: 10s
-    retries: 3
 
 services:
   db:
@@ -114,8 +103,6 @@ services:
       dockerfile: Dockerfile
     container_name: proxyai_api
     env_file: .env
-    # Можно заменить на entrypoint с wait-for-it.sh, если хочется ждать готовности БД:
-    # entrypoint: ["./wait-for-it.sh", "db:5432", "--", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "${API_WORKERS}"]
     command: >-
       sh -c "until nc -z db 5432; do sleep 1; done;
              uvicorn main:app --host 0.0.0.0 --port 8000 --workers ${API_WORKERS}"
@@ -152,7 +139,8 @@ services:
     container_name: proxyai_worker_cpu
     command:
       - celery
-      - -A celery_app:app
+      - -A
+      - celery_app:app
       - worker
       - --loglevel=info
       - --concurrency=${CPU_CONCURRENCY:-4}
@@ -163,7 +151,8 @@ services:
     container_name: proxyai_worker_gpu_transcribe
     command:
       - celery
-      - -A celery_app:app
+      - -A
+      - celery_app:app
       - worker
       - --loglevel=info
       - --concurrency=${GPU_CONCURRENCY_TRANSCRIBE:-1}
@@ -174,7 +163,8 @@ services:
     container_name: proxyai_worker_gpu_diarize
     command:
       - celery
-      - -A celery_app:app
+      - -A
+      - celery_app:app
       - worker
       - --loglevel=info
       - --concurrency=${GPU_CONCURRENCY_DIARIZE:-1}
@@ -188,7 +178,8 @@ services:
     env_file: .env
     command:
       - celery
-      - -A celery_app:app
+      - -A
+      - celery_app:app
       - beat
       - --loglevel=info
     environment:
