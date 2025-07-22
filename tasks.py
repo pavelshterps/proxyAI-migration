@@ -4,7 +4,7 @@ import subprocess
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, List, Dict
 
 import requests
 from redis import Redis
@@ -34,7 +34,6 @@ except ImportError as e:
     logger.warning(f"[INIT] faster-whisper not available: {e}")
 
 try:
-    # Новый unified pipeline 3.1
     from pyannote.audio import Pipeline as PyannotePipeline
     _PN_AVAILABLE = True
     logger.info("[INIT] pyannote.audio Pipeline available")
@@ -43,11 +42,11 @@ except ImportError as e:
     logger.warning(f"[INIT] pyannote.audio not available: {e}")
 
 # --- Global model holders ---
-_whisper_model = None
-_diarization_pipeline = None  # speaker-diarization-3.1
+_whisper_model: Optional["WhisperModel"] = None
+_diarization_pipeline: Optional["PyannotePipeline"] = None
 
 
-# --- Webhook helper ---
+# ---------------------- Helpers ----------------------
 def send_webhook_event(event_type: str, upload_id: str, data: Optional[Any]):
     """
     POST → settings.WEBHOOK_URL с заголовком X-WebHook-Secret.
@@ -64,10 +63,7 @@ def send_webhook_event(event_type: str, upload_id: str, data: Optional[Any]):
         "timestamp": datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
         "data": data,
     }
-    headers = {
-        "Content-Type": "application/json",
-        "X-WebHook-Secret": secret,
-    }
+    headers = {"Content-Type": "application/json", "X-WebHook-Secret": secret}
 
     while True:
         try:
@@ -81,33 +77,69 @@ def send_webhook_event(event_type: str, upload_id: str, data: Optional[Any]):
             continue
 
         code = resp.status_code
-        # Успех
-        if 200 <= code < 300 or code == 405:  # 405 трактуем как успех
-            if code == 405:
-                logger.info(
-                    f"[{datetime.utcnow().isoformat()}] [WEBHOOK] "
-                    f"{event_type} got 405 (treated as success) for {upload_id}"
-                )
-            else:
-                logger.info(
-                    f"[{datetime.utcnow().isoformat()}] [WEBHOOK] "
-                    f"{event_type} succeeded for {upload_id}"
-                )
+        if 200 <= code < 300 or code == 405:
+            logger.info(
+                f"[{datetime.utcnow().isoformat()}] [WEBHOOK] {event_type} "
+                f"{'treated as success' if code == 405 else 'succeeded'} for {upload_id}"
+            )
             return
 
         if 400 <= code < 500:
             logger.error(
-                f"[{datetime.utcnow().isoformat()}] [WEBHOOK] "
-                f"{event_type} returned {code} for {upload_id}, aborting retries"
+                f"[{datetime.utcnow().isoformat()}] [WEBHOOK] {event_type} returned {code} for {upload_id}, aborting"
             )
             return
 
-        # 5xx → повторяем
         logger.warning(
-            f"[{datetime.utcnow().isoformat()}] [WEBHOOK] "
-            f"{event_type} returned {code} for {upload_id}, retrying in 30s"
+            f"[{datetime.utcnow().isoformat()}] [WEBHOOK] {event_type} returned {code} for {upload_id}, retrying in 30s"
         )
         time.sleep(30)
+
+
+def merge_speakers(
+    transcript: List[Dict[str, Any]],
+    diar: List[Dict[str, Any]],
+    pad: float = 0.2,
+) -> List[Dict[str, Any]]:
+    """
+    Мержим спикеров из диаризации в сегменты транскрипции.
+    Возвращаем список сегментов с полями 'orig' и 'speaker' (speaker == orig до маппинга).
+    """
+    if not diar:
+        return [{**t, "orig": None, "speaker": None} for t in transcript]
+
+    diar = sorted(diar, key=lambda d: d["start"])
+    transcript = sorted(transcript, key=lambda t: t["start"])
+    starts = [d["start"] for d in diar]
+
+    from bisect import bisect_left
+
+    def nearest(idx: int, t0: float, t1: float):
+        if idx <= 0:
+            return diar[0]
+        if idx >= len(diar):
+            return diar[-1]
+        b = diar[idx - 1]
+        a = diar[idx]
+        db = max(0.0, t0 - b["end"])
+        da = max(0.0, a["start"] - t1)
+        return b if db <= da else a
+
+    out = []
+    for t in transcript:
+        t0 = max(0.0, t["start"] - pad)
+        t1 = t["end"] + pad
+        i = bisect_left(starts, t1)
+        candidates = [d for d in diar[max(0, i - 8): i + 8] if not (d["end"] <= t0 or d["start"] >= t1)]
+        if candidates:
+            def ovlp(d):
+                return max(0.0, min(d["end"], t1) - max(d["start"], t0))
+            best = max(candidates, key=ovlp)
+        else:
+            best = nearest(i, t0, t1)
+        out.append({**t, "orig": best["speaker"], "speaker": best["speaker"]})
+    return out
+# ----------------------------------------------------
 
 
 # --- Model loaders ---
@@ -149,10 +181,6 @@ def get_whisper_model(model_override: str = None):
 
 
 def get_diarization_pipeline():
-    """
-    Unified pipeline pyannote/speaker-diarization-3.1.
-    Прогреваем только на GPU воркерах.
-    """
     global _diarization_pipeline
     if _diarization_pipeline is None:
         logger.info(f"[{datetime.utcnow().isoformat()}] [DIARIZER] loading pipeline")
@@ -172,11 +200,6 @@ def get_diarization_pipeline():
 
 @worker_process_init.connect
 def preload_on_startup(**kwargs):
-    """
-    Прогрев моделей внутри каждого процесса воркера.
-    Whisper — на всех воркерах (CPU/GPU),
-    Диаризация — только если устройство GPU.
-    """
     device = settings.WHISPER_DEVICE.lower()
     try:
         if _HF_AVAILABLE:
@@ -214,9 +237,6 @@ def probe_audio(src: Path) -> dict:
 
 
 def prepare_wav(upload_id: str) -> (Path, float):
-    """
-    Полная конвертация исходного файла в WAV 16kHz mono.
-    """
     start = time.perf_counter()
     logger.info(f"[{datetime.utcnow().isoformat()}] [PREPARE] start for {upload_id}")
     src = next(Path(settings.UPLOAD_FOLDER).glob(f"{upload_id}.*"))
@@ -254,15 +274,13 @@ def prepare_wav(upload_id: str) -> (Path, float):
         ],
         check=True,
         stderr=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
     )
     logger.info(f"[{datetime.utcnow().isoformat()}] [PREPARE] converted ({time.perf_counter() - start:.2f}s)")
     return target, duration
 
 
 def prepare_preview_segment(upload_id: str) -> subprocess.Popen:
-    """
-    Отдаёт первые PREVIEW_LENGTH_S секунд через stdout (pipe) в виде WAV.
-    """
     src = next(Path(settings.UPLOAD_FOLDER).glob(f"{upload_id}.*"))
     cmd = [
         "ffmpeg",
@@ -451,6 +469,7 @@ def transcribe_segments(self, upload_id, correlation_id):
             i += 1
 
     transcript_data = [{"start": s.start, "end": s.end, "text": s.text} for s in all_segs]
+    transcript_data.sort(key=lambda x: x["start"])
     out_dir = Path(settings.RESULTS_FOLDER) / upload_id
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "transcript.json").write_text(
@@ -485,10 +504,9 @@ def diarize_full(self, upload_id, correlation_id):
         pipeline = get_diarization_pipeline()
 
         chunk_limit = getattr(settings, "DIARIZATION_CHUNK_LENGTH_S", 0) or 0
-        segs = []
+        segs: List[Dict[str, Any]] = []
 
         if chunk_limit and duration > chunk_limit:
-            # Чанкуем длинный файл
             logger.info(
                 f"[{datetime.utcnow().isoformat()}] [{cid}] diarization chunking enabled "
                 f"(chunk={chunk_limit}s, duration={duration:.2f}s)"
@@ -498,7 +516,6 @@ def diarize_full(self, upload_id, correlation_id):
             while offset < duration:
                 this_len = min(chunk_limit, duration - offset)
                 tmp_wav = Path(settings.DIARIZER_CACHE_DIR) / f"{upload_id}_diar_chunk_{i}.wav"
-                # вырезаем chunk
                 subprocess.run(
                     [
                         "ffmpeg",
@@ -539,7 +556,6 @@ def diarize_full(self, upload_id, correlation_id):
                 offset += this_len
                 i += 1
         else:
-            # Без чанкинга — простая обработка целиком
             t_infer = time.perf_counter()
             ann = pipeline(str(wav_path))
             logger.info(
@@ -556,6 +572,7 @@ def diarize_full(self, upload_id, correlation_id):
         send_webhook_event("processing_failed", upload_id, None)
         return
 
+    segs.sort(key=lambda x: x["start"])
     out_dir = Path(settings.RESULTS_FOLDER) / upload_id
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "diarization.json").write_text(json.dumps(segs, ensure_ascii=False, indent=2))

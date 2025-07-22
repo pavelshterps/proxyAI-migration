@@ -1,7 +1,9 @@
 import json
 from pathlib import Path
+from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from config.settings import settings
@@ -9,56 +11,98 @@ from dependencies import get_current_user
 from database import get_db
 import crud
 
-# импорт хелпера вебхуков из tasks
-from tasks import send_webhook_event
+from tasks import send_webhook_event, merge_speakers
 
 router = APIRouter(prefix="", dependencies=[Depends(get_current_user)])
 
 
-def _read_json(p: Path):
+def _read_json(p: Path) -> Any:
     if not p.exists():
         raise HTTPException(404, f"{p.name} not found")
     return json.loads(p.read_text(encoding="utf-8"))
 
 
 @router.get("/transcription/{upload_id}", tags=["default"])
-async def raw_transcription(upload_id: str):
+async def raw_transcription(upload_id: str,
+                            pad: float = Query(0.0, description="padding for speaker merge; 0 => no merge"),
+                            include_orig: bool = Query(False, description="include orig label field")):
     try:
-        p = Path(settings.RESULTS_FOLDER)/upload_id/"transcript.json"
-        return {"transcript": _read_json(p)}
+        base = Path(settings.RESULTS_FOLDER) / upload_id
+        tp = base / "transcript.json"
+        transcript = _read_json(tp)
+
+        if pad > 0:
+            dp = base / "diarization.json"
+            if dp.exists():
+                diar = _read_json(dp)
+                merged = merge_speakers(transcript, diar, pad=pad)
+                if not include_orig:
+                    for seg in merged:
+                        seg.pop("orig", None)
+                return {"transcript": merged}
+
+        return {"transcript": transcript}
     except HTTPException as e:
-        return {"status":"error","detail":e.detail}
+        return {"status": "error", "detail": e.detail}
 
 
 @router.get("/transcription/{upload_id}/preview", tags=["default"])
 async def raw_preview(upload_id: str):
     try:
-        p = Path(settings.RESULTS_FOLDER)/upload_id/"preview_transcript.json"
+        p = Path(settings.RESULTS_FOLDER) / upload_id / "preview_transcript.json"
         return {"preview": _read_json(p)}
     except HTTPException as e:
-        return {"status":"error","detail":e.detail}
+        return {"status": "error", "detail": e.detail}
 
 
 @router.get("/diarization/{upload_id}", tags=["default"])
-async def raw_diarization(upload_id: str):
+async def raw_diarization(upload_id: str,
+                          pad: float = Query(0.0, description="padding for merge against transcript; 0 => raw diar"),
+                          include_orig: bool = Query(False, description="include orig label in merged output")):
+    """
+    - 404 {"status":"not_found"} — если вообще нет папки upload_id.
+    - 202 {"status":"processing"} — если папка есть, транскрипция уже есть/в процессе, но diarization.json ещё не готов.
+    - 200 {"status":"done", ...} — diarization готова (или выдан мердж при pad>0).
+    """
+    base = Path(settings.RESULTS_FOLDER) / upload_id
+    if not base.exists():
+        return JSONResponse(status_code=404, content={"status": "not_found"})
+
+    diar_file = base / "diarization.json"
+    if not diar_file.exists():
+        # ещё не готово
+        return JSONResponse(status_code=202, content={"status": "processing"})
+
+    # diarization готова
     try:
-        p = Path(settings.RESULTS_FOLDER)/upload_id/"diarization.json"
-        return {"diarization": _read_json(p)}
+        if pad > 0:
+            tp = base / "transcript.json"
+            if tp.exists():
+                transcript = _read_json(tp)
+                diar = _read_json(diar_file)
+                merged = merge_speakers(transcript, diar, pad=pad)
+                if not include_orig:
+                    for seg in merged:
+                        seg.pop("orig", None)
+                return JSONResponse(status_code=200, content={"status": "done", "merged": merged})
+
+        diar = _read_json(diar_file)
+        return JSONResponse(status_code=200, content={"status": "done", "diarization": diar})
     except HTTPException as e:
-        return {"status":"error","detail":e.detail}
+        return {"status": "error", "detail": e.detail}
 
 
 @router.post("/labels/{upload_id}", tags=["default"])
 async def save_labels(upload_id: str, mapping: dict,
                       current=Depends(get_current_user),
-                      db: AsyncSession=Depends(get_db)):
+                      db: AsyncSession = Depends(get_db)):
     ok = await crud.update_label_mapping(db, current.id, upload_id, mapping)
     if not ok:
         raise HTTPException(404, "upload_id not found")
 
     # обновляем на диске
-    base = Path(settings.RESULTS_FOLDER)/upload_id
-    dfile = base/"diarization.json"
+    base = Path(settings.RESULTS_FOLDER) / upload_id
+    dfile = base / "diarization.json"
     dia = _read_json(dfile)
     for seg in dia:
         key = str(seg["speaker"])
@@ -66,7 +110,5 @@ async def save_labels(upload_id: str, mapping: dict,
             seg["speaker"] = mapping[key]
     dfile.write_text(json.dumps(dia, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    # webhook: метки спикеров обновлены
     send_webhook_event("labels_updated", upload_id, {"mapping": mapping})
-
     return {"detail": "Labels updated"}
