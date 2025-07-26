@@ -48,10 +48,6 @@ _diarization_pipeline: Optional["PyannotePipeline"] = None
 
 # ---------------------- Helpers ----------------------
 def send_webhook_event(event_type: str, upload_id: str, data: Optional[Any]):
-    """
-    POST → settings.WEBHOOK_URL с заголовком X-WebHook-Secret.
-    405 считаем успехом (игнорируем), ретраи только при сетевых ошибках или 5xx.
-    """
     url = settings.WEBHOOK_URL
     secret = settings.WEBHOOK_SECRET
     if not url or not secret:
@@ -65,35 +61,43 @@ def send_webhook_event(event_type: str, upload_id: str, data: Optional[Any]):
     }
     headers = {"Content-Type": "application/json", "X-WebHook-Secret": secret}
 
-    while True:
+    max_attempts = 5
+    for attempt in range(1, max_attempts + 1):
         try:
-            resp = requests.post(url, json=payload, headers=headers, timeout=5)
+            # 5s на connect, 30s на read
+            resp = requests.post(url, json=payload, headers=headers, timeout=(5, 30))
         except requests.RequestException as e:
             logger.warning(
                 f"[{datetime.utcnow().isoformat()}] [WEBHOOK] "
-                f"{event_type} network error for {upload_id}: {e}, retrying in 30s"
+                f"{event_type} network error (attempt {attempt}/{max_attempts}) for {upload_id}: {e}"
             )
+        else:
+            code = resp.status_code
+            if 200 <= code < 300 or code == 405:
+                logger.info(
+                    f"[{datetime.utcnow().isoformat()}] [WEBHOOK] {event_type} "
+                    f"{'treated as success' if code == 405 else 'succeeded'} "
+                    f"on attempt {attempt}/{max_attempts} for {upload_id}"
+                )
+                return
+            if 400 <= code < 500:
+                logger.error(
+                    f"[{datetime.utcnow().isoformat()}] [WEBHOOK] "
+                    f"{event_type} returned {code} for {upload_id}, aborting"
+                )
+                return
+            logger.warning(
+                f"[{datetime.utcnow().isoformat()}] [WEBHOOK] "
+                f"{event_type} returned {code} on attempt {attempt}/{max_attempts}, retrying"
+            )
+
+        if attempt < max_attempts:
             time.sleep(30)
-            continue
 
-        code = resp.status_code
-        if 200 <= code < 300 or code == 405:
-            logger.info(
-                f"[{datetime.utcnow().isoformat()}] [WEBHOOK] {event_type} "
-                f"{'treated as success' if code == 405 else 'succeeded'} for {upload_id}"
-            )
-            return
-
-        if 400 <= code < 500:
-            logger.error(
-                f"[{datetime.utcnow().isoformat()}] [WEBHOOK] {event_type} returned {code} for {upload_id}, aborting"
-            )
-            return
-
-        logger.warning(
-            f"[{datetime.utcnow().isoformat()}] [WEBHOOK] {event_type} returned {code} for {upload_id}, retrying in 30s"
-        )
-        time.sleep(30)
+    logger.error(
+        f"[{datetime.utcnow().isoformat()}] [WEBHOOK] "
+        f"{event_type} failed after {max_attempts} attempts for {upload_id}"
+    )
 
 
 def merge_speakers(
