@@ -2,6 +2,7 @@ import json
 import logging
 import subprocess
 import time
+import re
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional, List, Dict
@@ -64,7 +65,7 @@ def send_webhook_event(event_type: str, upload_id: str, data: Optional[Any]):
     max_attempts = 5
     for attempt in range(1, max_attempts + 1):
         try:
-            # 5s на connect, 30s на read
+            # 5s connect, 30s read
             resp = requests.post(url, json=payload, headers=headers, timeout=(5, 30))
         except requests.RequestException as e:
             logger.warning(
@@ -106,11 +107,10 @@ def merge_speakers(
     pad: float = 0.2,
 ) -> List[Dict[str, Any]]:
     """
-    Мержим спикеров из диаризации в сегменты транскрипции.
-    Возвращаем список сегментов с полями 'orig' и 'speaker' (speaker == orig до маппинга).
+    Assign a speaker to each transcript segment by overlapping with diarization.
     """
     if not diar:
-        return [{**t, "orig": None, "speaker": None} for t in transcript]
+        return [{**t, "speaker": None} for t in transcript]
 
     diar = sorted(diar, key=lambda d: d["start"])
     transcript = sorted(transcript, key=lambda t: t["start"])
@@ -123,8 +123,7 @@ def merge_speakers(
             return diar[0]
         if idx >= len(diar):
             return diar[-1]
-        b = diar[idx - 1]
-        a = diar[idx]
+        b, a = diar[idx-1], diar[idx]
         db = max(0.0, t0 - b["end"])
         da = max(0.0, a["start"] - t1)
         return b if db <= da else a
@@ -134,19 +133,70 @@ def merge_speakers(
         t0 = max(0.0, t["start"] - pad)
         t1 = t["end"] + pad
         i = bisect_left(starts, t1)
-        candidates = [d for d in diar[max(0, i - 8): i + 8] if not (d["end"] <= t0 or d["start"] >= t1)]
+        candidates = [
+            d for d in diar[max(0, i-8):i+8]
+            if not (d["end"] <= t0 or d["start"] >= t1)
+        ]
         if candidates:
-            def ovlp(d):
-                return max(0.0, min(d["end"], t1) - max(d["start"], t0))
-            best = max(candidates, key=ovlp)
+            best = max(candidates, key=lambda d: max(0.0, min(d["end"], t1) - max(d["start"], t0)))
         else:
             best = nearest(i, t0, t1)
-        out.append({**t, "orig": best["speaker"], "speaker": best["speaker"]})
+        out.append({**t, "speaker": best["speaker"]})
     return out
+
+
+def group_into_sentences(
+    segs: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """
+    Merge sequential segments into full sentences ending with punctuation.
+    Carries over speaker from the first segment.
+    """
+    sentences = []
+    buf_text = ""
+    buf_start = None
+    buf_end = None
+    buf_speaker = None
+
+    sentence_end_re = re.compile(r"[.!?]{1,3}$")
+
+    for seg in segs:
+        text = seg["text"].strip()
+        if not text:
+            continue
+
+        if buf_text == "":
+            buf_start = seg["start"]
+            buf_speaker = seg.get("speaker")
+        buf_text += (" " if buf_text else "") + text
+        buf_end = seg["end"]
+
+        if sentence_end_re.search(text):
+            sentences.append({
+                "start": buf_start,
+                "end": buf_end,
+                "speaker": buf_speaker,
+                "text": buf_text
+            })
+            buf_text = ""
+            buf_start = None
+            buf_end = None
+            buf_speaker = None
+
+    # flush remainder
+    if buf_text:
+        sentences.append({
+            "start": buf_start,
+            "end": buf_end,
+            "speaker": buf_speaker,
+            "text": buf_text
+        })
+
+    return sentences
+
+
 # ----------------------------------------------------
 
-
-# --- Model loaders ---
 def get_whisper_model(model_override: str = None):
     device = settings.WHISPER_DEVICE.lower()
     compute = getattr(
@@ -356,12 +406,10 @@ def preview_transcribe(self, upload_id, correlation_id):
         for seg in segments:
             r.publish(
                 f"progress:{upload_id}",
-                json.dumps(
-                    {
-                        "status": "preview_partial",
-                        "fragment": {"start": seg.start, "end": seg.end, "text": seg.text},
-                    }
-                ),
+                json.dumps({
+                    "status": "preview_partial",
+                    "fragment": {"start": seg.start, "end": seg.end, "text": seg.text}
+                })
             )
 
         preview = {
@@ -370,9 +418,7 @@ def preview_transcribe(self, upload_id, correlation_id):
         }
         out_dir = Path(settings.RESULTS_FOLDER) / upload_id
         out_dir.mkdir(parents=True, exist_ok=True)
-        (out_dir / "preview_transcript.json").write_text(
-            json.dumps(preview, ensure_ascii=False, indent=2)
-        )
+        (out_dir / "preview_transcript.json").write_text(json.dumps(preview, ensure_ascii=False, indent=2))
         r.publish(f"progress:{upload_id}", json.dumps({"status": "preview_done", "preview": preview}))
         send_webhook_event("preview_completed", upload_id, {"preview": preview})
         logger.info(
@@ -431,31 +477,18 @@ def transcribe_segments(self, upload_id, correlation_id):
         all_segs = list(segs)
     else:
         offset = 0.0
-        i = 0
         while offset < duration:
             this_len = min(chunk_len, duration - offset)
             logger.info(
-                f"[{datetime.utcnow().isoformat()}] [{cid}] transcribe chunk {i} "
-                f"offset={offset:.2f}s len={this_len:.2f}s"
+                f"[{datetime.utcnow().isoformat()}] [{cid}] transcribe chunk offset={offset:.2f}s len={this_len:.2f}s"
             )
             proc = subprocess.Popen(
                 [
-                    "ffmpeg",
-                    "-y",
-                    "-threads",
-                    str(threads),
-                    "-ss",
-                    str(offset),
-                    "-t",
-                    str(this_len),
-                    "-i",
-                    str(wav),
-                    "-f",
-                    "wav",
-                    "pipe:1",
+                    "ffmpeg", "-y", "-threads", str(threads),
+                    "-ss", str(offset), "-t", str(this_len),
+                    "-i", str(wav), "-f", "wav", "pipe:1"
                 ],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
             )
             seg_gen, _ = model.transcribe(
                 proc.stdout,
@@ -470,17 +503,27 @@ def transcribe_segments(self, upload_id, correlation_id):
                 s.end += offset
             all_segs.extend(chunk_segs)
             offset += this_len
-            i += 1
 
+    # raw transcript segments
     transcript_data = [{"start": s.start, "end": s.end, "text": s.text} for s in all_segs]
     transcript_data.sort(key=lambda x: x["start"])
+
+    # diarize & merge speakers
+    diar_path = Path(settings.RESULTS_FOLDER) / upload_id / "diarization.json"
+    diar = json.loads(diar_path.read_text()) if diar_path.exists() else []
+    merged = merge_speakers(transcript_data, diar)
+
+    # group into sentences
+    sentences = group_into_sentences(merged)
+
+    # write out and send
     out_dir = Path(settings.RESULTS_FOLDER) / upload_id
     out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / "transcript.json").write_text(
-        json.dumps(transcript_data, ensure_ascii=False, indent=2)
+    (out_dir / "transcript_sentences.json").write_text(
+        json.dumps(sentences, ensure_ascii=False, indent=2)
     )
     r.publish(f"progress:{upload_id}", json.dumps({"status": "transcript_done"}))
-    send_webhook_event("transcription_completed", upload_id, {"transcript": transcript_data})
+    send_webhook_event("transcription_completed", upload_id, {"transcript": sentences})
     logger.info(
         f"[{datetime.utcnow().isoformat()}] [{cid}] transcribe_segments done in "
         f"{time.perf_counter() - stage_t0:.2f}s for {upload_id}"
@@ -507,69 +550,40 @@ def diarize_full(self, upload_id, correlation_id):
         wav_path, duration = prepare_wav(upload_id)
         pipeline = get_diarization_pipeline()
 
-        chunk_limit = getattr(settings, "DIARIZATION_CHUNK_LENGTH_S", 0) or 0
         segs: List[Dict[str, Any]] = []
+        chunk_limit = getattr(settings, "DIARIZATION_CHUNK_LENGTH_S", 0)
 
         if chunk_limit and duration > chunk_limit:
-            logger.info(
-                f"[{datetime.utcnow().isoformat()}] [{cid}] diarization chunking enabled "
-                f"(chunk={chunk_limit}s, duration={duration:.2f}s)"
-            )
             offset = 0.0
-            i = 0
             while offset < duration:
                 this_len = min(chunk_limit, duration - offset)
-                tmp_wav = Path(settings.DIARIZER_CACHE_DIR) / f"{upload_id}_diar_chunk_{i}.wav"
+                tmp = Path(settings.DIARIZER_CACHE_DIR) / f"{upload_id}_chunk_{offset:.0f}.wav"
                 subprocess.run(
                     [
-                        "ffmpeg",
-                        "-y",
-                        "-threads",
-                        str(settings.FFMPEG_THREADS // 2 or 1),
-                        "-ss",
-                        str(offset),
-                        "-t",
-                        str(this_len),
-                        "-i",
-                        str(wav_path),
-                        str(tmp_wav),
+                        "ffmpeg", "-y", "-threads", str(settings.FFMPEG_THREADS//2 or 1),
+                        "-ss", str(offset), "-t", str(this_len),
+                        "-i", str(wav_path), str(tmp)
                     ],
-                    check=True,
-                    stderr=subprocess.DEVNULL,
-                    stdout=subprocess.DEVNULL,
+                    check=True, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL
                 )
-                t_chunk = time.perf_counter()
-                ann = pipeline(str(tmp_wav))
-                logger.info(
-                    f"[{datetime.utcnow().isoformat()}] [{cid}] diarization chunk {i} "
-                    f"offset={offset:.2f}s len={this_len:.2f}s "
-                    f"({time.perf_counter() - t_chunk:.2f}s)"
-                )
+                ann = pipeline(str(tmp))
                 for s, _, spk in ann.itertracks(yield_label=True):
-                    segs.append(
-                        {
-                            "start": float(s.start) + offset,
-                            "end": float(s.end) + offset,
-                            "speaker": spk,
-                        }
-                    )
-                try:
-                    tmp_wav.unlink()
-                except Exception:
-                    pass
+                    segs.append({
+                        "start": float(s.start)+offset,
+                        "end":   float(s.end)+offset,
+                        "speaker": spk
+                    })
+                tmp.unlink(missing_ok=True)
                 offset += this_len
-                i += 1
         else:
-            t_infer = time.perf_counter()
             ann = pipeline(str(wav_path))
-            logger.info(
-                f"[{datetime.utcnow().isoformat()}] [{cid}] diarization inference "
-                f"({time.perf_counter() - t_infer:.2f}s)"
-            )
-            segs = [
-                {"start": float(s.start), "end": float(s.end), "speaker": spk}
-                for s, _, spk in ann.itertracks(yield_label=True)
-            ]
+            for s, _, spk in ann.itertracks(yield_label=True):
+                segs.append({
+                    "start": float(s.start),
+                    "end":   float(s.end),
+                    "speaker": spk
+                })
+
     except Exception as e:
         logger.error(f"[{datetime.utcnow().isoformat()}] [{cid}] diarize_error: {e}", exc_info=True)
         r.publish(f"progress:{upload_id}", json.dumps({"status": "error", "error": str(e)}))
@@ -577,11 +591,28 @@ def diarize_full(self, upload_id, correlation_id):
         return
 
     segs.sort(key=lambda x: x["start"])
+
+    # group contiguous by speaker
+    diar_sentences = []
+    cur = None
+    for seg in segs:
+        if cur and seg["speaker"] == cur["speaker"] and abs(seg["start"] - cur["end"]) < 0.1:
+            cur["end"] = seg["end"]
+        else:
+            if cur:
+                diar_sentences.append(cur)
+            cur = {"start": seg["start"], "end": seg["end"], "speaker": seg["speaker"]}
+    if cur:
+        diar_sentences.append(cur)
+
+    # write out and send
     out_dir = Path(settings.RESULTS_FOLDER) / upload_id
     out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / "diarization.json").write_text(json.dumps(segs, ensure_ascii=False, indent=2))
+    (out_dir / "diarization_sentences.json").write_text(
+        json.dumps(diar_sentences, ensure_ascii=False, indent=2)
+    )
     r.publish(f"progress:{upload_id}", json.dumps({"status": "diarization_done"}))
-    send_webhook_event("diarization_completed", upload_id, {"diarization": segs})
+    send_webhook_event("diarization_completed", upload_id, {"diarization": diar_sentences})
     logger.info(
         f"[{datetime.utcnow().isoformat()}] [{cid}] diarize_full done in "
         f"{time.perf_counter() - stage_t0:.2f}s for {upload_id}"
