@@ -224,10 +224,11 @@ services:
     env_file: .env
     command: >-
       flower --broker=${CELERY_BROKER_URL}
-             --basic_auth=${FLOWER_USER}:${FLOWER_PASS}
-             --port=5555
-             --persistent=True
-             --db=/var/lib/flower/flower.db
+                 --address=0.0.0.0
+                 --basic_auth=${FLOWER_USER}:${FLOWER_PASS}
+                 --port=5555
+                 --persistent=True
+                 --db=/var/lib/flower/flower.db
     environment:
       - CELERY_BROKER_URL=${CELERY_BROKER_URL}
       - REDIS_URL=${REDIS_URL}
