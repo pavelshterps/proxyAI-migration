@@ -1,6 +1,7 @@
 import json
 import logging
 import subprocess
+import threading
 import time
 import re
 from datetime import datetime, timedelta
@@ -402,10 +403,17 @@ def diarize_full(self, upload_id, correlation_id):
 @app.task(bind=True, queue="transcribe_cpu")
 def deliver_webhook(self, event_type: str, upload_id: str, data: Optional[Any]):
     """
-    CPU-таск для отправки HTTP-webhook,
-    чтобы не блокировать GPU-воркеры.
+    CPU-таск для запуска отправки HTTP-webhook в фоне,
+    чтобы не блокировать GPU- и CPU-воркеры.
     """
-    send_webhook_event(event_type, upload_id, data)
+    # Запускаем функцию отправки web-hook’а в дамон-нитке
+    threading.Thread(
+        target=send_webhook_event,
+        args=(event_type, upload_id, data),
+        daemon=True
+    ).start()
+    # Task сразу возвращается и помечается как успешно выполненная
+    return
 
 @app.task(bind=True, queue="transcribe_cpu")
 def cleanup_old_files(self):
