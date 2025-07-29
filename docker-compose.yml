@@ -1,4 +1,5 @@
 version: '3.8'
+
 services:
   db:
     image: postgres:14-alpine
@@ -177,7 +178,7 @@ services:
       - HUGGINGFACE_CACHE_DIR=/hf_cache
       - WHISPER_MODEL_PATH=${WHISPER_MODEL_PATH}
       - WHISPER_DEVICE=cuda
-      - NVIDIA_VISIBLE_DEVICES=0
+      - NVIDIA_VISIBLE_DEVICES=1
       - WEBHOOK_URL=${WEBHOOK_URL}
       - WEBHOOK_SECRET=${WEBHOOK_SECRET}
     volumes:
@@ -225,9 +226,13 @@ services:
       flower --broker=${CELERY_BROKER_URL}
              --basic_auth=${FLOWER_USER}:${FLOWER_PASS}
              --port=5555
+             --persistent=True
+             --db=/var/lib/flower/flower.db
     environment:
       - CELERY_BROKER_URL=${CELERY_BROKER_URL}
       - REDIS_URL=${REDIS_URL}
+    volumes:
+      - flower_db:/var/lib/flower
     ports:
       - "5555:5555"
     depends_on:
@@ -258,6 +263,7 @@ volumes:
   upload_data:
   results_data:
   diarizer_cache:
+  flower_db:
 
 networks:
   proxyai_net:
