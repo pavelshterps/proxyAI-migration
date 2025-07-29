@@ -84,7 +84,7 @@ services:
       - worker
       - --loglevel=info
       - --concurrency=${CPU_CONCURRENCY}
-      - --queues=transcribe_cpu,celery
+      - --queues=transcribe_cpu
     environment:
       - CELERY_BROKER_URL=${CELERY_BROKER_URL}
       - CELERY_RESULT_BACKEND=${CELERY_RESULT_BACKEND}
@@ -125,7 +125,7 @@ services:
       - worker
       - --loglevel=info
       - --concurrency=${GPU_CONCURRENCY}
-      - --queues=transcribe_gpu,diarize_gpu,celery
+      - --queues=transcribe_gpu,diarize_gpu
     environment:
       - CELERY_BROKER_URL=${CELERY_BROKER_URL}
       - CELERY_RESULT_BACKEND=${CELERY_RESULT_BACKEND}
@@ -167,7 +167,7 @@ services:
       - worker
       - --loglevel=info
       - --concurrency=${GPU_CONCURRENCY}
-      - --queues=transcribe_gpu,diarize_gpu,celery
+      - --queues=transcribe_gpu,diarize_gpu
     environment:
       - CELERY_BROKER_URL=${CELERY_BROKER_URL}
       - CELERY_RESULT_BACKEND=${CELERY_RESULT_BACKEND}
@@ -178,7 +178,7 @@ services:
       - HUGGINGFACE_CACHE_DIR=/hf_cache
       - WHISPER_MODEL_PATH=${WHISPER_MODEL_PATH}
       - WHISPER_DEVICE=cuda
-      - NVIDIA_VISIBLE_DEVICES=0
+      - NVIDIA_VISIBLE_DEVICES=1
       - WEBHOOK_URL=${WEBHOOK_URL}
       - WEBHOOK_SECRET=${WEBHOOK_SECRET}
     volumes:
@@ -187,6 +187,35 @@ services:
       - results_data:${RESULTS_FOLDER}
       - diarizer_cache:${DIARIZER_CACHE_DIR}
       - ./data/hf_cache:/hf_cache
+    depends_on:
+      - api
+      - redis
+    networks:
+      - proxyai_net
+    restart: unless-stopped
+
+  worker_webhooks:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: proxyai_worker_webhooks
+    env_file: .env
+    command:
+      - celery
+      - -A
+      - celery_app:app
+      - worker
+      - --loglevel=info
+      - --concurrency=2
+      - --queues=webhooks
+    environment:
+      - CELERY_BROKER_URL=${CELERY_BROKER_URL}
+      - CELERY_RESULT_BACKEND=${CELERY_RESULT_BACKEND}
+      - REDIS_URL=${REDIS_URL}
+      - WEBHOOK_URL=${WEBHOOK_URL}
+      - WEBHOOK_SECRET=${WEBHOOK_SECRET}
+    volumes:
+      - ./:/app:delegated
     depends_on:
       - api
       - redis

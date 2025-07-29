@@ -1,7 +1,6 @@
 import json
 import logging
 import subprocess
-import threading
 import time
 import re
 from datetime import datetime, timedelta
@@ -11,6 +10,7 @@ from typing import Any, Optional, List, Dict
 import requests
 from redis import Redis
 from celery.signals import worker_process_init
+from celery import Task
 
 from celery_app import app
 from config.settings import settings
@@ -47,60 +47,6 @@ except ImportError as e:
     logger.warning(f"[INIT] pyannote.audio not available: {e}")
 
 # ---------------------- Helpers ----------------------
-
-def send_webhook_event(event_type: str, upload_id: str, data: Optional[Any]):
-    """
-    HTTP-запрос к внешнему webhook-endpoint.
-    Используется внутри deliver_webhook, чтобы не блокировать GPU-задачи.
-    """
-    url = settings.WEBHOOK_URL
-    secret = settings.WEBHOOK_SECRET
-    if not url or not secret:
-        return
-
-    payload = {
-        "event_type": event_type,
-        "upload_id": upload_id,
-        "timestamp": datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
-        "data": data,
-    }
-    headers = {"Content-Type": "application/json", "X-WebHook-Secret": secret}
-
-    max_attempts = 5
-    for attempt in range(1, max_attempts + 1):
-        try:
-            resp = requests.post(url, json=payload, headers=headers, timeout=(5, 30))
-        except requests.RequestException as e:
-            logger.warning(
-                f"[{datetime.utcnow().isoformat()}] [WEBHOOK] {event_type} network error "
-                f"(attempt {attempt}/{max_attempts}) for {upload_id}: {e}"
-            )
-        else:
-            code = resp.status_code
-            if 200 <= code < 300 or code == 405:
-                logger.info(
-                    f"[{datetime.utcnow().isoformat()}] [WEBHOOK] {event_type} "
-                    f"{'treated as success' if code == 405 else 'succeeded'} "
-                    f"(attempt {attempt}/{max_attempts}) for {upload_id}"
-                )
-                return
-            if 400 <= code < 500:
-                logger.error(
-                    f"[{datetime.utcnow().isoformat()}] [WEBHOOK] {event_type} returned {code} "
-                    f"for {upload_id}, aborting"
-                )
-                return
-            logger.warning(
-                f"[{datetime.utcnow().isoformat()}] [WEBHOOK] {event_type} returned {code} "
-                f"(attempt {attempt}/{max_attempts}), retrying"
-            )
-        if attempt < max_attempts:
-            time.sleep(30)
-
-    logger.error(
-        f"[{datetime.utcnow().isoformat()}] [WEBHOOK] {event_type} failed after "
-        f"{max_attempts} attempts for {upload_id}"
-    )
 
 def probe_audio(src: Path) -> dict:
     res = subprocess.run(
@@ -400,20 +346,48 @@ def diarize_full(self, upload_id, correlation_id):
     r.publish(f"progress:{upload_id}", json.dumps({"status": "diarization_done"}))
     deliver_webhook.delay("diarization_completed", upload_id, {"diarization": diar_sentences})
 
-@app.task(bind=True, queue="transcribe_cpu")
+@app.task(
+    bind=True,
+    name="deliver_webhook",
+    queue="webhooks",
+    max_retries=5,
+    default_retry_delay=30,  # seconds
+)
 def deliver_webhook(self, event_type: str, upload_id: str, data: Optional[Any]):
     """
-    CPU-таск для запуска отправки HTTP-webhook в фоне,
-    чтобы не блокировать GPU- и CPU-воркеры.
+    Celery-таска для отправки HTTP-webhook с retry через self.retry.
     """
-    # Запускаем функцию отправки web-hook’а в дамон-нитке
-    threading.Thread(
-        target=send_webhook_event,
-        args=(event_type, upload_id, data),
-        daemon=True
-    ).start()
-    # Task сразу возвращается и помечается как успешно выполненная
-    return
+    url = settings.WEBHOOK_URL
+    secret = settings.WEBHOOK_SECRET
+    if not url or not secret:
+        return
+
+    payload = {
+        "event_type": event_type,
+        "upload_id": upload_id,
+        "timestamp": datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+        "data": data,
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "X-WebHook-Secret": secret,
+    }
+
+    try:
+        resp = requests.post(url, json=payload, headers=headers, timeout=(5, 30))
+        code = resp.status_code
+        if 200 <= code < 300 or code == 405:
+            logger.info(f"[WEBHOOK] {event_type} succeeded for {upload_id} ({code})")
+            return
+        if 400 <= code < 500:
+            # client error — не будем retry
+            logger.error(f"[WEBHOOK] {event_type} returned {code} for {upload_id}, aborting")
+            return
+        # server error — кинем retry
+        raise Exception(f"Webhook returned {code}")
+    except Exception as exc:
+        logger.warning(f"[WEBHOOK] {event_type} error for {upload_id}, retrying: {exc}")
+        raise self.retry(exc=exc)
 
 @app.task(bind=True, queue="transcribe_cpu")
 def cleanup_old_files(self):
@@ -431,4 +405,4 @@ def cleanup_old_files(self):
                     deleted += 1
             except Exception:
                 continue
-    logger.info(f"[{datetime.utcnow().isoformat()}] [CLEANUP] deleted {deleted} old files")
+    logger.info(f"[CLEANUP] deleted {deleted} old files")
