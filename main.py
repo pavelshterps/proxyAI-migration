@@ -7,6 +7,7 @@ from urllib.parse import urlparse
 from urllib.request import urlretrieve
 from typing import Optional
 
+import yt_dlp
 import structlog
 import redis.asyncio as redis_async
 from fastapi import (
@@ -32,7 +33,6 @@ from config.settings import settings
 from database import init_models, engine, get_db
 from crud import create_upload_record, get_upload_for_user
 from dependencies import get_current_user
-
 from tasks import convert_to_wav_and_preview, diarize_full, merge_speakers
 from routes import router as api_router
 from admin_routes import router as admin_router
@@ -40,8 +40,8 @@ from admin_routes import router as admin_router
 app = FastAPI(title="proxyAI", version=settings.APP_VERSION)
 
 # rate limiter
-limiter = Limiter(key_func=get_remote_address)
-app.state.limiter = limiter
+timer_limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = timer_limiter
 app.add_middleware(SlowAPIMiddleware)
 app.add_exception_handler(RateLimitExceeded, lambda req, exc: JSONResponse({"detail": "Too Many Requests"}, status_code=429))
 
@@ -58,8 +58,48 @@ app.add_middleware(TrustedHostMiddleware,
 
 app.include_router(api_router)
 app.include_router(admin_router)
-
 app.mount("/static", StaticFiles(directory="static"), name="static")
+
+# logging
+structlog.configure(processors=[
+    structlog.processors.add_log_level,
+    structlog.processors.TimeStamper(fmt="iso"),
+    structlog.processors.JSONRenderer(),
+])
+log = structlog.get_logger()
+
+# Redis
+redis = redis_async.from_url(settings.REDIS_URL, decode_responses=True)
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+def is_direct_file(url: str) -> bool:
+    """
+    Определяем, является ли URL прямой ссылкой на аудио-файл по расширению.
+    """
+    suffix = Path(urlparse(url).path).suffix.lower()
+    return suffix in {'.mp3', '.wav', '.m4a', '.flac', '.aac', '.ogg'}
+
+async def get_api_key(x_api_key: Optional[str] = Depends(api_key_header), api_key: str = Query(None)):
+    key = x_api_key or api_key
+    if not key:
+        raise HTTPException(401, "Missing API Key")
+    return key
+
+@app.on_event("startup")
+async def on_startup():
+    # инициализация БД
+    for attempt in range(5):
+        try:
+            await init_models(engine)
+            log.info("DB connected", attempt=attempt)
+            break
+        except OSError as e:
+            log.warning("DB init failed", attempt=attempt, error=str(e))
+            await asyncio.sleep(2)
+    # создаём директории
+    for d in (settings.UPLOAD_FOLDER, settings.RESULTS_FOLDER, settings.DIARIZER_CACHE_DIR):
+        Path(d).mkdir(parents=True, exist_ok=True)
+        log.debug("Ensured dir", path=str(d))
 
 @app.get("/", include_in_schema=False)
 async def serve_frontend():
@@ -75,37 +115,6 @@ async def favicon():
         return FileResponse(str(ico))
     raise HTTPException(404, "favicon not found")
 
-structlog.configure(processors=[
-    structlog.processors.add_log_level,
-    structlog.processors.TimeStamper(fmt="iso"),
-    structlog.processors.JSONRenderer(),
-])
-log = structlog.get_logger()
-
-redis = redis_async.from_url(settings.REDIS_URL, decode_responses=True)
-api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
-
-async def get_api_key(x_api_key: Optional[str] = Depends(api_key_header), api_key: str = Query(None)):
-    key = x_api_key or api_key
-    if not key:
-        raise HTTPException(401, "Missing API Key")
-    return key
-
-@app.on_event("startup")
-async def on_startup():
-    for attempt in range(5):
-        try:
-            await init_models(engine)
-            log.info("DB connected", attempt=attempt)
-            break
-        except OSError as e:
-            log.warning("DB init failed", attempt=attempt, error=str(e))
-            await asyncio.sleep(2)
-    for d in (settings.UPLOAD_FOLDER, settings.RESULTS_FOLDER, settings.DIARIZER_CACHE_DIR):
-        Path(d).mkdir(parents=True, exist_ok=True)
-        log.debug("Ensured dir", path=str(d))
-
-
 @app.get("/health", tags=["default"])
 async def health():
     return {"status": "ok"}
@@ -117,7 +126,6 @@ async def ready():
 @app.get("/metrics", tags=["default"])
 async def metrics():
     return PlainTextResponse(generate_latest(), media_type=CONTENT_TYPE_LATEST)
-
 
 @app.get("/events/{upload_id}", tags=["default"])
 async def progress_events(upload_id: str, request: Request, api_key: str = Depends(get_api_key)):
@@ -141,7 +149,6 @@ async def progress_events(upload_id: str, request: Request, api_key: str = Depen
             await sub.unsubscribe(f"progress:{upload_id}")
     return EventSourceResponse(event_generator())
 
-
 @app.get("/status/{upload_id}", tags=["default"])
 async def get_status(upload_id: str, api_key: str = Depends(get_api_key)):
     raw = await redis.get(f"progress:{upload_id}")
@@ -149,56 +156,84 @@ async def get_status(upload_id: str, api_key: str = Depends(get_api_key)):
         raise HTTPException(404, "status not found")
     return json.loads(raw)
 
-
 @app.post("/upload/", tags=["default"])
-@limiter.limit("10/minute")
-async def upload(request: Request, file: UploadFile = File(None), file_url: str = Form(None),
-                 x_correlation_id: str | None = Header(None),
-                 api_key: str = Depends(get_api_key),
-                 current_user=Depends(get_current_user), db=Depends(get_db)):
+@timer_limiter.limit("10/minute")
+async def upload(
+    request: Request,
+    file: UploadFile = File(None),
+    file_url: str = Form(None),
+    x_correlation_id: Optional[str] = Header(None),
+    api_key: str = Depends(get_api_key),
+    current_user=Depends(get_current_user),
+    db=Depends(get_db),
+):
+    # проверяем вход
     if not file and not file_url:
         raise HTTPException(400, "Нужно передать либо файл, либо file_url")
 
     upload_id = uuid.uuid4().hex
     try:
         Path(settings.UPLOAD_FOLDER).mkdir(parents=True, exist_ok=True)
+        base = Path(settings.UPLOAD_FOLDER)
+        dst_base = base / upload_id
+
         if file:
             data = await file.read()
             if not data:
                 raise HTTPException(400, "File is empty")
             ext = Path(file.filename).suffix or ""
-            dst = Path(settings.UPLOAD_FOLDER) / f"{upload_id}{ext}"
+            dst = dst_base.with_suffix(ext)
             dst.write_bytes(data)
         else:
-            parsed = urlparse(file_url)
-            ext = Path(parsed.path).suffix or ""
-            dst = Path(settings.UPLOAD_FOLDER) / f"{upload_id}{ext}"
-            urlretrieve(file_url, str(dst))
+            # URL загрузка
+            if not is_direct_file(file_url):
+                # любой не-прямой аудио-URL — через yt-dlp
+                ydl_opts = {
+                    "format": "bestaudio/best",
+                    "outtmpl": str(dst_base) + ".%(ext)s",
+                    "quiet": True,
+                }
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(file_url, download=True)
+                ext = info.get('ext', '')
+                downloaded = dst_base.with_suffix(f".{ext}")
+                dst = base / f"{upload_id}.{ext}"
+                downloaded.rename(dst)
+            else:
+                # прямой файл по расширению
+                parsed = urlparse(file_url)
+                ext = Path(parsed.path).suffix or ""
+                dst = base / f"{upload_id}{ext}"
+                urlretrieve(file_url, str(dst))
     except HTTPException:
         raise
     except Exception as e:
         log.error("upload save error", error=str(e))
         raise HTTPException(500, f"Cannot save source: {e}")
 
+    # сохраняем запись в БД
     try:
         await create_upload_record(db, current_user.id, upload_id)
     except Exception:
         log.warning("DB create failed", upload_id=upload_id)
 
+    # начинаем процессинг
     cid = x_correlation_id or uuid.uuid4().hex
     await redis.set(f"progress:{upload_id}", json.dumps({"status": "started"}))
     await redis.publish(f"progress:{upload_id}", json.dumps({"status": "started"}))
-
     convert_to_wav_and_preview.delay(upload_id, cid)
+
     return JSONResponse({"upload_id": upload_id}, headers={"X-Correlation-ID": cid})
 
-
 @app.get("/results/{upload_id}", tags=["default"])
-async def get_results(upload_id: str,
-                      api_key: str = Depends(get_api_key),
-                      current_user=Depends(get_current_user), db=Depends(get_db),
-                      pad: float = Query(0.2, description="padding seconds when matching diarization"),
-                      include_orig: bool = Query(False, description="return orig diarization labels too")):
+async def get_results(
+    upload_id: str,
+    api_key: str = Depends(get_api_key),
+    current_user=Depends(get_current_user),
+    db=Depends(get_db),
+    pad: float = Query(0.2, description="padding seconds when matching diarization"),
+    include_orig: bool = Query(False, description="return orig diarization labels too"),
+):
     base = Path(settings.RESULTS_FOLDER) / upload_id
     tp = base / "transcript.json"
     if not tp.exists():
@@ -213,21 +248,15 @@ async def get_results(upload_id: str,
 
         merged = merge_speakers(transcript, raw, pad=pad)
         for seg in merged:
-            # если orig не задано (когда мы в таске никогда его не клали),
-            # берём текущее значение speaker как orig
-            orig = seg.get("orig", seg["speaker"])
-            # сохраняем исходный спикер-ID...
+            # если orig не задан, берём текущее поле speaker
+            orig = seg.get("orig", seg.get("speaker"))
             seg["orig"] = orig
-            # ...и маппим его через пользовательские метки
             seg["speaker"] = mapping.get(str(orig), orig)
-            # по флагу include_orig убираем поле orig, если не нужно отдавать его клиенту
             if not include_orig:
                 seg.pop("orig", None)
-
         return {"results": merged}
 
     return {"results": transcript}
-
 
 @app.post("/diarize/{upload_id}", tags=["default"])
 async def request_diarization(upload_id: str, api_key: str = Depends(get_api_key)):
