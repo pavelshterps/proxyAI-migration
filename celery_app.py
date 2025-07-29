@@ -1,4 +1,9 @@
 import os
+import sys
+# вставляем в PYTHONPATH директорию этого файла (/app)
+sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
+
+import os
 from celery import Celery
 from celery.signals import worker_process_init
 from config.settings import settings
@@ -23,6 +28,7 @@ app.conf.task_acks_late = True
 app.conf.worker_prefetch_multiplier = 1
 app.conf.broker_transport_options = {"visibility_timeout": 3600}
 
+# Инициализировать модели на старте процесса-воркера
 @worker_process_init.connect
 def preload_models(**kwargs):
     from tasks import get_whisper_model, get_diarization_pipeline
@@ -32,4 +38,7 @@ def preload_models(**kwargs):
         get_diarization_pipeline()
         logger.info(f"[{datetime.utcnow().isoformat()}] [PRELOAD] models loaded")
     except Exception as e:
-        logger.error(f"[{datetime.utcnow().isoformat()}] [PRELOAD] error loading models: {e}", exc_info=True)
+        logger.error(
+            f"[{datetime.utcnow().isoformat()}] [PRELOAD] error loading models: {e}",
+            exc_info=True,
+        )
