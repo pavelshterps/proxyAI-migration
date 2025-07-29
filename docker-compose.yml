@@ -222,13 +222,14 @@ services:
     image: mher/flower:0.9.7
     container_name: proxyai_flower
     env_file: .env
-    command: >-
-      flower --broker=${CELERY_BROKER_URL}
-                 --address=0.0.0.0
-                 --basic_auth=${FLOWER_USER}:${FLOWER_PASS}
-                 --port=5555
-                 --persistent=True
-                 --db=/var/lib/flower/flower.db
+    command: >
+      sh -c "chown -R 1000:1000 /var/lib/flower \
+             && flower --broker=${CELERY_BROKER_URL} \
+                       --address=0.0.0.0 \
+                       --basic_auth=${FLOWER_USER}:${FLOWER_PASS} \
+                       --port=5555 \
+                       --persistent=True \
+                       --db=/var/lib/flower/flower.db"
     environment:
       - CELERY_BROKER_URL=${CELERY_BROKER_URL}
       - REDIS_URL=${REDIS_URL}
