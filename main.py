@@ -213,9 +213,17 @@ async def get_results(upload_id: str,
 
         merged = merge_speakers(transcript, raw, pad=pad)
         for seg in merged:
-            seg["speaker"] = mapping.get(str(seg["orig"]), seg["orig"])
+            # если orig не задано (когда мы в таске никогда его не клали),
+            # берём текущее значение speaker как orig
+            orig = seg.get("orig", seg["speaker"])
+            # сохраняем исходный спикер-ID...
+            seg["orig"] = orig
+            # ...и маппим его через пользовательские метки
+            seg["speaker"] = mapping.get(str(orig), orig)
+            # по флагу include_orig убираем поле orig, если не нужно отдавать его клиенту
             if not include_orig:
                 seg.pop("orig", None)
+
         return {"results": merged}
 
     return {"results": transcript}
