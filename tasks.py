@@ -25,30 +25,33 @@ handler.setFormatter(formatter)
 logger.addHandler(handler)
 logger.setLevel(logging.INFO)
 
-# --- Model availability flags ---
+# --- Model availability flags & holders ---
+_HF_AVAILABLE = False
+_PN_AVAILABLE = False
+_whisper_model = None
+_diarization_pipeline = None
+
 try:
     from faster_whisper import WhisperModel, download_model
     _HF_AVAILABLE = True
     logger.info("[INIT] faster-whisper available")
 except ImportError as e:
-    _HF_AVAILABLE = False
     logger.warning(f"[INIT] faster-whisper not available: {e}")
 
 try:
     from pyannote.audio import Pipeline as PyannotePipeline
     _PN_AVAILABLE = True
-    logger.info("[INIT] pyannote.audio Pipeline available")
+    logger.info("[INIT] pyannote.audio available")
 except ImportError as e:
-    _PN_AVAILABLE = False
     logger.warning(f"[INIT] pyannote.audio not available: {e}")
 
-# --- Global model holders ---
-_whisper_model: Optional["WhisperModel"] = None
-_diarization_pipeline: Optional["PyannotePipeline"] = None
-
-
 # ---------------------- Helpers ----------------------
+
 def send_webhook_event(event_type: str, upload_id: str, data: Optional[Any]):
+    """
+    Собственно HTTP-запрос к внешнему webhook-endpoint.
+    Используется только внутри задачи deliver_webhook.
+    """
     url = settings.WEBHOOK_URL
     secret = settings.WEBHOOK_SECRET
     if not url or not secret:
@@ -65,12 +68,11 @@ def send_webhook_event(event_type: str, upload_id: str, data: Optional[Any]):
     max_attempts = 5
     for attempt in range(1, max_attempts + 1):
         try:
-            # 5s connect, 30s read
             resp = requests.post(url, json=payload, headers=headers, timeout=(5, 30))
         except requests.RequestException as e:
             logger.warning(
-                f"[{datetime.utcnow().isoformat()}] [WEBHOOK] "
-                f"{event_type} network error (attempt {attempt}/{max_attempts}) for {upload_id}: {e}"
+                f"[{datetime.utcnow().isoformat()}] [WEBHOOK] {event_type} network error "
+                f"(attempt {attempt}/{max_attempts}) for {upload_id}: {e}"
             )
         else:
             code = resp.status_code
@@ -78,198 +80,33 @@ def send_webhook_event(event_type: str, upload_id: str, data: Optional[Any]):
                 logger.info(
                     f"[{datetime.utcnow().isoformat()}] [WEBHOOK] {event_type} "
                     f"{'treated as success' if code == 405 else 'succeeded'} "
-                    f"on attempt {attempt}/{max_attempts} for {upload_id}"
+                    f"(attempt {attempt}/{max_attempts}) for {upload_id}"
                 )
                 return
             if 400 <= code < 500:
                 logger.error(
-                    f"[{datetime.utcnow().isoformat()}] [WEBHOOK] "
-                    f"{event_type} returned {code} for {upload_id}, aborting"
+                    f"[{datetime.utcnow().isoformat()}] [WEBHOOK] {event_type} returned {code} "
+                    f"for {upload_id}, aborting"
                 )
                 return
             logger.warning(
-                f"[{datetime.utcnow().isoformat()}] [WEBHOOK] "
-                f"{event_type} returned {code} on attempt {attempt}/{max_attempts}, retrying"
+                f"[{datetime.utcnow().isoformat()}] [WEBHOOK] {event_type} returned {code} "
+                f"(attempt {attempt}/{max_attempts}), retrying"
             )
 
         if attempt < max_attempts:
             time.sleep(30)
 
     logger.error(
-        f"[{datetime.utcnow().isoformat()}] [WEBHOOK] "
-        f"{event_type} failed after {max_attempts} attempts for {upload_id}"
+        f"[{datetime.utcnow().isoformat()}] [WEBHOOK] {event_type} failed after "
+        f"{max_attempts} attempts for {upload_id}"
     )
 
-
-def merge_speakers(
-    transcript: List[Dict[str, Any]],
-    diar: List[Dict[str, Any]],
-    pad: float = 0.2,
-) -> List[Dict[str, Any]]:
-    """
-    Assign a speaker to each transcript segment by overlapping with diarization.
-    """
-    if not diar:
-        return [{**t, "speaker": None} for t in transcript]
-
-    diar = sorted(diar, key=lambda d: d["start"])
-    transcript = sorted(transcript, key=lambda t: t["start"])
-    starts = [d["start"] for d in diar]
-
-    from bisect import bisect_left
-
-    def nearest(idx: int, t0: float, t1: float):
-        if idx <= 0:
-            return diar[0]
-        if idx >= len(diar):
-            return diar[-1]
-        b, a = diar[idx-1], diar[idx]
-        db = max(0.0, t0 - b["end"])
-        da = max(0.0, a["start"] - t1)
-        return b if db <= da else a
-
-    out = []
-    for t in transcript:
-        t0 = max(0.0, t["start"] - pad)
-        t1 = t["end"] + pad
-        i = bisect_left(starts, t1)
-        candidates = [
-            d for d in diar[max(0, i-8):i+8]
-            if not (d["end"] <= t0 or d["start"] >= t1)
-        ]
-        if candidates:
-            best = max(candidates, key=lambda d: max(0.0, min(d["end"], t1) - max(d["start"], t0)))
-        else:
-            best = nearest(i, t0, t1)
-        out.append({**t, "speaker": best["speaker"]})
-    return out
-
-
-def group_into_sentences(
-    segs: List[Dict[str, Any]]
-) -> List[Dict[str, Any]]:
-    """
-    Merge sequential segments into full sentences ending with punctuation.
-    Carries over speaker from the first segment.
-    """
-    sentences = []
-    buf_text = ""
-    buf_start = None
-    buf_end = None
-    buf_speaker = None
-
-    sentence_end_re = re.compile(r"[.!?]{1,3}$")
-
-    for seg in segs:
-        text = seg["text"].strip()
-        if not text:
-            continue
-
-        if buf_text == "":
-            buf_start = seg["start"]
-            buf_speaker = seg.get("speaker")
-        buf_text += (" " if buf_text else "") + text
-        buf_end = seg["end"]
-
-        if sentence_end_re.search(text):
-            sentences.append({
-                "start": buf_start,
-                "end": buf_end,
-                "speaker": buf_speaker,
-                "text": buf_text
-            })
-            buf_text = ""
-            buf_start = None
-            buf_end = None
-            buf_speaker = None
-
-    # flush remainder
-    if buf_text:
-        sentences.append({
-            "start": buf_start,
-            "end": buf_end,
-            "speaker": buf_speaker,
-            "text": buf_text
-        })
-
-    return sentences
-
-
-# ----------------------------------------------------
-
-def get_whisper_model(model_override: str = None):
-    device = settings.WHISPER_DEVICE.lower()
-    compute = getattr(
-        settings,
-        "WHISPER_COMPUTE_TYPE",
-        "float16" if device.startswith("cuda") else "int8",
-    ).lower()
-
-    if model_override:
-        logger.info(f"[{datetime.utcnow().isoformat()}] [WHISPER] override {model_override}")
-        return WhisperModel(model_override, device=device, compute_type=compute)
-
-    global _whisper_model
-    if _whisper_model is None:
-        model_id = settings.WHISPER_MODEL_PATH
-        logger.info(f"[{datetime.utcnow().isoformat()}] [WHISPER] init {model_id} on {device}")
-        t0 = time.perf_counter()
-        try:
-            path = download_model(
-                model_id,
-                cache_dir=settings.HUGGINGFACE_CACHE_DIR,
-                local_files_only=(device == "cpu"),
-            )
-        except Exception:
-            path = model_id
-
-        if device == "cpu" and compute in ("fp16", "float16"):
-            compute = "int8"
-
-        _whisper_model = WhisperModel(path, device=device, compute_type=compute)
-        logger.info(
-            f"[{datetime.utcnow().isoformat()}] [WHISPER] ready on {device} "
-            f"({time.perf_counter() - t0:.2f}s)"
-        )
-    return _whisper_model
-
-
-def get_diarization_pipeline():
-    global _diarization_pipeline
-    if _diarization_pipeline is None:
-        logger.info(f"[{datetime.utcnow().isoformat()}] [DIARIZER] loading pipeline")
-        t0 = time.perf_counter()
-        model_id = getattr(settings, "PYANNOTE_PIPELINE", "pyannote/speaker-diarization-3.1")
-        _diarization_pipeline = PyannotePipeline.from_pretrained(
-            model_id,
-            use_auth_token=settings.HUGGINGFACE_TOKEN,
-            cache_dir=settings.DIARIZER_CACHE_DIR,
-        )
-        logger.info(
-            f"[{datetime.utcnow().isoformat()}] [DIARIZER] pipeline ready "
-            f"({time.perf_counter() - t0:.2f}s)"
-        )
-    return _diarization_pipeline
-
-
-@worker_process_init.connect
-def preload_on_startup(**kwargs):
-    device = settings.WHISPER_DEVICE.lower()
-    try:
-        if _HF_AVAILABLE:
-            get_whisper_model()
-        if _PN_AVAILABLE and device.startswith("cuda"):
-            get_diarization_pipeline()
-    except Exception as e:
-        logger.error(f"[{datetime.utcnow().isoformat()}] [PRELOAD] error: {e}", exc_info=True)
-
-
-# --- Audio utils ---
 def probe_audio(src: Path) -> dict:
     res = subprocess.run(
         ["ffprobe", "-v", "error", "-print_format", "json", "-show_format", "-show_streams", str(src)],
         capture_output=True,
-        text=True,
+        text=True
     )
     info = {"duration": 0.0}
     try:
@@ -277,25 +114,19 @@ def probe_audio(src: Path) -> dict:
         info["duration"] = float(j["format"].get("duration", 0.0))
         for s in j.get("streams", []):
             if s.get("codec_type") == "audio":
-                info.update(
-                    {
-                        "codec_name": s.get("codec_name"),
-                        "sample_rate": int(s.get("sample_rate", 0)),
-                        "channels": int(s.get("channels", 0)),
-                    }
-                )
+                info.update({
+                    "codec_name": s.get("codec_name"),
+                    "sample_rate": int(s.get("sample_rate", 0)),
+                    "channels": int(s.get("channels", 0)),
+                })
                 break
     except Exception:
         pass
     return info
 
-
 def prepare_wav(upload_id: str) -> (Path, float):
-    start = time.perf_counter()
-    logger.info(f"[{datetime.utcnow().isoformat()}] [PREPARE] start for {upload_id}")
     src = next(Path(settings.UPLOAD_FOLDER).glob(f"{upload_id}.*"))
     target = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
-
     info = probe_audio(src)
     duration = info["duration"]
 
@@ -307,317 +138,277 @@ def prepare_wav(upload_id: str) -> (Path, float):
     ):
         if src != target:
             src.rename(target)
-        logger.info(f"[{datetime.utcnow().isoformat()}] [PREPARE] WAV OK ({time.perf_counter() - start:.2f}s)")
         return target, duration
 
-    subprocess.run(
-        [
-            "ffmpeg",
-            "-y",
-            "-threads",
-            str(settings.FFMPEG_THREADS),
-            "-i",
-            str(src),
-            "-acodec",
-            "pcm_s16le",
-            "-ac",
-            "1",
-            "-ar",
-            "16000",
-            str(target),
-        ],
-        check=True,
-        stderr=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-    )
-    logger.info(f"[{datetime.utcnow().isoformat()}] [PREPARE] converted ({time.perf_counter() - start:.2f}s)")
+    subprocess.run([
+        "ffmpeg", "-y", "-threads", str(settings.FFMPEG_THREADS),
+        "-i", str(src),
+        "-acodec", "pcm_s16le", "-ac", "1", "-ar", "16000", str(target),
+    ], check=True, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
     return target, duration
-
 
 def prepare_preview_segment(upload_id: str) -> subprocess.Popen:
     src = next(Path(settings.UPLOAD_FOLDER).glob(f"{upload_id}.*"))
-    cmd = [
-        "ffmpeg",
-        "-y",
-        "-threads",
-        str(settings.FFMPEG_THREADS // 2 or 1),
-        "-ss",
-        "0",
-        "-t",
-        str(settings.PREVIEW_LENGTH_S),
-        "-i",
-        str(src),
-        "-acodec",
-        "pcm_s16le",
-        "-ac",
-        "1",
-        "-ar",
-        "16000",
-        "-f",
-        "wav",
-        "pipe:1",
-    ]
-    return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    return subprocess.Popen([
+        "ffmpeg", "-y", "-threads", str(max(1, settings.FFMPEG_THREADS // 2)),
+        "-ss", "0", "-t", str(settings.PREVIEW_LENGTH_S),
+        "-i", str(src),
+        "-acodec", "pcm_s16le", "-ac", "1", "-ar", "16000",
+        "-f", "wav", "pipe:1",
+    ], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
 
+def group_into_sentences(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    sentences = []
+    buf = {"start": None, "end": None, "speaker": None, "text": []}
+    sentence_end_re = re.compile(r"[\.!\?]$")
+    for seg in segments:
+        txt = seg["text"].strip()
+        if not txt:
+            continue
+        if buf["start"] is None:
+            buf["start"] = seg["start"]
+            buf["speaker"] = seg.get("speaker")
+        buf["end"] = seg["end"]
+        buf["text"].append(txt)
+        if sentence_end_re.search(txt):
+            sentences.append({
+                "start": buf["start"],
+                "end": buf["end"],
+                "speaker": buf["speaker"],
+                "text": " ".join(buf["text"]),
+            })
+            buf = {"start": None, "end": None, "speaker": None, "text": []}
+    if buf["text"]:
+        sentences.append({
+            "start": buf["start"],
+            "end": buf["end"],
+            "speaker": buf["speaker"],
+            "text": " ".join(buf["text"]),
+        })
+    return sentences
+
+def merge_speakers(
+    transcript: List[Dict[str, Any]],
+    diar: List[Dict[str, Any]],
+    pad: float = 0.2,
+) -> List[Dict[str, Any]]:
+    if not diar:
+        return [{**t, "speaker": None} for t in transcript]
+    diar = sorted(diar, key=lambda d: d["start"])
+    transcript = sorted(transcript, key=lambda t: t["start"])
+    starts = [d["start"] for d in diar]
+    from bisect import bisect_left
+    def nearest(idx: int, t0: float, t1: float):
+        if idx <= 0:
+            return diar[0]
+        if idx >= len(diar):
+            return diar[-1]
+        b, a = diar[idx - 1], diar[idx]
+        db = max(0.0, t0 - b["end"])
+        da = max(0.0, a["start"] - t1)
+        return b if db <= da else a
+    out = []
+    for t in transcript:
+        t0 = max(0.0, t["start"] - pad)
+        t1 = t["end"] + pad
+        i = bisect_left(starts, t1)
+        candidates = [d for d in diar[max(0, i - 8): i + 8] if not (d["end"] <= t0 or d["start"] >= t1)]
+        best = max(candidates, key=lambda d: max(0.0, min(d["end"], t1) - max(d["start"], t0))) if candidates else nearest(i, t0, t1)
+        out.append({**t, "speaker": best["speaker"]})
+    return out
+
+def get_whisper_model(model_override: str = None):
+    global _whisper_model
+    device = settings.WHISPER_DEVICE.lower()
+    compute = getattr(
+        settings,
+        "WHISPER_COMPUTE_TYPE",
+        "float16" if device.startswith("cuda") else "int8",
+    ).lower()
+    if model_override:
+        return WhisperModel(model_override, device=device, compute_type=compute)
+    if _whisper_model is None:
+        model_id = settings.WHISPER_MODEL_PATH
+        try:
+            path = download_model(
+                model_id,
+                cache_dir=settings.HUGGINGFACE_CACHE_DIR,
+                local_files_only=(device == "cpu"),
+            )
+        except Exception:
+            path = model_id
+        if device == "cpu" and compute in ("fp16", "float16"):
+            compute = "int8"
+        _whisper_model = WhisperModel(path, device=device, compute_type=compute)
+    return _whisper_model
+
+def get_diarization_pipeline():
+    global _diarization_pipeline
+    if _diarization_pipeline is None:
+        model_id = getattr(settings, "PYANNOTE_PIPELINE", "pyannote/speaker-diarization-3.1")
+        _diarization_pipeline = PyannotePipeline.from_pretrained(
+            model_id,
+            use_auth_token=settings.HUGGINGFACE_TOKEN,
+            cache_dir=settings.DIARIZER_CACHE_DIR,
+        )
+    return _diarization_pipeline
+
+@worker_process_init.connect
+def preload_on_startup(**kwargs):
+    if _HF_AVAILABLE:
+        get_whisper_model()
+    if _PN_AVAILABLE:
+        get_diarization_pipeline()
 
 # --- Celery tasks ---
 
 @app.task(bind=True, queue="transcribe_cpu")
 def convert_to_wav_and_preview(self, upload_id, correlation_id):
-    cid = correlation_id or "?"
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
-
-    logger.info(f"[{datetime.utcnow().isoformat()}] [{cid}] processing_started for {upload_id}")
-    send_webhook_event("processing_started", upload_id, None)
-
+    # публикуем сразу в UI
+    r.publish(f"progress:{upload_id}", json.dumps({"status": "processing_started"}))
+    # выносим webhook на CPU
+    deliver_webhook.delay("processing_started", upload_id, None)
     try:
         prepare_wav(upload_id)
     except Exception as e:
-        logger.error(f"[{datetime.utcnow().isoformat()}] [{cid}] prepare_error: {e}", exc_info=True)
         r.publish(f"progress:{upload_id}", json.dumps({"status": "error", "error": str(e)}))
-        send_webhook_event("processing_failed", upload_id, None)
+        deliver_webhook.delay("processing_failed", upload_id, None)
         return
-
-    logger.info(f"[{datetime.utcnow().isoformat()}] [{cid}] enqueue preview_transcribe")
     from tasks import preview_transcribe
     preview_transcribe.delay(upload_id, correlation_id)
 
-
 @app.task(bind=True, queue="transcribe_gpu")
 def preview_transcribe(self, upload_id, correlation_id):
-    cid = correlation_id or "?"
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
-
-    try:
-        logger.info(f"[{datetime.utcnow().isoformat()}] [{cid}] preview_transcribe start for {upload_id}")
-        stage_t0 = time.perf_counter()
-        proc = prepare_preview_segment(upload_id)
-
-        model = get_whisper_model()
-        segments_gen, _ = model.transcribe(
-            proc.stdout,
-            word_timestamps=True,
-            **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {}),
+    proc = prepare_preview_segment(upload_id)
+    model = get_whisper_model()
+    segments_gen, _ = model.transcribe(
+        proc.stdout,
+        word_timestamps=True,
+        **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {}),
+    )
+    proc.stdout.close(); proc.wait()
+    segments = list(segments_gen)
+    for seg in segments:
+        r.publish(
+            f"progress:{upload_id}",
+            json.dumps({
+                "status": "preview_partial",
+                "fragment": {"start": seg.start, "end": seg.end, "text": seg.text}
+            })
         )
-        proc.stdout.close()
-        proc.wait()
-        segments = list(segments_gen)
-
-        for seg in segments:
-            r.publish(
-                f"progress:{upload_id}",
-                json.dumps({
-                    "status": "preview_partial",
-                    "fragment": {"start": seg.start, "end": seg.end, "text": seg.text}
-                })
-            )
-
-        preview = {
-            "text": "".join(s.text for s in segments),
-            "timestamps": [{"start": s.start, "end": s.end, "text": s.text} for s in segments],
-        }
-        out_dir = Path(settings.RESULTS_FOLDER) / upload_id
-        out_dir.mkdir(parents=True, exist_ok=True)
-        (out_dir / "preview_transcript.json").write_text(json.dumps(preview, ensure_ascii=False, indent=2))
-        r.publish(f"progress:{upload_id}", json.dumps({"status": "preview_done", "preview": preview}))
-        send_webhook_event("preview_completed", upload_id, {"preview": preview})
-        logger.info(
-            f"[{datetime.utcnow().isoformat()}] [{cid}] preview_transcribe done in "
-            f"{time.perf_counter() - stage_t0:.2f}s for {upload_id}"
-        )
-
-    except Exception as e:
-        logger.error(f"[{datetime.utcnow().isoformat()}] [{cid}] preview_error: {e}", exc_info=True)
-        r.publish(f"progress:{upload_id}", json.dumps({"status": "error", "error": str(e)}))
-        send_webhook_event("processing_failed", upload_id, None)
-        return
-
-    logger.info(f"[{datetime.utcnow().isoformat()}] [{cid}] enqueue transcribe_segments")
+    preview = {
+        "text": "".join(s.text for s in segments),
+        "timestamps": [{"start": s.start, "end": s.end, "text": s.text} for s in segments],
+    }
+    out = Path(settings.RESULTS_FOLDER) / upload_id
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "preview_transcript.json").write_text(json.dumps(preview, ensure_ascii=False, indent=2))
+    r.publish(f"progress:{upload_id}", json.dumps({"status": "preview_done", "preview": preview}))
+    deliver_webhook.delay("preview_completed", upload_id, {"preview": preview})
     from tasks import transcribe_segments
     transcribe_segments.delay(upload_id, correlation_id)
 
-
 @app.task(bind=True, queue="transcribe_gpu")
 def transcribe_segments(self, upload_id, correlation_id):
-    cid = correlation_id or "?"
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
-
-    logger.info(f"[{datetime.utcnow().isoformat()}] [{cid}] transcribe_segments start for {upload_id}")
-    stage_t0 = time.perf_counter()
-
-    wav = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
-    if not wav.exists():
-        error = "WAV not found"
-        logger.error(f"[{datetime.utcnow().isoformat()}] [{cid}] {error}")
-        r.publish(f"progress:{upload_id}", json.dumps({"status": "error", "error": error}))
-        send_webhook_event("processing_failed", upload_id, None)
-        return
-
-    info = probe_audio(wav)
-    duration = info["duration"]
-
+    wav, duration = prepare_wav(upload_id)
     if not _HF_AVAILABLE:
-        error = "Whisper unavailable"
-        logger.error(f"[{datetime.utcnow().isoformat()}] [{cid}] {error}")
-        r.publish(f"progress:{upload_id}", json.dumps({"status": "error", "error": error}))
-        send_webhook_event("processing_failed", upload_id, None)
+        deliver_webhook.delay("processing_failed", upload_id, None)
         return
-
     model = get_whisper_model()
     all_segs = []
-    chunk_len = settings.CHUNK_LENGTH_S
-    threads = settings.FFMPEG_THREADS
-
-    if duration <= chunk_len:
-        segs, _ = model.transcribe(
-            str(wav),
-            word_timestamps=True,
-            **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {}),
-        )
+    if duration <= settings.CHUNK_LENGTH_S:
+        segs, _ = model.transcribe(str(wav), word_timestamps=True,
+            **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {}))
         all_segs = list(segs)
     else:
         offset = 0.0
         while offset < duration:
-            this_len = min(chunk_len, duration - offset)
-            logger.info(
-                f"[{datetime.utcnow().isoformat()}] [{cid}] transcribe chunk offset={offset:.2f}s len={this_len:.2f}s"
-            )
-            proc = subprocess.Popen(
-                [
-                    "ffmpeg", "-y", "-threads", str(threads),
-                    "-ss", str(offset), "-t", str(this_len),
-                    "-i", str(wav), "-f", "wav", "pipe:1"
-                ],
-                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
-            )
+            length = min(settings.CHUNK_LENGTH_S, duration - offset)
+            p = subprocess.Popen([
+                "ffmpeg","-y","-threads",str(settings.FFMPEG_THREADS),
+                "-ss",str(offset),"-t",str(length),"-i",str(wav),"-f","wav","pipe:1"
+            ], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
             seg_gen, _ = model.transcribe(
-                proc.stdout,
-                word_timestamps=True,
-                **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {}),
+                p.stdout, word_timestamps=True,
+                **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {})
             )
-            proc.stdout.close()
-            proc.wait()
-            chunk_segs = list(seg_gen)
-            for s in chunk_segs:
-                s.start += offset
-                s.end += offset
-            all_segs.extend(chunk_segs)
-            offset += this_len
-
-    # raw transcript segments
-    transcript_data = [{"start": s.start, "end": s.end, "text": s.text} for s in all_segs]
-    transcript_data.sort(key=lambda x: x["start"])
-
-    # diarize & merge speakers
+            p.stdout.close(); p.wait()
+            chunk = list(seg_gen)
+            for s in chunk:
+                s.start += offset; s.end += offset
+            all_segs.extend(chunk)
+            offset += length
+    raw = [{"start": s.start, "end": s.end, "text": s.text} for s in all_segs]
+    raw.sort(key=lambda x: x["start"])
+    # merge with diarization if есть
     diar_path = Path(settings.RESULTS_FOLDER) / upload_id / "diarization.json"
     diar = json.loads(diar_path.read_text()) if diar_path.exists() else []
-    merged = merge_speakers(transcript_data, diar)
-
-    # group into sentences
+    merged = merge_speakers(raw, diar)
     sentences = group_into_sentences(merged)
-
-    # write out and send
-    out_dir = Path(settings.RESULTS_FOLDER) / upload_id
-    out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / "transcript_sentences.json").write_text(
-        json.dumps(sentences, ensure_ascii=False, indent=2)
-    )
+    out = Path(settings.RESULTS_FOLDER) / upload_id
+    (out / "transcript.json").write_text(json.dumps(sentences, ensure_ascii=False, indent=2))
     r.publish(f"progress:{upload_id}", json.dumps({"status": "transcript_done"}))
-    send_webhook_event("transcription_completed", upload_id, {"transcript": sentences})
-    logger.info(
-        f"[{datetime.utcnow().isoformat()}] [{cid}] transcribe_segments done in "
-        f"{time.perf_counter() - stage_t0:.2f}s for {upload_id}"
-    )
-
+    deliver_webhook.delay("transcription_completed", upload_id, {"transcript": sentences})
 
 @app.task(bind=True, queue="diarize_gpu")
 def diarize_full(self, upload_id, correlation_id):
-    cid = correlation_id or "?"
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
-
-    logger.info(f"[{datetime.utcnow().isoformat()}] [{cid}] diarize_full start for {upload_id}")
-    stage_t0 = time.perf_counter()
-    send_webhook_event("diarization_started", upload_id, None)
     r.publish(f"progress:{upload_id}", json.dumps({"status": "diarize_started"}))
-
-    device = settings.WHISPER_DEVICE.lower()
-    if not _PN_AVAILABLE or not device.startswith("cuda"):
-        logger.error(f"[{datetime.utcnow().isoformat()}] [{cid}] diarize_unavailable")
-        send_webhook_event("processing_failed", upload_id, None)
+    deliver_webhook.delay("diarization_started", upload_id, None)
+    wav, duration = prepare_wav(upload_id)
+    if not _PN_AVAILABLE:
+        deliver_webhook.delay("processing_failed", upload_id, None)
         return
-
-    try:
-        wav_path, duration = prepare_wav(upload_id)
-        pipeline = get_diarization_pipeline()
-
-        segs: List[Dict[str, Any]] = []
-        chunk_limit = getattr(settings, "DIARIZATION_CHUNK_LENGTH_S", 0)
-
-        if chunk_limit and duration > chunk_limit:
-            offset = 0.0
-            while offset < duration:
-                this_len = min(chunk_limit, duration - offset)
-                tmp = Path(settings.DIARIZER_CACHE_DIR) / f"{upload_id}_chunk_{offset:.0f}.wav"
-                subprocess.run(
-                    [
-                        "ffmpeg", "-y", "-threads", str(settings.FFMPEG_THREADS//2 or 1),
-                        "-ss", str(offset), "-t", str(this_len),
-                        "-i", str(wav_path), str(tmp)
-                    ],
-                    check=True, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL
-                )
-                ann = pipeline(str(tmp))
-                for s, _, spk in ann.itertracks(yield_label=True):
-                    segs.append({
-                        "start": float(s.start)+offset,
-                        "end":   float(s.end)+offset,
-                        "speaker": spk
-                    })
-                tmp.unlink(missing_ok=True)
-                offset += this_len
-        else:
-            ann = pipeline(str(wav_path))
+    pipeline = get_diarization_pipeline()
+    raw: List[Dict[str, Any]] = []
+    chunk_limit = getattr(settings, "DIARIZATION_CHUNK_LENGTH_S", 0)
+    if chunk_limit and duration > chunk_limit:
+        offset = 0.0
+        while offset < duration:
+            this_len = min(chunk_limit, duration - offset)
+            tmp = Path(settings.DIARIZER_CACHE_DIR) / f"{upload_id}_chunk_{int(offset)}.wav"
+            subprocess.run([
+                "ffmpeg","-y","-threads",str(max(1, settings.FFMPEG_THREADS//2)),
+                "-ss",str(offset),"-t",str(this_len),
+                "-i",str(wav),str(tmp)
+            ], check=True, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+            ann = pipeline(str(tmp))
             for s, _, spk in ann.itertracks(yield_label=True):
-                segs.append({
-                    "start": float(s.start),
-                    "end":   float(s.end),
-                    "speaker": spk
-                })
-
-    except Exception as e:
-        logger.error(f"[{datetime.utcnow().isoformat()}] [{cid}] diarize_error: {e}", exc_info=True)
-        r.publish(f"progress:{upload_id}", json.dumps({"status": "error", "error": str(e)}))
-        send_webhook_event("processing_failed", upload_id, None)
-        return
-
-    segs.sort(key=lambda x: x["start"])
-
-    # group contiguous by speaker
+                raw.append({"start": float(s.start)+offset, "end": float(s.end)+offset, "speaker": spk})
+            tmp.unlink(missing_ok=True)
+            offset += this_len
+    else:
+        ann = pipeline(str(wav))
+        for s, _, spk in ann.itertracks(yield_label=True):
+            raw.append({"start": float(s.start), "end": float(s.end), "speaker": spk})
+    raw.sort(key=lambda x: x["start"])
+    # merge contiguous by speaker
     diar_sentences = []
-    cur = None
-    for seg in segs:
-        if cur and seg["speaker"] == cur["speaker"] and abs(seg["start"] - cur["end"]) < 0.1:
-            cur["end"] = seg["end"]
+    buf = None
+    for seg in raw:
+        if buf and buf["speaker"] == seg["speaker"] and seg["start"] - buf["end"] < 0.1:
+            buf["end"] = seg["end"]
         else:
-            if cur:
-                diar_sentences.append(cur)
-            cur = {"start": seg["start"], "end": seg["end"], "speaker": seg["speaker"]}
-    if cur:
-        diar_sentences.append(cur)
-
-    # write out and send
-    out_dir = Path(settings.RESULTS_FOLDER) / upload_id
-    out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / "diarization_sentences.json").write_text(
-        json.dumps(diar_sentences, ensure_ascii=False, indent=2)
-    )
+            if buf:
+                diar_sentences.append(buf)
+            buf = dict(seg)
+    if buf:
+        diar_sentences.append(buf)
+    out = Path(settings.RESULTS_FOLDER) / upload_id
+    (out / "diarization.json").write_text(json.dumps(diar_sentences, ensure_ascii=False, indent=2))
     r.publish(f"progress:{upload_id}", json.dumps({"status": "diarization_done"}))
-    send_webhook_event("diarization_completed", upload_id, {"diarization": diar_sentences})
-    logger.info(
-        f"[{datetime.utcnow().isoformat()}] [{cid}] diarize_full done in "
-        f"{time.perf_counter() - stage_t0:.2f}s for {upload_id}"
-    )
+    deliver_webhook.delay("diarization_completed", upload_id, {"diarization": diar_sentences})
 
+@app.task(bind=True, queue="transcribe_cpu")
+def deliver_webhook(self, event_type: str, upload_id: str, data: Optional[Any]):
+    """
+    Отдельный CPU-таск для отправки HTTP-webhook’ов,
+    чтобы не блокировать GPU-воркеры.
+    """
+    send_webhook_event(event_type, upload_id, data)
 
 @app.task(bind=True, queue="transcribe_cpu")
 def cleanup_old_files(self):
