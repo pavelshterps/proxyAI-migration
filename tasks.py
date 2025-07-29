@@ -49,8 +49,8 @@ except ImportError as e:
 
 def send_webhook_event(event_type: str, upload_id: str, data: Optional[Any]):
     """
-    Собственно HTTP-запрос к внешнему webhook-endpoint.
-    Используется только внутри задачи deliver_webhook.
+    HTTP-запрос к внешнему webhook-endpoint.
+    Используется внутри deliver_webhook, чтобы не блокировать GPU-задачи.
     """
     url = settings.WEBHOOK_URL
     secret = settings.WEBHOOK_SECRET
@@ -93,7 +93,6 @@ def send_webhook_event(event_type: str, upload_id: str, data: Optional[Any]):
                 f"[{datetime.utcnow().isoformat()}] [WEBHOOK] {event_type} returned {code} "
                 f"(attempt {attempt}/{max_attempts}), retrying"
             )
-
         if attempt < max_attempts:
             time.sleep(30)
 
@@ -212,8 +211,12 @@ def merge_speakers(
         t0 = max(0.0, t["start"] - pad)
         t1 = t["end"] + pad
         i = bisect_left(starts, t1)
-        candidates = [d for d in diar[max(0, i - 8): i + 8] if not (d["end"] <= t0 or d["start"] >= t1)]
-        best = max(candidates, key=lambda d: max(0.0, min(d["end"], t1) - max(d["start"], t0))) if candidates else nearest(i, t0, t1)
+        candidates = [
+            d for d in diar[max(0, i - 8): i + 8]
+            if not (d["end"] <= t0 or d["start"] >= t1)
+        ]
+        best = (max(candidates, key=lambda d: max(0.0, min(d["end"], t1) - max(d["start"], t0)))
+                if candidates else nearest(i, t0, t1))
         out.append({**t, "speaker": best["speaker"]})
     return out
 
@@ -265,9 +268,7 @@ def preload_on_startup(**kwargs):
 @app.task(bind=True, queue="transcribe_cpu")
 def convert_to_wav_and_preview(self, upload_id, correlation_id):
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
-    # публикуем сразу в UI
     r.publish(f"progress:{upload_id}", json.dumps({"status": "processing_started"}))
-    # выносим webhook на CPU
     deliver_webhook.delay("processing_started", upload_id, None)
     try:
         prepare_wav(upload_id)
@@ -275,7 +276,6 @@ def convert_to_wav_and_preview(self, upload_id, correlation_id):
         r.publish(f"progress:{upload_id}", json.dumps({"status": "error", "error": str(e)}))
         deliver_webhook.delay("processing_failed", upload_id, None)
         return
-    from tasks import preview_transcribe
     preview_transcribe.delay(upload_id, correlation_id)
 
 @app.task(bind=True, queue="transcribe_gpu")
@@ -307,7 +307,6 @@ def preview_transcribe(self, upload_id, correlation_id):
     (out / "preview_transcript.json").write_text(json.dumps(preview, ensure_ascii=False, indent=2))
     r.publish(f"progress:{upload_id}", json.dumps({"status": "preview_done", "preview": preview}))
     deliver_webhook.delay("preview_completed", upload_id, {"preview": preview})
-    from tasks import transcribe_segments
     transcribe_segments.delay(upload_id, correlation_id)
 
 @app.task(bind=True, queue="transcribe_gpu")
@@ -343,7 +342,6 @@ def transcribe_segments(self, upload_id, correlation_id):
             offset += length
     raw = [{"start": s.start, "end": s.end, "text": s.text} for s in all_segs]
     raw.sort(key=lambda x: x["start"])
-    # merge with diarization if есть
     diar_path = Path(settings.RESULTS_FOLDER) / upload_id / "diarization.json"
     diar = json.loads(diar_path.read_text()) if diar_path.exists() else []
     merged = merge_speakers(raw, diar)
@@ -385,7 +383,6 @@ def diarize_full(self, upload_id, correlation_id):
         for s, _, spk in ann.itertracks(yield_label=True):
             raw.append({"start": float(s.start), "end": float(s.end), "speaker": spk})
     raw.sort(key=lambda x: x["start"])
-    # merge contiguous by speaker
     diar_sentences = []
     buf = None
     for seg in raw:
@@ -405,7 +402,7 @@ def diarize_full(self, upload_id, correlation_id):
 @app.task(bind=True, queue="transcribe_cpu")
 def deliver_webhook(self, event_type: str, upload_id: str, data: Optional[Any]):
     """
-    Отдельный CPU-таск для отправки HTTP-webhook’ов,
+    CPU-таск для отправки HTTP-webhook,
     чтобы не блокировать GPU-воркеры.
     """
     send_webhook_event(event_type, upload_id, data)
