@@ -84,7 +84,7 @@ services:
       - worker
       - --loglevel=info
       - --concurrency=${CPU_CONCURRENCY}
-      - --queues=transcribe_cpu
+      - --queues=transcribe_cpu,celery
     environment:
       - CELERY_BROKER_URL=${CELERY_BROKER_URL}
       - CELERY_RESULT_BACKEND=${CELERY_RESULT_BACKEND}
@@ -125,7 +125,7 @@ services:
       - worker
       - --loglevel=info
       - --concurrency=${GPU_CONCURRENCY}
-      - --queues=transcribe_gpu,diarize_gpu
+      - --queues=transcribe_gpu,diarize_gpu,celery
     environment:
       - CELERY_BROKER_URL=${CELERY_BROKER_URL}
       - CELERY_RESULT_BACKEND=${CELERY_RESULT_BACKEND}
@@ -167,7 +167,7 @@ services:
       - worker
       - --loglevel=info
       - --concurrency=${GPU_CONCURRENCY}
-      - --queues=transcribe_gpu,diarize_gpu
+      - --queues=transcribe_gpu,diarize_gpu,celery
     environment:
       - CELERY_BROKER_URL=${CELERY_BROKER_URL}
       - CELERY_RESULT_BACKEND=${CELERY_RESULT_BACKEND}
