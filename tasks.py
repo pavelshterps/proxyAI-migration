@@ -15,6 +15,60 @@ from celery import Task
 from celery_app import app
 from config.settings import settings
 
+def send_webhook_event(event_type: str, upload_id: str, data: Optional[Any]):
+    """
+    HTTP-запрос к внешнему webhook-endpoint.
+    Используется внутри deliver_webhook и в routes, чтобы не блокировать воркеры.
+    """
+    url = settings.WEBHOOK_URL
+    secret = settings.WEBHOOK_SECRET
+    if not url or not secret:
+        return
+
+    payload = {
+        "event_type": event_type,
+        "upload_id": upload_id,
+        "timestamp": datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+        "data": data,
+    }
+    headers = {"Content-Type": "application/json", "X-WebHook-Secret": secret}
+
+    max_attempts = 5
+    for attempt in range(1, max_attempts + 1):
+        try:
+            resp = requests.post(url, json=payload, headers=headers, timeout=(5, 30))
+        except requests.RequestException as e:
+            logger.warning(
+                f"[{datetime.utcnow().isoformat()}] [WEBHOOK] {event_type} network error "
+                f"(attempt {attempt}/{max_attempts}) for {upload_id}: {e}"
+            )
+        else:
+            code = resp.status_code
+            if 200 <= code < 300 or code == 405:
+                logger.info(
+                    f"[{datetime.utcnow().isoformat()}] [WEBHOOK] {event_type} "
+                    f"{'treated as success' if code == 405 else 'succeeded'} "
+                    f"(attempt {attempt}/{max_attempts}) for {upload_id}"
+                )
+                return
+            if 400 <= code < 500:
+                logger.error(
+                    f"[{datetime.utcnow().isoformat()}] [WEBHOOK] {event_type} returned {code} "
+                    f"for {upload_id}, aborting"
+                )
+                return
+            logger.warning(
+                f"[{datetime.utcnow().isoformat()}] [WEBHOOK] {event_type} returned {code} "
+                f"(attempt {attempt}/{max_attempts}), retrying"
+            )
+        if attempt < max_attempts:
+            time.sleep(30)
+
+    logger.error(
+        f"[{datetime.utcnow().isoformat()}] [WEBHOOK] {event_type} failed after "
+        f"{max_attempts} attempts for {upload_id}"
+    )
+
 # --- Logger setup ---
 logger = logging.getLogger(__name__)
 handler = logging.StreamHandler()
@@ -267,15 +321,16 @@ def transcribe_segments(self, upload_id, correlation_id):
     all_segs = []
     if duration <= settings.CHUNK_LENGTH_S:
         segs, _ = model.transcribe(str(wav), word_timestamps=True,
-            **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {}))
+            **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {})
+        )
         all_segs = list(segs)
     else:
         offset = 0.0
         while offset < duration:
             length = min(settings.CHUNK_LENGTH_S, duration - offset)
             p = subprocess.Popen([
-                "ffmpeg","-y","-threads",str(settings.FFMPEG_THREADS),
-                "-ss",str(offset),"-t",str(length),"-i",str(wav),"-f","wav","pipe:1"
+                "ffmpeg", "-y", "-threads", str(settings.FFMPEG_THREADS),
+                "-ss", str(offset), "-t", str(length), "-i", str(wav), "-f", "wav", "pipe:1"
             ], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
             seg_gen, _ = model.transcribe(
                 p.stdout, word_timestamps=True,
@@ -316,9 +371,9 @@ def diarize_full(self, upload_id, correlation_id):
             this_len = min(chunk_limit, duration - offset)
             tmp = Path(settings.DIARIZER_CACHE_DIR) / f"{upload_id}_chunk_{int(offset)}.wav"
             subprocess.run([
-                "ffmpeg","-y","-threads",str(max(1, settings.FFMPEG_THREADS//2)),
-                "-ss",str(offset),"-t",str(this_len),
-                "-i",str(wav),str(tmp)
+                "ffmpeg", "-y", "-threads", str(max(1, settings.FFMPEG_THREADS//2)),
+                "-ss", str(offset), "-t", str(this_len),
+                "-i", str(wav), str(tmp)
             ], check=True, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
             ann = pipeline(str(tmp))
             for s, _, spk in ann.itertracks(yield_label=True):
