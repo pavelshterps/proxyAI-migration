@@ -115,10 +115,7 @@ services:
       context: .
       dockerfile: Dockerfile.gpu
     container_name: proxyai_worker_gpu_1
-    # заменяем старый runtime: nvidia + NVIDIA_VISIBLE_DEVICES
-    # на современный блок gpus
-    gpus:
-      - "device=0"
+    runtime: nvidia
     mem_limit: 8g
     env_file: .env
     command:
@@ -139,6 +136,7 @@ services:
       - HUGGINGFACE_CACHE_DIR=/hf_cache
       - WHISPER_MODEL_PATH=${WHISPER_MODEL_PATH}
       - WHISPER_DEVICE=cuda
+      - NVIDIA_VISIBLE_DEVICES=0
       - WEBHOOK_URL=${WEBHOOK_URL}
       - WEBHOOK_SECRET=${WEBHOOK_SECRET}
     volumes:
@@ -159,9 +157,7 @@ services:
       context: .
       dockerfile: Dockerfile.gpu
     container_name: proxyai_worker_gpu_2
-    # аналогично: оба воркера используют GPU 0
-    gpus:
-      - "device=0"
+    runtime: nvidia
     mem_limit: 8g
     env_file: .env
     command:
@@ -182,6 +178,7 @@ services:
       - HUGGINGFACE_CACHE_DIR=/hf_cache
       - WHISPER_MODEL_PATH=${WHISPER_MODEL_PATH}
       - WHISPER_DEVICE=cuda
+      - NVIDIA_VISIBLE_DEVICES=1
       - WEBHOOK_URL=${WEBHOOK_URL}
       - WEBHOOK_SECRET=${WEBHOOK_SECRET}
     volumes:
