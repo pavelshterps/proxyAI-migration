@@ -15,6 +15,39 @@ from celery import Task
 from celery_app import app
 from config.settings import settings
 
+# --- Logger setup ---
+logger = logging.getLogger(__name__)
+handler = logging.StreamHandler()
+formatter = logging.Formatter(
+    "%(asctime)s %(levelname)s [%(name)s] %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S",
+)
+handler.setFormatter(formatter)
+logger.addHandler(handler)
+logger.setLevel(logging.INFO)
+
+# --- Model availability flags & holders ---
+_HF_AVAILABLE = False
+_PN_AVAILABLE = False
+_whisper_model = None
+_diarization_pipeline = None
+
+try:
+    from faster_whisper import WhisperModel, download_model
+    _HF_AVAILABLE = True
+    logger.info("[INIT] faster-whisper available")
+except ImportError as e:
+    logger.warning(f"[INIT] faster-whisper not available: {e}")
+
+try:
+    from pyannote.audio import Pipeline as PyannotePipeline
+    _PN_AVAILABLE = True
+    logger.info("[INIT] pyannote.audio available")
+except ImportError as e:
+    logger.warning(f"[INIT] pyannote.audio not available: {e}")
+
+# ---------------------- Helpers ----------------------
+
 def send_webhook_event(event_type: str, upload_id: str, data: Optional[Any]):
     """
     HTTP-запрос к внешнему webhook-endpoint.
@@ -68,39 +101,6 @@ def send_webhook_event(event_type: str, upload_id: str, data: Optional[Any]):
         f"[{datetime.utcnow().isoformat()}] [WEBHOOK] {event_type} failed after "
         f"{max_attempts} attempts for {upload_id}"
     )
-
-# --- Logger setup ---
-logger = logging.getLogger(__name__)
-handler = logging.StreamHandler()
-formatter = logging.Formatter(
-    "%(asctime)s %(levelname)s [%(name)s] %(message)s",
-    datefmt="%Y-%m-%dT%H:%M:%S",
-)
-handler.setFormatter(formatter)
-logger.addHandler(handler)
-logger.setLevel(logging.INFO)
-
-# --- Model availability flags & holders ---
-_HF_AVAILABLE = False
-_PN_AVAILABLE = False
-_whisper_model = None
-_diarization_pipeline = None
-
-try:
-    from faster_whisper import WhisperModel, download_model
-    _HF_AVAILABLE = True
-    logger.info("[INIT] faster-whisper available")
-except ImportError as e:
-    logger.warning(f"[INIT] faster-whisper not available: {e}")
-
-try:
-    from pyannote.audio import Pipeline as PyannotePipeline
-    _PN_AVAILABLE = True
-    logger.info("[INIT] pyannote.audio available")
-except ImportError as e:
-    logger.warning(f"[INIT] pyannote.audio not available: {e}")
-
-# ---------------------- Helpers ----------------------
 
 def probe_audio(src: Path) -> dict:
     res = subprocess.run(
@@ -317,10 +317,13 @@ def transcribe_segments(self, upload_id, correlation_id):
     if not _HF_AVAILABLE:
         deliver_webhook.delay("processing_failed", upload_id, None)
         return
+
     model = get_whisper_model()
     all_segs = []
     if duration <= settings.CHUNK_LENGTH_S:
-        segs, _ = model.transcribe(str(wav), word_timestamps=True,
+        segs, _ = model.transcribe(
+            str(wav),
+            word_timestamps=True,
             **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {})
         )
         all_segs = list(segs)
@@ -333,7 +336,8 @@ def transcribe_segments(self, upload_id, correlation_id):
                 "-ss", str(offset), "-t", str(length), "-i", str(wav), "-f", "wav", "pipe:1"
             ], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
             seg_gen, _ = model.transcribe(
-                p.stdout, word_timestamps=True,
+                p.stdout,
+                word_timestamps=True,
                 **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {})
             )
             p.stdout.close(); p.wait()
@@ -342,14 +346,49 @@ def transcribe_segments(self, upload_id, correlation_id):
                 s.start += offset; s.end += offset
             all_segs.extend(chunk)
             offset += length
+
+    # raw speech segments
     raw = [{"start": s.start, "end": s.end, "text": s.text} for s in all_segs]
     raw.sort(key=lambda x: x["start"])
+
+    # inline diarization if none exists on disk
     diar_path = Path(settings.RESULTS_FOLDER) / upload_id / "diarization.json"
-    diar = json.loads(diar_path.read_text()) if diar_path.exists() else []
+    if diar_path.exists():
+        diar = json.loads(diar_path.read_text())
+    elif _PN_AVAILABLE:
+        try:
+            pipeline = get_diarization_pipeline()
+            ann = pipeline(str(wav))
+            temp = []
+            for s, _, spk in ann.itertracks(yield_label=True):
+                temp.append({"start": float(s.start), "end": float(s.end), "speaker": spk})
+            # merge close segments
+            temp.sort(key=lambda x: x["start"])
+            diar = []
+            buf = None
+            for seg in temp:
+                if buf and buf["speaker"] == seg["speaker"] and seg["start"] - buf["end"] < 0.1:
+                    buf["end"] = seg["end"]
+                else:
+                    if buf:
+                        diar.append(buf)
+                    buf = dict(seg)
+            if buf:
+                diar.append(buf)
+        except Exception:
+            diar = []
+    else:
+        diar = []
+
+    # merge speakers + group into sentences
     merged = merge_speakers(raw, diar)
     sentences = group_into_sentences(merged)
+
+    # save transcript
     out = Path(settings.RESULTS_FOLDER) / upload_id
+    out.mkdir(parents=True, exist_ok=True)
     (out / "transcript.json").write_text(json.dumps(sentences, ensure_ascii=False, indent=2))
+
     r.publish(f"progress:{upload_id}", json.dumps({"status": "transcript_done"}))
     deliver_webhook.delay("transcription_completed", upload_id, {"transcript": sentences})
 
@@ -362,6 +401,7 @@ def diarize_full(self, upload_id, correlation_id):
     if not _PN_AVAILABLE:
         deliver_webhook.delay("processing_failed", upload_id, None)
         return
+
     pipeline = get_diarization_pipeline()
     raw: List[Dict[str, Any]] = []
     chunk_limit = getattr(settings, "DIARIZATION_CHUNK_LENGTH_S", 0)
@@ -384,6 +424,7 @@ def diarize_full(self, upload_id, correlation_id):
         ann = pipeline(str(wav))
         for s, _, spk in ann.itertracks(yield_label=True):
             raw.append({"start": float(s.start), "end": float(s.end), "speaker": spk})
+
     raw.sort(key=lambda x: x["start"])
     diar_sentences = []
     buf = None
@@ -396,8 +437,11 @@ def diarize_full(self, upload_id, correlation_id):
             buf = dict(seg)
     if buf:
         diar_sentences.append(buf)
+
     out = Path(settings.RESULTS_FOLDER) / upload_id
+    out.mkdir(parents=True, exist_ok=True)
     (out / "diarization.json").write_text(json.dumps(diar_sentences, ensure_ascii=False, indent=2))
+
     r.publish(f"progress:{upload_id}", json.dumps({"status": "diarization_done"}))
     deliver_webhook.delay("diarization_completed", upload_id, {"diarization": diar_sentences})
 
