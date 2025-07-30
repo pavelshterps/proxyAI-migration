@@ -1,7 +1,6 @@
 import json
 import logging
 import subprocess
-import threading
 import time
 import re
 from datetime import datetime, timedelta
@@ -185,12 +184,10 @@ def group_into_sentences(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]
         if not txt:
             continue
 
-        # если буфер пуст — стартуем новое предложение
         if buf["start"] is None:
             buf["start"] = seg["start"]
             buf["speaker"] = seg.get("speaker")
 
-        # пауза больше порога — заканчиваем предложение
         if buf["end"] is not None and (seg["start"] - buf["end"] > SILENCE_GAP_S):
             flush_buffer()
             buf["start"] = seg["start"]
@@ -199,14 +196,10 @@ def group_into_sentences(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]
         buf["end"] = seg["end"]
         buf["text"].append(txt)
 
-        # считаем слова в буфере
         word_count = sum(len(t.split()) for t in buf["text"])
-
-        # если встретили точку в конце ИЛИ достигли лимита слов — закрываем
         if sentence_end_re.search(txt) or word_count >= MAX_WORDS:
             flush_buffer()
 
-    # остаток
     flush_buffer()
     return sentences
 
@@ -215,12 +208,17 @@ def merge_speakers(
     diar: List[Dict[str, Any]],
     pad: float = 0.2,
 ) -> List[Dict[str, Any]]:
-    # ... здесь без изменений та же самая логика, как раньше
+    """
+    Сливаем список фраз транскрипции и дорожки диаризации по времени.
+    Возвращаем те же сегменты, но с полем 'speaker'.
+    """
     if not diar:
         return [{**t, "speaker": None} for t in transcript]
+
     diar = sorted(diar, key=lambda d: d["start"])
     transcript = sorted(transcript, key=lambda t: t["start"])
     starts = [d["start"] for d in diar]
+
     from bisect import bisect_left
     def nearest(idx: int, t0: float, t1: float):
         if idx <= 0:
@@ -231,22 +229,22 @@ def merge_speakers(
         db = max(0.0, t0 - b["end"])
         da = max(0.0, a["start"] - t1)
         return b if db <= da else a
+
     out = []
     for t in transcript:
         t0 = max(0.0, t["start"] - pad)
         t1 = t["end"] + pad
         i = bisect_left(starts, t1)
-        candidates = [
+        cands = [
             d for d in diar[max(0, i - 8): i + 8]
             if not (d["end"] <= t0 or d["start"] >= t1)
         ]
-        best = (max(candidates, key=lambda d: max(0.0, min(d["end"], t1) - max(d["start"], t0)))
-                if candidates else nearest(i, t0, t1))
+        best = max(cands, key=lambda d: max(0.0, min(d["end"], t1) - max(d["start"], t0))) \
+               if cands else nearest(i, t0, t1)
         out.append({**t, "speaker": best["speaker"]})
     return out
 
 def get_whisper_model(model_override: str = None):
-    # ... без изменений
     global _whisper_model
     device = settings.WHISPER_DEVICE.lower()
     compute = getattr(
@@ -272,7 +270,6 @@ def get_whisper_model(model_override: str = None):
     return _whisper_model
 
 def get_diarization_pipeline():
-    # ... без изменений
     global _diarization_pipeline
     if _diarization_pipeline is None:
         model_id = getattr(settings, "PYANNOTE_PIPELINE", "pyannote/speaker-diarization-3.1")
@@ -294,21 +291,25 @@ def preload_on_startup(**kwargs):
 
 @app.task(bind=True, queue="transcribe_cpu")
 def convert_to_wav_and_preview(self, upload_id, correlation_id):
-    # ... без изменений
+    logger.info(f"[{upload_id}] convert_to_wav_and_preview received")
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
     r.publish(f"progress:{upload_id}", json.dumps({"status": "processing_started"}))
     deliver_webhook.delay("processing_started", upload_id, None)
+
     try:
+        logger.info(f"[{upload_id}] preparing WAV")
         prepare_wav(upload_id)
+        logger.info(f"[{upload_id}] WAV ready")
     except Exception as e:
         r.publish(f"progress:{upload_id}", json.dumps({"status": "error", "error": str(e)}))
         deliver_webhook.delay("processing_failed", upload_id, None)
         return
+
     preview_transcribe.delay(upload_id, correlation_id)
 
 @app.task(bind=True, queue="transcribe_gpu")
 def preview_transcribe(self, upload_id, correlation_id):
-    # ... без изменений
+    # Точно как было в старом коде
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
     proc = prepare_preview_segment(upload_id)
     model = get_whisper_model()
@@ -333,7 +334,9 @@ def preview_transcribe(self, upload_id, correlation_id):
     }
     out = Path(settings.RESULTS_FOLDER) / upload_id
     out.mkdir(parents=True, exist_ok=True)
-    (out / "preview_transcript.json").write_text(json.dumps(preview, ensure_ascii=False, indent=2))
+    (out / "preview_transcript.json").write_text(
+        json.dumps(preview, ensure_ascii=False, indent=2)
+    )
     r.publish(f"progress:{upload_id}", json.dumps({"status": "preview_done", "preview": preview}))
     deliver_webhook.delay("preview_completed", upload_id, {"preview": preview})
     transcribe_segments.delay(upload_id, correlation_id)
@@ -341,9 +344,12 @@ def preview_transcribe(self, upload_id, correlation_id):
 @app.task(bind=True, queue="transcribe_gpu")
 def transcribe_segments(self, upload_id, correlation_id):
     """
-    Полная транскрипция БЕЗ принудительной диаризации:
-    просто сегменты → group_into_sentences(…) с новыми критериями.
+    Здесь включён VAD для всей транскрипции.
+    Короткие файлы — единый проход с vad_filter=True,
+    длинные — режем на чанки и каждый прогоняем через vad.
+    Формат вывода — точно такой же, как у preview_transcribe (list предложений).
     """
+    logger.info(f"[{upload_id}] transcribe_segments received")
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
     wav, duration = prepare_wav(upload_id)
     if not _HF_AVAILABLE:
@@ -351,55 +357,84 @@ def transcribe_segments(self, upload_id, correlation_id):
         return
 
     model = get_whisper_model()
-    all_segs = []
-    if duration <= settings.CHUNK_LENGTH_S:
+    raw_segs: List[Any] = []
+
+    def _transcribe_with_vad(source, offset: float = 0.0):
         segs, _ = model.transcribe(
-            str(wav), word_timestamps=True,
-            **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {})
+            source,
+            word_timestamps=True,
+            vad_filter=True,
+            vad_parameters={
+                "min_silence_duration_ms": int(settings.SENTENCE_MAX_GAP_S * 1000),
+                "speech_pad_ms": 200,
+            },
+            **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {}),
         )
-        all_segs = list(segs)
+        result = []
+        for s in segs:
+            s.start += offset
+            s.end += offset
+            result.append(s)
+        return result
+
+    if duration <= settings.VAD_MAX_LENGTH_S:
+        logger.info(f"[{upload_id}] short audio ({duration:.1f}s) → single VAD pass")
+        raw_segs = _transcribe_with_vad(str(wav))
     else:
+        logger.info(f"[{upload_id}] long audio ({duration:.1f}s) → chunking at {settings.CHUNK_LENGTH_S}s")
         offset = 0.0
         while offset < duration:
             length = min(settings.CHUNK_LENGTH_S, duration - offset)
-            p = subprocess.Popen([
-                "ffmpeg", "-y", "-threads", str(settings.FFMPEG_THREADS),
-                "-ss", str(offset), "-t", str(length), "-i", str(wav), "-f", "wav", "pipe:1"
-            ], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-            seg_gen, _ = model.transcribe(
-                p.stdout, word_timestamps=True,
-                **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {})
+            logger.debug(f"[{upload_id}] chunk {offset:.1f}s→{offset+length:.1f}s")
+            p = subprocess.Popen(
+                [
+                    "ffmpeg", "-y",
+                    "-threads", str(settings.FFMPEG_THREADS),
+                    "-ss", str(offset), "-t", str(length),
+                    "-i", str(wav), "-f", "wav", "pipe:1"
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL
             )
+            chunk_segs = _transcribe_with_vad(p.stdout, offset)
             p.stdout.close(); p.wait()
-            chunk = list(seg_gen)
-            for s in chunk:
-                s.start += offset; s.end += offset
-            all_segs.extend(chunk)
+            raw_segs.extend(chunk_segs)
             offset += length
 
-    raw = [{"start": s.start, "end": s.end, "text": s.text} for s in all_segs]
-    raw.sort(key=lambda x: x["start"])
-    sentences = group_into_sentences(raw)
+    # Приводим к списку словарей и сортируем
+    flat = [{"start": s.start, "end": s.end, "text": s.text} for s in raw_segs]
+    flat.sort(key=lambda x: x["start"])
+
+    # Группируем в предложения
+    sentences = group_into_sentences(flat)
+
+    # Сохраняем в старом формате — список предложений
     out = Path(settings.RESULTS_FOLDER) / upload_id
-    (out / "transcript.json").write_text(json.dumps(sentences, ensure_ascii=False, indent=2))
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "transcript.json").write_text(
+        json.dumps(sentences, ensure_ascii=False, indent=2)
+    )
+
+    logger.info(f"[{upload_id}] transcription completed ({len(sentences)} sentences)")
     r.publish(f"progress:{upload_id}", json.dumps({"status": "transcript_done"}))
     deliver_webhook.delay("transcription_completed", upload_id, {"transcript": sentences})
 
 @app.task(bind=True, queue="diarize_gpu")
 def diarize_full(self, upload_id, correlation_id):
-    """
-    Диаризация по запросу: не трогаем уже готовый transcript.json.
-    """
+    # Точно как в старом коде
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
     r.publish(f"progress:{upload_id}", json.dumps({"status": "diarize_started"}))
     deliver_webhook.delay("diarization_started", upload_id, None)
+
     wav, duration = prepare_wav(upload_id)
     if not _PN_AVAILABLE:
         deliver_webhook.delay("processing_failed", upload_id, None)
         return
+
     pipeline = get_diarization_pipeline()
     raw: List[Dict[str, Any]] = []
     chunk_limit = getattr(settings, "DIARIZATION_CHUNK_LENGTH_S", 0)
+
     if chunk_limit and duration > chunk_limit:
         offset = 0.0
         while offset < duration:
@@ -434,6 +469,7 @@ def diarize_full(self, upload_id, correlation_id):
         diar_sentences.append(buf)
 
     out = Path(settings.RESULTS_FOLDER) / upload_id
+    out.mkdir(parents=True, exist_ok=True)
     (out / "diarization.json").write_text(json.dumps(diar_sentences, ensure_ascii=False, indent=2))
     r.publish(f"progress:{upload_id}", json.dumps({"status": "diarization_done"}))
     deliver_webhook.delay("diarization_completed", upload_id, {"diarization": diar_sentences})
