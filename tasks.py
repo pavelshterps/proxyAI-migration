@@ -1,3 +1,4 @@
+# tasks.py
 import json
 import logging
 import subprocess
@@ -58,7 +59,6 @@ def send_webhook_event(event_type: str, upload_id: str, data: Optional[Any]):
     secret = settings.WEBHOOK_SECRET
     if not url or not secret:
         return
-
     payload = {
         "event_type": event_type,
         "upload_id": upload_id,
@@ -66,48 +66,33 @@ def send_webhook_event(event_type: str, upload_id: str, data: Optional[Any]):
         "data": data,
     }
     headers = {"Content-Type": "application/json", "X-WebHook-Secret": secret}
-
     max_attempts = 5
     for attempt in range(1, max_attempts + 1):
         try:
             resp = requests.post(url, json=payload, headers=headers, timeout=(5, 30))
         except requests.RequestException as e:
             logger.warning(
-                f"[{datetime.utcnow().isoformat()}] [WEBHOOK] {event_type} network error "
+                f"[{datetime.utcnow().isoformat()}] [WEBHOOK] network error "
                 f"(attempt {attempt}/{max_attempts}) for {upload_id}: {e}"
             )
         else:
             code = resp.status_code
             if 200 <= code < 300 or code == 405:
-                logger.info(
-                    f"[{datetime.utcnow().isoformat()}] [WEBHOOK] {event_type} "
-                    f"{'treated as success' if code == 405 else 'succeeded'} "
-                    f"(attempt {attempt}/{max_attempts}) for {upload_id}"
-                )
+                logger.info(f"[{datetime.utcnow().isoformat()}] [WEBHOOK] {event_type} succeeded ({code})")
                 return
             if 400 <= code < 500:
-                logger.error(
-                    f"[{datetime.utcnow().isoformat()}] [WEBHOOK] {event_type} returned {code} "
-                    f"for {upload_id}, aborting"
-                )
+                logger.error(f"[{datetime.utcnow().isoformat()}] [WEBHOOK] {event_type} returned {code}, aborting")
                 return
-            logger.warning(
-                f"[{datetime.utcnow().isoformat()}] [WEBHOOK] {event_type} returned {code} "
-                f"(attempt {attempt}/{max_attempts}), retrying"
-            )
+            logger.warning(f"[{datetime.utcnow().isoformat()}] [WEBHOOK] {event_type} returned {code}, retrying")
         if attempt < max_attempts:
             time.sleep(30)
-
-    logger.error(
-        f"[{datetime.utcnow().isoformat()}] [WEBHOOK] {event_type} failed after "
-        f"{max_attempts} attempts for {upload_id}"
-    )
+    logger.error(f"[{datetime.utcnow().isoformat()}] [WEBHOOK] {event_type} failed after {max_attempts} attempts")
 
 def probe_audio(src: Path) -> dict:
     res = subprocess.run(
-        ["ffprobe", "-v", "error", "-print_format", "json", "-show_format", "-show_streams", str(src)],
-        capture_output=True,
-        text=True
+        ["ffprobe", "-v", "error", "-print_format", "json",
+         "-show_format", "-show_streams", str(src)],
+        capture_output=True, text=True
     )
     info = {"duration": 0.0}
     try:
@@ -116,9 +101,9 @@ def probe_audio(src: Path) -> dict:
         for s in j.get("streams", []):
             if s.get("codec_type") == "audio":
                 info.update({
-                    "codec_name": s.get("codec_name"),
+                    "codec_name":  s.get("codec_name"),
                     "sample_rate": int(s.get("sample_rate", 0)),
-                    "channels": int(s.get("channels", 0)),
+                    "channels":    int(s.get("channels", 0)),
                 })
                 break
     except Exception:
@@ -129,8 +114,7 @@ def prepare_wav(upload_id: str) -> (Path, float):
     src = next(Path(settings.UPLOAD_FOLDER).glob(f"{upload_id}.*"))
     target = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
     info = probe_audio(src)
-    duration = info["duration"]
-
+    duration = info.get("duration", 0.0)
     if (
         src.suffix.lower() == ".wav"
         and info.get("codec_name") == "pcm_s16le"
@@ -140,7 +124,6 @@ def prepare_wav(upload_id: str) -> (Path, float):
         if src != target:
             src.rename(target)
         return target, duration
-
     subprocess.run([
         "ffmpeg", "-y", "-threads", str(settings.FFMPEG_THREADS),
         "-i", str(src),
@@ -160,54 +143,48 @@ def prepare_preview_segment(upload_id: str) -> subprocess.Popen:
 
 def group_into_sentences(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
-    Группируем по «знакам препинания» ИЛИ по паузам > SILENCE_GAP_S ИЛИ по длине > MAX_WORDS.
+    Разбивка по знакам препинания, паузам, числу слов и длительности.
     """
-    SILENCE_GAP_S = getattr(settings, "SENTENCE_MAX_GAP_S", 0.5)
-    MAX_WORDS     = getattr(settings, "SENTENCE_MAX_WORDS", 50)
+    SILENCE_GAP_S  = settings.SENTENCE_MAX_GAP_S
+    MAX_WORDS      = settings.SENTENCE_MAX_WORDS
+    MAX_DURATION_S = settings.SENTENCE_MAX_DURATION_S
 
-    sentences = []
-    buf = {"start": None, "end": None, "speaker": None, "text": []}
     sentence_end_re = re.compile(r"[\.!\?]$")
+    sentences = []
+    buf = {"start": None, "end": None, "text": []}
 
-    def flush_buffer():
+    def flush():
         if buf["text"] and buf["start"] is not None:
             sentences.append({
                 "start": buf["start"],
-                "end": buf["end"],
-                "speaker": buf["speaker"],
-                "text": " ".join(buf["text"]),
+                "end":   buf["end"],
+                "text":  " ".join(buf["text"])
             })
-        buf["start"] = buf["end"] = buf["speaker"] = None
-        buf["text"] = []
+        buf["start"] = buf["end"] = None
+        buf["text"].clear()
 
     for seg in segments:
         txt = seg["text"].strip()
         if not txt:
             continue
 
-        # если буфер пуст — стартуем новое предложение
         if buf["start"] is None:
             buf["start"] = seg["start"]
-            buf["speaker"] = seg.get("speaker")
 
-        # пауза больше порога — заканчиваем предложение
         if buf["end"] is not None and (seg["start"] - buf["end"] > SILENCE_GAP_S):
-            flush_buffer()
+            flush()
             buf["start"] = seg["start"]
-            buf["speaker"] = seg.get("speaker")
 
         buf["end"] = seg["end"]
         buf["text"].append(txt)
 
-        # считаем слова в буфере
         word_count = sum(len(t.split()) for t in buf["text"])
+        dur = buf["end"] - buf["start"]
 
-        # если встретили точку в конце ИЛИ достигли лимита слов — закрываем
-        if sentence_end_re.search(txt) or word_count >= MAX_WORDS:
-            flush_buffer()
+        if sentence_end_re.search(txt) or word_count >= MAX_WORDS or dur >= MAX_DURATION_S:
+            flush()
 
-    # остаток
-    flush_buffer()
+    flush()
     return sentences
 
 def merge_speakers(
@@ -215,13 +192,13 @@ def merge_speakers(
     diar: List[Dict[str, Any]],
     pad: float = 0.2,
 ) -> List[Dict[str, Any]]:
-    # ... здесь без изменений та же самая логика, как раньше
     if not diar:
         return [{**t, "speaker": None} for t in transcript]
     diar = sorted(diar, key=lambda d: d["start"])
     transcript = sorted(transcript, key=lambda t: t["start"])
     starts = [d["start"] for d in diar]
     from bisect import bisect_left
+
     def nearest(idx: int, t0: float, t1: float):
         if idx <= 0:
             return diar[0]
@@ -231,6 +208,7 @@ def merge_speakers(
         db = max(0.0, t0 - b["end"])
         da = max(0.0, a["start"] - t1)
         return b if db <= da else a
+
     out = []
     for t in transcript:
         t0 = max(0.0, t["start"] - pad)
@@ -240,13 +218,13 @@ def merge_speakers(
             d for d in diar[max(0, i - 8): i + 8]
             if not (d["end"] <= t0 or d["start"] >= t1)
         ]
-        best = (max(candidates, key=lambda d: max(0.0, min(d["end"], t1) - max(d["start"], t0)))
+        best = (max(candidates,
+                    key=lambda d: max(0.0, min(d["end"], t1) - max(d["start"], t0)))
                 if candidates else nearest(i, t0, t1))
         out.append({**t, "speaker": best["speaker"]})
     return out
 
 def get_whisper_model(model_override: str = None):
-    # ... без изменений
     global _whisper_model
     device = settings.WHISPER_DEVICE.lower()
     compute = getattr(
@@ -272,7 +250,6 @@ def get_whisper_model(model_override: str = None):
     return _whisper_model
 
 def get_diarization_pipeline():
-    # ... без изменений
     global _diarization_pipeline
     if _diarization_pipeline is None:
         model_id = getattr(settings, "PYANNOTE_PIPELINE", "pyannote/speaker-diarization-3.1")
@@ -294,7 +271,6 @@ def preload_on_startup(**kwargs):
 
 @app.task(bind=True, queue="transcribe_cpu")
 def convert_to_wav_and_preview(self, upload_id, correlation_id):
-    # ... без изменений
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
     r.publish(f"progress:{upload_id}", json.dumps({"status": "processing_started"}))
     deliver_webhook.delay("processing_started", upload_id, None)
@@ -308,14 +284,13 @@ def convert_to_wav_and_preview(self, upload_id, correlation_id):
 
 @app.task(bind=True, queue="transcribe_gpu")
 def preview_transcribe(self, upload_id, correlation_id):
-    # ... без изменений
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
     proc = prepare_preview_segment(upload_id)
     model = get_whisper_model()
     segments_gen, _ = model.transcribe(
         proc.stdout,
         word_timestamps=True,
-        **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {}),
+        **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {})
     )
     proc.stdout.close(); proc.wait()
     segments = list(segments_gen)
@@ -341,8 +316,7 @@ def preview_transcribe(self, upload_id, correlation_id):
 @app.task(bind=True, queue="transcribe_gpu")
 def transcribe_segments(self, upload_id, correlation_id):
     """
-    Полная транскрипция БЕЗ принудительной диаризации:
-    просто сегменты → group_into_sentences(…) с новыми критериями.
+    Транскрипция с VAD-фильтром (или по чанкам, если >VAD_MAX_LENGTH_S).
     """
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
     wav, duration = prepare_wav(upload_id)
@@ -351,45 +325,57 @@ def transcribe_segments(self, upload_id, correlation_id):
         return
 
     model = get_whisper_model()
-    all_segs = []
-    if duration <= settings.CHUNK_LENGTH_S:
+    raw_segs: List[Any] = []
+
+    if duration <= settings.VAD_MAX_LENGTH_S:
         segs, _ = model.transcribe(
-            str(wav), word_timestamps=True,
+            str(wav),
+            word_timestamps=True,
+            vad_filter=True,
+            vad_parameters={
+                "min_silence_duration_ms": int(settings.SENTENCE_MAX_GAP_S * 1000),
+                "speech_pad_ms": 200,
+            },
             **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {})
         )
-        all_segs = list(segs)
+        raw_segs = segs
     else:
         offset = 0.0
         while offset < duration:
             length = min(settings.CHUNK_LENGTH_S, duration - offset)
             p = subprocess.Popen([
                 "ffmpeg", "-y", "-threads", str(settings.FFMPEG_THREADS),
-                "-ss", str(offset), "-t", str(length), "-i", str(wav), "-f", "wav", "pipe:1"
+                "-ss", str(offset), "-t", str(length),
+                "-i", str(wav), "-f", "wav", "pipe:1"
             ], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-            seg_gen, _ = model.transcribe(
-                p.stdout, word_timestamps=True,
+            segs, _ = model.transcribe(
+                p.stdout,
+                word_timestamps=True,
+                vad_filter=True,
+                vad_parameters={
+                    "min_silence_duration_ms": int(settings.SENTENCE_MAX_GAP_S * 1000),
+                    "speech_pad_ms": 200,
+                },
                 **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {})
             )
             p.stdout.close(); p.wait()
-            chunk = list(seg_gen)
-            for s in chunk:
+            for s in segs:
                 s.start += offset; s.end += offset
-            all_segs.extend(chunk)
+            raw_segs.extend(segs)
             offset += length
 
-    raw = [{"start": s.start, "end": s.end, "text": s.text} for s in all_segs]
-    raw.sort(key=lambda x: x["start"])
-    sentences = group_into_sentences(raw)
+    flat = [{"start": s.start, "end": s.end, "text": s.text} for s in raw_segs]
+    flat.sort(key=lambda x: x["start"])
+    sentences = group_into_sentences(flat)
+
     out = Path(settings.RESULTS_FOLDER) / upload_id
+    out.mkdir(parents=True, exist_ok=True)
     (out / "transcript.json").write_text(json.dumps(sentences, ensure_ascii=False, indent=2))
     r.publish(f"progress:{upload_id}", json.dumps({"status": "transcript_done"}))
     deliver_webhook.delay("transcription_completed", upload_id, {"transcript": sentences})
 
 @app.task(bind=True, queue="diarize_gpu")
 def diarize_full(self, upload_id, correlation_id):
-    """
-    Диаризация по запросу: не трогаем уже готовый transcript.json.
-    """
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
     r.publish(f"progress:{upload_id}", json.dumps({"status": "diarize_started"}))
     deliver_webhook.delay("diarization_started", upload_id, None)
@@ -406,9 +392,9 @@ def diarize_full(self, upload_id, correlation_id):
             this_len = min(chunk_limit, duration - offset)
             tmp = Path(settings.DIARIZER_CACHE_DIR) / f"{upload_id}_chunk_{int(offset)}.wav"
             subprocess.run([
-                "ffmpeg","-y","-threads",str(max(1, settings.FFMPEG_THREADS//2)),
-                "-ss",str(offset),"-t",str(this_len),
-                "-i",str(wav),str(tmp)
+                "ffmpeg", "-y", "-threads", str(max(1, settings.FFMPEG_THREADS//2)),
+                "-ss", str(offset), "-t", str(this_len),
+                "-i", str(wav), str(tmp)
             ], check=True, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
             ann = pipeline(str(tmp))
             for s, _, spk in ann.itertracks(yield_label=True):
@@ -443,17 +429,13 @@ def diarize_full(self, upload_id, correlation_id):
     name="deliver_webhook",
     queue="webhooks",
     max_retries=5,
-    default_retry_delay=30,  # seconds
+    default_retry_delay=30,
 )
 def deliver_webhook(self, event_type: str, upload_id: str, data: Optional[Any]):
-    """
-    Celery-таска для отправки HTTP-webhook с retry через self.retry.
-    """
     url = settings.WEBHOOK_URL
     secret = settings.WEBHOOK_SECRET
     if not url or not secret:
         return
-
     payload = {
         "event_type": event_type,
         "upload_id": upload_id,
@@ -464,19 +446,18 @@ def deliver_webhook(self, event_type: str, upload_id: str, data: Optional[Any]):
         "Content-Type": "application/json",
         "X-WebHook-Secret": secret,
     }
-
     try:
         resp = requests.post(url, json=payload, headers=headers, timeout=(5, 30))
         code = resp.status_code
         if 200 <= code < 300 or code == 405:
-            logger.info(f"[WEBHOOK] {event_type} succeeded for {upload_id} ({code})")
+            logger.info(f"[WEBHOOK] {event_type} succeeded ({code})")
             return
         if 400 <= code < 500:
-            logger.error(f"[WEBHOOK] {event_type} returned {code} for {upload_id}, aborting")
+            logger.error(f"[WEBHOOK] {event_type} returned {code}, aborting")
             return
         raise Exception(f"Webhook returned {code}")
     except Exception as exc:
-        logger.warning(f"[WEBHOOK] {event_type} error for {upload_id}, retrying: {exc}")
+        logger.warning(f"[WEBHOOK] {event_type} error, retrying: {exc}")
         raise self.retry(exc=exc)
 
 @app.task(bind=True, queue="transcribe_cpu")

@@ -1,3 +1,4 @@
+# config/settings.py
 import json
 from typing import List, Optional
 from pydantic import Field, HttpUrl
@@ -88,17 +89,23 @@ class Settings(BaseSettings):
     EXTERNAL_POLL_INTERVAL_S: int = Field(5, env="EXTERNAL_POLL_INTERVAL_S")
     DEFAULT_TRANSCRIBE_MODE: str = Field("local", env="DEFAULT_TRANSCRIBE_MODE")
 
+    # webhook
     WEBHOOK_URL: Optional[HttpUrl] = Field(
         None,
         env="WEBHOOK_URL",
         description="URL для POST-запросов вебхука"
     )
-    # секрет для заголовка X-WebHook-Secret
     WEBHOOK_SECRET: str = Field(
         "",
         env="WEBHOOK_SECRET",
         description="Shared secret for X-WebHook-Secret header"
     )
+
+    # --- новые параметры для VAD и разбивки предложений ---
+    VAD_MAX_LENGTH_S: int     = Field(900, env="VAD_MAX_LENGTH_S")
+    SENTENCE_MAX_GAP_S: float = Field(0.5, env="SENTENCE_MAX_GAP_S")
+    SENTENCE_MAX_WORDS: int   = Field(50,  env="SENTENCE_MAX_WORDS")
+    SENTENCE_MAX_DURATION_S: float = Field(5.0, env="SENTENCE_MAX_DURATION_S")
 
     @property
     def ALLOWED_ORIGINS_LIST(self) -> List[str]:
