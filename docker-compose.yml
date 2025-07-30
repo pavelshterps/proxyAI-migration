@@ -279,7 +279,6 @@ services:
     env_file: .env
     environment:
       - METRICS_PORT=9808
-    # используем встроенный entrypoint, передаём только опцию
     command: ["--broker-url=${CELERY_BROKER_URL}"]
     ports:
       - "9808:9808"
@@ -293,7 +292,7 @@ services:
     restart: unless-stopped
 
   cadvisor:
-    image: google/cadvisor:latest
+    image: gcr.io/cadvisor/cadvisor:v0.47.2
     container_name: proxyai_cadvisor
     privileged: true
     pid: "host"
@@ -327,7 +326,7 @@ services:
       - "9090:9090"
     depends_on:
       - celery_exporter
-      - cadvisor
+      - proxyai_cadvisor
       - api
       - node_exporter
     networks:
@@ -346,7 +345,7 @@ services:
     ports:
       - "3000:3000"
     depends_on:
-      - prometheus
+      - proxyai_prometheus
     networks:
       - proxyai_net
     restart: unless-stopped
