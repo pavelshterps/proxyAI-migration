@@ -125,6 +125,9 @@ services:
       - worker
       - --loglevel=info
       - --concurrency=${GPU_CONCURRENCY}
+      --prefetch-multiplier=1
+      --max-tasks-per-child=1
+      --max-memory-per-child=8000000
       - --queues=transcribe_gpu,diarize_gpu
     environment:
       - CELERY_BROKER_URL=${CELERY_BROKER_URL}
@@ -167,6 +170,9 @@ services:
       - worker
       - --loglevel=info
       - --concurrency=${GPU_CONCURRENCY}
+      --prefetch-multiplier=1
+      --max-tasks-per-child=1
+      --max-memory-per-child=8000000
       - --queues=transcribe_gpu,diarize_gpu
     environment:
       - CELERY_BROKER_URL=${CELERY_BROKER_URL}
