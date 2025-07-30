@@ -125,9 +125,9 @@ services:
       - worker
       - --loglevel=info
       - --concurrency=${GPU_CONCURRENCY}
-      --prefetch-multiplier=1
-      --max-tasks-per-child=10
-      --max-memory-per-child=8000000
+      - --prefetch-multiplier=1
+      - --max-tasks-per-child=10
+      - --max-memory-per-child=8000000
       - --queues=transcribe_gpu,diarize_gpu
     environment:
       - CELERY_BROKER_URL=${CELERY_BROKER_URL}
@@ -170,9 +170,9 @@ services:
       - worker
       - --loglevel=info
       - --concurrency=${GPU_CONCURRENCY}
-      --prefetch-multiplier=1
-      --max-tasks-per-child=12
-      --max-memory-per-child=8000000
+      - --prefetch-multiplier=1
+      - --max-tasks-per-child=12
+      - --max-memory-per-child=8000000
       - --queues=transcribe_gpu,diarize_gpu
     environment:
       - CELERY_BROKER_URL=${CELERY_BROKER_URL}
@@ -309,7 +309,7 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - /sys:/sys:ro
       - /sys/fs/cgroup:/sys/fs/cgroup:ro
-      - /var/lib/docker/:/var/lib/docker:ro
+      - /var/lib/docker/:/var/lib/docker/:ro
     networks:
       - proxyai_net
     restart: unless-stopped
