@@ -273,32 +273,32 @@ services:
       - proxyai_net
     restart: unless-stopped
 
-  # Prometheus-экспортер метрик Celery
   celery_exporter:
-    image: zerok/celery-prometheus-exporter:latest
+    image: danihodovic/celery-exporter:latest
     container_name: proxyai_celery_exporter
     env_file: .env
-    environment:
-      - CE_BROKER_URL=${CELERY_BROKER_URL}
+    command: ["celery-exporter", "--broker-url=${CELERY_BROKER_URL}"]
     ports:
       - "9808:9808"
     depends_on:
       - redis
+      - worker_cpu
+      - worker_gpu_1
+      - worker_gpu_2
     networks:
       - proxyai_net
     restart: unless-stopped
 
-  # cAdvisor для метрик контейнера/хоста
   cadvisor:
-    image: gcr.io/cadvisor/cadvisor:latest
+    image: google/cadvisor:latest
     container_name: proxyai_cadvisor
+    ports:
+      - "8082:8080"
     volumes:
       - /:/rootfs:ro
       - /var/run:/var/run:ro
       - /sys:/sys:ro
       - /var/lib/docker/:/var/lib/docker:ro
-    ports:
-      - "8080:8080"
     networks:
       - proxyai_net
     restart: unless-stopped
