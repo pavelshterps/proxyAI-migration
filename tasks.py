@@ -419,7 +419,13 @@ def transcribe_segments(self, upload_id, correlation_id):
     r.publish(f"progress:{upload_id}", json.dumps({"status": "transcript_done"}))
     deliver_webhook.delay("transcription_completed", upload_id, {"transcript": sentences})
 
-@app.task(bind=True, queue="diarize_gpu")
+@app.task(bind=True,
+     queue="diarize_gpu",
+     acks_late=True,
+     reject_on_worker_lost=True,
+     max_retries=3,
+     default_retry_delay=60,
+ )
 def diarize_full(self, upload_id, correlation_id):
     # Точно как в старом коде
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
