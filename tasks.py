@@ -53,6 +53,10 @@ except ImportError as e:
 # ---------------------- Helpers ----------------------
 
 def send_webhook_event(event_type: str, upload_id: str, data: Optional[Any]):
+    """
+    HTTP-запрос к внешнему webhook-endpoint.
+    Используется внутри deliver_webhook и в routes, чтобы не блокировать воркеры.
+    """
     url = settings.WEBHOOK_URL
     secret = settings.WEBHOOK_SECRET
     if not url or not secret:
@@ -262,7 +266,9 @@ def get_whisper_model(model_override: str = None):
 def get_diarization_pipeline():
     global _diarization_pipeline
     if _diarization_pipeline is None:
-        model_id = getattr(settings, "PYANNOTE_PIPELINE", "pyannote/speaker-diarization-3.1")
+        model_id = getattr(settings,
+                           "PYANNOTE_PIPELINE",
+                           "pyannote/speaker-diarization-3.1")
         _diarization_pipeline = PyannotePipeline.from_pretrained(
             model_id,
             use_auth_token=settings.HUGGINGFACE_TOKEN,
@@ -286,12 +292,14 @@ def convert_to_wav_and_preview(self, upload_id, correlation_id):
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
     r.publish(f"progress:{upload_id}", json.dumps({"status": "processing_started"}))
     deliver_webhook.delay("processing_started", upload_id, None)
+
     try:
         prepare_wav(upload_id)
     except Exception as e:
         r.publish(f"progress:{upload_id}", json.dumps({"status": "error", "error": str(e)}))
         deliver_webhook.delay("processing_failed", upload_id, None)
         return
+
     preview_transcribe.delay(upload_id, correlation_id)
 
 
@@ -308,6 +316,7 @@ def preview_transcribe(self, upload_id, correlation_id):
     proc.stdout.close()
     proc.wait()
     segments = list(segments_gen)
+
     for seg in segments:
         r.publish(
             f"progress:{upload_id}",
@@ -316,13 +325,16 @@ def preview_transcribe(self, upload_id, correlation_id):
                 "fragment": {"start": seg.start, "end": seg.end, "text": seg.text}
             })
         )
+
     preview = {
         "text": "".join(s.text for s in segments),
         "timestamps": [{"start": s.start, "end": s.end, "text": s.text} for s in segments],
     }
     out = Path(settings.RESULTS_FOLDER) / upload_id
     out.mkdir(parents=True, exist_ok=True)
-    (out / "preview_transcript.json").write_text(json.dumps(preview, ensure_ascii=False, indent=2))
+    (out / "preview_transcript.json").write_text(
+        json.dumps(preview, ensure_ascii=False, indent=2)
+    )
     r.publish(f"progress:{upload_id}", json.dumps({"status": "preview_done", "preview": preview}))
     deliver_webhook.delay("preview_completed", upload_id, {"preview": preview})
     transcribe_segments.delay(upload_id, correlation_id)
@@ -331,8 +343,8 @@ def preview_transcribe(self, upload_id, correlation_id):
 @app.task(bind=True, queue="transcribe_gpu")
 def transcribe_segments(self, upload_id, correlation_id):
     """
-    Транскрипция с VAD-фильтром (при коротких файлах)
-    и с разбивкой на чанки + VAD (при длинных), с сохранением оригинальных таймстемпов.
+    Транскрипция с VAD-фильтром (короткие файлы)
+    и с чанками + VAD (длинные файлы), с сохранением оригинальных тайм­стемпов.
     """
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
     wav, duration = prepare_wav(upload_id)
@@ -341,11 +353,11 @@ def transcribe_segments(self, upload_id, correlation_id):
         return
 
     model = get_whisper_model()
-    raw_segs = []
+    raw_segs: List[Any] = []
 
-    # короткие файлы — единый вызов с VAD, timestamps уже привязаны к оригиналу
+    # короткие файлы — единый вызов с VAD, timestamps в рамках оригинала
     if duration <= settings.VAD_MAX_LENGTH_S:
-        logger.info(f"[transcribe_segments] short audio ({duration:.1f}s), using single VAD pass")
+        logger.info(f"[transcribe_segments] short audio ({duration:.1f}s), single VAD pass")
         segs, _ = model.transcribe(
             str(wav),
             word_timestamps=True,
@@ -358,7 +370,7 @@ def transcribe_segments(self, upload_id, correlation_id):
         )
         raw_segs = list(segs)
 
-    # длинные файлы — режем на чанки, в каждом чанке тоже VAD, и сдвигаем таймстемпы
+    # длинные файлы — режем на чанки, в каждом тоже VAD, и сдвигаем тайм­стемпы
     else:
         logger.info(f"[transcribe_segments] long audio ({duration:.1f}s), chunking at {settings.CHUNK_LENGTH_S}s")
         offset = 0.0
@@ -388,7 +400,6 @@ def transcribe_segments(self, upload_id, correlation_id):
             p.stdout.close()
             p.wait()
 
-            # сдвигаем таймстемпы в global timeline
             for s in segs:
                 s.start += offset
                 s.end   += offset
@@ -396,7 +407,7 @@ def transcribe_segments(self, upload_id, correlation_id):
             raw_segs.extend(segs)
             offset += length
 
-    # формируем единый список dict-ов с полем speaker=None
+    # формируем единый список dict-ов с speaker=None
     flat = [
         {"start": s.start, "end": s.end, "speaker": None, "text": s.text}
         for s in raw_segs
@@ -407,13 +418,18 @@ def transcribe_segments(self, upload_id, correlation_id):
 
     out = Path(settings.RESULTS_FOLDER) / upload_id
     out.mkdir(parents=True, exist_ok=True)
-    (out / "transcript.json").write_text(json.dumps(sentences, ensure_ascii=False, indent=2))
+    (out / "transcript.json").write_text(
+        json.dumps(sentences, ensure_ascii=False, indent=2)
+    )
     r.publish(f"progress:{upload_id}", json.dumps({"status": "transcript_done"}))
     deliver_webhook.delay("transcription_completed", upload_id, {"transcript": sentences})
 
 
 @app.task(bind=True, queue="diarize_gpu")
 def diarize_full(self, upload_id, correlation_id):
+    """
+    Диаризация по запросу: не трогаем уже готовый transcript.json.
+    """
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
     r.publish(f"progress:{upload_id}", json.dumps({"status": "diarize_started"}))
     deliver_webhook.delay("diarization_started", upload_id, None)
@@ -421,6 +437,7 @@ def diarize_full(self, upload_id, correlation_id):
     if not _PN_AVAILABLE:
         deliver_webhook.delay("processing_failed", upload_id, None)
         return
+
     pipeline = get_diarization_pipeline()
     raw: List[Dict[str, Any]] = []
     chunk_limit = getattr(settings, "DIARIZATION_CHUNK_LENGTH_S", 0)
@@ -437,8 +454,8 @@ def diarize_full(self, upload_id, correlation_id):
             ann = pipeline(str(tmp))
             for s, _, spk in ann.itertracks(yield_label=True):
                 raw.append({
-                    "start": float(s.start) + offset,
-                    "end":   float(s.end)   + offset,
+                    "start":   float(s.start) + offset,
+                    "end":     float(s.end)   + offset,
                     "speaker": spk
                 })
             tmp.unlink(missing_ok=True)
@@ -447,8 +464,8 @@ def diarize_full(self, upload_id, correlation_id):
         ann = pipeline(str(wav))
         for s, _, spk in ann.itertracks(yield_label=True):
             raw.append({
-                "start": float(s.start),
-                "end":   float(s.end),
+                "start":   float(s.start),
+                "end":     float(s.end),
                 "speaker": spk
             })
 
@@ -466,7 +483,9 @@ def diarize_full(self, upload_id, correlation_id):
         diar_sentences.append(buf)
 
     out = Path(settings.RESULTS_FOLDER) / upload_id
-    (out / "diarization.json").write_text(json.dumps(diar_sentences, ensure_ascii=False, indent=2))
+    (out / "diarization.json").write_text(
+        json.dumps(diar_sentences, ensure_ascii=False, indent=2)
+    )
     r.publish(f"progress:{upload_id}", json.dumps({"status": "diarization_done"}))
     deliver_webhook.delay("diarization_completed", upload_id, {"diarization": diar_sentences})
 
@@ -479,15 +498,18 @@ def diarize_full(self, upload_id, correlation_id):
     default_retry_delay=30,
 )
 def deliver_webhook(self, event_type: str, upload_id: str, data: Optional[Any]):
+    """
+    Celery-таска для отправки HTTP-webhook с retry.
+    """
     url = settings.WEBHOOK_URL
     secret = settings.WEBHOOK_SECRET
     if not url or not secret:
         return
     payload = {
-        "event_type": event_type,
-        "upload_id": upload_id,
-        "timestamp": datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
-        "data": data,
+        "event_type":  event_type,
+        "upload_id":   upload_id,
+        "timestamp":   datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+        "data":        data,
     }
     headers = {"Content-Type": "application/json", "X-WebHook-Secret": secret}
     try:
