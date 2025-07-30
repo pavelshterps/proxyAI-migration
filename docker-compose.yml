@@ -254,6 +254,7 @@ services:
     command: >
       sh -c "chown -R 1000:1000 /var/lib/flower \
              && flower --broker=${CELERY_BROKER_URL} \
+                       --broker_api=${CELERY_BROKER_URL} \
                        --address=0.0.0.0 \
                        --basic_auth=${FLOWER_USER}:${FLOWER_PASS} \
                        --port=5555 \
@@ -268,6 +269,32 @@ services:
       - "5555:5555"
     depends_on:
       - redis
+    networks:
+      - proxyai_net
+    restart: unless-stopped
+
+  celery_exporter:
+    image: oliver006/celery-prometheus-exporter:latest
+    container_name: proxyai_celery_exporter
+    env_file: .env
+    environment:
+      - CELERY_BROKER_URL=${CELERY_BROKER_URL}
+    ports:
+      - "9541:9541"
+    networks:
+      - proxyai_net
+    restart: unless-stopped
+
+  cadvisor:
+    image: google/cadvisor:latest
+    container_name: proxyai_cadvisor
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+    ports:
+      - "8080:8080"
     networks:
       - proxyai_net
     restart: unless-stopped
