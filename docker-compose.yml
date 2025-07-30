@@ -296,6 +296,7 @@ services:
     image: google/cadvisor:latest
     container_name: proxyai_cadvisor
     privileged: true
+    pid: "host"
     ports:
       - "8082:8080"
     volumes:
