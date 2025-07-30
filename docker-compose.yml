@@ -85,6 +85,7 @@ services:
       - --loglevel=info
       - --concurrency=${CPU_CONCURRENCY}
       - --queues=transcribe_cpu
+      - -E
     environment:
       - CELERY_BROKER_URL=${CELERY_BROKER_URL}
       - CELERY_RESULT_BACKEND=${CELERY_RESULT_BACKEND}
@@ -126,6 +127,7 @@ services:
       - --loglevel=info
       - --concurrency=${GPU_CONCURRENCY}
       - --queues=transcribe_gpu,diarize_gpu
+      - -E
     environment:
       - CELERY_BROKER_URL=${CELERY_BROKER_URL}
       - CELERY_RESULT_BACKEND=${CELERY_RESULT_BACKEND}
@@ -168,6 +170,7 @@ services:
       - --loglevel=info
       - --concurrency=${GPU_CONCURRENCY}
       - --queues=transcribe_gpu,diarize_gpu
+      - -E
     environment:
       - CELERY_BROKER_URL=${CELERY_BROKER_URL}
       - CELERY_RESULT_BACKEND=${CELERY_RESULT_BACKEND}
@@ -208,6 +211,7 @@ services:
       - --loglevel=info
       - --concurrency=2
       - --queues=webhooks
+      - -E
     environment:
       - CELERY_BROKER_URL=${CELERY_BROKER_URL}
       - CELERY_RESULT_BACKEND=${CELERY_RESULT_BACKEND}
@@ -292,12 +296,14 @@ services:
   cadvisor:
     image: google/cadvisor:latest
     container_name: proxyai_cadvisor
+    privileged: true
     ports:
       - "8082:8080"
     volumes:
       - /:/rootfs:ro
       - /var/run:/var/run:ro
       - /sys:/sys:ro
+      - /sys/fs/cgroup:/sys/fs/cgroup:ro
       - /var/lib/docker/:/var/lib/docker:ro
     networks:
       - proxyai_net
