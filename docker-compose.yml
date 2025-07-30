@@ -277,6 +277,8 @@ services:
     image: danihodovic/celery-exporter:latest
     container_name: proxyai_celery_exporter
     env_file: .env
+    environment:
+      - METRICS_PORT=9808
     # используем встроенный entrypoint, передаём только опцию
     command: ["--broker-url=${CELERY_BROKER_URL}"]
     ports:
@@ -306,6 +308,15 @@ services:
       - proxyai_net
     restart: unless-stopped
 
+  node_exporter:
+    image: prom/node-exporter:latest
+    container_name: proxyai_node_exporter
+    ports:
+      - "9100:9100"
+    networks:
+      - proxyai_net
+    restart: unless-stopped
+
   prometheus:
     image: prom/prometheus:latest
     container_name: proxyai_prometheus
@@ -317,6 +328,7 @@ services:
       - celery_exporter
       - cadvisor
       - api
+      - node_exporter
     networks:
       - proxyai_net
     restart: unless-stopped
