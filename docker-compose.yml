@@ -326,7 +326,7 @@ services:
       - "9090:9090"
     depends_on:
       - celery_exporter
-      - proxyai_cadvisor
+      - cadvisor
       - api
       - node_exporter
     networks:
@@ -345,7 +345,7 @@ services:
     ports:
       - "3000:3000"
     depends_on:
-      - proxyai_prometheus
+      - prometheus
     networks:
       - proxyai_net
     restart: unless-stopped
