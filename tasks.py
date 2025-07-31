@@ -339,9 +339,7 @@ def preview_transcribe(self, upload_id, correlation_id):
     }
     out = Path(settings.RESULTS_FOLDER) / upload_id
     out.mkdir(parents=True, exist_ok=True)
-    (out / "preview_transcript.json").write_text(
-        json.dumps(preview, ensure_ascii=False, indent=2)
-    )
+    (out / "preview_transcript.json").write_text(json.dumps(preview, ensure_ascii=False, indent=2))
     r.publish(f"progress:{upload_id}", json.dumps({"status": "preview_done", "preview": preview}))
     deliver_webhook.delay("preview_completed", upload_id, {"preview": preview})
     transcribe_segments.delay(upload_id, correlation_id)
@@ -452,7 +450,6 @@ def diarize_full(self, upload_id, correlation_id):
 
     wav, duration = prepare_wav(upload_id)
 
-    # chunk_limit извлекаем и приводим к int, надёжно
     raw_chunk_limit = getattr(settings, "DIARIZATION_CHUNK_LENGTH_S", 0)
     try:
         chunk_limit = int(raw_chunk_limit)
@@ -509,7 +506,6 @@ def diarize_full(self, upload_id, correlation_id):
 
     raw.sort(key=lambda x: x["start"])
 
-    # агрегируем соседние сегменты одного спикера
     diar_sentences = []
     buf = None
     for seg in raw:
