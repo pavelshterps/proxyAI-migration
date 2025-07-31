@@ -7,7 +7,7 @@ if [ -z "${1-}" ]; then
 fi
 
 UPLOAD_ID="$1"
-WORKER_SERVICE="worker_gpu_2"  # поменяй, если нужен другой
+WORKER_SERVICE="worker_gpu_2"  # поменяй, если нужно другой воркер/сервис
 APP_ARG="-A celery_app"
 
 echo "1. Получаем активные задачи diarize_full по upload_id=${UPLOAD_ID}"
@@ -20,66 +20,51 @@ else
   echo "$ACTIVE_JSON" | jq .
 fi
 
-# Собираем все задачи diarize_full, у которых args[0] == upload_id
-# Формат: node, id, time_start
-MAP=$(echo "$ACTIVE_JSON" | jq -c --arg UID "$UPLOAD_ID" '
-  to_entries
-  | map(
-      {node: .key, tasks: (.value.active? // [])}
-    )
-  | map(
-      .tasks[]
-      | select(.name == "tasks.diarize_full")
-      | select((.args | type == "array" and .[0] == $UID))
-      | {node: .hostname, id: .id, time_start: .time_start}
-    )
-')
+# Находим все active diarize_full задачи с args[0] == upload_id
+MATCHING_IDS=$(echo "$ACTIVE_JSON" | jq -r --arg UID "$UPLOAD_ID" '
+  to_entries[]
+  | .value.active? // []
+  | .[]
+  | select(.name == "tasks.diarize_full")
+  | (try (.args | fromjson) catch .) as $args
+  | select($args[0] == $UID)
+  | {id: .id, time_start: .time_start, hostname: .hostname}
+' | jq -s '.')
 
-# Если нет активных — будем запускать новую
-if [[ -z "$MAP" || "$MAP" == "null" ]]; then
-  echo "2. Дубликатов не найдено (активных diarize_full для этого upload_id нет)."
-  echo "3. Вызываем новую задачу diarize_full"
+# Выбираем одну оставшуюся (самую "свежую" по time_start)
+KEEP_ID=$(echo "$MATCHING_IDS" | jq -r 'sort_by(.time_start) | last | .id // empty')
+
+if [[ -n "$KEEP_ID" ]]; then
+  echo "2. Оставляем существующую задачу: $KEEP_ID"
+else
+  echo "2. Ни одной живой задачи не найдено, будет создана новая."
+fi
+
+# Отзываем остальные дубликаты (если больше одной)
+TO_REVOKE=$(echo "$MATCHING_IDS" | jq -r --arg KEEP "$KEEP_ID" '
+  .[] | select(.id != $KEEP) | .id
+' | sort | uniq)
+
+if [[ -n "$TO_REVOKE" ]]; then
+  echo "3. Отзываем дубликаты:"
+  for tid in $TO_REVOKE; do
+    echo "  revoke $tid"
+    docker-compose exec -T "$WORKER_SERVICE" celery $APP_ARG control revoke "$tid" || true
+  done
+else
+  echo "3. Дубликатов для отзыва не найдено."
+fi
+
+# Если нет оставшейся, запускаем новую
+if [[ -z "$KEEP_ID" ]]; then
+  echo "4. Запускаем новую задачу diarize_full"
   NEW_ID=$(docker-compose exec -T "$WORKER_SERVICE" celery $APP_ARG call tasks.diarize_full --args="[\"$UPLOAD_ID\", null]" --queue=diarize_gpu)
   echo "  Запрошена новая задача: $NEW_ID"
 else
-  # Найдём задачу с минимальным time_start — её сохраняем, остальные ревоким
-  echo "2. Найденные активные diarize_full задачи с args[0]=${UPLOAD_ID}:"
-  echo "$MAP" | jq .
-
-  KEEP_ID=$(echo "$MAP" | jq -r 'sort_by(.time_start)[0].id')
-  echo "  Оставляем задачу: $KEEP_ID"
-
-  # Ревоким все остальные
-  TO_REVOKE=$(echo "$MAP" | jq -r --arg keep "$KEEP_ID" '. | map(select(.id != $keep)) | .[].id' | sort | uniq)
-  if [[ -n "$TO_REVOKE" ]]; then
-    echo "  Отзываем дубликаты:"
-    for tid in $TO_REVOKE; do
-      echo "    revoke $tid"
-      docker-compose exec -T "$WORKER_SERVICE" celery $APP_ARG control revoke "$tid" || true
-    done
-  else
-    echo "  Дубликатов для отзыва не найдено (уже одна активная)."
-  fi
-
-  echo "3. Проверяем: если ни одной оставшейся задачи нет (вдруг была убита), то запускаем новую"
-  # Повторно выгрузим active и убедимся что KEEP_ID всё ещё активна
-  UPDATED=$(docker-compose exec -T "$WORKER_SERVICE" celery $APP_ARG inspect active -j || true)
-  STILL_THERE=$(echo "$UPDATED" | jq -e --arg keep "$KEEP_ID" '
-    to_entries
-    | any(.value.active? // [] | .[] | select(.id == $keep))
-  ' >/dev/null 2>&1 && echo "yes" || echo "no")
-
-  if [[ "$STILL_THERE" != "yes" ]]; then
-    echo "  Оставшаяся задача исчезла, запускаем новую diarize_full"
-    NEW_ID=$(docker-compose exec -T "$WORKER_SERVICE" celery $APP_ARG call tasks.diarize_full --args="[\"$UPLOAD_ID\", null]" --queue=diarize_gpu)
-    echo "    Запрошена новая задача: $NEW_ID"
-  else
-    echo "  Задача $KEEP_ID продолжает висеть — новую не запускаем."
-  fi
+  echo "4. Пропускаем запуск, живая задача уже есть."
 fi
 
-echo "4. Ждём секунду и показываем текущее состояние"
-sleep 1
+echo "5. Текущее состояние active после ревокаций/создания:"
 docker-compose exec -T "$WORKER_SERVICE" celery $APP_ARG inspect active -j | jq .
 
 echo
