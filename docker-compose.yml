@@ -124,6 +124,7 @@ services:
       - celery_app:app
       - worker
       - --loglevel=info
+      - -E
       - --concurrency=${GPU_CONCURRENCY}
       - --prefetch-multiplier=1
       - --max-tasks-per-child=10
@@ -169,6 +170,7 @@ services:
       - celery_app:app
       - worker
       - --loglevel=info
+      - -E
       - --concurrency=${GPU_CONCURRENCY}
       - --prefetch-multiplier=1
       - --max-tasks-per-child=12
