@@ -442,6 +442,12 @@ def transcribe_segments(self, upload_id, correlation_id):
     r.publish(f"progress:{upload_id}", json.dumps({"status": "transcript_done"}))
     deliver_webhook.delay("transcription_completed", upload_id, {"transcript": sentences})
 
+    try:
+        import torch
+        logger.info(f"[{upload_id}] GPU memory reserved after transcription: {torch.cuda.memory_reserved() if torch.cuda.is_available() else 'n/a'}")
+    except ImportError:
+        pass
+
 @app.task(bind=True, queue="diarize_gpu")
 def diarize_full(self, upload_id, correlation_id):
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
