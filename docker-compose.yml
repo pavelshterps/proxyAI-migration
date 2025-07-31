@@ -92,7 +92,7 @@ services:
       - UPLOAD_FOLDER=${UPLOAD_FOLDER}
       - RESULTS_FOLDER=${RESULTS_FOLDER}
       - DIARIZER_CACHE_DIR=${DIARIZER_CACHE_DIR}
-      - HUGGINGFACE_CACHE_DIR=/hf_cache
+      - HUGGINGFACE_CACHE_DIR=${HUGGINGFACE_CACHE_DIR}
       - WHISPER_MODEL_PATH=${WHISPER_MODEL_PATH}
       - WHISPER_DEVICE=cpu
       - WEBHOOK_URL=${WEBHOOK_URL}
@@ -123,8 +123,12 @@ services:
       - -A
       - celery_app:app
       - worker
+      - -E
       - --loglevel=info
       - --concurrency=${GPU_CONCURRENCY}
+      - --prefetch-multiplier=1
+      - --max-tasks-per-child=10
+      - --max-memory-per-child=8000000
       - --queues=transcribe_gpu,diarize_gpu
     environment:
       - CELERY_BROKER_URL=${CELERY_BROKER_URL}
@@ -133,7 +137,7 @@ services:
       - UPLOAD_FOLDER=${UPLOAD_FOLDER}
       - RESULTS_FOLDER=${RESULTS_FOLDER}
       - DIARIZER_CACHE_DIR=${DIARIZER_CACHE_DIR}
-      - HUGGINGFACE_CACHE_DIR=/hf_cache
+      - HUGGINGFACE_CACHE_DIR=${HUGGINGFACE_CACHE_DIR}
       - WHISPER_MODEL_PATH=${WHISPER_MODEL_PATH}
       - WHISPER_DEVICE=cuda
       - NVIDIA_VISIBLE_DEVICES=0
@@ -165,8 +169,12 @@ services:
       - -A
       - celery_app:app
       - worker
+      - -E
       - --loglevel=info
       - --concurrency=${GPU_CONCURRENCY}
+      - --prefetch-multiplier=1
+      - --max-tasks-per-child=12
+      - --max-memory-per-child=8000000
       - --queues=transcribe_gpu,diarize_gpu
     environment:
       - CELERY_BROKER_URL=${CELERY_BROKER_URL}
@@ -175,7 +183,7 @@ services:
       - UPLOAD_FOLDER=${UPLOAD_FOLDER}
       - RESULTS_FOLDER=${RESULTS_FOLDER}
       - DIARIZER_CACHE_DIR=${DIARIZER_CACHE_DIR}
-      - HUGGINGFACE_CACHE_DIR=/hf_cache
+      - HUGGINGFACE_CACHE_DIR=${HUGGINGFACE_CACHE_DIR}
       - WHISPER_MODEL_PATH=${WHISPER_MODEL_PATH}
       - WHISPER_DEVICE=cuda
       - NVIDIA_VISIBLE_DEVICES=0
@@ -254,6 +262,7 @@ services:
     command: >
       sh -c "chown -R 1000:1000 /var/lib/flower \
              && flower --broker=${CELERY_BROKER_URL} \
+                       --broker_api=${CELERY_BROKER_URL} \
                        --address=0.0.0.0 \
                        --basic_auth=${FLOWER_USER}:${FLOWER_PASS} \
                        --port=5555 \
@@ -268,6 +277,83 @@ services:
       - "5555:5555"
     depends_on:
       - redis
+    networks:
+      - proxyai_net
+    restart: unless-stopped
+
+  celery_exporter:
+    image: danihodovic/celery-exporter:latest
+    container_name: proxyai_celery_exporter
+    env_file: .env
+    environment:
+      - METRICS_PORT=9808
+    command: ["--broker-url=${CELERY_BROKER_URL}"]
+    ports:
+      - "9808:9808"
+    depends_on:
+      - redis
+      - worker_cpu
+      - worker_gpu_1
+      - worker_gpu_2
+    networks:
+      - proxyai_net
+    restart: unless-stopped
+
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.47.2
+    container_name: proxyai_cadvisor
+    privileged: true
+    pid: "host"
+    ports:
+      - "8082:8080"
+    volumes:
+      - /:/rootfs:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /sys:/sys:ro
+      - /sys/fs/cgroup:/sys/fs/cgroup:ro
+      - /var/lib/docker/:/var/lib/docker/:ro
+    networks:
+      - proxyai_net
+    restart: unless-stopped
+
+  node_exporter:
+    image: prom/node-exporter:latest
+    container_name: proxyai_node_exporter
+    ports:
+      - "9100:9100"
+    networks:
+      - proxyai_net
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: proxyai_prometheus
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    depends_on:
+      - celery_exporter
+      - cadvisor
+      - api
+      - node_exporter
+    networks:
+      - proxyai_net
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: proxyai_grafana
+    env_file: .env
+    environment:
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_USER}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASS}
+    volumes:
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
     networks:
       - proxyai_net
     restart: unless-stopped
@@ -295,6 +381,7 @@ volumes:
   results_data:
   diarizer_cache:
   flower_db:
+  grafana_data:
 
 networks:
   proxyai_net:
