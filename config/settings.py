@@ -71,6 +71,8 @@ class Settings(BaseSettings):
     CHUNK_LENGTH_S: int = Field(..., env="CHUNK_LENGTH_S")
     DIARIZATION_CHUNK_LENGTH_S: int = Field(..., env="DIARIZATION_CHUNK_LENGTH_S")
     VAD_MAX_LENGTH_S: int = Field(..., env="VAD_MAX_LENGTH_S")
+    SENTENCE_MAX_GAP_S: float = Field(0.5, env="SENTENCE_MAX_GAP_S")
+    SENTENCE_MAX_WORDS: int = Field(50, env="SENTENCE_MAX_WORDS")
     # limits & retention
     MAX_FILE_SIZE: int = Field(1_073_741_824, env="MAX_FILE_SIZE")
     FILE_RETENTION_DAYS: int = Field(7, env="FILE_RETENTION_DAYS")
