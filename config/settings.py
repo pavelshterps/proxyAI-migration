@@ -69,7 +69,8 @@ class Settings(BaseSettings):
     # preview / chunking
     PREVIEW_LENGTH_S: int = Field(60, env="PREVIEW_LENGTH_S")
     CHUNK_LENGTH_S: int = Field(..., env="CHUNK_LENGTH_S")
-
+    DIARIZATION_CHUNK_LENGTH_S: int = Field(..., env="DIARIZATION_CHUNK_LENGTH_S")
+    VAD_MAX_LENGTH_S: int = Field(..., env="VAD_MAX_LENGTH_S")
     # limits & retention
     MAX_FILE_SIZE: int = Field(1_073_741_824, env="MAX_FILE_SIZE")
     FILE_RETENTION_DAYS: int = Field(7, env="FILE_RETENTION_DAYS")
