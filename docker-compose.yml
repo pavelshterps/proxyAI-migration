@@ -40,7 +40,7 @@ services:
       dockerfile: Dockerfile
     container_name: proxyai_api
     env_file: .env
-    command: >-
+    command: >
       sh -c "until nc -z db 5432; do sleep 1; done;
              uvicorn main:app --host 0.0.0.0 --port 8000 --workers ${API_WORKERS}"
     environment:
@@ -51,7 +51,7 @@ services:
       - UPLOAD_FOLDER=${UPLOAD_FOLDER}
       - RESULTS_FOLDER=${RESULTS_FOLDER}
       - DIARIZER_CACHE_DIR=${DIARIZER_CACHE_DIR}
-      - HUGGINGFACE_CACHE_DIR=/hf_cache
+      - HUGGINGFACE_CACHE_DIR=${HUGGINGFACE_CACHE_DIR}
       - WHISPER_MODEL_PATH=${WHISPER_MODEL_PATH}
       - WHISPER_DEVICE=${WHISPER_DEVICE}
       - WEBHOOK_URL=${WEBHOOK_URL}
@@ -128,7 +128,6 @@ services:
       - --concurrency=${GPU_CONCURRENCY}
       - --prefetch-multiplier=1
       - --max-tasks-per-child=10
-      - --max-memory-per-child=8000000
       - --queues=transcribe_gpu,diarize_gpu
     environment:
       - CELERY_BROKER_URL=${CELERY_BROKER_URL}
@@ -174,7 +173,6 @@ services:
       - --concurrency=${GPU_CONCURRENCY}
       - --prefetch-multiplier=1
       - --max-tasks-per-child=12
-      - --max-memory-per-child=8000000
       - --queues=transcribe_gpu,diarize_gpu
     environment:
       - CELERY_BROKER_URL=${CELERY_BROKER_URL}
