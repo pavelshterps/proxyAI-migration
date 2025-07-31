@@ -421,6 +421,12 @@ def transcribe_segments(self, upload_id, correlation_id):
             chunk_segs = _transcribe_with_vad(p.stdout, offset)
             p.stdout.close(); p.wait()
             raw_segs.extend(chunk_segs)
+            # попытка очистить GPU-кеш между чанками
+            try:
+                import torch
+                torch.cuda.empty_cache()
+            except ImportError:
+                pass
             offset += length
             chunk_idx += 1
 
@@ -496,6 +502,12 @@ def diarize_full(self, upload_id, correlation_id):
                 "added_segments": segment_count_after - segment_count_before,
             }))
             tmp.unlink(missing_ok=True)
+            # освобождаем кеш GPU между чанками, если есть
+            try:
+                import torch
+                torch.cuda.empty_cache()
+            except ImportError:
+                pass
             offset += this_len
             chunk_idx += 1
     else:
