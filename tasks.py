@@ -35,6 +35,8 @@ _diarization_pipeline = None
 SPEAKER_STITCH_ENABLED = getattr(settings, "SPEAKER_STITCH_ENABLED", True)
 SPEAKER_STITCH_THRESHOLD = float(getattr(settings, "SPEAKER_STITCH_THRESHOLD", 0.75))
 SPEAKER_STITCH_POOL_SIZE = int(getattr(settings, "SPEAKER_STITCH_POOL_SIZE", 5))
+SPEAKER_STITCH_EMA_ALPHA = float(getattr(settings, "SPEAKER_STITCH_EMA_ALPHA", 0.4))
+SPEAKER_STITCH_MERGE_THRESHOLD = float(getattr(settings, "SPEAKER_STITCH_MERGE_THRESHOLD", 0.95))
 _speaker_embedding_model = None  # type: ignore
 
 try:
@@ -309,6 +311,13 @@ def get_speaker_embedding_model():
 def stitch_speakers(raw: List[Dict[str, Any]], wav: Path, upload_id: str) -> List[Dict[str, Any]]:
     if not SPEAKER_STITCH_ENABLED:
         return raw
+
+    # если pyannote выдал только одного исходного спикера — не трогаем
+    unique_orig = set(seg.get("speaker") for seg in raw)
+    if len(unique_orig) <= 1:
+        logger.debug(f"[{upload_id}] only one original speaker {unique_orig}, skipping stitching")
+        return raw
+
     try:
         import torch
         import torchaudio
@@ -323,7 +332,8 @@ def stitch_speakers(raw: List[Dict[str, Any]], wav: Path, upload_id: str) -> Lis
             waveform = resampler(waveform)
             sr = 16000
 
-        stitch_pool: Dict[str, List[torch.Tensor]] = {}
+        stitch_centroids: Dict[str, torch.Tensor] = {}
+        stitch_histories: Dict[str, List[torch.Tensor]] = {}
         next_label_idx = 0
 
         def new_canonical_label():
@@ -359,29 +369,81 @@ def stitch_speakers(raw: List[Dict[str, Any]], wav: Path, upload_id: str) -> Lis
 
             assigned_label = None
             best_sim = -1.0
-            candidate = None
-            for canon_label, embeddings in stitch_pool.items():
-                centroid = torch.stack(embeddings[-SPEAKER_STITCH_POOL_SIZE:])
-                centroid = centroid.mean(dim=0)
-                centroid = F.normalize(centroid, p=2, dim=0)
+            for canon_label, centroid in stitch_centroids.items():
                 sim = torch.dot(emb, centroid).item()
                 if sim > best_sim:
                     best_sim = sim
-                    candidate = canon_label
-            if candidate is not None and best_sim >= SPEAKER_STITCH_THRESHOLD:
-                assigned_label = candidate
+                    assigned_label = canon_label
+
+            if assigned_label is not None and best_sim >= SPEAKER_STITCH_THRESHOLD:
+                # обновляем центроид через EMA
+                old_centroid = stitch_centroids[assigned_label]
+                updated_centroid = F.normalize(
+                    SPEAKER_STITCH_EMA_ALPHA * emb + (1 - SPEAKER_STITCH_EMA_ALPHA) * old_centroid, p=2, dim=0
+                )
+                stitch_centroids[assigned_label] = updated_centroid
+                # обновляем историю
+                hist = stitch_histories[assigned_label]
+                hist.append(emb)
+                if len(hist) > SPEAKER_STITCH_POOL_SIZE:
+                    hist.pop(0)
                 logger.debug(f"[{upload_id}] reused speaker {assigned_label} (sim={best_sim:.3f})")
             else:
                 assigned_label = new_canonical_label()
-                stitch_pool[assigned_label] = []
+                stitch_centroids[assigned_label] = emb
+                stitch_histories[assigned_label] = [emb]
                 logger.debug(f"[{upload_id}] created new speaker label {assigned_label}")
-
-            stitch_pool[assigned_label].append(emb)
-            if len(stitch_pool[assigned_label]) > SPEAKER_STITCH_POOL_SIZE:
-                stitch_pool[assigned_label] = stitch_pool[assigned_label][-SPEAKER_STITCH_POOL_SIZE:]
 
             seg["speaker"] = assigned_label
             stitched.append(seg)
+
+        # Постобъединение лейблов с очень схожими центроидами
+        label_centroids: Dict[str, torch.Tensor] = {}
+        for label, hist in stitch_histories.items():
+            centroid = torch.stack(hist).mean(dim=0)
+            centroid = F.normalize(centroid, p=2, dim=0)
+            label_centroids[label] = centroid
+
+        # строим граф схожести и находим компоненты для слияния
+        adj: Dict[str, set] = {label: set() for label in label_centroids}
+        labels = list(label_centroids.keys())
+        for i in range(len(labels)):
+            for j in range(i + 1, len(labels)):
+                a = labels[i]
+                b = labels[j]
+                sim = torch.dot(label_centroids[a], label_centroids[b]).item()
+                if sim >= SPEAKER_STITCH_MERGE_THRESHOLD:
+                    adj[a].add(b)
+                    adj[b].add(a)
+
+        visited = set()
+        merge_map: Dict[str, str] = {}
+        for label in adj:
+            if label in visited:
+                continue
+            stack = [label]
+            component = []
+            while stack:
+                l = stack.pop()
+                if l in visited:
+                    continue
+                visited.add(l)
+                component.append(l)
+                stack.extend(adj[l] - visited)
+            if len(component) > 1:
+                rep = sorted(component)[0]
+                for l in component:
+                    merge_map[l] = rep
+
+        if merge_map:
+            for seg in stitched:
+                old = seg["speaker"]
+                if old in merge_map:
+                    new = merge_map[old]
+                    if new != old:
+                        logger.debug(f"[{upload_id}] merged speaker {old} -> {new} based on centroid similarity")
+                        seg["speaker"] = new
+
         return stitched
     except Exception as e:
         logger.warning(f"[{upload_id}] speaker stitching failed, falling back to original diarization labels: {e}")
@@ -584,7 +646,9 @@ def diarize_full(self, upload_id, correlation_id):
         logger.warning(f"[{upload_id}] invalid DIARIZATION_CHUNK_LENGTH_S={raw_chunk_limit!r}, falling back to 0")
         chunk_limit = 0
 
-    logger.info(f"[{upload_id}] WAV prepared for diarization, duration={duration:.1f}s; chunk_limit={chunk_limit}")
+    using_chunking = bool(chunk_limit and duration > chunk_limit)
+
+    logger.info(f"[{upload_id}] WAV prepared for diarization, duration={duration:.1f}s; chunk_limit={chunk_limit}; using_chunking={using_chunking}")
 
     if not _PN_AVAILABLE:
         logger.error(f"[{upload_id}] pyannote.audio not available, aborting diarization")
@@ -596,7 +660,7 @@ def diarize_full(self, upload_id, correlation_id):
 
     MAX_RETRIES_PER_CHUNK = 2
 
-    if chunk_limit and duration > chunk_limit:
+    if using_chunking:
         offset = 0.0
         chunk_idx = 0
         while offset < duration:
@@ -618,7 +682,7 @@ def diarize_full(self, upload_id, correlation_id):
                     for s, _, spk in ann.itertracks(yield_label=True):
                         raw.append({
                             "start": float(s.start) + offset,
-                            "end": float(s.end) + offset,
+                            "end":   float(s.end)   + offset,
                             "speaker": spk
                         })
                     added = len(raw) - before
@@ -655,14 +719,16 @@ def diarize_full(self, upload_id, correlation_id):
         for s, _, spk in ann.itertracks(yield_label=True):
             raw.append({
                 "start": float(s.start),
-                "end": float(s.end),
+                "end":   float(s.end),
                 "speaker": spk
             })
 
     raw.sort(key=lambda x: x["start"])
 
-    if SPEAKER_STITCH_ENABLED:
+    if SPEAKER_STITCH_ENABLED and using_chunking:
         raw = stitch_speakers(raw, wav, upload_id)
+    else:
+        logger.debug(f"[{upload_id}] skipping speaker stitching (using_chunking={using_chunking})")
 
     diar_sentences = []
     buf = None
