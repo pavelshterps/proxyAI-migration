@@ -7,7 +7,6 @@ from urllib.parse import urlparse
 from urllib.request import urlretrieve
 from typing import Optional
 
-from database import get_db
 import yt_dlp
 import structlog
 import redis.asyncio as redis_async
@@ -35,6 +34,8 @@ from database import init_models, engine, wait_for_db
 from crud import create_upload_record, get_upload_for_user
 from dependencies import get_current_user
 from tasks import convert_to_wav_and_preview, diarize_full, merge_speakers
+from routes import router as api_router
+from admin_routes import router as admin_router  # предполагается, что этот файл существует и экспортирует router
 
 app = FastAPI(title="proxyAI", version=settings.APP_VERSION)
 

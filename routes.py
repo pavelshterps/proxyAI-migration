@@ -21,9 +21,11 @@ def _read_json(p: Path) -> Any:
 
 
 @router.get("/transcription/{upload_id}", tags=["default"])
-async def raw_transcription(upload_id: str,
-                            pad: float = Query(0.0, description="padding for speaker merge; 0 => no merge"),
-                            include_orig: bool = Query(False, description="include orig label field")):
+async def raw_transcription(
+    upload_id: str,
+    pad: float = Query(0.0, description="padding for speaker merge; 0 => no merge"),
+    include_orig: bool = Query(False, description="include orig label field")
+):
     try:
         base = Path(settings.RESULTS_FOLDER) / upload_id
         tp = base / "transcript.json"
@@ -33,7 +35,7 @@ async def raw_transcription(upload_id: str,
             dp = base / "diarization.json"
             if dp.exists():
                 diar = _read_json(dp)
-                from tasks import merge_speakers  # локальный импорт
+                from tasks import merge_speakers  # локальный импорт для избежания circular import
                 merged = merge_speakers(transcript, diar, pad=pad)
                 if not include_orig:
                     for seg in merged:
@@ -55,9 +57,11 @@ async def raw_preview(upload_id: str):
 
 
 @router.get("/diarization/{upload_id}", tags=["default"])
-async def raw_diarization(upload_id: str,
-                          pad: float = Query(0.0, description="padding for merge against transcript; 0 => raw diar"),
-                          include_orig: bool = Query(False, description="include orig label in merged output")):
+async def raw_diarization(
+    upload_id: str,
+    pad: float = Query(0.0, description="padding for merge against transcript; 0 => raw diar"),
+    include_orig: bool = Query(False, description="include orig label in merged output")
+):
     base = Path(settings.RESULTS_FOLDER) / upload_id
     if not base.exists():
         return JSONResponse(status_code=404, content={"status": "not_found"})
@@ -86,9 +90,12 @@ async def raw_diarization(upload_id: str,
 
 
 @router.post("/labels/{upload_id}", tags=["default"])
-async def save_labels(upload_id: str, mapping: dict,
-                      current=Depends(get_current_user),
-                      db: AsyncSession = Depends(get_db)):
+async def save_labels(
+    upload_id: str,
+    mapping: dict,
+    current=Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
     ok = await crud.update_label_mapping(db, current.id, upload_id, mapping)
     if not ok:
         raise HTTPException(404, "upload_id not found")

@@ -69,7 +69,6 @@ app.conf.update(
 
 @worker_process_init.connect
 def preload_models(**kwargs):
-    # импорт локально, чтобы избежать circular import на уровне модуля
     try:
         from tasks import get_whisper_model, get_diarization_pipeline
         get_whisper_model()

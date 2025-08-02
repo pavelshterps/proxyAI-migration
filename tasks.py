@@ -334,7 +334,6 @@ def stitch_speakers(raw: List[Dict[str, Any]], wav: Path, upload_id: str) -> Lis
             return label
 
         stitched: List[Dict[str, Any]] = []
-        # deterministic order
         raw_sorted = sorted(raw, key=lambda x: x["start"])
         for seg in raw_sorted:
             start, end = seg["start"], seg["end"]
@@ -350,16 +349,14 @@ def stitch_speakers(raw: List[Dict[str, Any]], wav: Path, upload_id: str) -> Lis
             if segment_waveform.numel() == 0:
                 stitched.append(seg)
                 continue
-            # If multi-channel, average to mono
             if segment_waveform.size(0) > 1:
                 segment_waveform = segment_waveform.mean(dim=0, keepdim=True)
             with torch.no_grad():
                 emb = model.encode_batch(segment_waveform)
-            # remove singleton dims
             emb = emb.squeeze()
             if emb.ndim > 1:
                 emb = emb.flatten()
-            emb = F.normalize(emb, p=2, dim=0)  # unit norm
+            emb = F.normalize(emb, p=2, dim=0)
 
             assigned_label = None
             best_sim = -1.0
@@ -380,7 +377,6 @@ def stitch_speakers(raw: List[Dict[str, Any]], wav: Path, upload_id: str) -> Lis
                 stitch_pool[assigned_label] = []
                 logger.debug(f"[{upload_id}] created new speaker label {assigned_label}")
 
-            # Update pool
             stitch_pool[assigned_label].append(emb)
             if len(stitch_pool[assigned_label]) > SPEAKER_STITCH_POOL_SIZE:
                 stitch_pool[assigned_label] = stitch_pool[assigned_label][-SPEAKER_STITCH_POOL_SIZE:]
@@ -396,9 +392,15 @@ def stitch_speakers(raw: List[Dict[str, Any]], wav: Path, upload_id: str) -> Lis
 @worker_process_init.connect
 def preload_on_startup(**kwargs):
     if _HF_AVAILABLE:
-        get_whisper_model()
+        try:
+            get_whisper_model()
+        except Exception as e:
+            logger.error(f"[PRELOAD] error loading whisper model: {e}", exc_info=True)
     if _PN_AVAILABLE:
-        get_diarization_pipeline()
+        try:
+            get_diarization_pipeline()
+        except Exception as e:
+            logger.error(f"[PRELOAD] error loading diarization pipeline: {e}", exc_info=True)
 
 
 # --- Celery tasks ---
@@ -425,7 +427,13 @@ def convert_to_wav_and_preview(self, upload_id, correlation_id):
 @app.task(bind=True, queue="transcribe_gpu")
 def preview_transcribe(self, upload_id, correlation_id):
     logger.info(f"[{upload_id}] preview_transcribe received")
-    # если оба GPU заняты тяжёлыми тасками, переключаем на CPU
+    if not _HF_AVAILABLE:
+        logger.error(f"[{upload_id}] faster-whisper unavailable for preview_transcribe, falling back to CPU transcription")
+        # fallback to full transcription on CPU
+        from tasks import transcribe_segments  # local import to avoid hypothetical issues
+        transcribe_segments.apply_async((upload_id, correlation_id), queue="transcribe_cpu")
+        return
+
     try:
         inspector = app.control.inspect()
         active = inspector.active() or {}
@@ -436,6 +444,7 @@ def preview_transcribe(self, upload_id, correlation_id):
                     heavy += 1
         if heavy >= 2:
             logger.info(f"[{upload_id}] both GPUs busy (found {heavy} heavy tasks), falling back to CPU for transcription preview")
+            from tasks import transcribe_segments  # local import
             transcribe_segments.apply_async((upload_id, correlation_id), queue="transcribe_cpu")
             return
     except Exception:
@@ -443,7 +452,14 @@ def preview_transcribe(self, upload_id, correlation_id):
 
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
     proc = prepare_preview_segment(upload_id)
-    model = get_whisper_model()
+    try:
+        model = get_whisper_model()
+    except Exception as e:
+        logger.error(f"[{upload_id}] failed to get whisper model for preview: {e}")
+        r.publish(f"progress:{upload_id}", json.dumps({"status": "preview_failed", "error": str(e)}))
+        deliver_webhook.delay("processing_failed", upload_id, None)
+        return
+
     segments_gen, _ = model.transcribe(
         proc.stdout,
         word_timestamps=True,
