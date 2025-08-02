@@ -11,8 +11,6 @@ from dependencies import get_current_user
 from database import get_db
 import crud
 
-from tasks import send_webhook_event, merge_speakers
-
 router = APIRouter(prefix="", dependencies=[Depends(get_current_user)])
 
 
@@ -35,6 +33,7 @@ async def raw_transcription(upload_id: str,
             dp = base / "diarization.json"
             if dp.exists():
                 diar = _read_json(dp)
+                from tasks import merge_speakers  # локальный импорт
                 merged = merge_speakers(transcript, diar, pad=pad)
                 if not include_orig:
                     for seg in merged:
@@ -59,27 +58,21 @@ async def raw_preview(upload_id: str):
 async def raw_diarization(upload_id: str,
                           pad: float = Query(0.0, description="padding for merge against transcript; 0 => raw diar"),
                           include_orig: bool = Query(False, description="include orig label in merged output")):
-    """
-    - 404 {"status":"not_found"} — если вообще нет папки upload_id.
-    - 202 {"status":"processing"} — если папка есть, транскрипция уже есть/в процессе, но diarization.json ещё не готов.
-    - 200 {"status":"done", ...} — diarization готова (или выдан мердж при pad>0).
-    """
     base = Path(settings.RESULTS_FOLDER) / upload_id
     if not base.exists():
         return JSONResponse(status_code=404, content={"status": "not_found"})
 
     diar_file = base / "diarization.json"
     if not diar_file.exists():
-        # ещё не готово
         return JSONResponse(status_code=202, content={"status": "processing"})
 
-    # diarization готова
     try:
         if pad > 0:
             tp = base / "transcript.json"
             if tp.exists():
                 transcript = _read_json(tp)
                 diar = _read_json(diar_file)
+                from tasks import merge_speakers  # локальный импорт
                 merged = merge_speakers(transcript, diar, pad=pad)
                 if not include_orig:
                     for seg in merged:
@@ -100,7 +93,6 @@ async def save_labels(upload_id: str, mapping: dict,
     if not ok:
         raise HTTPException(404, "upload_id not found")
 
-    # обновляем на диске
     base = Path(settings.RESULTS_FOLDER) / upload_id
     dfile = base / "diarization.json"
     dia = _read_json(dfile)
@@ -110,5 +102,6 @@ async def save_labels(upload_id: str, mapping: dict,
             seg["speaker"] = mapping[key]
     dfile.write_text(json.dumps(dia, ensure_ascii=False, indent=2), encoding="utf-8")
 
+    from tasks import send_webhook_event  # локальный импорт
     send_webhook_event("labels_updated", upload_id, {"mapping": mapping})
     return {"detail": "Labels updated"}
