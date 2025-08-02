@@ -73,6 +73,12 @@ class Settings(BaseSettings):
     VAD_MAX_LENGTH_S: int = Field(..., env="VAD_MAX_LENGTH_S")
     SENTENCE_MAX_GAP_S: float = Field(0.5, env="SENTENCE_MAX_GAP_S")
     SENTENCE_MAX_WORDS: int = Field(50, env="SENTENCE_MAX_WORDS")
+
+    # speaker stitching incremental merging (embedding-based)
+    SPEAKER_STITCH_ENABLED: bool = Field(True, env="SPEAKER_STITCH_ENABLED")
+    SPEAKER_STITCH_THRESHOLD: float = Field(0.75, env="SPEAKER_STITCH_THRESHOLD")
+    SPEAKER_STITCH_POOL_SIZE: int = Field(5, env="SPEAKER_STITCH_POOL_SIZE")
+
     # limits & retention
     MAX_FILE_SIZE: int = Field(1_073_741_824, env="MAX_FILE_SIZE")
     FILE_RETENTION_DAYS: int = Field(7, env="FILE_RETENTION_DAYS")

@@ -32,6 +32,12 @@ _PN_AVAILABLE = False
 _whisper_model = None
 _diarization_pipeline = None
 
+# --- Speaker stitching / embedding ---
+SPEAKER_STITCH_ENABLED = getattr(settings, "SPEAKER_STITCH_ENABLED", True)
+SPEAKER_STITCH_THRESHOLD = float(getattr(settings, "SPEAKER_STITCH_THRESHOLD", 0.75))
+SPEAKER_STITCH_POOL_SIZE = int(getattr(settings, "SPEAKER_STITCH_POOL_SIZE", 5))
+_speaker_embedding_model = None  # type: ignore
+
 try:
     from faster_whisper import WhisperModel, download_model
     _HF_AVAILABLE = True
@@ -269,6 +275,99 @@ def get_diarization_pipeline():
         )
     return _diarization_pipeline
 
+def get_speaker_embedding_model():
+    global _speaker_embedding_model
+    if _speaker_embedding_model is None:
+        try:
+            from speechbrain.inference.speaker import EncoderClassifier
+        except ImportError as e:
+            logger.warning(f"[STITCH] speechbrain not available, cannot do speaker stitching: {e}")
+            raise
+        savedir = Path(settings.DIARIZER_CACHE_DIR) / "spkrec-ecapa-voxceleb"
+        _speaker_embedding_model = EncoderClassifier.from_hparams(
+            source="speechbrain/spkrec-ecapa-voxceleb",
+            savedir=str(savedir)
+        )
+    return _speaker_embedding_model
+
+def stitch_speakers(raw: List[Dict[str, Any]], wav: Path, upload_id: str) -> List[Dict[str, Any]]:
+    if not SPEAKER_STITCH_ENABLED:
+        return raw
+    try:
+        import torch
+        import torchaudio
+        model = get_speaker_embedding_model()
+        # Load full wav once
+        waveform, sr = torchaudio.load(str(wav))  # [channels, samples]
+        if sr != 16000:
+            from torchaudio.transforms import Resample
+            resampler = Resample(sr, 16000)
+            waveform = resampler(waveform)
+            sr = 16000
+
+        # Normalize waveform to expected shape
+        stitch_pool: Dict[str, List[Any]] = {}
+        next_label_idx = 0
+
+        def new_canonical_label():
+            nonlocal next_label_idx
+            label = f"spk_{next_label_idx}"
+            next_label_idx += 1
+            return label
+
+        stitched: List[Dict[str, Any]] = []
+        # Ensure deterministic order for incremental assignment
+        raw_sorted = sorted(raw, key=lambda x: x["start"])
+        for seg in raw_sorted:
+            start, end = seg["start"], seg["end"]
+            if end <= start:
+                stitched.append(seg)
+                continue
+            start_sample = int(start * sr)
+            end_sample = int(end * sr)
+            if end_sample <= start_sample or start_sample >= waveform.size(1):
+                stitched.append(seg)
+                continue
+            segment_waveform = waveform[:, start_sample:end_sample]
+            if segment_waveform.numel() == 0:
+                stitched.append(seg)
+                continue
+            # If multi-channel, average to mono
+            if segment_waveform.size(0) > 1:
+                segment_waveform = segment_waveform.mean(dim=0, keepdim=True)
+            with torch.no_grad():
+                emb = model.encode_batch(segment_waveform)  # [1, emb_dim]
+            emb = emb.squeeze(0)  # [emb_dim]
+            emb = emb / (emb.norm(p=2) + 1e-8)  # normalize
+
+            assigned_label = None
+            best_sim = -1.0
+            candidate = None
+            for canon_label, embeddings in stitch_pool.items():
+                centroid = torch.stack(embeddings[-SPEAKER_STITCH_POOL_SIZE:]).mean(dim=0)
+                centroid = centroid / (centroid.norm(p=2) + 1e-8)
+                sim = torch.dot(emb, centroid).item()
+                if sim > best_sim:
+                    best_sim = sim
+                    candidate = canon_label
+            if candidate is not None and best_sim >= SPEAKER_STITCH_THRESHOLD:
+                assigned_label = candidate
+            else:
+                assigned_label = new_canonical_label()
+                stitch_pool[assigned_label] = []
+
+            # Update pool
+            stitch_pool[assigned_label].append(emb)
+            if len(stitch_pool[assigned_label]) > SPEAKER_STITCH_POOL_SIZE:
+                stitch_pool[assigned_label] = stitch_pool[assigned_label][-SPEAKER_STITCH_POOL_SIZE:]
+
+            seg["speaker"] = assigned_label
+            stitched.append(seg)
+        return stitched
+    except Exception as e:
+        logger.warning(f"[{upload_id}] speaker stitching failed, falling back to original diarization labels: {e}")
+        return raw
+
 @worker_process_init.connect
 def preload_on_startup(**kwargs):
     if _HF_AVAILABLE:
@@ -419,14 +518,6 @@ def transcribe_segments(self, upload_id, correlation_id):
             chunk_segs = _transcribe_with_vad(p.stdout, offset)
             p.stdout.close(); p.wait()
 
-            # очистка GPU-кеша между чанками
-            try:
-                import torch
-                torch.cuda.empty_cache()
-                logger.info(f"[{upload_id}] GPU cache cleared after chunk {chunk_idx}")
-            except ImportError:
-                pass
-
             raw_segs.extend(chunk_segs)
             offset += length
             chunk_idx += 1
@@ -454,6 +545,12 @@ def diarize_full(self, upload_id, correlation_id):
     logger.info(f"[{upload_id}] diarize_full started")
     r.publish(f"progress:{upload_id}", json.dumps({"status": "diarize_started"}))
     deliver_webhook.delay("diarization_started", upload_id, None)
+
+    try:
+        import torch
+        logger.info(f"[{upload_id}] GPU memory reserved before diarization: {torch.cuda.memory_reserved() if torch.cuda.is_available() else 'n/a'}")
+    except ImportError:
+        pass
 
     wav, duration = prepare_wav(upload_id)
 
@@ -527,14 +624,6 @@ def diarize_full(self, upload_id, correlation_id):
                 return
 
             tmp.unlink(missing_ok=True)
-            # очистить GPU-кеш после успешного чанка
-            try:
-                import torch
-                torch.cuda.empty_cache()
-                logger.info(f"[{upload_id}] GPU cache cleared after chunk {chunk_idx}")
-            except ImportError:
-                pass
-
             offset += this_len
             chunk_idx += 1
     else:
@@ -547,7 +636,12 @@ def diarize_full(self, upload_id, correlation_id):
                 "speaker": spk
             })
 
+    # сортируем
     raw.sort(key=lambda x: x["start"])
+
+    # применяем stitching (в случае включённой фичи)
+    if SPEAKER_STITCH_ENABLED:
+        raw = stitch_speakers(raw, wav, upload_id)
 
     # агрегируем соседние сегменты одного спикера
     diar_sentences = []
@@ -566,6 +660,11 @@ def diarize_full(self, upload_id, correlation_id):
     out.mkdir(parents=True, exist_ok=True)
     (out / "diarization.json").write_text(json.dumps(diar_sentences, ensure_ascii=False, indent=2))
     logger.info(f"[{upload_id}] diarization_done, total segments: {len(diar_sentences)}")
+    try:
+        import torch
+        logger.info(f"[{upload_id}] GPU memory reserved after diarization: {torch.cuda.memory_reserved() if torch.cuda.is_available() else 'n/a'}")
+    except ImportError:
+        pass
     r.publish(f"progress:{upload_id}", json.dumps({"status": "diarization_done", "segments": len(diar_sentences)}))
     deliver_webhook.delay("diarization_completed", upload_id, {"diarization": diar_sentences})
 
