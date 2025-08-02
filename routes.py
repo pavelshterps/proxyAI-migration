@@ -6,12 +6,17 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
+import redis.asyncio as redis_async
+
 from config.settings import settings
 from dependencies import get_current_user
 from database import get_db
 import crud
+from tasks import merge_speakers, send_webhook_event
 
 router = APIRouter(prefix="", dependencies=[Depends(get_current_user)])
+
+redis = redis_async.from_url(settings.REDIS_URL, decode_responses=True)
 
 
 def _read_json(p: Path) -> Any:
@@ -24,7 +29,7 @@ def _read_json(p: Path) -> Any:
 async def raw_transcription(
     upload_id: str,
     pad: float = Query(0.0, description="padding for speaker merge; 0 => no merge"),
-    include_orig: bool = Query(False, description="include orig label field")
+    include_orig: bool = Query(False, description="include orig label field"),
 ):
     try:
         base = Path(settings.RESULTS_FOLDER) / upload_id
@@ -35,7 +40,6 @@ async def raw_transcription(
             dp = base / "diarization.json"
             if dp.exists():
                 diar = _read_json(dp)
-                from tasks import merge_speakers  # локальный импорт для избежания circular import
                 merged = merge_speakers(transcript, diar, pad=pad)
                 if not include_orig:
                     for seg in merged:
@@ -60,7 +64,7 @@ async def raw_preview(upload_id: str):
 async def raw_diarization(
     upload_id: str,
     pad: float = Query(0.0, description="padding for merge against transcript; 0 => raw diar"),
-    include_orig: bool = Query(False, description="include orig label in merged output")
+    include_orig: bool = Query(False, description="include orig label in merged output"),
 ):
     base = Path(settings.RESULTS_FOLDER) / upload_id
     if not base.exists():
@@ -76,7 +80,6 @@ async def raw_diarization(
             if tp.exists():
                 transcript = _read_json(tp)
                 diar = _read_json(diar_file)
-                from tasks import merge_speakers  # локальный импорт
                 merged = merge_speakers(transcript, diar, pad=pad)
                 if not include_orig:
                     for seg in merged:
@@ -94,7 +97,7 @@ async def save_labels(
     upload_id: str,
     mapping: dict,
     current=Depends(get_current_user),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
 ):
     ok = await crud.update_label_mapping(db, current.id, upload_id, mapping)
     if not ok:
@@ -109,6 +112,12 @@ async def save_labels(
             seg["speaker"] = mapping[key]
     dfile.write_text(json.dumps(dia, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    from tasks import send_webhook_event  # локальный импорт
+    # пушим обновление в SSE/redis, чтобы фронт моментально видел смену labels
+    await redis.set(f"progress:{upload_id}", json.dumps({"status": "labels_updated"}))
+    await redis.publish(
+        f"progress:{upload_id}",
+        json.dumps({"status": "labels_updated", "mapping": mapping}),
+    )
+
     send_webhook_event("labels_updated", upload_id, {"mapping": mapping})
     return {"detail": "Labels updated"}

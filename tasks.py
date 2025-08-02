@@ -316,7 +316,6 @@ def stitch_speakers(raw: List[Dict[str, Any]], wav: Path, upload_id: str) -> Lis
 
         model = get_speaker_embedding_model()
 
-        # Load full wav once
         waveform, sr = torchaudio.load(str(wav))  # [channels, samples]
         if sr != 16000:
             from torchaudio.transforms import Resample
@@ -392,15 +391,9 @@ def stitch_speakers(raw: List[Dict[str, Any]], wav: Path, upload_id: str) -> Lis
 @worker_process_init.connect
 def preload_on_startup(**kwargs):
     if _HF_AVAILABLE:
-        try:
-            get_whisper_model()
-        except Exception as e:
-            logger.error(f"[PRELOAD] error loading whisper model: {e}", exc_info=True)
+        get_whisper_model()
     if _PN_AVAILABLE:
-        try:
-            get_diarization_pipeline()
-        except Exception as e:
-            logger.error(f"[PRELOAD] error loading diarization pipeline: {e}", exc_info=True)
+        get_diarization_pipeline()
 
 
 # --- Celery tasks ---
@@ -427,13 +420,6 @@ def convert_to_wav_and_preview(self, upload_id, correlation_id):
 @app.task(bind=True, queue="transcribe_gpu")
 def preview_transcribe(self, upload_id, correlation_id):
     logger.info(f"[{upload_id}] preview_transcribe received")
-    if not _HF_AVAILABLE:
-        logger.error(f"[{upload_id}] faster-whisper unavailable for preview_transcribe, falling back to CPU transcription")
-        # fallback to full transcription on CPU
-        from tasks import transcribe_segments  # local import to avoid hypothetical issues
-        transcribe_segments.apply_async((upload_id, correlation_id), queue="transcribe_cpu")
-        return
-
     try:
         inspector = app.control.inspect()
         active = inspector.active() or {}
@@ -444,7 +430,6 @@ def preview_transcribe(self, upload_id, correlation_id):
                     heavy += 1
         if heavy >= 2:
             logger.info(f"[{upload_id}] both GPUs busy (found {heavy} heavy tasks), falling back to CPU for transcription preview")
-            from tasks import transcribe_segments  # local import
             transcribe_segments.apply_async((upload_id, correlation_id), queue="transcribe_cpu")
             return
     except Exception:
@@ -452,14 +437,7 @@ def preview_transcribe(self, upload_id, correlation_id):
 
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
     proc = prepare_preview_segment(upload_id)
-    try:
-        model = get_whisper_model()
-    except Exception as e:
-        logger.error(f"[{upload_id}] failed to get whisper model for preview: {e}")
-        r.publish(f"progress:{upload_id}", json.dumps({"status": "preview_failed", "error": str(e)}))
-        deliver_webhook.delay("processing_failed", upload_id, None)
-        return
-
+    model = get_whisper_model()
     segments_gen, _ = model.transcribe(
         proc.stdout,
         word_timestamps=True,
@@ -681,14 +659,11 @@ def diarize_full(self, upload_id, correlation_id):
                 "speaker": spk
             })
 
-    # сортируем
     raw.sort(key=lambda x: x["start"])
 
-    # применяем stitching (в случае включённой фичи)
     if SPEAKER_STITCH_ENABLED:
         raw = stitch_speakers(raw, wav, upload_id)
 
-    # агрегируем соседние сегменты одного спикера
     diar_sentences = []
     buf = None
     for seg in raw:

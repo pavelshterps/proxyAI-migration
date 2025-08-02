@@ -30,12 +30,12 @@ from sse_starlette.sse import EventSourceResponse
 from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 
 from config.settings import settings
-from database import init_models, engine, wait_for_db
+from database import init_models, engine, wait_for_db, get_db
 from crud import create_upload_record, get_upload_for_user
 from dependencies import get_current_user
-from tasks import convert_to_wav_and_preview, diarize_full, merge_speakers
 from routes import router as api_router
-from admin_routes import router as admin_router  # предполагается, что этот файл существует и экспортирует router
+from admin_routes import router as admin_router
+from tasks import convert_to_wav_and_preview, diarize_full, merge_speakers
 
 app = FastAPI(title="proxyAI", version=settings.APP_VERSION)
 
@@ -71,11 +71,11 @@ log = structlog.get_logger()
 # Redis
 redis = redis_async.from_url(settings.REDIS_URL, decode_responses=True)
 
-# API key extraction (used independently in some endpoints)
+# API key extraction
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 
-async def get_api_key(x_api_key: Optional[str] = Depends(api_key_header), api_key: str = Query(None)):
+async def get_api_key(x_api_key: Optional[str] = Depends(api_key_header), api_key: Optional[str] = Query(None)):
     key = x_api_key or api_key
     if not key:
         raise HTTPException(401, "Missing API Key")
@@ -83,21 +83,16 @@ async def get_api_key(x_api_key: Optional[str] = Depends(api_key_header), api_ke
 
 
 def is_direct_file(url: str) -> bool:
-    """
-    Определяем, является ли URL прямой ссылкой на аудио-файл по расширению.
-    """
     suffix = Path(urlparse(url).path).suffix.lower()
     return suffix in {'.mp3', '.wav', '.m4a', '.flac', '.aac', '.ogg'}
 
 
 @app.on_event("startup")
 async def on_startup():
-    # создаём директории (до работы с файлами)
     for d in (settings.UPLOAD_FOLDER, settings.RESULTS_FOLDER, settings.DIARIZER_CACHE_DIR):
         Path(d).mkdir(parents=True, exist_ok=True)
         log.debug("Ensured dir", path=str(d))
 
-    # ожидаем, что DNS/порт БД доступны (чтобы не было Temporary failure in name resolution)
     parsed = urlparse(settings.DATABASE_URL)
     host = parsed.hostname or "db"
     port = parsed.port or 5432
@@ -106,7 +101,6 @@ async def on_startup():
     except Exception as e:
         log.error("Database not reachable at startup", error=str(e))
 
-    # инициализация БД с повторными попытками
     for attempt in range(5):
         try:
             await init_models(engine)
@@ -192,7 +186,6 @@ async def upload(
     current_user=Depends(get_current_user),
     db=Depends(get_db),
 ):
-    # проверяем вход
     if not file and not file_url:
         raise HTTPException(400, "Нужно передать либо файл, либо file_url")
 
@@ -210,9 +203,7 @@ async def upload(
             dst = dst_base.with_suffix(ext)
             dst.write_bytes(data)
         else:
-            # URL загрузка
             if not is_direct_file(file_url):
-                # любой не-прямой аудио-URL — через yt-dlp
                 ydl_opts = {
                     "format": "bestaudio/best",
                     "outtmpl": str(dst_base) + ".%(ext)s",
@@ -225,7 +216,6 @@ async def upload(
                 dst = base / f"{upload_id}.{ext}"
                 downloaded.rename(dst)
             else:
-                # прямой файл по расширению
                 parsed = urlparse(file_url)
                 ext = Path(parsed.path).suffix or ""
                 dst = base / f"{upload_id}{ext}"
@@ -236,13 +226,11 @@ async def upload(
         log.error("upload save error", error=str(e))
         raise HTTPException(500, f"Cannot save source: {e}")
 
-    # сохраняем запись в БД (ошибки не препятствуют продолжению обработки)
     try:
         await create_upload_record(db, current_user.id, upload_id)
     except Exception as e:
         log.warning("DB create failed", upload_id=upload_id, error=str(e))
 
-    # начинаем процессинг
     cid = x_correlation_id or uuid.uuid4().hex
     await redis.set(f"progress:{upload_id}", json.dumps({"status": "started"}))
     await redis.publish(f"progress:{upload_id}", json.dumps({"status": "started"}))
