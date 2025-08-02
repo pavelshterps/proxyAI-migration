@@ -7,6 +7,7 @@ from urllib.parse import urlparse
 from urllib.request import urlretrieve
 from typing import Optional
 
+from database import get_db
 import yt_dlp
 import structlog
 import redis.asyncio as redis_async
@@ -34,8 +35,6 @@ from database import init_models, engine, wait_for_db
 from crud import create_upload_record, get_upload_for_user
 from dependencies import get_current_user
 from tasks import convert_to_wav_and_preview, diarize_full, merge_speakers
-from routes import router as api_router
-from admin_routes import router as admin_router
 
 app = FastAPI(title="proxyAI", version=settings.APP_VERSION)
 
@@ -190,7 +189,7 @@ async def upload(
     x_correlation_id: Optional[str] = Header(None),
     api_key: str = Depends(get_api_key),
     current_user=Depends(get_current_user),
-    db=Depends(lambda: None),  # placeholder; create_upload_record gets session via dependency in its own logic
+    db=Depends(get_db),
 ):
     # проверяем вход
     if not file and not file_url:
@@ -256,7 +255,7 @@ async def get_results(
     upload_id: str,
     api_key: str = Depends(get_api_key),
     current_user=Depends(get_current_user),
-    db=Depends(lambda: None),
+    db=Depends(get_db),
     pad: float = Query(0.2, description="padding seconds when matching diarization"),
     include_orig: bool = Query(False, description="return orig diarization labels too"),
 ):

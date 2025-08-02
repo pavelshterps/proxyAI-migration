@@ -10,13 +10,12 @@ from typing import Any, Optional, List, Dict
 import requests
 from redis import Redis
 from celery.signals import worker_process_init
-from celery import Task
 
-from celery_app import app
+from celery_app import app  # импорт Celery instance
 from config.settings import settings
 
 # --- Logger setup ---
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("tasks")
 handler = logging.StreamHandler()
 formatter = logging.Formatter(
     "%(asctime)s %(levelname)s [%(name)s] %(message)s",
@@ -40,6 +39,7 @@ _speaker_embedding_model = None  # type: ignore
 
 try:
     from faster_whisper import WhisperModel, download_model
+
     _HF_AVAILABLE = True
     logger.info("[INIT] faster-whisper available")
 except ImportError as e:
@@ -47,10 +47,12 @@ except ImportError as e:
 
 try:
     from pyannote.audio import Pipeline as PyannotePipeline
+
     _PN_AVAILABLE = True
     logger.info("[INIT] pyannote.audio available")
 except ImportError as e:
     logger.warning(f"[INIT] pyannote.audio not available: {e}")
+
 
 # ---------------------- Helpers ----------------------
 
@@ -104,6 +106,7 @@ def send_webhook_event(event_type: str, upload_id: str, data: Optional[Any]):
         f"{max_attempts} attempts for {upload_id}"
     )
 
+
 def probe_audio(src: Path) -> dict:
     res = subprocess.run(
         ["ffprobe", "-v", "error", "-print_format", "json", "-show_format", "-show_streams", str(src)],
@@ -125,6 +128,7 @@ def probe_audio(src: Path) -> dict:
     except Exception:
         pass
     return info
+
 
 def prepare_wav(upload_id: str) -> (Path, float):
     src = next(Path(settings.UPLOAD_FOLDER).glob(f"{upload_id}.*"))
@@ -149,6 +153,7 @@ def prepare_wav(upload_id: str) -> (Path, float):
     ], check=True, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
     return target, duration
 
+
 def prepare_preview_segment(upload_id: str) -> subprocess.Popen:
     src = next(Path(settings.UPLOAD_FOLDER).glob(f"{upload_id}.*"))
     return subprocess.Popen([
@@ -159,9 +164,10 @@ def prepare_preview_segment(upload_id: str) -> subprocess.Popen:
         "-f", "wav", "pipe:1",
     ], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
 
+
 def group_into_sentences(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     SILENCE_GAP_S = getattr(settings, "SENTENCE_MAX_GAP_S", 0.5)
-    MAX_WORDS     = getattr(settings, "SENTENCE_MAX_WORDS", 50)
+    MAX_WORDS = getattr(settings, "SENTENCE_MAX_WORDS", 50)
 
     sentences = []
     buf = {"start": None, "end": None, "speaker": None, "text": []}
@@ -202,6 +208,7 @@ def group_into_sentences(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]
     flush_buffer()
     return sentences
 
+
 def merge_speakers(
     transcript: List[Dict[str, Any]],
     diar: List[Dict[str, Any]],
@@ -215,6 +222,7 @@ def merge_speakers(
     starts = [d["start"] for d in diar]
 
     from bisect import bisect_left
+
     def nearest(idx: int, t0: float, t1: float):
         if idx <= 0:
             return diar[0]
@@ -235,9 +243,10 @@ def merge_speakers(
             if not (d["end"] <= t0 or d["start"] >= t1)
         ]
         best = max(cands, key=lambda d: max(0.0, min(d["end"], t1) - max(d["start"], t0))) \
-               if cands else nearest(i, t0, t1)
+            if cands else nearest(i, t0, t1)
         out.append({**t, "speaker": best["speaker"]})
     return out
+
 
 def get_whisper_model(model_override: str = None):
     global _whisper_model
@@ -248,6 +257,7 @@ def get_whisper_model(model_override: str = None):
         "float16" if device.startswith("cuda") else "int8",
     ).lower()
     if model_override:
+        logger.info(f"[WHISPER] loading override model {model_override}")
         return WhisperModel(model_override, device=device, compute_type=compute)
     if _whisper_model is None:
         model_id = settings.WHISPER_MODEL_PATH
@@ -262,7 +272,9 @@ def get_whisper_model(model_override: str = None):
         if device == "cpu" and compute in ("fp16", "float16"):
             compute = "int8"
         _whisper_model = WhisperModel(path, device=device, compute_type=compute)
+        logger.info(f"[WHISPER] loaded model from {path} on {device} with compute_type={compute}")
     return _whisper_model
+
 
 def get_diarization_pipeline():
     global _diarization_pipeline
@@ -273,7 +285,9 @@ def get_diarization_pipeline():
             use_auth_token=settings.HUGGINGFACE_TOKEN,
             cache_dir=settings.DIARIZER_CACHE_DIR,
         )
+        logger.info(f"[DIARIZE] loaded pipeline {model_id}")
     return _diarization_pipeline
+
 
 def get_speaker_embedding_model():
     global _speaker_embedding_model
@@ -288,7 +302,9 @@ def get_speaker_embedding_model():
             source="speechbrain/spkrec-ecapa-voxceleb",
             savedir=str(savedir)
         )
+        logger.info("[STITCH] loaded speaker embedding model from speechbrain/spkrec-ecapa-voxceleb")
     return _speaker_embedding_model
+
 
 def stitch_speakers(raw: List[Dict[str, Any]], wav: Path, upload_id: str) -> List[Dict[str, Any]]:
     if not SPEAKER_STITCH_ENABLED:
@@ -296,7 +312,10 @@ def stitch_speakers(raw: List[Dict[str, Any]], wav: Path, upload_id: str) -> Lis
     try:
         import torch
         import torchaudio
+        import torch.nn.functional as F
+
         model = get_speaker_embedding_model()
+
         # Load full wav once
         waveform, sr = torchaudio.load(str(wav))  # [channels, samples]
         if sr != 16000:
@@ -305,8 +324,7 @@ def stitch_speakers(raw: List[Dict[str, Any]], wav: Path, upload_id: str) -> Lis
             waveform = resampler(waveform)
             sr = 16000
 
-        # Normalize waveform to expected shape
-        stitch_pool: Dict[str, List[Any]] = {}
+        stitch_pool: Dict[str, List[torch.Tensor]] = {}
         next_label_idx = 0
 
         def new_canonical_label():
@@ -316,7 +334,7 @@ def stitch_speakers(raw: List[Dict[str, Any]], wav: Path, upload_id: str) -> Lis
             return label
 
         stitched: List[Dict[str, Any]] = []
-        # Ensure deterministic order for incremental assignment
+        # deterministic order
         raw_sorted = sorted(raw, key=lambda x: x["start"])
         for seg in raw_sorted:
             start, end = seg["start"], seg["end"]
@@ -336,25 +354,31 @@ def stitch_speakers(raw: List[Dict[str, Any]], wav: Path, upload_id: str) -> Lis
             if segment_waveform.size(0) > 1:
                 segment_waveform = segment_waveform.mean(dim=0, keepdim=True)
             with torch.no_grad():
-                emb = model.encode_batch(segment_waveform)  # [1, emb_dim]
-            emb = emb.squeeze(0)  # [emb_dim]
-            emb = emb / (emb.norm(p=2) + 1e-8)  # normalize
+                emb = model.encode_batch(segment_waveform)
+            # remove singleton dims
+            emb = emb.squeeze()
+            if emb.ndim > 1:
+                emb = emb.flatten()
+            emb = F.normalize(emb, p=2, dim=0)  # unit norm
 
             assigned_label = None
             best_sim = -1.0
             candidate = None
             for canon_label, embeddings in stitch_pool.items():
-                centroid = torch.stack(embeddings[-SPEAKER_STITCH_POOL_SIZE:]).mean(dim=0)
-                centroid = centroid / (centroid.norm(p=2) + 1e-8)
+                centroid = torch.stack(embeddings[-SPEAKER_STITCH_POOL_SIZE:])
+                centroid = centroid.mean(dim=0)
+                centroid = F.normalize(centroid, p=2, dim=0)
                 sim = torch.dot(emb, centroid).item()
                 if sim > best_sim:
                     best_sim = sim
                     candidate = canon_label
             if candidate is not None and best_sim >= SPEAKER_STITCH_THRESHOLD:
                 assigned_label = candidate
+                logger.debug(f"[{upload_id}] reused speaker {assigned_label} (sim={best_sim:.3f})")
             else:
                 assigned_label = new_canonical_label()
                 stitch_pool[assigned_label] = []
+                logger.debug(f"[{upload_id}] created new speaker label {assigned_label}")
 
             # Update pool
             stitch_pool[assigned_label].append(emb)
@@ -368,12 +392,14 @@ def stitch_speakers(raw: List[Dict[str, Any]], wav: Path, upload_id: str) -> Lis
         logger.warning(f"[{upload_id}] speaker stitching failed, falling back to original diarization labels: {e}")
         return raw
 
+
 @worker_process_init.connect
 def preload_on_startup(**kwargs):
     if _HF_AVAILABLE:
         get_whisper_model()
     if _PN_AVAILABLE:
         get_diarization_pipeline()
+
 
 # --- Celery tasks ---
 
@@ -394,6 +420,7 @@ def convert_to_wav_and_preview(self, upload_id, correlation_id):
         return
 
     preview_transcribe.delay(upload_id, correlation_id)
+
 
 @app.task(bind=True, queue="transcribe_gpu")
 def preview_transcribe(self, upload_id, correlation_id):
@@ -442,6 +469,7 @@ def preview_transcribe(self, upload_id, correlation_id):
     r.publish(f"progress:{upload_id}", json.dumps({"status": "preview_done", "preview": preview}))
     deliver_webhook.delay("preview_completed", upload_id, {"preview": preview})
     transcribe_segments.delay(upload_id, correlation_id)
+
 
 @app.task(bind=True, queue="transcribe_gpu")
 def transcribe_segments(self, upload_id, correlation_id):
@@ -539,6 +567,7 @@ def transcribe_segments(self, upload_id, correlation_id):
     except ImportError:
         pass
 
+
 @app.task(bind=True, queue="diarize_gpu")
 def diarize_full(self, upload_id, correlation_id):
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
@@ -595,7 +624,7 @@ def diarize_full(self, upload_id, correlation_id):
                     for s, _, spk in ann.itertracks(yield_label=True):
                         raw.append({
                             "start": float(s.start) + offset,
-                            "end":   float(s.end)   + offset,
+                            "end": float(s.end) + offset,
                             "speaker": spk
                         })
                     added = len(raw) - before
@@ -620,7 +649,7 @@ def diarize_full(self, upload_id, correlation_id):
 
             if not success:
                 logger.error(f"[{upload_id}] failed diarization chunk #{chunk_idx} after {MAX_RETRIES_PER_CHUNK} attempts")
-                deliver_webhook.delay("processing_failed", upload_id, {"reason":"diarization_chunk_failure"})
+                deliver_webhook.delay("processing_failed", upload_id, {"reason": "diarization_chunk_failure"})
                 return
 
             tmp.unlink(missing_ok=True)
@@ -632,7 +661,7 @@ def diarize_full(self, upload_id, correlation_id):
         for s, _, spk in ann.itertracks(yield_label=True):
             raw.append({
                 "start": float(s.start),
-                "end":   float(s.end),
+                "end": float(s.end),
                 "speaker": spk
             })
 
@@ -667,6 +696,7 @@ def diarize_full(self, upload_id, correlation_id):
         pass
     r.publish(f"progress:{upload_id}", json.dumps({"status": "diarization_done", "segments": len(diar_sentences)}))
     deliver_webhook.delay("diarization_completed", upload_id, {"diarization": diar_sentences})
+
 
 @app.task(
     bind=True,
@@ -706,10 +736,10 @@ def deliver_webhook(self, event_type: str, upload_id: str, data: Optional[Any]):
         logger.warning(f"[WEBHOOK] {event_type} error for {upload_id}, retrying: {exc}")
         raise self.retry(exc=exc)
 
+
 @app.task(bind=True, queue="transcribe_cpu")
 def cleanup_old_files(self):
     age = settings.FILE_RETENTION_DAYS
-    cutoff = datetime.utcnow() - timedelta(days=age)
     deleted = 0
     for base in (Path(settings.UPLOAD_FOLDER), Path(settings.RESULTS_FOLDER)):
         for p in base.glob("**/*"):

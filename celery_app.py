@@ -1,18 +1,20 @@
 import os
 import sys
-
-# Добавляем корень приложения в PYTHONPATH, чтобы модуль tasks всегда находился
-sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
-
 import logging
 from datetime import datetime
 
 from celery import Celery
 from celery.signals import worker_process_init
+from celery.schedules import crontab
+from kombu import Queue
+
 from config.settings import settings
 
+# Добавляем корень приложения в PYTHONPATH, чтобы tasks всегда находился
+sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
+
 # --- Logger setup ---
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("celery_app")
 handler = logging.StreamHandler()
 formatter = logging.Formatter(
     "%(asctime)s %(levelname)s [%(name)s] %(message)s",
@@ -22,26 +24,54 @@ handler.setFormatter(formatter)
 logger.addHandler(handler)
 logger.setLevel(logging.INFO)
 
-# Создаём Celery и сразу включаем модуль tasks
+# Создаём Celery
 app = Celery(
     "proxyai",
     broker=settings.CELERY_BROKER_URL,
     backend=settings.CELERY_RESULT_BACKEND,
-    include=["tasks"],               # <-- сюда включаем наш tasks.py
+    include=["tasks"],
 )
-app.conf.task_acks_late = True
-app.conf.worker_prefetch_multiplier = 1
-app.conf.broker_transport_options = {"visibility_timeout": 3600}
 
-# Дополнительно явно импортируем tasks, чтобы декораторы @app.task сработали
-import tasks  # noqa: E402
+# Общая конфигурация
+app.conf.update(
+    task_acks_late=True,
+    worker_prefetch_multiplier=1,
+    broker_transport_options={
+        "sentinels": settings.CELERY_SENTINELS,
+        "master_name": settings.CELERY_SENTINEL_MASTER_NAME,
+        "socket_timeout": settings.CELERY_SENTINEL_SOCKET_TIMEOUT,
+        "retry_on_timeout": True,
+        "preload_reconnect": True,
+        "role": "master",
+    },
+    task_serializer="json",
+    accept_content=["json"],
+    result_serializer="json",
+    timezone=settings.CELERY_TIMEZONE,
+    task_queues=[
+        Queue("transcribe_cpu"),
+        Queue("transcribe_gpu"),
+        Queue("diarize_gpu"),
+    ],
+    task_routes={
+        "tasks.preview_transcribe": {"queue": "transcribe_gpu"},
+        "tasks.transcribe_segments": {"queue": "transcribe_gpu"},
+        "tasks.diarize_full": {"queue": "diarize_gpu"},
+    },
+    beat_schedule={
+        "daily-cleanup-old-files": {
+            "task": "tasks.cleanup_old_files",
+            "schedule": crontab(hour=3, minute=0),
+        },
+    },
+)
 
-# Инициализировать модели на старте процесса-воркера
+
 @worker_process_init.connect
 def preload_models(**kwargs):
-    from tasks import get_whisper_model, get_diarization_pipeline
-
+    # импорт локально, чтобы избежать circular import на уровне модуля
     try:
+        from tasks import get_whisper_model, get_diarization_pipeline
         get_whisper_model()
         get_diarization_pipeline()
         logger.info(f"[{datetime.utcnow().isoformat()}] [PRELOAD] models loaded")
