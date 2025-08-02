@@ -30,7 +30,7 @@ from sse_starlette.sse import EventSourceResponse
 from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 
 from config.settings import settings
-from database import init_models, engine, get_db
+from database import init_models, engine, wait_for_db
 from crud import create_upload_record, get_upload_for_user
 from dependencies import get_current_user
 from tasks import convert_to_wav_and_preview, diarize_full, merge_speakers
@@ -70,7 +70,17 @@ log = structlog.get_logger()
 
 # Redis
 redis = redis_async.from_url(settings.REDIS_URL, decode_responses=True)
+
+# API key extraction (used independently in some endpoints)
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+
+async def get_api_key(x_api_key: Optional[str] = Depends(api_key_header), api_key: str = Query(None)):
+    key = x_api_key or api_key
+    if not key:
+        raise HTTPException(401, "Missing API Key")
+    return key
+
 
 def is_direct_file(url: str) -> bool:
     """
@@ -79,27 +89,35 @@ def is_direct_file(url: str) -> bool:
     suffix = Path(urlparse(url).path).suffix.lower()
     return suffix in {'.mp3', '.wav', '.m4a', '.flac', '.aac', '.ogg'}
 
-async def get_api_key(x_api_key: Optional[str] = Depends(api_key_header), api_key: str = Query(None)):
-    key = x_api_key or api_key
-    if not key:
-        raise HTTPException(401, "Missing API Key")
-    return key
 
 @app.on_event("startup")
 async def on_startup():
-    # инициализация БД
+    # создаём директории (до работы с файлами)
+    for d in (settings.UPLOAD_FOLDER, settings.RESULTS_FOLDER, settings.DIARIZER_CACHE_DIR):
+        Path(d).mkdir(parents=True, exist_ok=True)
+        log.debug("Ensured dir", path=str(d))
+
+    # ожидаем, что DNS/порт БД доступны (чтобы не было Temporary failure in name resolution)
+    parsed = urlparse(settings.DATABASE_URL)
+    host = parsed.hostname or "db"
+    port = parsed.port or 5432
+    try:
+        await wait_for_db(host, port, timeout=30)
+    except Exception as e:
+        log.error("Database not reachable at startup", error=str(e))
+
+    # инициализация БД с повторными попытками
     for attempt in range(5):
         try:
             await init_models(engine)
             log.info("DB connected", attempt=attempt)
             break
-        except OSError as e:
+        except Exception as e:
             log.warning("DB init failed", attempt=attempt, error=str(e))
             await asyncio.sleep(2)
-    # создаём директории
-    for d in (settings.UPLOAD_FOLDER, settings.RESULTS_FOLDER, settings.DIARIZER_CACHE_DIR):
-        Path(d).mkdir(parents=True, exist_ok=True)
-        log.debug("Ensured dir", path=str(d))
+    else:
+        log.error("Could not initialize DB after retries; dependent endpoints may fail.")
+
 
 @app.get("/", include_in_schema=False)
 async def serve_frontend():
@@ -108,6 +126,7 @@ async def serve_frontend():
         raise HTTPException(404, "Not found")
     return HTMLResponse(index.read_text(encoding="utf-8"))
 
+
 @app.get("/favicon.ico", include_in_schema=False)
 async def favicon():
     ico = Path("static/favicon.ico")
@@ -115,17 +134,21 @@ async def favicon():
         return FileResponse(str(ico))
     raise HTTPException(404, "favicon not found")
 
+
 @app.get("/health", tags=["default"])
 async def health():
     return {"status": "ok"}
+
 
 @app.get("/ready", tags=["default"])
 async def ready():
     return {"status": "ready"}
 
+
 @app.get("/metrics", tags=["default"])
 async def metrics():
     return PlainTextResponse(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
 
 @app.get("/events/{upload_id}", tags=["default"])
 async def progress_events(upload_id: str, request: Request, api_key: str = Depends(get_api_key)):
@@ -139,7 +162,7 @@ async def progress_events(upload_id: str, request: Request, api_key: str = Depen
                     break
                 msg = await sub.get_message(ignore_subscribe_messages=True, timeout=0.5)
                 now = time.time()
-                if msg and msg["type"] == "message":
+                if msg and msg.get("type") == "message":
                     yield f"data: {msg['data']}\n\n"
                 elif now - last_hb > 1.0:
                     yield ":\n\n"
@@ -149,12 +172,14 @@ async def progress_events(upload_id: str, request: Request, api_key: str = Depen
             await sub.unsubscribe(f"progress:{upload_id}")
     return EventSourceResponse(event_generator())
 
+
 @app.get("/status/{upload_id}", tags=["default"])
 async def get_status(upload_id: str, api_key: str = Depends(get_api_key)):
     raw = await redis.get(f"progress:{upload_id}")
     if not raw:
         raise HTTPException(404, "status not found")
     return json.loads(raw)
+
 
 @app.post("/upload/", tags=["default"])
 @timer_limiter.limit("10/minute")
@@ -165,7 +190,7 @@ async def upload(
     x_correlation_id: Optional[str] = Header(None),
     api_key: str = Depends(get_api_key),
     current_user=Depends(get_current_user),
-    db=Depends(get_db),
+    db=Depends(lambda: None),  # placeholder; create_upload_record gets session via dependency in its own logic
 ):
     # проверяем вход
     if not file and not file_url:
@@ -211,11 +236,11 @@ async def upload(
         log.error("upload save error", error=str(e))
         raise HTTPException(500, f"Cannot save source: {e}")
 
-    # сохраняем запись в БД
+    # сохраняем запись в БД (ошибки не препятствуют продолжению обработки)
     try:
         await create_upload_record(db, current_user.id, upload_id)
-    except Exception:
-        log.warning("DB create failed", upload_id=upload_id)
+    except Exception as e:
+        log.warning("DB create failed", upload_id=upload_id, error=str(e))
 
     # начинаем процессинг
     cid = x_correlation_id or uuid.uuid4().hex
@@ -225,12 +250,13 @@ async def upload(
 
     return JSONResponse({"upload_id": upload_id}, headers={"X-Correlation-ID": cid})
 
+
 @app.get("/results/{upload_id}", tags=["default"])
 async def get_results(
     upload_id: str,
     api_key: str = Depends(get_api_key),
     current_user=Depends(get_current_user),
-    db=Depends(get_db),
+    db=Depends(lambda: None),
     pad: float = Query(0.2, description="padding seconds when matching diarization"),
     include_orig: bool = Query(False, description="return orig diarization labels too"),
 ):
@@ -243,12 +269,15 @@ async def get_results(
     dp = base / "diarization.json"
     if dp.exists():
         raw = json.loads(dp.read_text(encoding="utf-8"))
-        rec = await get_upload_for_user(db, current_user.id, upload_id)
+        try:
+            rec = await get_upload_for_user(db, current_user.id, upload_id)
+        except Exception as e:
+            log.error("Failed to get upload record for user", upload_id=upload_id, error=str(e))
+            raise HTTPException(503, "Database unavailable")
         mapping = rec.label_mapping or {}
 
         merged = merge_speakers(transcript, raw, pad=pad)
         for seg in merged:
-            # если orig не задан, берём текущее поле speaker
             orig = seg.get("orig", seg.get("speaker"))
             seg["orig"] = orig
             seg["speaker"] = mapping.get(str(orig), orig)
@@ -257,6 +286,7 @@ async def get_results(
         return {"results": merged}
 
     return {"results": transcript}
+
 
 @app.post("/diarize/{upload_id}", tags=["default"])
 async def request_diarization(upload_id: str, api_key: str = Depends(get_api_key)):
