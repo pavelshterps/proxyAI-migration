@@ -212,6 +212,47 @@ def group_into_sentences(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]
     return sentences
 
 
+# простое слияние спикеров по таймкодам
+def _simple_merge(
+    transcript: List[Dict[str, Any]],
+    diar: List[Dict[str, Any]],
+    pad: float = 0.2
+) -> List[Dict[str, Any]]:
+    if not diar:
+        return [{**t, "speaker": None} for t in transcript]
+    diar = sorted(diar, key=lambda d: d["start"])
+    transcript = sorted(transcript, key=lambda t: t["start"])
+    starts = [d["start"] for d in diar]
+
+    from bisect import bisect_left
+
+    def nearest(idx: int, t0: float, t1: float):
+        if idx <= 0:
+            return diar[0]
+        if idx >= len(diar):
+            return diar[-1]
+        b, a = diar[idx - 1], diar[idx]
+        db = max(0.0, t0 - b["end"])
+        da = max(0.0, a["start"] - t1)
+        return b if db <= da else a
+
+    out = []
+    for t in transcript:
+        t0 = max(0.0, t["start"] - pad)
+        t1 = t["end"] + pad
+        i = bisect_left(starts, t1)
+        cands = [
+            d for d in diar[max(0, i - 8): i + 8]
+            if not (d["end"] <= t0 or d["start"] >= t1)
+        ]
+        best = (
+            max(cands, key=lambda d: max(0.0, min(d["end"], t1) - max(d["start"], t0)))
+            if cands else nearest(i, t0, t1)
+        )
+        out.append({**t, "speaker": best["speaker"]})
+    return out
+
+
 def get_whisper_model(model_override: str = None):
     global _whisper_model
     device = settings.WHISPER_DEVICE.lower()
@@ -246,11 +287,8 @@ def get_whisper_model(model_override: str = None):
             settings.WHISPER_DEVICE = "cpu"
             _whisper_model = WhisperModel(path, device="cpu", compute_type="int8")
 
-        # используем локальную переменную compute,
-        # т.к. .compute_type в WhisperModel теперь отсутствует
-        logger.info(
-            f"[WHISPER] loaded model from {path} on {settings.WHISPER_DEVICE} with compute_type={compute}"
-        )
+        # WhisperModel.compute_type убран, используем локальную переменную compute
+        logger.info(f"[WHISPER] loaded model from {path} on {settings.WHISPER_DEVICE} with compute_type={compute}")
 
     return _whisper_model
 
@@ -281,7 +319,12 @@ def get_speaker_embedding_model():
     return _speaker_embedding_model
 
 
-def global_cluster_speakers(raw: List[Dict[str, Any]], wav: Path, upload_id: str) -> List[Dict[str, Any]]:
+def global_cluster_speakers(
+    raw: List[Dict[str, Any]],
+    wav: Path,
+    upload_id: str,
+    pad: float = 0.2
+) -> List[Dict[str, Any]]:
     import torch
     from torchaudio.transforms import Resample
     from torchaudio import load as load_wav
@@ -294,8 +337,9 @@ def global_cluster_speakers(raw: List[Dict[str, Any]], wav: Path, upload_id: str
     model = get_speaker_embedding_model()
     embeddings = []
     for seg in raw:
-        start, end = int(seg["start"] * sr), int(seg["end"] * sr)
-        wf = waveform[:, start:end]
+        start_sample = int(seg["start"] * sr)
+        end_sample = int(seg["end"] * sr)
+        wf = waveform[:, start_sample:end_sample]
         if wf.numel() == 0:
             emb = torch.zeros(model.meta["embedding_size"])
         else:
@@ -320,8 +364,19 @@ def global_cluster_speakers(raw: List[Dict[str, Any]], wav: Path, upload_id: str
         seg["speaker"] = f"spk_{lbl}"
     return raw
 
-# экспортируем новую функцию как прежнюю
-merge_speakers = global_cluster_speakers
+
+# Экспорт для API — теперь обе функции в едином интерфейсе
+def merge_speakers(
+    transcript: List[Dict[str, Any]],
+    diar: List[Dict[str, Any]],
+    pad: float = 0.2
+) -> List[Dict[str, Any]]:
+    # Если нужен обычный merge по таймкодам — раскомментируйте строку ниже:
+    # return _simple_merge(transcript, diar, pad)
+    # Иначе — глобальный кластеринг по embedding
+    # Note: global_cluster_speakers expects raw list as first arg,
+    # here we pass diar segments as `raw`, and transcript as `wav` unused.
+    return global_cluster_speakers(diar, Path("unused"), "api_merge", pad)
 
 
 @worker_process_init.connect
@@ -356,7 +411,7 @@ def convert_to_wav_and_preview(self, upload_id, correlation_id):
 @app.task(bind=True, queue="transcribe_gpu")
 def preview_transcribe(self, upload_id, correlation_id):
     logger.info(f"[{upload_id}] preview_transcribe received")
-    # --- CPU fallback when GPUs заняты ---
+    # --- CPU fallback when GPUs busy ---
     try:
         inspector = app.control.inspect()
         active = inspector.active() or {}
@@ -371,7 +426,7 @@ def preview_transcribe(self, upload_id, correlation_id):
             transcribe_segments.apply_async((upload_id, correlation_id), queue="transcribe_cpu")
             return
     except Exception:
-        logger.warning(f"[{upload_id}] preview_transcribe: не удалось инспектировать воркеры, продолжаем на GPU")
+        logger.warning(f"[{upload_id}] preview_transcribe: failed to inspect workers, proceeding on GPU")
 
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
     proc = prepare_preview_segment(upload_id)
@@ -411,7 +466,7 @@ def transcribe_segments(self, upload_id, correlation_id):
     except ImportError:
         pass
 
-    # --- CPU fallback при перегрузке GPU ---
+    # --- CPU fallback if GPUs overloaded ---
     try:
         inspector = app.control.inspect()
         active = inspector.active() or {}
@@ -426,7 +481,7 @@ def transcribe_segments(self, upload_id, correlation_id):
             transcribe_segments.apply_async((upload_id, correlation_id), queue="transcribe_cpu")
             return
     except Exception:
-        logger.warning(f"[{upload_id}] transcribe_segments: не удалось инспектировать воркеры")
+        logger.warning(f"[{upload_id}] transcribe_segments: failed to inspect workers")
 
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
     wav, duration = prepare_wav(upload_id)
@@ -455,23 +510,29 @@ def transcribe_segments(self, upload_id, correlation_id):
         return list(segs)
 
     if duration <= settings.VAD_MAX_LENGTH_S:
-        logger.info(f"[{upload_id}] короткое аудио ({duration:.1f}s) → один VAD-проход")
+        logger.info(f"[{upload_id}] short audio ({duration:.1f}s) → single VAD pass")
         raw_segs = _transcribe_with_vad(str(wav))
     else:
         total_chunks = math.ceil(duration / settings.CHUNK_LENGTH_S)
         offset = 0.0
         chunk_idx = 0
+        logger.info(f"[{upload_id}] long audio ({duration:.1f}s) → {total_chunks} chunks по {settings.CHUNK_LENGTH_S}s")
         while offset < duration:
             length = min(settings.CHUNK_LENGTH_S, duration - offset)
             logger.info(f"[{upload_id}] processing chunk {chunk_idx+1}/{total_chunks}: {offset:.1f}s→{offset+length:.1f}s")
             p = subprocess.Popen(
-                ["ffmpeg", "-y", "-threads", str(settings.FFMPEG_THREADS),
-                 "-ss", str(offset), "-t", str(length),
-                 "-i", str(wav), "-f", "wav", "pipe:1"],
-                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+                [
+                    "ffmpeg", "-y",
+                    "-threads", str(settings.FFMPEG_THREADS),
+                    "-ss", str(offset), "-t", str(length),
+                    "-i", str(wav), "-f", "wav", "pipe:1"
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL
             )
             chunk_segs = _transcribe_with_vad(p.stdout, offset)
             p.stdout.close(); p.wait()
+
             raw_segs.extend(chunk_segs)
             offset += length
             chunk_idx += 1
@@ -531,12 +592,14 @@ def diarize_full(self, upload_id, correlation_id):
         total_chunks = math.ceil(duration / chunk_limit)
         offset = 0.0
         chunk_idx = 0
+        logger.info(f"[{upload_id}] long audio ({duration:.1f}s) → {total_chunks} diarization-чанков по {chunk_limit}s")
         while offset < duration:
             this_len = min(chunk_limit, duration - offset)
-            logger.info(f"[{upload_id}] processing diarization chunk {chunk_idx+1}/{total_chunks}: {offset:.1f}s→{offset+this_len:.1f}s")
+            logger.info(f"[{upload_id}] diarization chunk {chunk_idx+1}/{total_chunks} start: {offset:.1f}s→{offset+this_len:.1f}s")
             tmp = Path(settings.DIARIZER_CACHE_DIR) / f"{upload_id}_chunk_{int(offset)}.wav"
             subprocess.run([
-                "ffmpeg", "-y", "-threads", str(max(1, settings.FFMPEG_THREADS // 2)),
+                "ffmpeg", "-y",
+                "-threads", str(max(1, settings.FFMPEG_THREADS // 2)),
                 "-ss", str(offset), "-t", str(this_len),
                 "-i", str(wav), str(tmp)
             ], check=True, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
@@ -548,7 +611,11 @@ def diarize_full(self, upload_id, correlation_id):
                     ann = pipeline(str(tmp))
                     before = len(raw)
                     for s, _, spk in ann.itertracks(yield_label=True):
-                        raw.append({"start": float(s.start)+offset, "end": float(s.end)+offset, "speaker": spk})
+                        raw.append({
+                            "start": float(s.start) + offset,
+                            "end":   float(s.end)   + offset,
+                            "speaker": spk
+                        })
                     added = len(raw) - before
                     logger.info(f"[{upload_id}] chunk {chunk_idx+1}/{total_chunks} done: added {added} segments")
                     r.publish(f"progress:{upload_id}", json.dumps({
@@ -562,8 +629,11 @@ def diarize_full(self, upload_id, correlation_id):
                 except Exception as e:
                     attempt += 1
                     logger.warning(f"[{upload_id}] error in chunk {chunk_idx+1}/{total_chunks}, attempt {attempt}: {e}")
-                    try: torch.cuda.empty_cache()
-                    except: pass
+                    try:
+                        import torch
+                        torch.cuda.empty_cache()
+                    except ImportError:
+                        pass
                     time.sleep(5)
 
             if not success:
@@ -578,11 +648,14 @@ def diarize_full(self, upload_id, correlation_id):
         logger.info(f"[{upload_id}] single-pass diarization")
         ann = pipeline(str(wav))
         for s, _, spk in ann.itertracks(yield_label=True):
-            raw.append({"start": float(s.start), "end": float(s.end), "speaker": spk})
+            raw.append({
+                "start": float(s.start),
+                "end":   float(s.end),
+                "speaker": spk
+            })
 
     raw.sort(key=lambda x: x["start"])
 
-    # speaker stitching / clustering
     if SPEAKER_STITCH_ENABLED and using_chunking:
         raw = global_cluster_speakers(raw, wav, upload_id)
     else:
@@ -592,18 +665,20 @@ def diarize_full(self, upload_id, correlation_id):
     diar = []
     buf = None
     for seg in raw:
-        if buf and buf["speaker"]==seg["speaker"] and seg["start"]-buf["end"] < 0.1:
+        if buf and buf["speaker"] == seg["speaker"] and seg["start"] - buf["end"] < 0.1:
             buf["end"] = seg["end"]
         else:
-            if buf: diar.append(buf)
+            if buf:
+                diar.append(buf)
             buf = dict(seg)
-    if buf: diar.append(buf)
+    if buf:
+        diar.append(buf)
 
     out = Path(settings.RESULTS_FOLDER) / upload_id
     out.mkdir(parents=True, exist_ok=True)
-    (out/"diarization.json").write_text(json.dumps(diar, ensure_ascii=False, indent=2))
+    (out / "diarization.json").write_text(json.dumps(diar, ensure_ascii=False, indent=2))
     logger.info(f"[{upload_id}] diarization_done, segments={len(diar)}")
-    r.publish(f"progress:{upload_id}", json.dumps({"status":"diarization_done","segments":len(diar)}))
+    r.publish(f"progress:{upload_id}", json.dumps({"status": "diarization_done", "segments": len(diar)}))
     send_webhook_event("diarization_completed", upload_id, {"diarization": diar})
 
 
@@ -615,8 +690,10 @@ def cleanup_old_files(self):
         for p in base.glob("**/*"):
             try:
                 if datetime.utcnow() - datetime.fromtimestamp(p.stat().st_mtime) > timedelta(days=age):
-                    if p.is_dir(): p.rmdir()
-                    else: p.unlink()
+                    if p.is_dir():
+                        p.rmdir()
+                    else:
+                        p.unlink()
                     deleted += 1
             except Exception:
                 continue
