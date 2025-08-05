@@ -3,6 +3,7 @@ import logging
 import subprocess
 import time
 import re
+import math
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional, List, Dict
@@ -244,8 +245,10 @@ def merge_speakers(
             d for d in diar[max(0, i - 8): i + 8]
             if not (d["end"] <= t0 or d["start"] >= t1)
         ]
-        best = max(cands, key=lambda d: max(0.0, min(d["end"], t1) - max(d["start"], t0))) \
-            if cands else nearest(i, t0, t1)
+        best = max(
+            cands,
+            key=lambda d: max(0.0, min(d["end"], t1) - max(d["start"], t0))
+        ) if cands else nearest(i, t0, t1)
         out.append({**t, "speaker": best["speaker"]})
     return out
 
@@ -271,10 +274,13 @@ def get_whisper_model(model_override: str = None):
             )
         except Exception:
             path = model_id
-        if device == "cpu" and compute in ("fp16", "float16"):
-            compute = "int8"
-        _whisper_model = WhisperModel(path, device=device, compute_type=compute)
-        logger.info(f"[WHISPER] loaded model from {path} on {device} with compute_type={compute}")
+        try:
+            _whisper_model = WhisperModel(path, device=device, compute_type=compute)
+        except RuntimeError as e:
+            logger.warning(f"Whisper GPU unavailable ({e}), falling back to CPU")
+            settings.WHISPER_DEVICE = "cpu"
+            _whisper_model = WhisperModel(path, device="cpu", compute_type="int8")
+        logger.info(f"[WHISPER] loaded model from {path} on {settings.WHISPER_DEVICE} with compute_type={compute}")
     return _whisper_model
 
 
@@ -306,148 +312,6 @@ def get_speaker_embedding_model():
         )
         logger.info("[STITCH] loaded speaker embedding model from speechbrain/spkrec-ecapa-voxceleb")
     return _speaker_embedding_model
-
-
-def stitch_speakers(raw: List[Dict[str, Any]], wav: Path, upload_id: str) -> List[Dict[str, Any]]:
-    if not SPEAKER_STITCH_ENABLED:
-        return raw
-
-    # если pyannote выдал только одного исходного спикера — не трогаем
-    unique_orig = set(seg.get("speaker") for seg in raw)
-    if len(unique_orig) <= 1:
-        logger.debug(f"[{upload_id}] only one original speaker {unique_orig}, skipping stitching")
-        return raw
-
-    try:
-        import torch
-        import torchaudio
-        import torch.nn.functional as F
-
-        model = get_speaker_embedding_model()
-
-        waveform, sr = torchaudio.load(str(wav))  # [channels, samples]
-        if sr != 16000:
-            from torchaudio.transforms import Resample
-            resampler = Resample(sr, 16000)
-            waveform = resampler(waveform)
-            sr = 16000
-
-        stitch_centroids: Dict[str, torch.Tensor] = {}
-        stitch_histories: Dict[str, List[torch.Tensor]] = {}
-        next_label_idx = 0
-
-        def new_canonical_label():
-            nonlocal next_label_idx
-            label = f"spk_{next_label_idx}"
-            next_label_idx += 1
-            return label
-
-        stitched: List[Dict[str, Any]] = []
-        raw_sorted = sorted(raw, key=lambda x: x["start"])
-        for seg in raw_sorted:
-            start, end = seg["start"], seg["end"]
-            if end <= start:
-                stitched.append(seg)
-                continue
-            start_sample = int(start * sr)
-            end_sample = int(end * sr)
-            if end_sample <= start_sample or start_sample >= waveform.size(1):
-                stitched.append(seg)
-                continue
-            segment_waveform = waveform[:, start_sample:end_sample]
-            if segment_waveform.numel() == 0:
-                stitched.append(seg)
-                continue
-            if segment_waveform.size(0) > 1:
-                segment_waveform = segment_waveform.mean(dim=0, keepdim=True)
-            with torch.no_grad():
-                emb = model.encode_batch(segment_waveform)
-            emb = emb.squeeze()
-            if emb.ndim > 1:
-                emb = emb.flatten()
-            emb = F.normalize(emb, p=2, dim=0)
-
-            assigned_label = None
-            best_sim = -1.0
-            for canon_label, centroid in stitch_centroids.items():
-                sim = torch.dot(emb, centroid).item()
-                if sim > best_sim:
-                    best_sim = sim
-                    assigned_label = canon_label
-
-            if assigned_label is not None and best_sim >= SPEAKER_STITCH_THRESHOLD:
-                # обновляем центроид через EMA
-                old_centroid = stitch_centroids[assigned_label]
-                updated_centroid = F.normalize(
-                    SPEAKER_STITCH_EMA_ALPHA * emb + (1 - SPEAKER_STITCH_EMA_ALPHA) * old_centroid, p=2, dim=0
-                )
-                stitch_centroids[assigned_label] = updated_centroid
-                # обновляем историю
-                hist = stitch_histories[assigned_label]
-                hist.append(emb)
-                if len(hist) > SPEAKER_STITCH_POOL_SIZE:
-                    hist.pop(0)
-                logger.debug(f"[{upload_id}] reused speaker {assigned_label} (sim={best_sim:.3f})")
-            else:
-                assigned_label = new_canonical_label()
-                stitch_centroids[assigned_label] = emb
-                stitch_histories[assigned_label] = [emb]
-                logger.debug(f"[{upload_id}] created new speaker label {assigned_label}")
-
-            seg["speaker"] = assigned_label
-            stitched.append(seg)
-
-        # Постобъединение лейблов с очень схожими центроидами
-        label_centroids: Dict[str, torch.Tensor] = {}
-        for label, hist in stitch_histories.items():
-            centroid = torch.stack(hist).mean(dim=0)
-            centroid = F.normalize(centroid, p=2, dim=0)
-            label_centroids[label] = centroid
-
-        # строим граф схожести и находим компоненты для слияния
-        adj: Dict[str, set] = {label: set() for label in label_centroids}
-        labels = list(label_centroids.keys())
-        for i in range(len(labels)):
-            for j in range(i + 1, len(labels)):
-                a = labels[i]
-                b = labels[j]
-                sim = torch.dot(label_centroids[a], label_centroids[b]).item()
-                if sim >= SPEAKER_STITCH_MERGE_THRESHOLD:
-                    adj[a].add(b)
-                    adj[b].add(a)
-
-        visited = set()
-        merge_map: Dict[str, str] = {}
-        for label in adj:
-            if label in visited:
-                continue
-            stack = [label]
-            component = []
-            while stack:
-                l = stack.pop()
-                if l in visited:
-                    continue
-                visited.add(l)
-                component.append(l)
-                stack.extend(adj[l] - visited)
-            if len(component) > 1:
-                rep = sorted(component)[0]
-                for l in component:
-                    merge_map[l] = rep
-
-        if merge_map:
-            for seg in stitched:
-                old = seg["speaker"]
-                if old in merge_map:
-                    new = merge_map[old]
-                    if new != old:
-                        logger.debug(f"[{upload_id}] merged speaker {old} -> {new} based on centroid similarity")
-                        seg["speaker"] = new
-
-        return stitched
-    except Exception as e:
-        logger.warning(f"[{upload_id}] speaker stitching failed, falling back to original diarization labels: {e}")
-        return raw
 
 
 @worker_process_init.connect
@@ -485,13 +349,16 @@ def preview_transcribe(self, upload_id, correlation_id):
     try:
         inspector = app.control.inspect()
         active = inspector.active() or {}
-        heavy = 0
-        for node_tasks in active.values():
-            for t in node_tasks:
-                if t["name"] in ("tasks.diarize_full", "tasks.transcribe_segments"):
-                    heavy += 1
+        heavy = sum(
+            1
+            for node_tasks in active.values()
+            for t in node_tasks
+            if t["name"] in ("tasks.diarize_full", "tasks.transcribe_segments")
+        )
         if heavy >= 2:
-            logger.info(f"[{upload_id}] both GPUs busy (found {heavy} heavy tasks), falling back to CPU for transcription preview")
+            logger.info(
+                f"[{upload_id}] both GPUs busy (found {heavy} heavy tasks), falling back to CPU"
+            )
             transcribe_segments.apply_async((upload_id, correlation_id), queue="transcribe_cpu")
             return
     except Exception:
@@ -505,7 +372,8 @@ def preview_transcribe(self, upload_id, correlation_id):
         word_timestamps=True,
         **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {}),
     )
-    proc.stdout.close(); proc.wait()
+    proc.stdout.close()
+    proc.wait()
     segments = list(segments_gen)
     for seg in segments:
         r.publish(
@@ -532,20 +400,25 @@ def transcribe_segments(self, upload_id, correlation_id):
     logger.info(f"[{upload_id}] transcribe_segments received")
     try:
         import torch
-        logger.info(f"[{upload_id}] GPU memory reserved before transcription: {torch.cuda.memory_reserved() if torch.cuda.is_available() else 'n/a'}")
+        logger.info(
+            f"[{upload_id}] GPU memory reserved before transcription: "
+            f"{torch.cuda.memory_reserved() if torch.cuda.is_available() else 'n/a'}"
+        )
     except ImportError:
         pass
 
     try:
         inspector = app.control.inspect()
         active = inspector.active() or {}
-        heavy = 0
-        for node_tasks in active.values():
-            for t in node_tasks:
-                if t["name"] in ("tasks.diarize_full", "tasks.transcribe_segments") and t["name"] != "tasks.transcribe_segments":
-                    heavy += 1
+        heavy = sum(
+            1
+            for node_tasks in active.values()
+            for t in node_tasks
+            if t["name"] in ("tasks.diarize_full", "tasks.transcribe_segments")
+               and t["name"] != "tasks.transcribe_segments"
+        )
         if heavy >= 2 and self.request.delivery_info.get("routing_key") != "transcribe_cpu":
-            logger.info(f"[{upload_id}] GPUs appear busy ({heavy} heavy tasks), rescheduling transcription to CPU")
+            logger.info(f"[{upload_id}] GPUs appear busy ({heavy} heavy tasks), switching to CPU")
             transcribe_segments.apply_async((upload_id, correlation_id), queue="transcribe_cpu")
             return
     except Exception:
@@ -572,23 +445,23 @@ def transcribe_segments(self, upload_id, correlation_id):
             },
             **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {}),
         )
-        result = []
         for s in segs:
             s.start += offset
             s.end += offset
-            result.append(s)
-        return result
+        return segs
 
     if duration <= settings.VAD_MAX_LENGTH_S:
         logger.info(f"[{upload_id}] short audio ({duration:.1f}s) → single VAD pass")
         raw_segs = _transcribe_with_vad(str(wav))
     else:
-        logger.info(f"[{upload_id}] long audio ({duration:.1f}s) → chunking at {settings.CHUNK_LENGTH_S}s")
+        chunk_len = settings.CHUNK_LENGTH_S
+        total_chunks = math.ceil(duration / chunk_len)
+        logger.info(f"[{upload_id}] long audio ({duration:.1f}s) → chunking into {total_chunks} parts")
         offset = 0.0
         chunk_idx = 0
         while offset < duration:
-            length = min(settings.CHUNK_LENGTH_S, duration - offset)
-            logger.debug(f"[{upload_id}] chunk {chunk_idx} {offset:.1f}s→{offset+length:.1f}s")
+            length = min(chunk_len, duration - offset)
+            logger.info(f"[{upload_id}] transcribe chunk {chunk_idx+1}/{total_chunks}: {offset:.1f}s→{offset+length:.1f}s")
             p = subprocess.Popen(
                 [
                     "ffmpeg", "-y",
@@ -600,7 +473,8 @@ def transcribe_segments(self, upload_id, correlation_id):
                 stderr=subprocess.DEVNULL
             )
             chunk_segs = _transcribe_with_vad(p.stdout, offset)
-            p.stdout.close(); p.wait()
+            p.stdout.close()
+            p.wait()
 
             raw_segs.extend(chunk_segs)
             offset += length
@@ -619,13 +493,19 @@ def transcribe_segments(self, upload_id, correlation_id):
 
     try:
         import torch
-        logger.info(f"[{upload_id}] GPU memory reserved after transcription: {torch.cuda.memory_reserved() if torch.cuda.is_available() else 'n/a'}")
+        logger.info(
+            f"[{upload_id}] GPU memory reserved after transcription: "
+            f"{torch.cuda.memory_reserved() if torch.cuda.is_available() else 'n/a'}"
+        )
     except ImportError:
         pass
 
 
 @app.task(bind=True, queue="diarize_gpu")
 def diarize_full(self, upload_id, correlation_id):
+    import numpy as np
+    from sklearn.cluster import AgglomerativeClustering
+
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
     logger.info(f"[{upload_id}] diarize_full started")
     r.publish(f"progress:{upload_id}", json.dumps({"status": "diarize_started"}))
@@ -633,7 +513,10 @@ def diarize_full(self, upload_id, correlation_id):
 
     try:
         import torch
-        logger.info(f"[{upload_id}] GPU memory reserved before diarization: {torch.cuda.memory_reserved() if torch.cuda.is_available() else 'n/a'}")
+        logger.info(
+            f"[{upload_id}] GPU memory reserved before diarization: "
+            f"{torch.cuda.memory_reserved() if torch.cuda.is_available() else 'n/a'}"
+        )
     except ImportError:
         pass
 
@@ -643,12 +526,20 @@ def diarize_full(self, upload_id, correlation_id):
     try:
         chunk_limit = int(raw_chunk_limit)
     except Exception:
-        logger.warning(f"[{upload_id}] invalid DIARIZATION_CHUNK_LENGTH_S={raw_chunk_limit!r}, falling back to 0")
+        logger.warning(
+            f"[{upload_id}] invalid DIARIZATION_CHUNK_LENGTH_S={raw_chunk_limit!r}, falling back to 0"
+        )
         chunk_limit = 0
 
     using_chunking = bool(chunk_limit and duration > chunk_limit)
-
-    logger.info(f"[{upload_id}] WAV prepared for diarization, duration={duration:.1f}s; chunk_limit={chunk_limit}; using_chunking={using_chunking}")
+    if using_chunking:
+        total_chunks = math.ceil(duration / chunk_limit)
+    else:
+        total_chunks = 1
+    logger.info(
+        f"[{upload_id}] WAV prepared for diarization, duration={duration:.1f}s; "
+        f"chunk_limit={chunk_limit}; using_chunking={using_chunking}; total_chunks={total_chunks}"
+    )
 
     if not _PN_AVAILABLE:
         logger.error(f"[{upload_id}] pyannote.audio not available, aborting diarization")
@@ -658,14 +549,28 @@ def diarize_full(self, upload_id, correlation_id):
     pipeline = get_diarization_pipeline()
     raw: List[Dict[str, Any]] = []
 
+    # for global clustering
+    global_embeddings: List[torch.Tensor] = []
+    segment_indices: List[int] = []
+
     MAX_RETRIES_PER_CHUNK = 2
 
     if using_chunking:
+        # preload waveform & embedding model
+        import torchaudio
+        import torch.nn.functional as F
+        emb_model = get_speaker_embedding_model()
+        waveform, sr = torchaudio.load(str(wav))
+        if sr != 16000:
+            from torchaudio.transforms import Resample
+            waveform = Resample(sr, 16000)(waveform)
+            sr = 16000
+
         offset = 0.0
         chunk_idx = 0
         while offset < duration:
             this_len = min(chunk_limit, duration - offset)
-            logger.info(f"[{upload_id}] diarization chunk #{chunk_idx} start: {offset:.1f}s→{offset+this_len:.1f}s")
+            logger.info(f"[{upload_id}] diarize chunk {chunk_idx+1}/{total_chunks}: {offset:.1f}s→{offset+this_len:.1f}s")
             tmp = Path(settings.DIARIZER_CACHE_DIR) / f"{upload_id}_chunk_{int(offset)}.wav"
             subprocess.run([
                 "ffmpeg", "-y", "-threads", str(max(1, settings.FFMPEG_THREADS // 2)),
@@ -679,12 +584,23 @@ def diarize_full(self, upload_id, correlation_id):
                 try:
                     ann = pipeline(str(tmp))
                     before = len(raw)
-                    for s, _, spk in ann.itertracks(yield_label=True):
-                        raw.append({
-                            "start": float(s.start) + offset,
-                            "end":   float(s.end)   + offset,
-                            "speaker": spk
-                        })
+                    for seg_obj, _, local_label in ann.itertracks(yield_label=True):
+                        start = float(seg_obj.start) + offset
+                        end = float(seg_obj.end) + offset
+                        raw.append({"start": start, "end": end, "speaker": local_label})
+                        idx = len(raw) - 1
+                        # extract embedding
+                        start_sample = int(start * sr)
+                        end_sample = int(end * sr)
+                        segment_waveform = waveform[:, start_sample:end_sample]
+                        if segment_waveform.numel() > 0:
+                            if segment_waveform.size(0) > 1:
+                                segment_waveform = segment_waveform.mean(dim=0, keepdim=True)
+                            with torch.no_grad():
+                                emb = emb_model.encode_batch(segment_waveform).squeeze()
+                            emb = F.normalize(emb.flatten(), p=2, dim=0)
+                            global_embeddings.append(emb.cpu())
+                            segment_indices.append(idx)
                     added = len(raw) - before
                     logger.info(f"[{upload_id}] diarization chunk #{chunk_idx} done: added {added} segments")
                     r.publish(f"progress:{upload_id}", json.dumps({
@@ -699,9 +615,8 @@ def diarize_full(self, upload_id, correlation_id):
                     attempt += 1
                     logger.warning(f"[{upload_id}] error in diarization chunk #{chunk_idx}, attempt {attempt}: {e}")
                     try:
-                        import torch
                         torch.cuda.empty_cache()
-                    except ImportError:
+                    except Exception:
                         pass
                     time.sleep(5)
 
@@ -713,19 +628,35 @@ def diarize_full(self, upload_id, correlation_id):
             tmp.unlink(missing_ok=True)
             offset += this_len
             chunk_idx += 1
+
+        # global clustering of embeddings
+        if global_embeddings:
+            X = np.vstack([emb.numpy() for emb in global_embeddings])
+            clustering = AgglomerativeClustering(
+                n_clusters=None,
+                affinity="cosine",
+                linkage="average",
+                distance_threshold=1 - SPEAKER_STITCH_THRESHOLD
+            ).fit(X)
+            labels = clustering.labels_
+            logger.info(f"[{upload_id}] global speaker clusters found: {len(set(labels))}")
+            for seg_idx, cluster_id in zip(segment_indices, labels):
+                raw[seg_idx]["speaker"] = f"spk_{cluster_id}"
+
     else:
-        logger.info(f"[{upload_id}] Short audio or chunking disabled, single diarization pass")
+        logger.info(f"[{upload_id}] short audio or chunking disabled, single diarization pass")
         ann = pipeline(str(wav))
-        for s, _, spk in ann.itertracks(yield_label=True):
+        for seg_obj, _, spk in ann.itertracks(yield_label=True):
             raw.append({
-                "start": float(s.start),
-                "end":   float(s.end),
+                "start": float(seg_obj.start),
+                "end":   float(seg_obj.end),
                 "speaker": spk
             })
 
     raw.sort(key=lambda x: x["start"])
 
-    if SPEAKER_STITCH_ENABLED and using_chunking:
+    # skip stitch_speakers when using_chunking because we've clustered globally
+    if SPEAKER_STITCH_ENABLED and not using_chunking:
         raw = stitch_speakers(raw, wav, upload_id)
     else:
         logger.debug(f"[{upload_id}] skipping speaker stitching (using_chunking={using_chunking})")
@@ -748,7 +679,10 @@ def diarize_full(self, upload_id, correlation_id):
     logger.info(f"[{upload_id}] diarization_done, total segments: {len(diar_sentences)}")
     try:
         import torch
-        logger.info(f"[{upload_id}] GPU memory reserved after diarization: {torch.cuda.memory_reserved() if torch.cuda.is_available() else 'n/a'}")
+        logger.info(
+            f"[{upload_id}] GPU memory reserved after diarization: "
+            f"{torch.cuda.memory_reserved() if torch.cuda.is_available() else 'n/a'}"
+        )
     except ImportError:
         pass
     r.publish(f"progress:{upload_id}", json.dumps({"status": "diarization_done", "segments": len(diar_sentences)}))
