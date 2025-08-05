@@ -11,11 +11,11 @@ from typing import Any, Optional, List, Dict
 import numpy as np
 import requests
 from redis import Redis
-from celery.signals import worker_process_init
-from sklearn.cluster import AgglomerativeClustering
-
 from celery_app import app  # импорт Celery instance
 from config.settings import settings
+
+# поддержка глобальной кластеризации эмбеддингов
+from sklearn.cluster import AgglomerativeClustering
 
 # --- Logger setup ---
 logger = logging.getLogger("tasks")
@@ -40,8 +40,9 @@ SPEAKER_STITCH_THRESHOLD = float(getattr(settings, "SPEAKER_STITCH_THRESHOLD", 0
 SPEAKER_STITCH_POOL_SIZE = int(getattr(settings, "SPEAKER_STITCH_POOL_SIZE", 5))
 SPEAKER_STITCH_EMA_ALPHA = float(getattr(settings, "SPEAKER_STITCH_EMA_ALPHA", 0.4))
 SPEAKER_STITCH_MERGE_THRESHOLD = float(getattr(settings, "SPEAKER_STITCH_MERGE_THRESHOLD", 0.95))
-_speaker_embedding_model: Any = None
+_speaker_embedding_model: Any = None  # type: ignore
 
+# попытка импортов внешних библиотек
 try:
     from faster_whisper import WhisperModel, download_model
     _HF_AVAILABLE = True
@@ -55,7 +56,6 @@ try:
     logger.info("[INIT] pyannote.audio available")
 except ImportError as e:
     logger.warning(f"[INIT] pyannote.audio not available: {e}")
-
 
 # ---------------------- Helpers ----------------------
 
@@ -91,7 +91,8 @@ def send_webhook_event(event_type: str, upload_id: str, data: Optional[Any]):
 def probe_audio(src: Path) -> dict:
     res = subprocess.run(
         ["ffprobe", "-v", "error", "-print_format", "json", "-show_format", "-show_streams", str(src)],
-        capture_output=True, text=True
+        capture_output=True,
+        text=True
     )
     info = {"duration": 0.0}
     try:
@@ -125,29 +126,34 @@ def prepare_wav(upload_id: str) -> (Path, float):
             src.rename(target)
         return target, duration
 
-    subprocess.run([
-        "ffmpeg", "-y", "-threads", str(settings.FFMPEG_THREADS),
-        "-i", str(src),
-        "-acodec", "pcm_s16le", "-ac", "1", "-ar", "16000", str(target),
-    ], check=True, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-threads", str(settings.FFMPEG_THREADS),
+            "-i", str(src),
+            "-acodec", "pcm_s16le", "-ac", "1", "-ar", "16000", str(target),
+        ],
+        check=True, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL
+    )
     return target, duration
 
 
 def prepare_preview_segment(upload_id: str) -> subprocess.Popen:
     src = next(Path(settings.UPLOAD_FOLDER).glob(f"{upload_id}.*"))
-    return subprocess.Popen([
-        "ffmpeg", "-y", "-threads", str(max(1, settings.FFMPEG_THREADS // 2)),
-        "-ss", "0", "-t", str(settings.PREVIEW_LENGTH_S),
-        "-i", str(src),
-        "-acodec", "pcm_s16le", "-ac", "1", "-ar", "16000",
-        "-f", "wav", "pipe:1",
-    ], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    return subprocess.Popen(
+        [
+            "ffmpeg", "-y", "-threads", str(max(1, settings.FFMPEG_THREADS // 2)),
+            "-ss", "0", "-t", str(settings.PREVIEW_LENGTH_S),
+            "-i", str(src),
+            "-acodec", "pcm_s16le", "-ac", "1", "-ar", "16000",
+            "-f", "wav", "pipe:1",
+        ],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+    )
 
 
 def group_into_sentences(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     SILENCE_GAP_S = getattr(settings, "SENTENCE_MAX_GAP_S", 0.5)
     MAX_WORDS = getattr(settings, "SENTENCE_MAX_WORDS", 50)
-
     sentences = []
     buf = {"start": None, "end": None, "speaker": None, "text": []}
     sentence_end_re = re.compile(r"[\.!\?]$")
@@ -166,21 +172,14 @@ def group_into_sentences(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]
         txt = seg["text"].strip()
         if not txt:
             continue
-
         if buf["start"] is None:
-            buf["start"] = seg["start"]
-            buf["speaker"] = seg.get("speaker")
-
+            buf["start"], buf["speaker"] = seg["start"], seg.get("speaker")
         if buf["end"] is not None and (seg["start"] - buf["end"] > SILENCE_GAP_S):
             flush_buffer()
-            buf["start"] = seg["start"]
-            buf["speaker"] = seg.get("speaker")
-
+            buf["start"], buf["speaker"] = seg["start"], seg.get("speaker")
         buf["end"] = seg["end"]
         buf["text"].append(txt)
-
-        word_count = sum(len(t.split()) for t in buf["text"])
-        if sentence_end_re.search(txt) or word_count >= MAX_WORDS:
+        if sentence_end_re.search(txt) or sum(len(t.split()) for t in buf["text"]) >= MAX_WORDS:
             flush_buffer()
 
     flush_buffer()
@@ -189,17 +188,23 @@ def group_into_sentences(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]
 
 def get_whisper_model(model_override: str = None):
     global _whisper_model
-    device = settings.WHISPER_DEVICE.lower()
-    compute = getattr(
-        settings, "WHISPER_COMPUTE_TYPE",
-        "float16" if device.startswith("cuda") else "int8",
-    ).lower()
-
     if model_override:
+        device = settings.WHISPER_DEVICE.lower()
+        compute = getattr(
+            settings,
+            "WHISPER_COMPUTE_TYPE",
+            "float16" if device.startswith("cuda") else "int8",
+        ).lower()
         logger.info(f"[WHISPER] loading override model {model_override}")
         return WhisperModel(model_override, device=device, compute_type=compute)
 
     if _whisper_model is None:
+        device = settings.WHISPER_DEVICE.lower()
+        compute = getattr(
+            settings,
+            "WHISPER_COMPUTE_TYPE",
+            "float16" if device.startswith("cuda") else "int8",
+        ).lower()
         model_id = settings.WHISPER_MODEL_PATH
         try:
             path = download_model(
@@ -264,9 +269,9 @@ def global_cluster_speakers(raw: List[Dict[str, Any]], wav: Path, upload_id: str
     model = get_speaker_embedding_model()
     embeddings = []
     for seg in raw:
-        s_sample = int(seg["start"] * sr)
-        e_sample = int(seg["end"]   * sr)
-        wf = waveform[:, s_sample:e_sample]
+        start_sample = int(seg["start"] * sr)
+        end_sample   = int(seg["end"]   * sr)
+        wf = waveform[:, start_sample:end_sample]
         if wf.numel() == 0:
             emb = torch.zeros(model.meta["embedding_size"])
         else:
@@ -291,22 +296,22 @@ def global_cluster_speakers(raw: List[Dict[str, Any]], wav: Path, upload_id: str
         seg["speaker"] = f"spk_{lbl}"
     return raw
 
-
-# экспорт для API
+# для API
 merge_speakers = global_cluster_speakers
 
-
-@worker_process_init.connect
-def preload_on_startup(**kwargs):
-    """
-    Предзагружаем только в GPU-процессах (чтобы CPU-воркеры не валились
-    во время fork & init из-за слишком большого потребления памяти).
-    """
-    if settings.WHISPER_DEVICE.lower().startswith("cuda") and _HF_AVAILABLE:
+# --- Предзагрузка моделей один раз при импортировании модуля (COW при fork) ---
+if _HF_AVAILABLE:
+    try:
         get_whisper_model()
-    if settings.WHISPER_DEVICE.lower().startswith("cuda") and _PN_AVAILABLE:
+        logger.info("[PRELOAD] whisper model preloaded")
+    except Exception as e:
+        logger.warning(f"[PRELOAD] failed to preload whisper model: {e}")
+if _PN_AVAILABLE:
+    try:
         get_diarization_pipeline()
-
+        logger.info("[PRELOAD] diarization pipeline preloaded")
+    except Exception as e:
+        logger.warning(f"[PRELOAD] failed to preload diarization pipeline: {e}")
 
 # --- Celery tasks ---
 
@@ -332,7 +337,7 @@ def convert_to_wav_and_preview(self, upload_id, correlation_id):
 @app.task(bind=True, queue="transcribe_gpu")
 def preview_transcribe(self, upload_id, correlation_id):
     logger.info(f"[{upload_id}] preview_transcribe received")
-    # ... ваша существующая fallback-логика GPU/CPU ...
+    # … логика fallback GPU/CPU …
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
     proc = prepare_preview_segment(upload_id)
     model = get_whisper_model()
@@ -341,8 +346,10 @@ def preview_transcribe(self, upload_id, correlation_id):
         word_timestamps=True,
         **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {}),
     )
-    proc.stdout.close(); proc.wait()
+    proc.stdout.close()
+    proc.wait()
     segments = list(segments_gen)
+
     for seg in segments:
         r.publish(
             f"progress:{upload_id}",
@@ -355,9 +362,11 @@ def preview_transcribe(self, upload_id, correlation_id):
         "text": "".join(s.text for s in segments),
         "timestamps": [{"start": s.start, "end": s.end, "text": s.text} for s in segments],
     }
+
     out = Path(settings.RESULTS_FOLDER) / upload_id
     out.mkdir(parents=True, exist_ok=True)
     (out / "preview_transcript.json").write_text(json.dumps(preview, ensure_ascii=False, indent=2))
+
     r.publish(f"progress:{upload_id}", json.dumps({"status": "preview_done", "preview": preview}))
     send_webhook_event("preview_completed", upload_id, {"preview": preview})
     transcribe_segments.delay(upload_id, correlation_id)
@@ -372,7 +381,10 @@ def transcribe_segments(self, upload_id, correlation_id):
     if total_chunks > 1:
         logger.info(f"[{upload_id}] total transcription chunks: {total_chunks}")
 
-    offset, idx, raw_segs = 0.0, 0, []
+    offset = 0.0
+    idx = 0
+    raw_segs: List[Any] = []
+
     def _transcribe_with_vad(source, offset: float = 0.0):
         segs, _ = get_whisper_model().transcribe(
             source,
@@ -384,7 +396,12 @@ def transcribe_segments(self, upload_id, correlation_id):
             },
             **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {}),
         )
-        return [type(s)(**{**s.__dict__, **{"start": s.start+offset, "end": s.end+offset}}) for s in segs]
+        result = []
+        for s in segs:
+            s.start += offset
+            s.end += offset
+            result.append(s)
+        return result
 
     while offset < duration:
         length = min(settings.CHUNK_LENGTH_S, duration - offset)
@@ -392,23 +409,29 @@ def transcribe_segments(self, upload_id, correlation_id):
             logger.info(f"[{upload_id}] transcription chunk {idx+1}/{total_chunks}: {offset:.1f}s→{offset+length:.1f}s")
         p = subprocess.Popen(
             [
-                "ffmpeg", "-y", "-threads", str(settings.FFMPEG_THREADS),
+                "ffmpeg", "-y",
+                "-threads", str(settings.FFMPEG_THREADS),
                 "-ss", str(offset), "-t", str(length),
                 "-i", str(wav), "-f", "wav", "pipe:1"
             ],
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
         )
         chunk_segs = _transcribe_with_vad(p.stdout, offset)
-        p.stdout.close(); p.wait()
+        p.stdout.close()
+        p.wait()
+
         raw_segs.extend(chunk_segs)
-        offset += length; idx += 1
+        offset += length
+        idx += 1
 
     flat = [{"start": s.start, "end": s.end, "text": s.text} for s in raw_segs]
     flat.sort(key=lambda x: x["start"])
     sentences = group_into_sentences(flat)
+
     out = Path(settings.RESULTS_FOLDER) / upload_id
     out.mkdir(parents=True, exist_ok=True)
     (out / "transcript.json").write_text(json.dumps(sentences, ensure_ascii=False, indent=2))
+
     Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True).publish(
         f"progress:{upload_id}", json.dumps({"status": "transcript_done"})
     )
@@ -419,13 +442,15 @@ def transcribe_segments(self, upload_id, correlation_id):
 def diarize_full(self, upload_id, correlation_id):
     logger.info(f"[{upload_id}] diarize_full received")
     wav, duration = prepare_wav(upload_id)
+
     raw_chunk_limit = int(getattr(settings, "DIARIZATION_CHUNK_LENGTH_S", 0))
     using_chunking = bool(raw_chunk_limit and duration > raw_chunk_limit)
-
     total_chunks = math.ceil(duration / raw_chunk_limit) if using_chunking else 1
     logger.info(f"[{upload_id}] total diarization chunks: {total_chunks}")
 
-    offset, idx, raw = 0.0, 0, []
+    offset = 0.0
+    idx = 0
+    raw: List[Dict[str, Any]] = []
     pipeline = get_diarization_pipeline()
 
     while offset < duration:
@@ -433,11 +458,14 @@ def diarize_full(self, upload_id, correlation_id):
         if using_chunking:
             logger.info(f"[{upload_id}] diarization chunk {idx+1}/{total_chunks}: {offset:.1f}s→{offset+length:.1f}s")
         tmp = Path(settings.DIARIZER_CACHE_DIR) / f"{upload_id}_chunk_{int(offset)}.wav"
-        subprocess.run([
-            "ffmpeg", "-y", "-threads", str(max(1, settings.FFMPEG_THREADS // 2)),
-            "-ss", str(offset), "-t", str(length),
-            "-i", str(wav), str(tmp)
-        ], check=True, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-threads", str(max(1, settings.FFMPEG_THREADS // 2)),
+                "-ss", str(offset), "-t", str(length),
+                "-i", str(wav), str(tmp)
+            ],
+            check=True, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL
+        )
 
         ann = pipeline(str(tmp))
         for s, _, spk in ann.itertracks(yield_label=True):
@@ -447,7 +475,8 @@ def diarize_full(self, upload_id, correlation_id):
                 "speaker": spk
             })
         tmp.unlink(missing_ok=True)
-        offset += length; idx += 1
+        offset += length
+        idx += 1
 
     raw.sort(key=lambda x: x["start"])
 
@@ -456,7 +485,8 @@ def diarize_full(self, upload_id, correlation_id):
     else:
         logger.debug(f"[{upload_id}] skipping speaker stitching/cluster (using_chunking={using_chunking})")
 
-    diar_sentences, buf = [], None
+    diar_sentences = []
+    buf = None
     for seg in raw:
         if buf and buf["speaker"] == seg["speaker"] and seg["start"] - buf["end"] < 0.1:
             buf["end"] = seg["end"]
