@@ -201,7 +201,6 @@ def group_into_sentences(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]
             buf["start"] = seg["start"]
             buf["speaker"] = seg.get("speaker")
 
-        # FIX: split tuple assignment into two lines
         buf["end"] = seg["end"]
         buf["text"].append(txt)
 
@@ -262,9 +261,11 @@ def get_whisper_model(model_override: str = None):
         "WHISPER_COMPUTE_TYPE",
         "float16" if device.startswith("cuda") else "int8",
     ).lower()
+
     if model_override:
         logger.info(f"[WHISPER] loading override model {model_override}")
         return WhisperModel(model_override, device=device, compute_type=compute)
+
     if _whisper_model is None:
         model_id = settings.WHISPER_MODEL_PATH
         try:
@@ -275,10 +276,19 @@ def get_whisper_model(model_override: str = None):
             )
         except Exception:
             path = model_id
+
         if device == "cpu" and compute in ("fp16", "float16"):
             compute = "int8"
-        _whisper_model = WhisperModel(path, device=device, compute_type=compute)
-        logger.info(f"[WHISPER] loaded model from {path} on {device} with compute_type={compute}")
+
+        try:
+            _whisper_model = WhisperModel(path, device=device, compute_type=compute)
+        except RuntimeError as e:
+            logger.warning(f"[WHISPER] GPU init failed ({e}), falling back to CPU")
+            settings.WHISPER_DEVICE = "cpu"
+            _whisper_model = WhisperModel(path, device="cpu", compute_type="int8")
+
+        logger.info(f"[WHISPER] loaded model from {path} on {settings.WHISPER_DEVICE} with compute_type={_whisper_model.compute_type}")
+
     return _whisper_model
 
 
@@ -351,10 +361,6 @@ def global_cluster_speakers(raw: List[Dict[str, Any]], wav: Path, upload_id: str
     for seg, lbl in zip(raw, clustering.labels_):
         seg["speaker"] = f"spk_{lbl}"
     return raw
-
-
-# Экспорт для API
-merge_speakers = global_cluster_speakers
 
 
 @worker_process_init.connect
