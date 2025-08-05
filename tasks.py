@@ -7,7 +7,6 @@ import math
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional, List, Dict
-from multiprocessing import current_process
 
 import numpy as np
 import requests
@@ -32,8 +31,8 @@ logger.setLevel(logging.INFO)
 # --- Model availability flags & holders ---
 _HF_AVAILABLE = False
 _PN_AVAILABLE = False
-_whisper_model = None
-_diarization_pipeline = None
+_whisper_model: Any = None
+_diarization_pipeline: Any = None
 
 # --- Speaker stitching / embedding ---
 SPEAKER_STITCH_ENABLED = getattr(settings, "SPEAKER_STITCH_ENABLED", True)
@@ -41,7 +40,7 @@ SPEAKER_STITCH_THRESHOLD = float(getattr(settings, "SPEAKER_STITCH_THRESHOLD", 0
 SPEAKER_STITCH_POOL_SIZE = int(getattr(settings, "SPEAKER_STITCH_POOL_SIZE", 5))
 SPEAKER_STITCH_EMA_ALPHA = float(getattr(settings, "SPEAKER_STITCH_EMA_ALPHA", 0.4))
 SPEAKER_STITCH_MERGE_THRESHOLD = float(getattr(settings, "SPEAKER_STITCH_MERGE_THRESHOLD", 0.95))
-_speaker_embedding_model = None  # type: ignore
+_speaker_embedding_model: Any = None
 
 try:
     from faster_whisper import WhisperModel, download_model
@@ -61,7 +60,8 @@ except ImportError as e:
 # ---------------------- Helpers ----------------------
 
 def send_webhook_event(event_type: str, upload_id: str, data: Optional[Any]):
-    url, secret = settings.WEBHOOK_URL, settings.WEBHOOK_SECRET
+    url = settings.WEBHOOK_URL
+    secret = settings.WEBHOOK_SECRET
     if not url or not secret:
         return
     payload = {
@@ -90,8 +90,7 @@ def send_webhook_event(event_type: str, upload_id: str, data: Optional[Any]):
 
 def probe_audio(src: Path) -> dict:
     res = subprocess.run(
-        ["ffprobe", "-v", "error", "-print_format", "json",
-         "-show_format", "-show_streams", str(src)],
+        ["ffprobe", "-v", "error", "-print_format", "json", "-show_format", "-show_streams", str(src)],
         capture_output=True, text=True
     )
     info = {"duration": 0.0}
@@ -125,6 +124,7 @@ def prepare_wav(upload_id: str) -> (Path, float):
         if src != target:
             src.rename(target)
         return target, duration
+
     subprocess.run([
         "ffmpeg", "-y", "-threads", str(settings.FFMPEG_THREADS),
         "-i", str(src),
@@ -147,28 +147,42 @@ def prepare_preview_segment(upload_id: str) -> subprocess.Popen:
 def group_into_sentences(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     SILENCE_GAP_S = getattr(settings, "SENTENCE_MAX_GAP_S", 0.5)
     MAX_WORDS = getattr(settings, "SENTENCE_MAX_WORDS", 50)
-    sentences, buf = [], {"start": None, "end": None, "speaker": None, "text": []}
+
+    sentences = []
+    buf = {"start": None, "end": None, "speaker": None, "text": []}
     sentence_end_re = re.compile(r"[\.!\?]$")
+
     def flush_buffer():
         if buf["text"] and buf["start"] is not None:
             sentences.append({
-                "start": buf["start"], "end": buf["end"],
-                "speaker": buf["speaker"], "text": " ".join(buf["text"])
+                "start": buf["start"],
+                "end": buf["end"],
+                "speaker": buf["speaker"],
+                "text": " ".join(buf["text"]),
             })
         buf.update(start=None, end=None, speaker=None, text=[])
+
     for seg in segments:
         txt = seg["text"].strip()
         if not txt:
             continue
+
         if buf["start"] is None:
-            buf["start"], buf["speaker"] = seg["start"], seg.get("speaker")
+            buf["start"] = seg["start"]
+            buf["speaker"] = seg.get("speaker")
+
         if buf["end"] is not None and (seg["start"] - buf["end"] > SILENCE_GAP_S):
             flush_buffer()
-            buf["start"], buf["speaker"] = seg["start"], seg.get("speaker")
+            buf["start"] = seg["start"]
+            buf["speaker"] = seg.get("speaker")
+
         buf["end"] = seg["end"]
         buf["text"].append(txt)
-        if sentence_end_re.search(txt) or sum(len(t.split()) for t in buf["text"]) >= MAX_WORDS:
+
+        word_count = sum(len(t.split()) for t in buf["text"])
+        if sentence_end_re.search(txt) or word_count >= MAX_WORDS:
             flush_buffer()
+
     flush_buffer()
     return sentences
 
@@ -178,27 +192,32 @@ def get_whisper_model(model_override: str = None):
     device = settings.WHISPER_DEVICE.lower()
     compute = getattr(
         settings, "WHISPER_COMPUTE_TYPE",
-        "float16" if device.startswith("cuda") else "int8"
+        "float16" if device.startswith("cuda") else "int8",
     ).lower()
+
     if model_override:
+        logger.info(f"[WHISPER] loading override model {model_override}")
         return WhisperModel(model_override, device=device, compute_type=compute)
+
     if _whisper_model is None:
         model_id = settings.WHISPER_MODEL_PATH
         try:
             path = download_model(
                 model_id,
                 cache_dir=settings.HUGGINGFACE_CACHE_DIR,
-                local_files_only=(device == "cpu")
+                local_files_only=(device == "cpu"),
             )
         except Exception:
             path = model_id
+
         try:
             _whisper_model = WhisperModel(path, device=device, compute_type=compute)
-            logger.info(f"[WHISPER] loaded model from {path} on {device} ({compute})")
+            logger.info(f"[WHISPER] loaded model from {path} on {device} with compute_type={compute}")
         except (RuntimeError, ValueError) as e:
             logger.warning(f"[WHISPER] GPU unavailable ({e}), falling back to CPU/int8")
             settings.WHISPER_DEVICE = "cpu"
             _whisper_model = WhisperModel(path, device="cpu", compute_type="int8")
+
     return _whisper_model
 
 
@@ -218,10 +237,15 @@ def get_diarization_pipeline():
 def get_speaker_embedding_model():
     global _speaker_embedding_model
     if _speaker_embedding_model is None:
-        from speechbrain.inference.speaker import EncoderClassifier
+        try:
+            from speechbrain.inference.speaker import EncoderClassifier
+        except ImportError as e:
+            logger.warning(f"[STITCH] speechbrain not available: {e}")
+            raise
         savedir = Path(settings.DIARIZER_CACHE_DIR) / "spkrec-ecapa-voxceleb"
         _speaker_embedding_model = EncoderClassifier.from_hparams(
-            source="speechbrain/spkrec-ecapa-voxceleb", savedir=str(savedir)
+            source="speechbrain/spkrec-ecapa-voxceleb",
+            savedir=str(savedir)
         )
         logger.info("[STITCH] loaded speaker embedding model")
     return _speaker_embedding_model
@@ -240,9 +264,9 @@ def global_cluster_speakers(raw: List[Dict[str, Any]], wav: Path, upload_id: str
     model = get_speaker_embedding_model()
     embeddings = []
     for seg in raw:
-        s0 = int(seg["start"] * sr)
-        s1 = int(seg["end"]   * sr)
-        wf = waveform[:, s0:s1]
+        s_sample = int(seg["start"] * sr)
+        e_sample = int(seg["end"]   * sr)
+        wf = waveform[:, s_sample:e_sample]
         if wf.numel() == 0:
             emb = torch.zeros(model.meta["embedding_size"])
         else:
@@ -256,7 +280,10 @@ def global_cluster_speakers(raw: List[Dict[str, Any]], wav: Path, upload_id: str
     X = np.vstack(embeddings)
     thresh = 1 - SPEAKER_STITCH_MERGE_THRESHOLD
     clustering = AgglomerativeClustering(
-        n_clusters=None, affinity="cosine", linkage="average", distance_threshold=thresh
+        n_clusters=None,
+        affinity="cosine",
+        linkage="average",
+        distance_threshold=thresh
     ).fit(X)
 
     logger.info(f"[{upload_id}] global clustering of {len(raw)} segments")
@@ -264,25 +291,21 @@ def global_cluster_speakers(raw: List[Dict[str, Any]], wav: Path, upload_id: str
         seg["speaker"] = f"spk_{lbl}"
     return raw
 
-# Для API
+
+# экспорт для API
 merge_speakers = global_cluster_speakers
 
 
 @worker_process_init.connect
 def preload_on_startup(**kwargs):
-    # Выполняем heavy-load только в MainProcess, чтобы дочерние CPU-воркеры не блокировались
-    if current_process().name != "MainProcess":
-        return
-    if _HF_AVAILABLE:
-        try:
-            get_whisper_model()
-        except Exception as e:
-            logger.warning(f"[PRELOAD] Whisper preload failed: {e}")
-    if _PN_AVAILABLE:
-        try:
-            get_diarization_pipeline()
-        except Exception as e:
-            logger.warning(f"[PRELOAD] Diarization preload failed: {e}")
+    """
+    Предзагружаем только в GPU-процессах (чтобы CPU-воркеры не валились
+    во время fork & init из-за слишком большого потребления памяти).
+    """
+    if settings.WHISPER_DEVICE.lower().startswith("cuda") and _HF_AVAILABLE:
+        get_whisper_model()
+    if settings.WHISPER_DEVICE.lower().startswith("cuda") and _PN_AVAILABLE:
+        get_diarization_pipeline()
 
 
 # --- Celery tasks ---
@@ -309,6 +332,7 @@ def convert_to_wav_and_preview(self, upload_id, correlation_id):
 @app.task(bind=True, queue="transcribe_gpu")
 def preview_transcribe(self, upload_id, correlation_id):
     logger.info(f"[{upload_id}] preview_transcribe received")
+    # ... ваша существующая fallback-логика GPU/CPU ...
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
     proc = prepare_preview_segment(upload_id)
     model = get_whisper_model()
@@ -320,10 +344,13 @@ def preview_transcribe(self, upload_id, correlation_id):
     proc.stdout.close(); proc.wait()
     segments = list(segments_gen)
     for seg in segments:
-        r.publish(f"progress:{upload_id}", json.dumps({
-            "status": "preview_partial",
-            "fragment": {"start": seg.start, "end": seg.end, "text": seg.text}
-        }))
+        r.publish(
+            f"progress:{upload_id}",
+            json.dumps({
+                "status": "preview_partial",
+                "fragment": {"start": seg.start, "end": seg.end, "text": seg.text}
+            })
+        )
     preview = {
         "text": "".join(s.text for s in segments),
         "timestamps": [{"start": s.start, "end": s.end, "text": s.text} for s in segments],
@@ -345,9 +372,7 @@ def transcribe_segments(self, upload_id, correlation_id):
     if total_chunks > 1:
         logger.info(f"[{upload_id}] total transcription chunks: {total_chunks}")
 
-    offset, idx = 0.0, 0
-    raw_segs: List[Any] = []
-
+    offset, idx, raw_segs = 0.0, 0, []
     def _transcribe_with_vad(source, offset: float = 0.0):
         segs, _ = get_whisper_model().transcribe(
             source,
@@ -359,19 +384,18 @@ def transcribe_segments(self, upload_id, correlation_id):
             },
             **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {}),
         )
-        for s in segs:
-            s.start += offset
-            s.end += offset
-        return segs
+        return [type(s)(**{**s.__dict__, **{"start": s.start+offset, "end": s.end+offset}}) for s in segs]
 
     while offset < duration:
         length = min(settings.CHUNK_LENGTH_S, duration - offset)
         if total_chunks > 1:
             logger.info(f"[{upload_id}] transcription chunk {idx+1}/{total_chunks}: {offset:.1f}s→{offset+length:.1f}s")
         p = subprocess.Popen(
-            ["ffmpeg","-y","-threads",str(settings.FFMPEG_THREADS),
-             "-ss",str(offset),"-t",str(length),
-             "-i",str(wav),"-f","wav","pipe:1"],
+            [
+                "ffmpeg", "-y", "-threads", str(settings.FFMPEG_THREADS),
+                "-ss", str(offset), "-t", str(length),
+                "-i", str(wav), "-f", "wav", "pipe:1"
+            ],
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
         )
         chunk_segs = _transcribe_with_vad(p.stdout, offset)
@@ -395,37 +419,38 @@ def transcribe_segments(self, upload_id, correlation_id):
 def diarize_full(self, upload_id, correlation_id):
     logger.info(f"[{upload_id}] diarize_full received")
     wav, duration = prepare_wav(upload_id)
-    chunk_limit = int(getattr(settings, "DIARIZATION_CHUNK_LENGTH_S", 0)) or duration
-    using_chunking = duration > chunk_limit
-    total_chunks = math.ceil(duration / chunk_limit) if using_chunking else 1
+    raw_chunk_limit = int(getattr(settings, "DIARIZATION_CHUNK_LENGTH_S", 0))
+    using_chunking = bool(raw_chunk_limit and duration > raw_chunk_limit)
+
+    total_chunks = math.ceil(duration / raw_chunk_limit) if using_chunking else 1
     logger.info(f"[{upload_id}] total diarization chunks: {total_chunks}")
 
-    offset, idx = 0.0, 0
-    raw: List[Dict[str, Any]] = []
+    offset, idx, raw = 0.0, 0, []
     pipeline = get_diarization_pipeline()
 
     while offset < duration:
-        length = min(chunk_limit, duration - offset)
+        length = min(raw_chunk_limit, duration - offset)
         if using_chunking:
             logger.info(f"[{upload_id}] diarization chunk {idx+1}/{total_chunks}: {offset:.1f}s→{offset+length:.1f}s")
         tmp = Path(settings.DIARIZER_CACHE_DIR) / f"{upload_id}_chunk_{int(offset)}.wav"
         subprocess.run([
-            "ffmpeg","-y","-threads",str(max(1,settings.FFMPEG_THREADS//2)),
-            "-ss",str(offset),"-t",str(length),
-            "-i",str(wav),str(tmp)
+            "ffmpeg", "-y", "-threads", str(max(1, settings.FFMPEG_THREADS // 2)),
+            "-ss", str(offset), "-t", str(length),
+            "-i", str(wav), str(tmp)
         ], check=True, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
 
         ann = pipeline(str(tmp))
         for s, _, spk in ann.itertracks(yield_label=True):
             raw.append({
-                "start": float(s.start)+offset,
-                "end": float(s.end)+offset,
+                "start": float(s.start) + offset,
+                "end":   float(s.end)   + offset,
                 "speaker": spk
             })
         tmp.unlink(missing_ok=True)
         offset += length; idx += 1
 
     raw.sort(key=lambda x: x["start"])
+
     if SPEAKER_STITCH_ENABLED and using_chunking:
         raw = global_cluster_speakers(raw, wav, upload_id)
     else:
@@ -433,12 +458,14 @@ def diarize_full(self, upload_id, correlation_id):
 
     diar_sentences, buf = [], None
     for seg in raw:
-        if buf and buf["speaker"] == seg["speaker"] and seg["start"]-buf["end"]<0.1:
+        if buf and buf["speaker"] == seg["speaker"] and seg["start"] - buf["end"] < 0.1:
             buf["end"] = seg["end"]
         else:
-            if buf: diar_sentences.append(buf)
+            if buf:
+                diar_sentences.append(buf)
             buf = dict(seg)
-    if buf: diar_sentences.append(buf)
+    if buf:
+        diar_sentences.append(buf)
 
     out = Path(settings.RESULTS_FOLDER) / upload_id
     out.mkdir(parents=True, exist_ok=True)
@@ -454,7 +481,10 @@ def cleanup_old_files(self):
         for p in base.glob("**/*"):
             try:
                 if datetime.utcnow() - datetime.fromtimestamp(p.stat().st_mtime) > timedelta(days=age):
-                    p.unlink() if p.is_file() else p.rmdir()
+                    if p.is_dir():
+                        p.rmdir()
+                    else:
+                        p.unlink()
                     deleted += 1
             except Exception:
                 continue
