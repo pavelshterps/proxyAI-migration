@@ -3,7 +3,6 @@ import logging
 import subprocess
 import time
 import re
-import math
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional, List, Dict
@@ -11,6 +10,9 @@ from typing import Any, Optional, List, Dict
 import requests
 from redis import Redis
 from celery.signals import worker_process_init
+
+import numpy as np
+from sklearn.cluster import AgglomerativeClustering
 
 from celery_app import app  # импорт Celery instance
 from config.settings import settings
@@ -245,10 +247,8 @@ def merge_speakers(
             d for d in diar[max(0, i - 8): i + 8]
             if not (d["end"] <= t0 or d["start"] >= t1)
         ]
-        best = max(
-            cands,
-            key=lambda d: max(0.0, min(d["end"], t1) - max(d["start"], t0))
-        ) if cands else nearest(i, t0, t1)
+        best = max(cands, key=lambda d: max(0.0, min(d["end"], t1) - max(d["start"], t0))) \
+            if cands else nearest(i, t0, t1)
         out.append({**t, "speaker": best["speaker"]})
     return out
 
@@ -261,9 +261,11 @@ def get_whisper_model(model_override: str = None):
         "WHISPER_COMPUTE_TYPE",
         "float16" if device.startswith("cuda") else "int8",
     ).lower()
+
     if model_override:
         logger.info(f"[WHISPER] loading override model {model_override}")
         return WhisperModel(model_override, device=device, compute_type=compute)
+
     if _whisper_model is None:
         model_id = settings.WHISPER_MODEL_PATH
         try:
@@ -274,13 +276,17 @@ def get_whisper_model(model_override: str = None):
             )
         except Exception:
             path = model_id
+
+        # try loading on GPU/F16, fallback to CPU/INT8 on failure
         try:
             _whisper_model = WhisperModel(path, device=device, compute_type=compute)
-        except RuntimeError as e:
-            logger.warning(f"Whisper GPU unavailable ({e}), falling back to CPU")
+            logger.info(f"[WHISPER] loaded model from {path} on {device} with compute_type={compute}")
+        except (RuntimeError, ValueError) as e:
+            logger.warning(f"[WHISPER] GPU/F16 unavailable ({e}), falling back to CPU/INT8")
             settings.WHISPER_DEVICE = "cpu"
             _whisper_model = WhisperModel(path, device="cpu", compute_type="int8")
-        logger.info(f"[WHISPER] loaded model from {path} on {settings.WHISPER_DEVICE} with compute_type={compute}")
+            logger.info(f"[WHISPER] loaded model from {path} on cpu with compute_type=int8")
+
     return _whisper_model
 
 
@@ -356,9 +362,7 @@ def preview_transcribe(self, upload_id, correlation_id):
             if t["name"] in ("tasks.diarize_full", "tasks.transcribe_segments")
         )
         if heavy >= 2:
-            logger.info(
-                f"[{upload_id}] both GPUs busy (found {heavy} heavy tasks), falling back to CPU"
-            )
+            logger.info(f"[{upload_id}] both GPUs busy ({heavy} heavy), falling back to CPU preview")
             transcribe_segments.apply_async((upload_id, correlation_id), queue="transcribe_cpu")
             return
     except Exception:
@@ -372,8 +376,7 @@ def preview_transcribe(self, upload_id, correlation_id):
         word_timestamps=True,
         **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {}),
     )
-    proc.stdout.close()
-    proc.wait()
+    proc.stdout.close(); proc.wait()
     segments = list(segments_gen)
     for seg in segments:
         r.publish(
@@ -400,10 +403,8 @@ def transcribe_segments(self, upload_id, correlation_id):
     logger.info(f"[{upload_id}] transcribe_segments received")
     try:
         import torch
-        logger.info(
-            f"[{upload_id}] GPU memory reserved before transcription: "
-            f"{torch.cuda.memory_reserved() if torch.cuda.is_available() else 'n/a'}"
-        )
+        logger.info(f"[{upload_id}] GPU memory reserved before transcription: "
+                    f"{torch.cuda.memory_reserved() if torch.cuda.is_available() else 'n/a'}")
     except ImportError:
         pass
 
@@ -414,11 +415,10 @@ def transcribe_segments(self, upload_id, correlation_id):
             1
             for node_tasks in active.values()
             for t in node_tasks
-            if t["name"] in ("tasks.diarize_full", "tasks.transcribe_segments")
-               and t["name"] != "tasks.transcribe_segments"
+            if t["name"] in ("tasks.diarize_full", "tasks.transcribe_segments") and t["name"] != "tasks.transcribe_segments"
         )
         if heavy >= 2 and self.request.delivery_info.get("routing_key") != "transcribe_cpu":
-            logger.info(f"[{upload_id}] GPUs appear busy ({heavy} heavy tasks), switching to CPU")
+            logger.info(f"[{upload_id}] GPUs busy ({heavy}), rescheduling transcription to CPU")
             transcribe_segments.apply_async((upload_id, correlation_id), queue="transcribe_cpu")
             return
     except Exception:
@@ -426,10 +426,8 @@ def transcribe_segments(self, upload_id, correlation_id):
 
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
     wav, duration = prepare_wav(upload_id)
-    if not _HF_AVAILABLE:
-        logger.error(f"[{upload_id}] whisper model unavailable, failing")
-        deliver_webhook.delay("processing_failed", upload_id, None)
-        return
+    total_chunks = int((duration + settings.CHUNK_LENGTH_S - 1) // settings.CHUNK_LENGTH_S)
+    logger.info(f"[{upload_id}] long audio ({duration:.1f}s) → chunking into {total_chunks} segments at {settings.CHUNK_LENGTH_S}s each")
 
     model = get_whisper_model()
     raw_segs: List[Any] = []
@@ -445,27 +443,25 @@ def transcribe_segments(self, upload_id, correlation_id):
             },
             **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {}),
         )
+        result = []
         for s in segs:
             s.start += offset
             s.end += offset
-        return segs
+            result.append(s)
+        return result
 
     if duration <= settings.VAD_MAX_LENGTH_S:
         logger.info(f"[{upload_id}] short audio ({duration:.1f}s) → single VAD pass")
         raw_segs = _transcribe_with_vad(str(wav))
     else:
-        chunk_len = settings.CHUNK_LENGTH_S
-        total_chunks = math.ceil(duration / chunk_len)
-        logger.info(f"[{upload_id}] long audio ({duration:.1f}s) → chunking into {total_chunks} parts")
         offset = 0.0
         chunk_idx = 0
         while offset < duration:
-            length = min(chunk_len, duration - offset)
-            logger.info(f"[{upload_id}] transcribe chunk {chunk_idx+1}/{total_chunks}: {offset:.1f}s→{offset+length:.1f}s")
+            length = min(settings.CHUNK_LENGTH_S, duration - offset)
+            logger.info(f"[{upload_id}] transcription chunk {chunk_idx+1}/{total_chunks}: {offset:.1f}s→{offset+length:.1f}s")
             p = subprocess.Popen(
                 [
-                    "ffmpeg", "-y",
-                    "-threads", str(settings.FFMPEG_THREADS),
+                    "ffmpeg", "-y", "-threads", str(settings.FFMPEG_THREADS),
                     "-ss", str(offset), "-t", str(length),
                     "-i", str(wav), "-f", "wav", "pipe:1"
                 ],
@@ -473,8 +469,7 @@ def transcribe_segments(self, upload_id, correlation_id):
                 stderr=subprocess.DEVNULL
             )
             chunk_segs = _transcribe_with_vad(p.stdout, offset)
-            p.stdout.close()
-            p.wait()
+            p.stdout.close(); p.wait()
 
             raw_segs.extend(chunk_segs)
             offset += length
@@ -493,19 +488,14 @@ def transcribe_segments(self, upload_id, correlation_id):
 
     try:
         import torch
-        logger.info(
-            f"[{upload_id}] GPU memory reserved after transcription: "
-            f"{torch.cuda.memory_reserved() if torch.cuda.is_available() else 'n/a'}"
-        )
+        logger.info(f"[{upload_id}] GPU memory reserved after transcription: "
+                    f"{torch.cuda.memory_reserved() if torch.cuda.is_available() else 'n/a'}")
     except ImportError:
         pass
 
 
 @app.task(bind=True, queue="diarize_gpu")
 def diarize_full(self, upload_id, correlation_id):
-    import numpy as np
-    from sklearn.cluster import AgglomerativeClustering
-
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
     logger.info(f"[{upload_id}] diarize_full started")
     r.publish(f"progress:{upload_id}", json.dumps({"status": "diarize_started"}))
@@ -513,33 +503,22 @@ def diarize_full(self, upload_id, correlation_id):
 
     try:
         import torch
-        logger.info(
-            f"[{upload_id}] GPU memory reserved before diarization: "
-            f"{torch.cuda.memory_reserved() if torch.cuda.is_available() else 'n/a'}"
-        )
+        logger.info(f"[{upload_id}] GPU memory reserved before diarization: "
+                    f"{torch.cuda.memory_reserved() if torch.cuda.is_available() else 'n/a'}")
     except ImportError:
         pass
 
     wav, duration = prepare_wav(upload_id)
-
     raw_chunk_limit = getattr(settings, "DIARIZATION_CHUNK_LENGTH_S", 0)
     try:
         chunk_limit = int(raw_chunk_limit)
     except Exception:
-        logger.warning(
-            f"[{upload_id}] invalid DIARIZATION_CHUNK_LENGTH_S={raw_chunk_limit!r}, falling back to 0"
-        )
+        logger.warning(f"[{upload_id}] invalid DIARIZATION_CHUNK_LENGTH_S={raw_chunk_limit!r}, falling back to 0")
         chunk_limit = 0
 
     using_chunking = bool(chunk_limit and duration > chunk_limit)
-    if using_chunking:
-        total_chunks = math.ceil(duration / chunk_limit)
-    else:
-        total_chunks = 1
-    logger.info(
-        f"[{upload_id}] WAV prepared for diarization, duration={duration:.1f}s; "
-        f"chunk_limit={chunk_limit}; using_chunking={using_chunking}; total_chunks={total_chunks}"
-    )
+    total_chunks = int((duration + chunk_limit - 1) // chunk_limit) if using_chunking else 1
+    logger.info(f"[{upload_id}] WAV prepared ({duration:.1f}s); chunk_limit={chunk_limit}; using_chunking={using_chunking}; total_chunks={total_chunks}")
 
     if not _PN_AVAILABLE:
         logger.error(f"[{upload_id}] pyannote.audio not available, aborting diarization")
@@ -549,28 +528,14 @@ def diarize_full(self, upload_id, correlation_id):
     pipeline = get_diarization_pipeline()
     raw: List[Dict[str, Any]] = []
 
-    # for global clustering
-    global_embeddings: List[torch.Tensor] = []
-    segment_indices: List[int] = []
-
     MAX_RETRIES_PER_CHUNK = 2
 
     if using_chunking:
-        # preload waveform & embedding model
-        import torchaudio
-        import torch.nn.functional as F
-        emb_model = get_speaker_embedding_model()
-        waveform, sr = torchaudio.load(str(wav))
-        if sr != 16000:
-            from torchaudio.transforms import Resample
-            waveform = Resample(sr, 16000)(waveform)
-            sr = 16000
-
         offset = 0.0
         chunk_idx = 0
         while offset < duration:
             this_len = min(chunk_limit, duration - offset)
-            logger.info(f"[{upload_id}] diarize chunk {chunk_idx+1}/{total_chunks}: {offset:.1f}s→{offset+this_len:.1f}s")
+            logger.info(f"[{upload_id}] diarization chunk {chunk_idx+1}/{total_chunks}: {offset:.1f}s→{offset+this_len:.1f}s")
             tmp = Path(settings.DIARIZER_CACHE_DIR) / f"{upload_id}_chunk_{int(offset)}.wav"
             subprocess.run([
                 "ffmpeg", "-y", "-threads", str(max(1, settings.FFMPEG_THREADS // 2)),
@@ -584,25 +549,14 @@ def diarize_full(self, upload_id, correlation_id):
                 try:
                     ann = pipeline(str(tmp))
                     before = len(raw)
-                    for seg_obj, _, local_label in ann.itertracks(yield_label=True):
-                        start = float(seg_obj.start) + offset
-                        end = float(seg_obj.end) + offset
-                        raw.append({"start": start, "end": end, "speaker": local_label})
-                        idx = len(raw) - 1
-                        # extract embedding
-                        start_sample = int(start * sr)
-                        end_sample = int(end * sr)
-                        segment_waveform = waveform[:, start_sample:end_sample]
-                        if segment_waveform.numel() > 0:
-                            if segment_waveform.size(0) > 1:
-                                segment_waveform = segment_waveform.mean(dim=0, keepdim=True)
-                            with torch.no_grad():
-                                emb = emb_model.encode_batch(segment_waveform).squeeze()
-                            emb = F.normalize(emb.flatten(), p=2, dim=0)
-                            global_embeddings.append(emb.cpu())
-                            segment_indices.append(idx)
+                    for s, _, spk in ann.itertracks(yield_label=True):
+                        raw.append({
+                            "start": float(s.start) + offset,
+                            "end":   float(s.end)   + offset,
+                            "speaker": spk
+                        })
                     added = len(raw) - before
-                    logger.info(f"[{upload_id}] diarization chunk #{chunk_idx} done: added {added} segments")
+                    logger.info(f"[{upload_id}] diarization chunk {chunk_idx+1}/{total_chunks} done: added {added} segments")
                     r.publish(f"progress:{upload_id}", json.dumps({
                         "status": "diarize_chunk_done",
                         "chunk_index": chunk_idx,
@@ -613,7 +567,7 @@ def diarize_full(self, upload_id, correlation_id):
                     success = True
                 except Exception as e:
                     attempt += 1
-                    logger.warning(f"[{upload_id}] error in diarization chunk #{chunk_idx}, attempt {attempt}: {e}")
+                    logger.warning(f"[{upload_id}] error in diarization chunk {chunk_idx+1}/{total_chunks}, attempt {attempt}: {e}")
                     try:
                         torch.cuda.empty_cache()
                     except Exception:
@@ -621,7 +575,7 @@ def diarize_full(self, upload_id, correlation_id):
                     time.sleep(5)
 
             if not success:
-                logger.error(f"[{upload_id}] failed diarization chunk #{chunk_idx} after {MAX_RETRIES_PER_CHUNK} attempts")
+                logger.error(f"[{upload_id}] failed diarization chunk {chunk_idx+1}/{total_chunks} after {MAX_RETRIES_PER_CHUNK} attempts")
                 deliver_webhook.delay("processing_failed", upload_id, {"reason": "diarization_chunk_failure"})
                 return
 
@@ -629,37 +583,58 @@ def diarize_full(self, upload_id, correlation_id):
             offset += this_len
             chunk_idx += 1
 
-        # global clustering of embeddings
-        if global_embeddings:
-            X = np.vstack([emb.numpy() for emb in global_embeddings])
+        # --- Global speaker clustering across all chunks ---
+        logger.info(f"[{upload_id}] performing global speaker clustering over {len(raw)} segments")
+        import torch, torchaudio
+        import torch.nn.functional as F
+        model = get_speaker_embedding_model()
+        waveform, sr = torchaudio.load(str(wav))
+        if sr != 16000:
+            from torchaudio.transforms import Resample
+            resampler = Resample(sr, 16000)
+            waveform = resampler(waveform)
+            sr = 16000
+
+        segment_embeddings = []
+        for seg in raw:
+            start, end = seg["start"], seg["end"]
+            start_sample = int(start * sr)
+            end_sample = int(end * sr)
+            if end_sample <= start_sample:
+                continue
+            seg_wave = waveform[:, start_sample:end_sample]
+            if seg_wave.size(0) > 1:
+                seg_wave = seg_wave.mean(dim=0, keepdim=True)
+            with torch.no_grad():
+                emb = model.encode_batch(seg_wave)
+            emb = emb.squeeze()
+            if emb.ndim > 1:
+                emb = emb.flatten()
+            emb = F.normalize(emb, p=2, dim=0)
+            segment_embeddings.append((seg, emb))
+
+        if segment_embeddings:
+            X = np.vstack([emb.cpu().numpy() for _, emb in segment_embeddings])
             clustering = AgglomerativeClustering(
                 n_clusters=None,
                 affinity="cosine",
                 linkage="average",
-                distance_threshold=1 - SPEAKER_STITCH_THRESHOLD
+                distance_threshold=1 - SPEAKER_STITCH_MERGE_THRESHOLD
             ).fit(X)
-            labels = clustering.labels_
-            logger.info(f"[{upload_id}] global speaker clusters found: {len(set(labels))}")
-            for seg_idx, cluster_id in zip(segment_indices, labels):
-                raw[seg_idx]["speaker"] = f"spk_{cluster_id}"
+            for (seg, _), label in zip(segment_embeddings, clustering.labels_):
+                seg["speaker"] = f"spk_{label}"
 
     else:
-        logger.info(f"[{upload_id}] short audio or chunking disabled, single diarization pass")
+        logger.info(f"[{upload_id}] single-pass diarization (no chunking)")
         ann = pipeline(str(wav))
-        for seg_obj, _, spk in ann.itertracks(yield_label=True):
+        for s, _, spk in ann.itertracks(yield_label=True):
             raw.append({
-                "start": float(seg_obj.start),
-                "end":   float(seg_obj.end),
+                "start": float(s.start),
+                "end":   float(s.end),
                 "speaker": spk
             })
 
     raw.sort(key=lambda x: x["start"])
-
-    # skip stitch_speakers when using_chunking because we've clustered globally
-    if SPEAKER_STITCH_ENABLED and not using_chunking:
-        raw = stitch_speakers(raw, wav, upload_id)
-    else:
-        logger.debug(f"[{upload_id}] skipping speaker stitching (using_chunking={using_chunking})")
 
     diar_sentences = []
     buf = None
@@ -679,10 +654,8 @@ def diarize_full(self, upload_id, correlation_id):
     logger.info(f"[{upload_id}] diarization_done, total segments: {len(diar_sentences)}")
     try:
         import torch
-        logger.info(
-            f"[{upload_id}] GPU memory reserved after diarization: "
-            f"{torch.cuda.memory_reserved() if torch.cuda.is_available() else 'n/a'}"
-        )
+        logger.info(f"[{upload_id}] GPU memory reserved after diarization: "
+                    f"{torch.cuda.memory_reserved() if torch.cuda.is_available() else 'n/a'}")
     except ImportError:
         pass
     r.publish(f"progress:{upload_id}", json.dumps({"status": "diarization_done", "segments": len(diar_sentences)}))
