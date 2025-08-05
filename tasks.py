@@ -253,7 +253,7 @@ def global_cluster_speakers(raw: List[Dict[str, Any]], wav: Path, upload_id: str
     embeddings = []
     for seg in raw:
         start_sample = int(seg["start"] * sr)
-        end_sample   = int(seg["end"]   * sr)
+        end_sample = int(seg["end"]   * sr)
         wf = waveform[:, start_sample:end_sample]
         if wf.numel() == 0:
             emb = torch.zeros(model.meta["embedding_size"])
@@ -295,8 +295,7 @@ def preload_on_startup(**kwargs):
 
 @app.task(bind=True, queue="transcribe_cpu")
 def convert_to_wav_and_preview(self, upload_id, correlation_id):
-    logger.info(f"[{
-upload_id}] convert_to_wav_and_preview received")
+    logger.info(f"[{upload_id}] convert_to_wav_and_preview received")
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
     r.publish(f"progress:{upload_id}", json.dumps({"status": "processing_started"}))
     send_webhook_event("processing_started", upload_id, None)
@@ -352,7 +351,6 @@ def transcribe_segments(self, upload_id, correlation_id):
     logger.info(f"[{upload_id}] transcribe_segments received")
     wav, duration = prepare_wav(upload_id)
 
-    # логируем общее число чанков
     total_chunks = math.ceil(duration / settings.CHUNK_LENGTH_S) if duration > settings.CHUNK_LENGTH_S else 1
     if total_chunks > 1:
         logger.info(f"[{upload_id}] total transcription chunks: {total_chunks}")
