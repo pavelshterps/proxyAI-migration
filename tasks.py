@@ -6,7 +6,7 @@ import re
 import math
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Optional, List, Dict
+from typing import Any, Optional, List, Dict, Tuple
 
 import numpy as np
 import requests
@@ -133,7 +133,7 @@ def probe_audio(src: Path) -> dict:
     return info
 
 
-def prepare_wav(upload_id: str) -> (Path, float):
+def prepare_wav(upload_id: str) -> Tuple[Path, float]:
     src = next(Path(settings.UPLOAD_FOLDER).glob(f"{upload_id}.*"))
     target = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
     info = probe_audio(src)
@@ -287,7 +287,6 @@ def get_whisper_model(model_override: str = None):
             settings.WHISPER_DEVICE = "cpu"
             _whisper_model = WhisperModel(path, device="cpu", compute_type="int8")
 
-        # Use the local `compute` variable since WhisperModel no longer exposes `.compute_type`
         logger.info(
             f"[WHISPER] loaded model from {path} "
             f"on {settings.WHISPER_DEVICE} with compute_type={compute}"
@@ -365,10 +364,6 @@ def global_cluster_speakers(raw: List[Dict[str, Any]], wav: Path, upload_id: str
     for seg, lbl in zip(raw, clustering.labels_):
         seg["speaker"] = f"spk_{lbl}"
     return raw
-
-
-# Экспорт для API
-merge_speakers = global_cluster_speakers
 
 
 @worker_process_init.connect
@@ -623,13 +618,12 @@ def diarize_full(self, upload_id, correlation_id):
     MAX_RETRIES_PER_CHUNK = 2
 
     if using_chunking:
-        total_chunks = math.ceil(duration / chunk_limit)
         offset = 0.0
         chunk_idx = 0
         while offset < duration:
             this_len = min(chunk_limit, duration - offset)
             logger.info(
-                f"[{upload_id}] processing diarization chunk {chunk_idx+1}/{total_chunks}: "
+                f"[{upload_id}] diarization chunk #{chunk_idx} start: "
                 f"{offset:.1f}s→{offset+this_len:.1f}s"
             )
             tmp = Path(settings.DIARIZER_CACHE_DIR) / f"{upload_id}_chunk_{int(offset)}.wav"
@@ -656,12 +650,12 @@ def diarize_full(self, upload_id, correlation_id):
                             "speaker": spk
                         })
                     added = len(raw) - before
-                    logger.info(f"[{upload_id}] diarization chunk {chunk_idx+1}/{total_chunks} done: added {added} segments")
+                    logger.info(f"[{upload_id}] diarization chunk #{chunk_idx} done: added {added} segments")
                     r.publish(
                         f"progress:{upload_id}",
                         json.dumps({
                             "status": "diarize_chunk_done",
-                            "chunk_index": chunk_idx+1,
+                            "chunk_index": chunk_idx,
                             "offset": offset,
                             "length": this_len,
                             "added_segments": added,
@@ -671,7 +665,7 @@ def diarize_full(self, upload_id, correlation_id):
                 except Exception as e:
                     attempt += 1
                     logger.warning(
-                        f"[{upload_id}] error in diarization chunk {chunk_idx+1}/{total_chunks}, "
+                        f"[{upload_id}] error in diarization chunk #{chunk_idx}, "
                         f"attempt {attempt}: {e}"
                     )
                     try:
@@ -683,7 +677,7 @@ def diarize_full(self, upload_id, correlation_id):
 
             if not success:
                 logger.error(
-                    f"[{upload_id}] failed diarization chunk {chunk_idx+1}/{total_chunks} after "
+                    f"[{upload_id}] failed diarization chunk #{chunk_idx} after "
                     f"{MAX_RETRIES_PER_CHUNK} attempts"
                 )
                 send_webhook_event(
@@ -708,10 +702,7 @@ def diarize_full(self, upload_id, correlation_id):
     raw.sort(key=lambda x: x["start"])
 
     if SPEAKER_STITCH_ENABLED and using_chunking:
-        raw = stitch_speakers(raw, wav, upload_id)
-    else:
-        logger.debug(f"[{upload_id}] skipping speaker stitching (using_chunking={using_chunking})")
-
+        raw = merge_speakers  # reuse original merge logic if desired
     diar_sentences = []
     buf = None
     for seg in raw:
