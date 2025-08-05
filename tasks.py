@@ -6,7 +6,7 @@ import re
 import math
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Optional, List, Dict, Tuple
+from typing import Any, Optional, List, Dict
 
 import numpy as np
 import requests
@@ -133,7 +133,7 @@ def probe_audio(src: Path) -> dict:
     return info
 
 
-def prepare_wav(upload_id: str) -> Tuple[Path, float]:
+def prepare_wav(upload_id: str) -> (Path, float):
     src = next(Path(settings.UPLOAD_FOLDER).glob(f"{upload_id}.*"))
     target = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
     info = probe_audio(src)
@@ -217,13 +217,16 @@ def merge_speakers(
     diar: List[Dict[str, Any]],
     pad: float = 0.2,
 ) -> List[Dict[str, Any]]:
+    """
+    Merge Whisper transcript segments with pyannote diarization segments,
+    assigning speakers to each transcript sentence.
+    """
     if not diar:
         return [{**t, "speaker": None} for t in transcript]
 
     diar = sorted(diar, key=lambda d: d["start"])
     transcript = sorted(transcript, key=lambda t: t["start"])
     starts = [d["start"] for d in diar]
-
     from bisect import bisect_left
 
     def nearest(idx: int, t0: float, t1: float):
@@ -254,6 +257,9 @@ def merge_speakers(
 
 
 def get_whisper_model(model_override: str = None):
+    """
+    Load (and cache) the faster-whisper model, logging compute type without .compute_type.
+    """
     global _whisper_model
     device = settings.WHISPER_DEVICE.lower()
     compute = getattr(
@@ -287,6 +293,7 @@ def get_whisper_model(model_override: str = None):
             settings.WHISPER_DEVICE = "cpu"
             _whisper_model = WhisperModel(path, device="cpu", compute_type="int8")
 
+        # Log the compute type from our local variable
         logger.info(
             f"[WHISPER] loaded model from {path} "
             f"on {settings.WHISPER_DEVICE} with compute_type={compute}"
@@ -326,6 +333,9 @@ def get_speaker_embedding_model():
 
 
 def global_cluster_speakers(raw: List[Dict[str, Any]], wav: Path, upload_id: str) -> List[Dict[str, Any]]:
+    """
+    Perform global clustering of speaker embeddings on diarization segments.
+    """
     import torch
     from torchaudio.transforms import Resample
     from torchaudio import load as load_wav
@@ -404,11 +414,12 @@ def preview_transcribe(self, upload_id, correlation_id):
     try:
         inspector = app.control.inspect()
         active = inspector.active() or {}
-        heavy = 0
-        for node_tasks in active.values():
-            for t in node_tasks:
-                if t["name"] in ("tasks.diarize_full", "tasks.transcribe_segments"):
-                    heavy += 1
+        heavy = sum(
+            1
+            for node_tasks in active.values()
+            for t in node_tasks
+            if t["name"] in ("tasks.diarize_full", "tasks.transcribe_segments")
+        )
         if heavy >= 2:
             logger.info(
                 f"[{upload_id}] both GPUs busy (found {heavy} heavy tasks), "
@@ -469,14 +480,13 @@ def transcribe_segments(self, upload_id, correlation_id):
     try:
         inspector = app.control.inspect()
         active = inspector.active() or {}
-        heavy = 0
-        for node_tasks in active.values():
-            for t in node_tasks:
-                if (
-                    t["name"] in ("tasks.diarize_full", "tasks.transcribe_segments")
-                    and t["name"] != "tasks.transcribe_segments"
-                ):
-                    heavy += 1
+        heavy = sum(
+            1
+            for node_tasks in active.values()
+            for t in node_tasks
+            if t["name"] in ("tasks.diarize_full", "tasks.transcribe_segments")
+               and t["name"] != "tasks.transcribe_segments"
+        )
         if heavy >= 2 and self.request.delivery_info.get("routing_key") != "transcribe_cpu":
             logger.info(
                 f"[{upload_id}] GPUs appear busy ({heavy} heavy tasks), "
@@ -522,7 +532,6 @@ def transcribe_segments(self, upload_id, correlation_id):
         logger.info(f"[{upload_id}] short audio ({duration:.1f}s) → single VAD pass")
         raw_segs = _transcribe_with_vad(str(wav))
     else:
-        logger.info(f"[{upload_id}] long audio ({duration:.1f}s) → chunking at {settings.CHUNK_LENGTH_S}s")
         total_chunks = math.ceil(duration / settings.CHUNK_LENGTH_S)
         offset = 0.0
         chunk_idx = 0
@@ -601,6 +610,7 @@ def diarize_full(self, upload_id, correlation_id):
         chunk_limit = 0
 
     using_chunking = bool(chunk_limit and duration > chunk_limit)
+    total_chunks = math.ceil(duration / chunk_limit) if chunk_limit else 1
 
     logger.info(
         f"[{upload_id}] WAV prepared for diarization, duration={duration:.1f}s; "
@@ -623,7 +633,7 @@ def diarize_full(self, upload_id, correlation_id):
         while offset < duration:
             this_len = min(chunk_limit, duration - offset)
             logger.info(
-                f"[{upload_id}] diarization chunk #{chunk_idx} start: "
+                f"[{upload_id}] processing diarization chunk {chunk_idx+1}/{total_chunks}: "
                 f"{offset:.1f}s→{offset+this_len:.1f}s"
             )
             tmp = Path(settings.DIARIZER_CACHE_DIR) / f"{upload_id}_chunk_{int(offset)}.wav"
@@ -650,12 +660,14 @@ def diarize_full(self, upload_id, correlation_id):
                             "speaker": spk
                         })
                     added = len(raw) - before
-                    logger.info(f"[{upload_id}] diarization chunk #{chunk_idx} done: added {added} segments")
+                    logger.info(
+                        f"[{upload_id}] diarization chunk {chunk_idx+1}/{total_chunks} done: added {added} segments"
+                    )
                     r.publish(
                         f"progress:{upload_id}",
                         json.dumps({
                             "status": "diarize_chunk_done",
-                            "chunk_index": chunk_idx,
+                            "chunk_index": chunk_idx+1,
                             "offset": offset,
                             "length": this_len,
                             "added_segments": added,
@@ -665,7 +677,7 @@ def diarize_full(self, upload_id, correlation_id):
                 except Exception as e:
                     attempt += 1
                     logger.warning(
-                        f"[{upload_id}] error in diarization chunk #{chunk_idx}, "
+                        f"[{upload_id}] error in diarization chunk {chunk_idx+1}/{total_chunks}, "
                         f"attempt {attempt}: {e}"
                     )
                     try:
@@ -677,7 +689,7 @@ def diarize_full(self, upload_id, correlation_id):
 
             if not success:
                 logger.error(
-                    f"[{upload_id}] failed diarization chunk #{chunk_idx} after "
+                    f"[{upload_id}] failed diarization chunk {chunk_idx+1}/{total_chunks} after "
                     f"{MAX_RETRIES_PER_CHUNK} attempts"
                 )
                 send_webhook_event(
@@ -702,7 +714,10 @@ def diarize_full(self, upload_id, correlation_id):
     raw.sort(key=lambda x: x["start"])
 
     if SPEAKER_STITCH_ENABLED and using_chunking:
-        raw = merge_speakers  # reuse original merge logic if desired
+        raw = global_cluster_speakers(raw, wav, upload_id)
+    else:
+        logger.debug(f"[{upload_id}] skipping speaker stitching (using_chunking={using_chunking})")
+
     diar_sentences = []
     buf = None
     for seg in raw:
