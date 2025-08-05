@@ -11,11 +11,11 @@ from typing import Any, Optional, List, Dict
 import numpy as np
 import requests
 from redis import Redis
+from celery.signals import worker_process_init
+from sklearn.cluster import AgglomerativeClustering
+
 from celery_app import app  # импорт Celery instance
 from config.settings import settings
-
-# поддержка глобальной кластеризации эмбеддингов
-from sklearn.cluster import AgglomerativeClustering
 
 # --- Logger setup ---
 logger = logging.getLogger("tasks")
@@ -31,8 +31,8 @@ logger.setLevel(logging.INFO)
 # --- Model availability flags & holders ---
 _HF_AVAILABLE = False
 _PN_AVAILABLE = False
-_whisper_model: Any = None
-_diarization_pipeline: Any = None
+_whisper_model = None
+_diarization_pipeline = None
 
 # --- Speaker stitching / embedding ---
 SPEAKER_STITCH_ENABLED = getattr(settings, "SPEAKER_STITCH_ENABLED", True)
@@ -40,9 +40,8 @@ SPEAKER_STITCH_THRESHOLD = float(getattr(settings, "SPEAKER_STITCH_THRESHOLD", 0
 SPEAKER_STITCH_POOL_SIZE = int(getattr(settings, "SPEAKER_STITCH_POOL_SIZE", 5))
 SPEAKER_STITCH_EMA_ALPHA = float(getattr(settings, "SPEAKER_STITCH_EMA_ALPHA", 0.4))
 SPEAKER_STITCH_MERGE_THRESHOLD = float(getattr(settings, "SPEAKER_STITCH_MERGE_THRESHOLD", 0.95))
-_speaker_embedding_model: Any = None  # type: ignore
+_speaker_embedding_model = None  # type: ignore
 
-# попытка импортов внешних библиотек
 try:
     from faster_whisper import WhisperModel, download_model
     _HF_AVAILABLE = True
@@ -56,6 +55,7 @@ try:
     logger.info("[INIT] pyannote.audio available")
 except ImportError as e:
     logger.warning(f"[INIT] pyannote.audio not available: {e}")
+
 
 # ---------------------- Helpers ----------------------
 
@@ -91,8 +91,7 @@ def send_webhook_event(event_type: str, upload_id: str, data: Optional[Any]):
 def probe_audio(src: Path) -> dict:
     res = subprocess.run(
         ["ffprobe", "-v", "error", "-print_format", "json", "-show_format", "-show_streams", str(src)],
-        capture_output=True,
-        text=True
+        capture_output=True, text=True
     )
     info = {"duration": 0.0}
     try:
@@ -125,30 +124,23 @@ def prepare_wav(upload_id: str) -> (Path, float):
         if src != target:
             src.rename(target)
         return target, duration
-
-    subprocess.run(
-        [
-            "ffmpeg", "-y", "-threads", str(settings.FFMPEG_THREADS),
-            "-i", str(src),
-            "-acodec", "pcm_s16le", "-ac", "1", "-ar", "16000", str(target),
-        ],
-        check=True, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL
-    )
+    subprocess.run([
+        "ffmpeg", "-y", "-threads", str(settings.FFMPEG_THREADS),
+        "-i", str(src),
+        "-acodec", "pcm_s16le", "-ac", "1", "-ar", "16000", str(target),
+    ], check=True, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
     return target, duration
 
 
 def prepare_preview_segment(upload_id: str) -> subprocess.Popen:
     src = next(Path(settings.UPLOAD_FOLDER).glob(f"{upload_id}.*"))
-    return subprocess.Popen(
-        [
-            "ffmpeg", "-y", "-threads", str(max(1, settings.FFMPEG_THREADS // 2)),
-            "-ss", "0", "-t", str(settings.PREVIEW_LENGTH_S),
-            "-i", str(src),
-            "-acodec", "pcm_s16le", "-ac", "1", "-ar", "16000",
-            "-f", "wav", "pipe:1",
-        ],
-        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
-    )
+    return subprocess.Popen([
+        "ffmpeg", "-y", "-threads", str(max(1, settings.FFMPEG_THREADS // 2)),
+        "-ss", "0", "-t", str(settings.PREVIEW_LENGTH_S),
+        "-i", str(src),
+        "-acodec", "pcm_s16le", "-ac", "1", "-ar", "16000",
+        "-f", "wav", "pipe:1",
+    ], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
 
 
 def group_into_sentences(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -157,7 +149,6 @@ def group_into_sentences(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]
     sentences = []
     buf = {"start": None, "end": None, "speaker": None, "text": []}
     sentence_end_re = re.compile(r"[\.!\?]$")
-
     def flush_buffer():
         if buf["text"] and buf["start"] is not None:
             sentences.append({
@@ -167,7 +158,6 @@ def group_into_sentences(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                 "text": " ".join(buf["text"]),
             })
         buf.update(start=None, end=None, speaker=None, text=[])
-
     for seg in segments:
         txt = seg["text"].strip()
         if not txt:
@@ -181,30 +171,22 @@ def group_into_sentences(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]
         buf["text"].append(txt)
         if sentence_end_re.search(txt) or sum(len(t.split()) for t in buf["text"]) >= MAX_WORDS:
             flush_buffer()
-
     flush_buffer()
     return sentences
 
 
 def get_whisper_model(model_override: str = None):
     global _whisper_model
+    device = settings.WHISPER_DEVICE.lower()
+    compute = getattr(
+        settings,
+        "WHISPER_COMPUTE_TYPE",
+        "float16" if device.startswith("cuda") else "int8",
+    ).lower()
     if model_override:
-        device = settings.WHISPER_DEVICE.lower()
-        compute = getattr(
-            settings,
-            "WHISPER_COMPUTE_TYPE",
-            "float16" if device.startswith("cuda") else "int8",
-        ).lower()
         logger.info(f"[WHISPER] loading override model {model_override}")
         return WhisperModel(model_override, device=device, compute_type=compute)
-
     if _whisper_model is None:
-        device = settings.WHISPER_DEVICE.lower()
-        compute = getattr(
-            settings,
-            "WHISPER_COMPUTE_TYPE",
-            "float16" if device.startswith("cuda") else "int8",
-        ).lower()
         model_id = settings.WHISPER_MODEL_PATH
         try:
             path = download_model(
@@ -214,15 +196,13 @@ def get_whisper_model(model_override: str = None):
             )
         except Exception:
             path = model_id
-
         try:
             _whisper_model = WhisperModel(path, device=device, compute_type=compute)
             logger.info(f"[WHISPER] loaded model from {path} on {device} with compute_type={compute}")
         except (RuntimeError, ValueError) as e:
-            logger.warning(f"[WHISPER] GPU unavailable ({e}), falling back to CPU/int8")
+            logger.warning(f"[WHISPER] GPU unavailable ({e}), falling back to CPU/INT8")
             settings.WHISPER_DEVICE = "cpu"
             _whisper_model = WhisperModel(path, device="cpu", compute_type="int8")
-
     return _whisper_model
 
 
@@ -245,14 +225,14 @@ def get_speaker_embedding_model():
         try:
             from speechbrain.inference.speaker import EncoderClassifier
         except ImportError as e:
-            logger.warning(f"[STITCH] speechbrain not available: {e}")
+            logger.warning(f"[STITCH] speechbrain not available, cannot do speaker stitching: {e}")
             raise
         savedir = Path(settings.DIARIZER_CACHE_DIR) / "spkrec-ecapa-voxceleb"
         _speaker_embedding_model = EncoderClassifier.from_hparams(
             source="speechbrain/spkrec-ecapa-voxceleb",
             savedir=str(savedir)
         )
-        logger.info("[STITCH] loaded speaker embedding model")
+        logger.info("[STITCH] loaded speaker embedding model from speechbrain/spkrec-ecapa-voxceleb")
     return _speaker_embedding_model
 
 
@@ -296,22 +276,17 @@ def global_cluster_speakers(raw: List[Dict[str, Any]], wav: Path, upload_id: str
         seg["speaker"] = f"spk_{lbl}"
     return raw
 
-# для API
+# Экспорт для API
 merge_speakers = global_cluster_speakers
 
-# --- Предзагрузка моделей один раз при импортировании модуля (COW при fork) ---
-if _HF_AVAILABLE:
-    try:
+
+@worker_process_init.connect
+def preload_on_startup(**kwargs):
+    if _HF_AVAILABLE:
         get_whisper_model()
-        logger.info("[PRELOAD] whisper model preloaded")
-    except Exception as e:
-        logger.warning(f"[PRELOAD] failed to preload whisper model: {e}")
-if _PN_AVAILABLE:
-    try:
+    if _PN_AVAILABLE:
         get_diarization_pipeline()
-        logger.info("[PRELOAD] diarization pipeline preloaded")
-    except Exception as e:
-        logger.warning(f"[PRELOAD] failed to preload diarization pipeline: {e}")
+
 
 # --- Celery tasks ---
 
@@ -327,8 +302,9 @@ def convert_to_wav_and_preview(self, upload_id, correlation_id):
         prepare_wav(upload_id)
         logger.info(f"[{upload_id}] WAV ready")
     except Exception as e:
+        logger.error(f"[{upload_id}] convert_to_wav_and_preview failed: {e}", exc_info=True)
         r.publish(f"progress:{upload_id}", json.dumps({"status": "error", "error": str(e)}))
-        send_webhook_event("processing_failed", upload_id, None)
+        send_webhook_event("processing_failed", upload_id, {"stage": "wav", "error": str(e)})
         return
 
     preview_transcribe.delay(upload_id, correlation_id)
@@ -337,39 +313,60 @@ def convert_to_wav_and_preview(self, upload_id, correlation_id):
 @app.task(bind=True, queue="transcribe_gpu")
 def preview_transcribe(self, upload_id, correlation_id):
     logger.info(f"[{upload_id}] preview_transcribe received")
-    # … логика fallback GPU/CPU …
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
-    proc = prepare_preview_segment(upload_id)
-    model = get_whisper_model()
-    segments_gen, _ = model.transcribe(
-        proc.stdout,
-        word_timestamps=True,
-        **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {}),
-    )
-    proc.stdout.close()
-    proc.wait()
-    segments = list(segments_gen)
 
-    for seg in segments:
-        r.publish(
-            f"progress:{upload_id}",
-            json.dumps({
-                "status": "preview_partial",
-                "fragment": {"start": seg.start, "end": seg.end, "text": seg.text}
-            })
+    # fallback to CPU if GPUs busy
+    try:
+        inspector = app.control.inspect()
+        active = inspector.active() or {}
+        heavy = sum(1 for tasks in active.values() for t in tasks
+                    if t["name"] in ("tasks.diarize_full", "tasks.transcribe_segments"))
+        if heavy >= 2:
+            logger.info(f"[{upload_id}] GPUs busy ({heavy}), falling back to CPU for preview")
+            transcribe_segments.apply_async((upload_id, correlation_id), queue="transcribe_cpu")
+            return
+    except Exception:
+        logger.warning(f"[{upload_id}] failed to inspect workers for preview fallback")
+
+    try:
+        proc = prepare_preview_segment(upload_id)
+        model = get_whisper_model()
+        segments_gen, _ = model.transcribe(
+            proc.stdout,
+            word_timestamps=True,
+            **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {}),
         )
-    preview = {
-        "text": "".join(s.text for s in segments),
-        "timestamps": [{"start": s.start, "end": s.end, "text": s.text} for s in segments],
-    }
+        proc.stdout.close()
+        proc.wait()
 
-    out = Path(settings.RESULTS_FOLDER) / upload_id
-    out.mkdir(parents=True, exist_ok=True)
-    (out / "preview_transcript.json").write_text(json.dumps(preview, ensure_ascii=False, indent=2))
+        segments = list(segments_gen)
+        for seg in segments:
+            r.publish(
+                f"progress:{upload_id}",
+                json.dumps({
+                    "status": "preview_partial",
+                    "fragment": {"start": seg.start, "end": seg.end, "text": seg.text}
+                })
+            )
 
-    r.publish(f"progress:{upload_id}", json.dumps({"status": "preview_done", "preview": preview}))
-    send_webhook_event("preview_completed", upload_id, {"preview": preview})
-    transcribe_segments.delay(upload_id, correlation_id)
+        preview = {
+            "text": "".join(s.text for s in segments),
+            "timestamps": [{"start": s.start, "end": s.end, "text": s.text} for s in segments],
+        }
+        out = Path(settings.RESULTS_FOLDER) / upload_id
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "preview_transcript.json").write_text(json.dumps(preview, ensure_ascii=False, indent=2))
+
+        r.publish(f"progress:{upload_id}", json.dumps({"status": "preview_done", "preview": preview}))
+        send_webhook_event("preview_completed", upload_id, {"preview": preview})
+
+        transcribe_segments.delay(upload_id, correlation_id)
+
+    except Exception as e:
+        logger.error(f"[{upload_id}] preview_transcribe failed: {e}", exc_info=True)
+        r.publish(f"progress:{upload_id}", json.dumps({"status": "error", "error": str(e)}))
+        send_webhook_event("processing_failed", upload_id, {"stage": "preview", "error": str(e)})
+        return
 
 
 @app.task(bind=True, queue="transcribe_gpu")
@@ -385,7 +382,7 @@ def transcribe_segments(self, upload_id, correlation_id):
     idx = 0
     raw_segs: List[Any] = []
 
-    def _transcribe_with_vad(source, offset: float = 0.0):
+    def _transcribe_with_vad(source, offset=0.0):
         segs, _ = get_whisper_model().transcribe(
             source,
             word_timestamps=True,
@@ -396,30 +393,24 @@ def transcribe_segments(self, upload_id, correlation_id):
             },
             **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {}),
         )
-        result = []
         for s in segs:
             s.start += offset
             s.end += offset
-            result.append(s)
-        return result
+        return list(segs)
 
     while offset < duration:
         length = min(settings.CHUNK_LENGTH_S, duration - offset)
         if total_chunks > 1:
             logger.info(f"[{upload_id}] transcription chunk {idx+1}/{total_chunks}: {offset:.1f}s→{offset+length:.1f}s")
         p = subprocess.Popen(
-            [
-                "ffmpeg", "-y",
-                "-threads", str(settings.FFMPEG_THREADS),
-                "-ss", str(offset), "-t", str(length),
-                "-i", str(wav), "-f", "wav", "pipe:1"
-            ],
+            ["ffmpeg", "-y", "-threads", str(settings.FFMPEG_THREADS),
+             "-ss", str(offset), "-t", str(length),
+             "-i", str(wav), "-f", "wav", "pipe:1"],
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
         )
         chunk_segs = _transcribe_with_vad(p.stdout, offset)
         p.stdout.close()
         p.wait()
-
         raw_segs.extend(chunk_segs)
         offset += length
         idx += 1
@@ -442,9 +433,9 @@ def transcribe_segments(self, upload_id, correlation_id):
 def diarize_full(self, upload_id, correlation_id):
     logger.info(f"[{upload_id}] diarize_full received")
     wav, duration = prepare_wav(upload_id)
-
     raw_chunk_limit = int(getattr(settings, "DIARIZATION_CHUNK_LENGTH_S", 0))
     using_chunking = bool(raw_chunk_limit and duration > raw_chunk_limit)
+
     total_chunks = math.ceil(duration / raw_chunk_limit) if using_chunking else 1
     logger.info(f"[{upload_id}] total diarization chunks: {total_chunks}")
 
@@ -458,14 +449,11 @@ def diarize_full(self, upload_id, correlation_id):
         if using_chunking:
             logger.info(f"[{upload_id}] diarization chunk {idx+1}/{total_chunks}: {offset:.1f}s→{offset+length:.1f}s")
         tmp = Path(settings.DIARIZER_CACHE_DIR) / f"{upload_id}_chunk_{int(offset)}.wav"
-        subprocess.run(
-            [
-                "ffmpeg", "-y", "-threads", str(max(1, settings.FFMPEG_THREADS // 2)),
-                "-ss", str(offset), "-t", str(length),
-                "-i", str(wav), str(tmp)
-            ],
-            check=True, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL
-        )
+        subprocess.run([
+            "ffmpeg", "-y", "-threads", str(max(1, settings.FFMPEG_THREADS // 2)),
+            "-ss", str(offset), "-t", str(length),
+            "-i", str(wav), str(tmp)
+        ], check=True, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
 
         ann = pipeline(str(tmp))
         for s, _, spk in ann.itertracks(yield_label=True):
