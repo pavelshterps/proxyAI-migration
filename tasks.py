@@ -287,7 +287,11 @@ def get_whisper_model(model_override: str = None):
             settings.WHISPER_DEVICE = "cpu"
             _whisper_model = WhisperModel(path, device="cpu", compute_type="int8")
 
-        logger.info(f"[WHISPER] loaded model from {path} on {settings.WHISPER_DEVICE} with compute_type={_whisper_model.compute_type}")
+        # Use the local `compute` variable since WhisperModel no longer exposes `.compute_type`
+        logger.info(
+            f"[WHISPER] loaded model from {path} "
+            f"on {settings.WHISPER_DEVICE} with compute_type={compute}"
+        )
 
     return _whisper_model
 
@@ -363,6 +367,10 @@ def global_cluster_speakers(raw: List[Dict[str, Any]], wav: Path, upload_id: str
     return raw
 
 
+# Экспорт для API
+merge_speakers = global_cluster_speakers
+
+
 @worker_process_init.connect
 def preload_on_startup(**kwargs):
     if _HF_AVAILABLE:
@@ -385,7 +393,10 @@ def convert_to_wav_and_preview(self, upload_id, correlation_id):
         prepare_wav(upload_id)
         logger.info(f"[{upload_id}] WAV ready")
     except Exception as e:
-        r.publish(f"progress:{upload_id}", json.dumps({"status": "error", "error": str(e)}))
+        r.publish(
+            f"progress:{upload_id}",
+            json.dumps({"status": "error", "error": str(e)})
+        )
         send_webhook_event("processing_failed", upload_id, None)
         return
 
@@ -404,8 +415,14 @@ def preview_transcribe(self, upload_id, correlation_id):
                 if t["name"] in ("tasks.diarize_full", "tasks.transcribe_segments"):
                     heavy += 1
         if heavy >= 2:
-            logger.info(f"[{upload_id}] both GPUs busy (found {heavy} heavy tasks), falling back to CPU for transcription preview")
-            transcribe_segments.apply_async((upload_id, correlation_id), queue="transcribe_cpu")
+            logger.info(
+                f"[{upload_id}] both GPUs busy (found {heavy} heavy tasks), "
+                "falling back to CPU for transcription preview"
+            )
+            transcribe_segments.apply_async(
+                (upload_id, correlation_id),
+                queue="transcribe_cpu"
+            )
             return
     except Exception:
         logger.warning(f"[{upload_id}] failed to inspect workers, proceeding on GPU")
@@ -434,7 +451,9 @@ def preview_transcribe(self, upload_id, correlation_id):
     }
     out = Path(settings.RESULTS_FOLDER) / upload_id
     out.mkdir(parents=True, exist_ok=True)
-    (out / "preview_transcript.json").write_text(json.dumps(preview, ensure_ascii=False, indent=2))
+    (out / "preview_transcript.json").write_text(
+        json.dumps(preview, ensure_ascii=False, indent=2)
+    )
     r.publish(f"progress:{upload_id}", json.dumps({"status": "preview_done", "preview": preview}))
     send_webhook_event("preview_completed", upload_id, {"preview": preview})
     transcribe_segments.delay(upload_id, correlation_id)
@@ -445,7 +464,10 @@ def transcribe_segments(self, upload_id, correlation_id):
     logger.info(f"[{upload_id}] transcribe_segments received")
     try:
         import torch
-        logger.info(f"[{upload_id}] GPU memory reserved before transcription: {torch.cuda.memory_reserved() if torch.cuda.is_available() else 'n/a'}")
+        logger.info(
+            f"[{upload_id}] GPU memory reserved before transcription: "
+            f"{torch.cuda.memory_reserved() if torch.cuda.is_available() else 'n/a'}"
+        )
     except ImportError:
         pass
 
@@ -455,11 +477,20 @@ def transcribe_segments(self, upload_id, correlation_id):
         heavy = 0
         for node_tasks in active.values():
             for t in node_tasks:
-                if t["name"] in ("tasks.diarize_full", "tasks.transcribe_segments") and t["name"] != "tasks.transcribe_segments":
+                if (
+                    t["name"] in ("tasks.diarize_full", "tasks.transcribe_segments")
+                    and t["name"] != "tasks.transcribe_segments"
+                ):
                     heavy += 1
         if heavy >= 2 and self.request.delivery_info.get("routing_key") != "transcribe_cpu":
-            logger.info(f"[{upload_id}] GPUs appear busy ({heavy} heavy tasks), rescheduling transcription to CPU")
-            transcribe_segments.apply_async((upload_id, correlation_id), queue="transcribe_cpu")
+            logger.info(
+                f"[{upload_id}] GPUs appear busy ({heavy} heavy tasks), "
+                "rescheduling transcription to CPU"
+            )
+            transcribe_segments.apply_async(
+                (upload_id, correlation_id),
+                queue="transcribe_cpu"
+            )
             return
     except Exception:
         logger.warning(f"[{upload_id}] failed to inspect workers for fallback logic")
@@ -497,11 +528,15 @@ def transcribe_segments(self, upload_id, correlation_id):
         raw_segs = _transcribe_with_vad(str(wav))
     else:
         logger.info(f"[{upload_id}] long audio ({duration:.1f}s) → chunking at {settings.CHUNK_LENGTH_S}s")
+        total_chunks = math.ceil(duration / settings.CHUNK_LENGTH_S)
         offset = 0.0
         chunk_idx = 0
         while offset < duration:
             length = min(settings.CHUNK_LENGTH_S, duration - offset)
-            logger.debug(f"[{upload_id}] chunk {chunk_idx} {offset:.1f}s→{offset+length:.1f}s")
+            logger.info(
+                f"[{upload_id}] processing chunk {chunk_idx+1}/{total_chunks}: "
+                f"{offset:.1f}s→{offset+length:.1f}s"
+            )
             p = subprocess.Popen(
                 [
                     "ffmpeg", "-y",
@@ -525,14 +560,19 @@ def transcribe_segments(self, upload_id, correlation_id):
 
     out = Path(settings.RESULTS_FOLDER) / upload_id
     out.mkdir(parents=True, exist_ok=True)
-    (out / "transcript.json").write_text(json.dumps(sentences, ensure_ascii=False, indent=2))
+    (out / "transcript.json").write_text(
+        json.dumps(sentences, ensure_ascii=False, indent=2)
+    )
     logger.info(f"[{upload_id}] transcription completed ({len(sentences)} sentences)")
     r.publish(f"progress:{upload_id}", json.dumps({"status": "transcript_done"}))
     send_webhook_event("transcription_completed", upload_id, {"transcript": sentences})
 
     try:
         import torch
-        logger.info(f"[{upload_id}] GPU memory reserved after transcription: {torch.cuda.memory_reserved() if torch.cuda.is_available() else 'n/a'}")
+        logger.info(
+            f"[{upload_id}] GPU memory reserved after transcription: "
+            f"{torch.cuda.memory_reserved() if torch.cuda.is_available() else 'n/a'}"
+        )
     except ImportError:
         pass
 
@@ -546,7 +586,10 @@ def diarize_full(self, upload_id, correlation_id):
 
     try:
         import torch
-        logger.info(f"[{upload_id}] GPU memory reserved before diarization: {torch.cuda.memory_reserved() if torch.cuda.is_available() else 'n/a'}")
+        logger.info(
+            f"[{upload_id}] GPU memory reserved before diarization: "
+            f"{torch.cuda.memory_reserved() if torch.cuda.is_available() else 'n/a'}"
+        )
     except ImportError:
         pass
 
@@ -556,12 +599,18 @@ def diarize_full(self, upload_id, correlation_id):
     try:
         chunk_limit = int(raw_chunk_limit)
     except Exception:
-        logger.warning(f"[{upload_id}] invalid DIARIZATION_CHUNK_LENGTH_S={raw_chunk_limit!r}, falling back to 0")
+        logger.warning(
+            f"[{upload_id}] invalid DIARIZATION_CHUNK_LENGTH_S={raw_chunk_limit!r}, "
+            "falling back to 0"
+        )
         chunk_limit = 0
 
     using_chunking = bool(chunk_limit and duration > chunk_limit)
 
-    logger.info(f"[{upload_id}] WAV prepared for diarization, duration={duration:.1f}s; chunk_limit={chunk_limit}; using_chunking={using_chunking}")
+    logger.info(
+        f"[{upload_id}] WAV prepared for diarization, duration={duration:.1f}s; "
+        f"chunk_limit={chunk_limit}; using_chunking={using_chunking}"
+    )
 
     if not _PN_AVAILABLE:
         logger.error(f"[{upload_id}] pyannote.audio not available, aborting diarization")
@@ -574,17 +623,25 @@ def diarize_full(self, upload_id, correlation_id):
     MAX_RETRIES_PER_CHUNK = 2
 
     if using_chunking:
+        total_chunks = math.ceil(duration / chunk_limit)
         offset = 0.0
         chunk_idx = 0
         while offset < duration:
             this_len = min(chunk_limit, duration - offset)
-            logger.info(f"[{upload_id}] diarization chunk #{chunk_idx} start: {offset:.1f}s→{offset+this_len:.1f}s")
+            logger.info(
+                f"[{upload_id}] processing diarization chunk {chunk_idx+1}/{total_chunks}: "
+                f"{offset:.1f}s→{offset+this_len:.1f}s"
+            )
             tmp = Path(settings.DIARIZER_CACHE_DIR) / f"{upload_id}_chunk_{int(offset)}.wav"
-            subprocess.run([
-                "ffmpeg", "-y", "-threads", str(max(1, settings.FFMPEG_THREADS // 2)),
-                "-ss", str(offset), "-t", str(this_len),
-                "-i", str(wav), str(tmp)
-            ], check=True, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+            subprocess.run(
+                [
+                    "ffmpeg", "-y",
+                    "-threads", str(max(1, settings.FFMPEG_THREADS // 2)),
+                    "-ss", str(offset), "-t", str(this_len),
+                    "-i", str(wav), str(tmp)
+                ],
+                check=True, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL
+            )
 
             attempt = 0
             success = False
@@ -599,18 +656,24 @@ def diarize_full(self, upload_id, correlation_id):
                             "speaker": spk
                         })
                     added = len(raw) - before
-                    logger.info(f"[{upload_id}] diarization chunk #{chunk_idx} done: added {added} segments")
-                    r.publish(f"progress:{upload_id}", json.dumps({
-                        "status": "diarize_chunk_done",
-                        "chunk_index": chunk_idx,
-                        "offset": offset,
-                        "length": this_len,
-                        "added_segments": added,
-                    }))
+                    logger.info(f"[{upload_id}] diarization chunk {chunk_idx+1}/{total_chunks} done: added {added} segments")
+                    r.publish(
+                        f"progress:{upload_id}",
+                        json.dumps({
+                            "status": "diarize_chunk_done",
+                            "chunk_index": chunk_idx+1,
+                            "offset": offset,
+                            "length": this_len,
+                            "added_segments": added,
+                        })
+                    )
                     success = True
                 except Exception as e:
                     attempt += 1
-                    logger.warning(f"[{upload_id}] error in diarization chunk #{chunk_idx}, attempt {attempt}: {e}")
+                    logger.warning(
+                        f"[{upload_id}] error in diarization chunk {chunk_idx+1}/{total_chunks}, "
+                        f"attempt {attempt}: {e}"
+                    )
                     try:
                         import torch
                         torch.cuda.empty_cache()
@@ -619,8 +682,14 @@ def diarize_full(self, upload_id, correlation_id):
                     time.sleep(5)
 
             if not success:
-                logger.error(f"[{upload_id}] failed diarization chunk #{chunk_idx} after {MAX_RETRIES_PER_CHUNK} attempts")
-                send_webhook_event("processing_failed", upload_id, {"reason": "diarization_chunk_failure"})
+                logger.error(
+                    f"[{upload_id}] failed diarization chunk {chunk_idx+1}/{total_chunks} after "
+                    f"{MAX_RETRIES_PER_CHUNK} attempts"
+                )
+                send_webhook_event(
+                    "processing_failed", upload_id,
+                    {"reason": "diarization_chunk_failure"}
+                )
                 return
 
             tmp.unlink(missing_ok=True)
@@ -657,9 +726,14 @@ def diarize_full(self, upload_id, correlation_id):
 
     out = Path(settings.RESULTS_FOLDER) / upload_id
     out.mkdir(parents=True, exist_ok=True)
-    (out / "diarization.json").write_text(json.dumps(diar_sentences, ensure_ascii=False, indent=2))
+    (out / "diarization.json").write_text(
+        json.dumps(diar_sentences, ensure_ascii=False, indent=2)
+    )
     logger.info(f"[{upload_id}] diarization_done, total segments: {len(diar_sentences)}")
-    r.publish(f"progress:{upload_id}", json.dumps({"status": "diarization_done", "segments": len(diar_sentences)}))
+    r.publish(
+        f"progress:{upload_id}",
+        json.dumps({"status": "diarization_done", "segments": len(diar_sentences)})
+    )
     send_webhook_event("diarization_completed", upload_id, {"diarization": diar_sentences})
 
 
