@@ -263,7 +263,6 @@ def global_cluster_speakers(
             dummy_emb = model.encode_batch(dummy).squeeze().flatten()
         embedding_size = dummy_emb.shape[0]
     except Exception:
-        # на крайний случай жестко задаем 192, как для ECAPA-TDNN
         embedding_size = 192
 
     embeddings = []
@@ -289,7 +288,10 @@ def global_cluster_speakers(
     X = np.vstack(embeddings)
     thresh = 1 - SPEAKER_STITCH_MERGE_THRESHOLD
     clustering = AgglomerativeClustering(
-        n_clusters=None, affinity="cosine", linkage="average", distance_threshold=thresh
+        n_clusters=None,
+        metric="cosine",
+        linkage="average",
+        distance_threshold=thresh
     ).fit(X)
 
     logger.info(f"[{upload_id}] clustered {len(raw)} segments into {len(set(clustering.labels_))} speakers")
@@ -414,7 +416,6 @@ def transcribe_segments(self, upload_id, correlation_id):
             **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {})
         )
         segs = list(segs_gen)
-        # publish per-chunk progress if needed
         if chunk_idx is not None and total_chunks is not None:
             r.publish(
                 f"progress:{upload_id}",
