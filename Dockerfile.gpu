@@ -1,42 +1,38 @@
-# Dockerfile.gpu — для GPU-воркера
-
 FROM nvidia/cuda:12.9.1-cudnn-runtime-ubuntu22.04
 
 WORKDIR /app
 
-# 0) Отключаем проверку подписей (временное решение)
-RUN printf '\
-Acquire::AllowInsecureRepositories "true";\n\
-Acquire::AllowDowngradeToInsecureRepositories "true";\n\
-APT::Get::AllowUnauthenticated "true";\n' \
-    > /etc/apt/apt.conf.d/99no-check-signature
+# чтобы apt не пытался взаимодействовать с терминалом
+ARG DEBIAN_FRONTEND=noninteractive
+ENV DEBIAN_FRONTEND=${DEBIAN_FRONTEND}
 
-# 1) Системные зависимости (без проверки подписи)
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
+# 1) Системные зависимости в тихом режиме
+RUN apt-get update -qq && \
+    apt-get install -y -qq --no-install-recommends \
       python3-pip python3-dev build-essential \
       ffmpeg libsndfile1 git \
       libavformat-dev libavcodec-dev libavutil-dev libswscale-dev \
-      libportaudio2 \
-      --allow-unauthenticated && \
+      libportaudio2 && \
     rm -rf /var/lib/apt/lists/*
 
-# 2) Все питон-зависимости (heavy + light)
+# 2) Настроим pip на тихий режим
+ENV PIP_NO_PROGRESS_BAR=1
+
+# 3) Все питон-зависимости (heavy + light)
 COPY requirements.txt ./
-ENV PIP_NO_PROGRESS_BAR=off
-RUN pip3 install --upgrade pip && \
+RUN pip3 install --upgrade pip -q && \
     pip3 install -q --no-cache-dir --progress-bar off -r requirements.txt && \
     rm -rf /root/.cache/pip
 
-# 3) GPU-специфичные оптимизации
-RUN pip3 install --no-cache-dir \
+# 4) GPU-специфичные оптимизации тоже в тихом режиме
+RUN pip3 install --no-cache-dir -q --progress-bar off \
       faster-whisper[cuda12]==1.1.1 \
       ctranslate2[cuda12]>=4.6.0
 
-# 4) Копируем приложение
+# 5) Копируем приложение
 COPY . .
 
-# 5) Окружение для GPU-воркера
+# 6) Окружение для GPU-воркера
 ENV WHISPER_DEVICE=cuda \
     WHISPER_COMPUTE_TYPE=float16 \
     HUGGINGFACE_CACHE_DIR=/hf_cache \
@@ -44,7 +40,7 @@ ENV WHISPER_DEVICE=cuda \
     UPLOAD_FOLDER=/app/uploads \
     RESULTS_FOLDER=/app/results
 
-# 6) Запуск GPU-воркера
+# 7) Запуск GPU-воркера
 CMD ["celery", "-A", "tasks", "worker", \
      "--loglevel=info", \
      "--concurrency=${GPU_CONCURRENCY}", \

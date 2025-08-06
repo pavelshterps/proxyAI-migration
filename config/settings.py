@@ -105,7 +105,7 @@ class Settings(BaseSettings):
     EXTERNAL_API_KEY: str = Field(..., env="EXTERNAL_API_KEY")
     EXTERNAL_POLL_INTERVAL_S: int = Field(5, env="EXTERNAL_POLL_INTERVAL_S")
     DEFAULT_TRANSCRIBE_MODE: str = Field("local", env="DEFAULT_TRANSCRIBE_MODE")
-
+    OPENAI_API_KEY: str = Field(..., env="OPENAI_API_KEY")
     # webhook
     WEBHOOK_URL: Optional[HttpUrl] = Field(None, env="WEBHOOK_URL")
     WEBHOOK_SECRET: str = Field("", env="WEBHOOK_SECRET")

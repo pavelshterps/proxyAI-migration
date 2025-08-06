@@ -1,3 +1,4 @@
+import os
 import json
 import logging
 import subprocess
@@ -15,6 +16,13 @@ from celery.signals import worker_process_init
 from celery_app import app  # импорт Celery instance
 from config.settings import settings
 
+# --- dotenv & OpenAI ---
+from dotenv import load_dotenv
+import openai
+
+load_dotenv()
+openai.api_key = settings.OPENAI_API_KEY
+
 # --- Logger setup ---
 logger = logging.getLogger("tasks")
 handler = logging.StreamHandler()
@@ -25,6 +33,18 @@ formatter = logging.Formatter(
 handler.setFormatter(formatter)
 logger.addHandler(handler)
 logger.setLevel(logging.INFO)
+
+# --- полировка через GPT ---
+def polish_with_gpt(text: str) -> str:
+    resp = openai.ChatCompletion.create(
+        model="gpt-4",
+        temperature=0.3,
+        messages=[
+            {"role": "system", "content": "Ты редактор русского текста. Исправь ошибки и сделай текст читабельным."},
+            {"role": "user", "content": text},
+        ],
+    )
+    return resp.choices[0].message.content
 
 # --- Model availability flags & holders ---
 _HF_AVAILABLE = False
@@ -42,7 +62,6 @@ _speaker_embedding_model = None  # type: ignore
 
 try:
     from faster_whisper import WhisperModel, download_model
-
     _HF_AVAILABLE = True
     logger.info("[INIT] faster-whisper available")
 except ImportError as e:
@@ -50,7 +69,6 @@ except ImportError as e:
 
 try:
     from pyannote.audio import Pipeline as PyannotePipeline
-
     _PN_AVAILABLE = True
     logger.info("[INIT] pyannote.audio available")
 except ImportError as e:
@@ -606,10 +624,23 @@ def transcribe_segments(self, upload_id, correlation_id):
     flat.sort(key=lambda x: x["start"])
     sentences = group_into_sentences(flat)
 
+    # сохраняем оригинальную структуру
     out = Path(settings.RESULTS_FOLDER) / upload_id
     out.mkdir(parents=True, exist_ok=True)
-    (out / "transcript.json").write_text(json.dumps(sentences, ensure_ascii=False, indent=2))
-    logger.info(f"[{upload_id}] transcription completed ({len(sentences)} sentences)")
+    (out / "transcript_original.json").write_text(json.dumps(sentences, ensure_ascii=False, indent=2))
+    logger.info(f"[{upload_id}] saved original transcript ({len(sentences)} sentences)")
+
+    # полировка и сохранение итогового transcript.json
+    try:
+        raw_text = " ".join(s["text"] for s in sentences)
+        polished = polish_with_gpt(raw_text)
+        (out / "transcript.json").write_text(json.dumps({"text": polished}, ensure_ascii=False, indent=2))
+        logger.info(f"[{upload_id}] saved polished transcript")
+    except Exception as e:
+        logger.warning(f"[{upload_id}] polishing failed: {e}")
+        # fallback: сохранить оригинал как финал
+        (out / "transcript.json").write_text(json.dumps(sentences, ensure_ascii=False, indent=2))
+
     r.publish(f"progress:{upload_id}", json.dumps({"status": "transcript_done"}))
     deliver_webhook.delay("transcription_completed", upload_id, {"transcript": sentences})
 
