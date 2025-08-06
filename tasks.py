@@ -210,7 +210,6 @@ def merge_speakers(
     Простое сопоставление транскрипта к диаризации по таймкодам.
     Не требует аудио-файла и используется в API /results.
     """
-    # сортируем
     diar_sorted = sorted(diar, key=lambda d: d["start"])
     transcript_sorted = sorted(transcript, key=lambda t: t["start"])
     starts = [d["start"] for d in diar_sorted]
@@ -354,9 +353,15 @@ def global_cluster_speakers(
 @worker_process_init.connect
 def preload_on_startup(**kwargs):
     if _HF_AVAILABLE:
-        get_whisper_model()
+        try:
+            get_whisper_model()
+        except Exception:
+            pass
     if _PN_AVAILABLE:
-        get_diarization_pipeline()
+        try:
+            get_diarization_pipeline()
+        except Exception:
+            pass
 
 
 # --- Celery tasks ---
@@ -382,14 +387,161 @@ def convert_to_wav_and_preview(self, upload_id, correlation_id):
 
 @app.task(bind=True, queue="transcribe_gpu")
 def preview_transcribe(self, upload_id, correlation_id):
-    # Ваша логика preview транскрипции (не затрагивается)
-    pass
+    logger.info(f"[{upload_id}] preview_transcribe received")
+    try:
+        inspector = app.control.inspect()
+        active = inspector.active() or {}
+        heavy = sum(
+            1
+            for tasks in active.values()
+            for t in tasks
+            if t["name"] in ("tasks.diarize_full", "tasks.transcribe_segments")
+        )
+        if heavy >= 2:
+            logger.info(f"[{upload_id}] GPUs busy ({heavy}), fallback to CPU for preview")
+            transcribe_segments.apply_async((upload_id, correlation_id), queue="transcribe_cpu")
+            return
+    except Exception:
+        logger.warning(f"[{upload_id}] inspector failed, using GPU")
+
+    r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
+    proc = prepare_wav(upload_id)[0].parent / f"{upload_id}.wav"
+    # full preview logic as in initial implementation:
+    proc = subprocess.Popen([
+        "ffmpeg", "-y", "-threads", str(max(1, settings.FFMPEG_THREADS // 2)),
+        "-ss", "0", "-t", str(settings.PREVIEW_LENGTH_S),
+        "-i", str(proc),
+        "-acodec", "pcm_s16le", "-ac", "1", "-ar", "16000",
+        "-f", "wav", "pipe:1",
+    ], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    model = get_whisper_model()
+    segments_gen, _ = model.transcribe(
+        proc.stdout,
+        word_timestamps=True,
+        **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {}),
+    )
+    proc.stdout.close(); proc.wait()
+    segments = list(segments_gen)
+
+    for seg in segments:
+        r.publish(
+            f"progress:{upload_id}",
+            json.dumps({
+                "status": "preview_partial",
+                "fragment": {"start": seg.start, "end": seg.end, "text": seg.text}
+            })
+        )
+    preview = {
+        "text": "".join(s.text for s in segments),
+        "timestamps": [{"start": s.start, "end": s.end, "text": s.text} for s in segments],
+    }
+    out = Path(settings.RESULTS_FOLDER) / upload_id
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "preview_transcript.json").write_text(
+        json.dumps(preview, ensure_ascii=False, indent=2)
+    )
+    r.publish(f"progress:{upload_id}", json.dumps({"status": "preview_done", "preview": preview}))
+    send_webhook_event("preview_completed", upload_id, {"preview": preview})
+
+    transcribe_segments.delay(upload_id, correlation_id)
 
 
 @app.task(bind=True, queue="transcribe_gpu")
 def transcribe_segments(self, upload_id, correlation_id):
-    # Ваша полная логика транскрипции (оставлена без изменений)
-    pass
+    logger.info(f"[{upload_id}] transcribe_segments received")
+    try:
+        import torch
+        logger.info(
+            f"[{upload_id}] GPU memory reserved before transcription: "
+            f"{torch.cuda.memory_reserved() if torch.cuda.is_available() else 'n/a'}"
+        )
+    except ImportError:
+        pass
+
+    try:
+        inspector = app.control.inspect()
+        active = inspector.active() or {}
+        heavy = sum(
+            1
+            for tasks in active.values()
+            for t in tasks
+            if t["name"] in ("tasks.diarize_full", "tasks.transcribe_segments")
+        )
+        if heavy >= 2 and self.request.delivery_info.get("routing_key") != "transcribe_cpu":
+            logger.info(f"[{upload_id}] GPUs busy ({heavy}), rescheduling transcription to CPU")
+            transcribe_segments.apply_async((upload_id, correlation_id), queue="transcribe_cpu")
+            return
+    except Exception:
+        logger.warning(f"[{upload_id}] inspector fallback logic failed")
+
+    r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
+    wav, duration = prepare_wav(upload_id)
+    if not _HF_AVAILABLE:
+        logger.error(f"[{upload_id}] whisper model unavailable, failing")
+        send_webhook_event("processing_failed", upload_id, None)
+        return
+
+    model = get_whisper_model()
+    raw_segs: List[Any] = []
+
+    def _transcribe_with_vad(source, offset: float = 0.0):
+        segs, _ = model.transcribe(
+            source,
+            word_timestamps=True,
+            vad_filter=True,
+            vad_parameters={
+                "min_silence_duration_ms": int(settings.SENTENCE_MAX_GAP_S * 1000),
+                "speech_pad_ms": 200,
+            },
+            **({"language": settings.WHIS_PER_LANGUAGE} if settings.WHIS_PER_LANGUAGE else {}),
+        )
+        for s in segs:
+            s.start += offset
+            s.end += offset
+        return list(segs)
+
+    if duration <= settings.VAD_MAX_LENGTH_S:
+        logger.info(f"[{upload_id}] short audio ({duration:.1f}s) → single VAD pass")
+        raw_segs = _transcribe_with_vad(str(wav))
+    else:
+        logger.info(f"[{upload_id}] long audio ({duration:.1f}s) → chunking at {settings.CHUNK_LENGTH_S}s")
+        offset = 0.0
+        while offset < duration:
+            length = min(settings.CHUNK_LENGTH_S, duration - offset)
+            p = subprocess.Popen(
+                [
+                    "ffmpeg", "-y",
+                    "-threads", str(settings.FFMPEG_THREADS),
+                    "-ss", str(offset), "-t", str(length),
+                    "-i", str(wav), "-f", "wav", "pipe:1"
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL
+            )
+            chunk_segs = _transcribe_with_vad(p.stdout, offset)
+            p.stdout.close(); p.wait()
+            raw_segs.extend(chunk_segs)
+            offset += length
+
+    flat = [{"start": s.start, "end": s.end, "text": s.text} for s in raw_segs]
+    flat.sort(key=lambda x: x["start"])
+    sentences = group_into_sentences(flat)
+
+    out = Path(settings.RESULTS_FOLDER) / upload_id
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "transcript.json").write_text(json.dumps(sentences, ensure_ascii=False, indent=2))
+    logger.info(f"[{upload_id}] transcription completed ({len(sentences)} sentences)")
+    r.publish(f"progress:{upload_id}", json.dumps({"status": "transcript_done"}))
+    send_webhook_event("transcription_completed", upload_id, {"transcript": sentences})
+
+    try:
+        import torch
+        logger.info(
+            f"[{upload_id}] GPU memory reserved after transcription: "
+            f"{torch.cuda.memory_reserved() if torch.cuda.is_available() else 'n/a'}"
+        )
+    except ImportError:
+        pass
 
 
 @app.task(bind=True, queue="diarize_gpu")
@@ -443,10 +595,11 @@ def diarize_full(self, upload_id, correlation_id):
                     except ImportError:
                         pass
                     time.sleep(5)
+
             tmp.unlink(missing_ok=True)
             offset += length
 
-        # Полный кластери��инг по embedding для всех чанков
+        # Полный кластеринг по embedding для всех чанков
         raw = global_cluster_speakers(raw, wav, upload_id)
 
     else:
