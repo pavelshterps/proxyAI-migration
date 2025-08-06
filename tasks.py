@@ -40,10 +40,10 @@ _diarization_pipeline = None
 _speaker_embedding_model = None  # type: ignore
 
 # --- Speaker stitching / embedding thresholds ---
-SPEAKER_STITCH_ENABLED = getattr(settings, "SPEAKER_STITCH_ENABLED", True)
-SPEAKER_STITCH_THRESHOLD = float(getattr(settings, "SPEAKER_STITCH_THRESHOLD", 0.75))
-SPEAKER_STITCH_POOL_SIZE = int(getattr(settings, "SPEAKER_STITCH_POOL_SIZE", 5))
-SPEAKER_STITCH_EMA_ALPHA = float(getattr(settings, "SPEAKER_STITCH_EMA_ALPHA", 0.4))
+SPEAKER_STITCH_ENABLED      = getattr(settings, "SPEAKER_STITCH_ENABLED", True)
+SPEAKER_STITCH_THRESHOLD    = float(getattr(settings, "SPEAKER_STITCH_THRESHOLD", 0.75))
+SPEAKER_STITCH_POOL_SIZE    = int(getattr(settings, "SPEAKER_STITCH_POOL_SIZE", 5))
+SPEAKER_STITCH_EMA_ALPHA    = float(getattr(settings, "SPEAKER_STITCH_EMA_ALPHA", 0.4))
 SPEAKER_STITCH_MERGE_THRESHOLD = float(getattr(settings, "SPEAKER_STITCH_MERGE_THRESHOLD", 0.95))
 
 try:
@@ -180,21 +180,23 @@ def merge_speakers(
 ) -> List[Dict[str, Any]]:
     if not diar:
         return [{**t, "speaker": None} for t in transcript]
-    diar_sorted = sorted(diar, key=lambda d: d["start"])
-    transcript_sorted = sorted(transcript, key=lambda t: t["start"])
-    starts = [d["start"] for d in diar_sorted]
     from bisect import bisect_left
+    diar_sorted       = sorted(diar,   key=lambda d: d["start"])
+    transcript_sorted = sorted(transcript, key=lambda t: t["start"])
+    starts            = [d["start"] for d in diar_sorted]
     def nearest(idx: int, t0: float, t1: float):
         if idx <= 0: return diar_sorted[0]
         if idx >= len(diar_sorted): return diar_sorted[-1]
         b, a = diar_sorted[idx-1], diar_sorted[idx]
         db = max(0.0, t0 - b["end"]); da = max(0.0, a["start"] - t1)
         return b if db <= da else a
+
     merged = []
     for t in transcript_sorted:
         t0, t1 = max(0.0, t["start"]-pad), t["end"]+pad
         i = bisect_left(starts, t1)
-        cands = [d for d in diar_sorted[max(0,i-8):i+8] if not (d["end"]<=t0 or d["start"]>=t1)]
+        cands = [d for d in diar_sorted[max(0,i-8):i+8]
+                 if not (d["end"]<=t0 or d["start"]>=t1)]
         best = (max(cands, key=lambda d: max(0.0, min(d["end"],t1)-max(d["start"],t0)))
                 if cands else nearest(i,t0,t1))
         merged.append({**t, "speaker": best["speaker"]})
@@ -202,7 +204,7 @@ def merge_speakers(
 
 def get_whisper_model(model_override: str = None):
     global _whisper_model
-    device = settings.WHISPER_DEVICE.lower()
+    device  = settings.WHISPER_DEVICE.lower()
     compute = getattr(settings, "WHISPER_COMPUTE_TYPE", "float16" if device.startswith("cuda") else "int8").lower()
     if model_override:
         return WhisperModel(model_override, device=device, compute_type=compute)
@@ -248,7 +250,8 @@ def global_cluster_speakers(
 ) -> List[Dict[str, Any]]:
     """
     Собираем эмбеддинги каждого сегмента и кластеризуем их по cosine distance.
-    Если сегмент слишком короткий для модели, заменяем его на нулевой вектор.
+    Если сегмент слишком короткий для модели, заменяем его на нулевой вектор,
+    а затем переназначаем каждый нулевой сегмент на ближайшего по времени «валидного» спикера.
     """
     waveform, sr = load_wav(str(wav))
     if sr != 16000:
@@ -287,13 +290,12 @@ def global_cluster_speakers(
         embeddings.append(emb.cpu().numpy())
 
     X = np.vstack(embeddings)
-    # Обработка случаев с нулевыми векторами
     nonzero_mask = np.any(X != 0, axis=1)
+
     if nonzero_mask.sum() == 0:
         # все сегменты нулевые: объединяем в один кластер
         labels_full = np.zeros(len(raw), dtype=int)
     else:
-        # кластеризуем только ненулевые эмбеддинги
         X_nz = X[nonzero_mask]
         if X_nz.shape[0] == 1:
             labels_nz = np.array([0], dtype=int)
@@ -308,13 +310,28 @@ def global_cluster_speakers(
             ).fit(X_nz)
             labels_nz = clustering.labels_
             max_label = labels_nz.max()
-        # заполняем полную метку
         labels_full = np.full(len(raw), fill_value=max_label+1, dtype=int)
         labels_full[nonzero_mask] = labels_nz
 
     logger.info(f"[{upload_id}] clustered {len(raw)} segments into {len(set(labels_full))} speakers")
+    # Присваиваем спикеров
     for seg, lbl in zip(raw, labels_full):
         seg["speaker"] = f"spk_{lbl}"
+
+    # Переназначаем «нулевые» сегменты (nonzero_mask==False) на ближайший по времени валидный спикер
+    for idx, is_valid in enumerate(nonzero_mask):
+        if not is_valid:
+            seg = raw[idx]
+            # выбираем всех валидных кандидатов
+            candidates = [
+                (abs(seg["start"] - raw[j]["start"]), raw[j]["speaker"])
+                for j in range(len(raw)) if nonzero_mask[j]
+            ]
+            if candidates:
+                # ближайший по абсолютной разнице времени
+                nearest_spk = min(candidates, key=lambda x: x[0])[1]
+                seg["speaker"] = nearest_spk
+
     return raw
 
 @worker_process_init.connect
@@ -497,16 +514,26 @@ def diarize_full(self, upload_id, correlation_id):
     pipeline = get_diarization_pipeline()
     raw: List[Dict[str, Any]] = []
 
+    # determine padding in seconds: either explicit or fraction of chunk
+    DIARIZATION_CHUNK_PADDING_S = float(getattr(settings, "DIARIZATION_CHUNK_PADDING_S", 0))
+    pad = DIARIZATION_CHUNK_PADDING_S or (raw_chunk_limit * 0.1)
+
     if using_chunking:
         total_chunks = math.ceil(duration / raw_chunk_limit)
         offset = 0.0
         for idx in range(total_chunks):
             length = min(raw_chunk_limit, duration - offset)
-            logger.info(f"[{upload_id}] diarize chunk {idx+1}/{total_chunks}: {offset:.1f}s→{offset+length:.1f}s")
+            start_pad = max(0.0, offset - pad)
+            end_pad   = min(duration, offset + length + pad)
+            proc_dur  = end_pad - start_pad
+
+            logger.info(f"[{upload_id}] diarize chunk {idx+1}/{total_chunks}: "
+                        f"{start_pad:.1f}s→{end_pad:.1f}s (core {offset:.1f}-{offset+length:.1f})")
             tmp = Path(settings.DIARIZER_CACHE_DIR) / f"{upload_id}_chunk_{idx}.wav"
             subprocess.run([
-                "ffmpeg", "-y", "-threads", str(max(1, settings.FFMPEG_THREADS // 2)),
-                "-ss", str(offset), "-t", str(length),
+                "ffmpeg", "-y",
+                "-threads", str(max(1, settings.FFMPEG_THREADS // 2)),
+                "-ss", str(start_pad), "-t", str(proc_dur),
                 "-i", str(wav), str(tmp)
             ], check=True, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
 
@@ -515,11 +542,12 @@ def diarize_full(self, upload_id, correlation_id):
                     ann = pipeline(str(tmp))
                     before = len(raw)
                     for s, _, spk in ann.itertracks(yield_label=True):
-                        raw.append({
-                            "start": float(s.start) + offset,
-                            "end":   float(s.end)   + offset,
-                            "speaker": spk
-                        })
+                        t0 = float(s.start) + start_pad
+                        t1 = float(s.end)   + start_pad
+                        c0 = max(t0, offset)
+                        c1 = min(t1, offset + length)
+                        if c1 > c0:
+                            raw.append({"start": c0, "end": c1, "speaker": spk})
                     added = len(raw) - before
                     logger.info(f"[{upload_id}] chunk {idx+1} added {added} segments")
                     r.publish(f"progress:{upload_id}", json.dumps({
@@ -538,6 +566,7 @@ def diarize_full(self, upload_id, correlation_id):
             offset += length
 
         raw = global_cluster_speakers(raw, wav, upload_id)
+
     else:
         ann = pipeline(str(wav))
         for s, _, spk in ann.itertracks(yield_label=True):
@@ -564,7 +593,9 @@ def diarize_full(self, upload_id, correlation_id):
     out.mkdir(parents=True, exist_ok=True)
     (out / "diarization.json").write_text(json.dumps(diar_sentences, ensure_ascii=False, indent=2))
     logger.info(f"[{upload_id}] diarization_done: {len(diar_sentences)} segments")
-    r.publish(f"progress:{upload_id}", json.dumps({"status": "diarization_done", "segments": len(diar_sentences)}))
+    r.publish(f"progress:{upload_id}", json.dumps({
+        "status": "diarization_done", "segments": len(diar_sentences)
+    }))
     deliver_webhook.delay("diarization_completed", upload_id, {"diarization": diar_sentences})
 
 @app.task(
