@@ -46,6 +46,10 @@ SPEAKER_STITCH_POOL_SIZE       = int(getattr(settings, "SPEAKER_STITCH_POOL_SIZE
 SPEAKER_STITCH_EMA_ALPHA       = float(getattr(settings, "SPEAKER_STITCH_EMA_ALPHA", 0.4))
 SPEAKER_STITCH_MERGE_THRESHOLD = float(getattr(settings, "SPEAKER_STITCH_MERGE_THRESHOLD", 0.75))
 
+# --- Additional clustering controls ---
+MIN_SEGMENT_LENGTH_S = float(getattr(settings, "MIN_SEGMENT_LENGTH_S", 0.2))
+MIN_CLUSTER_SIZE     = int(getattr(settings, "MIN_CLUSTER_SIZE", 5))
+
 try:
     from faster_whisper import WhisperModel, download_model
     _HF_AVAILABLE = True
@@ -250,9 +254,13 @@ def global_cluster_speakers(
 ) -> List[Dict[str, Any]]:
     """
     Собираем эмбеддинги каждого сегмента и кластеризуем их по cosine distance.
-    Если сегмент слишком короткий для модели, заменяем его на нулевой вектор,
-    а затем переназначаем каждый нулевой сегмент на ближайшего по времени «валидного» спикера.
+    Фильтруем сегменты короче MIN_SEGMENT_LENGTH_S, кластеризуем остальные,
+    затем короткие и мелкие кластеры перераспределяем к ближайшим по времени.
     """
+    # разделим на короткие и валидные
+    valid_indices = [i for i, seg in enumerate(raw) if seg["end"] - seg["start"] >= MIN_SEGMENT_LENGTH_S]
+    short_indices = [i for i in range(len(raw)) if i not in valid_indices]
+
     waveform, sr = load_wav(str(wav))
     if sr != 16000:
         waveform = Resample(sr, 16000)(waveform)
@@ -260,75 +268,68 @@ def global_cluster_speakers(
 
     model = get_speaker_embedding_model()
 
-    # Определяем размер эмбеддинга на «заглушечном» сегменте
-    try:
-        with torch.no_grad():
-            dummy = waveform[:, :sr] if waveform.size(1) >= sr else waveform
-            dummy_emb = model.encode_batch(dummy).squeeze().flatten()
-        embedding_size = dummy_emb.shape[0]
-    except Exception:
-        embedding_size = 192  # fallback для ECAPA-TDNN
-
+    # формируем эмбеддинги только для валидных
     embeddings = []
-    for seg in raw:
+    for i in valid_indices:
+        seg = raw[i]
         s0, s1 = int(seg["start"] * sr), int(seg["end"] * sr)
         wf = waveform[:, s0:s1]
         if wf.numel() == 0:
-            emb = torch.zeros(embedding_size)
+            emb = torch.zeros(model._embedding_size if hasattr(model, "_embedding_size") else 192)
         else:
-            try:
-                with torch.no_grad():
-                    out = model.encode_batch(wf)
-                emb_tensor = out.squeeze()
-                emb = F.normalize(emb_tensor.flatten(), p=2, dim=0)
-            except Exception as e:
-                logger.warning(
-                    f"[{upload_id}] segment {seg['start']:.2f}-{seg['end']:.2f}s "
-                    f"too short for embedding, using zero vector: {e}"
-                )
-                emb = torch.zeros(embedding_size)
+            with torch.no_grad():
+                out = model.encode_batch(wf)
+            emb_tensor = out.squeeze()
+            emb = F.normalize(emb_tensor.flatten(), p=2, dim=0)
         embeddings.append(emb.cpu().numpy())
 
+    if not embeddings:
+        # нет валидных сегментов — возвращаем исходное
+        return raw
+
     X = np.vstack(embeddings)
-    nonzero_mask = np.any(X != 0, axis=1)
+    thresh = 1.0 - SPEAKER_STITCH_MERGE_THRESHOLD
+    clustering = AgglomerativeClustering(
+        n_clusters=None,
+        metric="cosine",
+        linkage="average",
+        distance_threshold=thresh
+    ).fit(X)
+    labels = clustering.labels_
 
-    if nonzero_mask.sum() == 0:
-        # все сегменты нулевые: объединяем в один кластер
-        labels_full = np.zeros(len(raw), dtype=int)
-    else:
-        X_nz = X[nonzero_mask]
-        if X_nz.shape[0] == 1:
-            labels_nz = np.array([0], dtype=int)
-            max_label = 0
-        else:
-            thresh = 1 - SPEAKER_STITCH_MERGE_THRESHOLD
-            clustering = AgglomerativeClustering(
-                n_clusters=None,
-                metric="cosine",
-                linkage="average",
-                distance_threshold=thresh
-            ).fit(X_nz)
-            labels_nz = clustering.labels_
-            max_label = labels_nz.max()
-        labels_full = np.full(len(raw), fill_value=max_label+1, dtype=int)
-        labels_full[nonzero_mask] = labels_nz
+    # посчитаем размеры кластеров и выделим мелкие
+    from collections import Counter
+    cnt = Counter(labels)
+    small_clusters = {lab for lab, c in cnt.items() if c < MIN_CLUSTER_SIZE}
 
-    logger.info(f"[{upload_id}] clustered {len(raw)} segments into {len(set(labels_full))} speakers")
-    # Присваиваем спикеров
-    for seg, lbl in zip(raw, labels_full):
-        seg["speaker"] = f"spk_{lbl}"
+    # Если есть мелкие, переназначаем их в ближайший крупный по центроиду
+    centroids = {}
+    for lab in set(labels):
+        inds = [j for j, l in enumerate(labels) if l == lab]
+        centroids[lab] = np.mean(X[inds], axis=0)
+        centroids[lab] /= np.linalg.norm(centroids[lab]) + 1e-8
 
-    # Переназначаем «нулевые» сегменты (nonzero_mask==False) на ближайший по времени валидный спикер
-    for idx, is_valid in enumerate(nonzero_mask):
-        if not is_valid:
-            seg = raw[idx]
-            candidates = [
-                (abs(seg["start"] - raw[j]["start"]), raw[j]["speaker"])
-                for j in range(len(raw)) if nonzero_mask[j]
-            ]
-            if candidates:
-                nearest_spk = min(candidates, key=lambda x: x[0])[1]
-                seg["speaker"] = nearest_spk
+    # перераспределяем мелкие кластеры
+    for idx, lab in enumerate(labels):
+        if lab in small_clusters:
+            # найдем ближайший крупный кластер
+            sims = {L: np.dot(centroids[lab], centroids[L]) for L in centroids if L not in small_clusters}
+            best = max(sims, key=sims.get)
+            labels[idx] = best
+
+    # присваиваем лейблы обратно raw
+    for pos, seg_idx in enumerate(valid_indices):
+        raw[seg_idx]["speaker"] = f"spk_{labels[pos]}"
+
+    # для коротких сегментов переназначаем к ближайшему по времени
+    for i in short_indices:
+        seg = raw[i]
+        cand = [
+            (abs(seg["start"] - raw[j]["start"]), raw[j]["speaker"])
+            for j in valid_indices
+        ]
+        if cand:
+            raw[i]["speaker"] = min(cand, key=lambda x: x[0])[1]
 
     return raw
 
@@ -348,7 +349,7 @@ def convert_to_wav_and_preview(self, upload_id, correlation_id):
     logger.info(f"[{upload_id}] convert_to_wav_and_preview received")
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
     r.publish(f"progress:{upload_id}", json.dumps({"status": "processing_started"}))
-    deliver_webhook.delay("processing_started", upload_id, None)
+    send_webhook_event("processing_started", upload_id, None)
 
     try:
         prepare_wav(upload_id)
@@ -356,7 +357,7 @@ def convert_to_wav_and_preview(self, upload_id, correlation_id):
     except Exception as e:
         logger.error(f"[{upload_id}] WAV prep failed: {e}")
         r.publish(f"progress:{upload_id}", json.dumps({"status": "error", "error": str(e)}))
-        deliver_webhook.delay("processing_failed", upload_id, None)
+        send_webhook_event("processing_failed", upload_id, None)
         return
 
     preview_transcribe.delay(upload_id, correlation_id)
@@ -367,10 +368,8 @@ def preview_transcribe(self, upload_id, correlation_id):
     try:
         insp = app.control.inspect()
         active = insp.active() or {}
-        heavy = sum(
-            1 for tasks in active.values() for t in tasks
-            if t["name"] in ("tasks.diarize_full", "tasks.transcribe_segments")
-        )
+        heavy = sum(1 for tasks in active.values() for t in tasks
+                    if t["name"] in ("tasks.diarize_full", "tasks.transcribe_segments"))
         if heavy >= 2:
             logger.info(f"[{upload_id}] GPUs busy ({heavy}), fallback to CPU preview")
             transcribe_segments.apply_async((upload_id, correlation_id), queue="transcribe_cpu")
@@ -403,7 +402,7 @@ def preview_transcribe(self, upload_id, correlation_id):
     out.mkdir(parents=True, exist_ok=True)
     (out / "preview_transcript.json").write_text(json.dumps(preview, ensure_ascii=False, indent=2))
     r.publish(f"progress:{upload_id}", json.dumps({"status": "preview_done", "preview": preview}))
-    deliver_webhook.delay("preview_completed", upload_id, {"preview": preview})
+    send_webhook_event("preview_completed", upload_id, {"preview": preview})
 
     transcribe_segments.delay(upload_id, correlation_id)
 
@@ -418,10 +417,8 @@ def transcribe_segments(self, upload_id, correlation_id):
     try:
         insp = app.control.inspect()
         active = insp.active() or {}
-        heavy = sum(
-            1 for tasks in active.values() for t in tasks
-            if t["name"] in ("tasks.diarize_full", "tasks.transcribe_segments")
-        )
+        heavy = sum(1 for tasks in active.values() for t in tasks
+                    if t["name"] in ("tasks.diarize_full", "tasks.transcribe_segments"))
         if heavy >= 2 and self.request.delivery_info.get("routing_key") != "transcribe_cpu":
             logger.info(f"[{upload_id}] GPUs busy ({heavy}), reschedule CPU")
             transcribe_segments.apply_async((upload_id, correlation_id), queue="transcribe_cpu")
@@ -433,7 +430,7 @@ def transcribe_segments(self, upload_id, correlation_id):
     wav, duration = prepare_wav(upload_id)
     if not _HF_AVAILABLE:
         logger.error(f"[{upload_id}] whisper unavailable, abort")
-        deliver_webhook.delay("processing_failed", upload_id, None)
+        send_webhook_event("processing_failed", upload_id, None)
         return
 
     model = get_whisper_model()
@@ -450,15 +447,12 @@ def transcribe_segments(self, upload_id, correlation_id):
         )
         segs = list(segs_gen)
         if chunk_idx is not None and total_chunks is not None:
-            r.publish(
-                f"progress:{upload_id}",
-                json.dumps({
-                    "status": "transcribe_chunk_done",
-                    "chunk_index": chunk_idx,
-                    "total_chunks": total_chunks,
-                    "segments": len(segs),
-                })
-            )
+            r.publish(f"progress:{upload_id}", json.dumps({
+                "status": "transcribe_chunk_done",
+                "chunk_index": chunk_idx,
+                "total_chunks": total_chunks,
+                "segments": len(segs),
+            }))
         for s in segs:
             s.start += offset
             s.end += offset
@@ -492,7 +486,7 @@ def transcribe_segments(self, upload_id, correlation_id):
     (out / "transcript.json").write_text(json.dumps(sentences, ensure_ascii=False, indent=2))
     logger.info(f"[{upload_id}] transcription done ({len(sentences)} sentences)")
     r.publish(f"progress:{upload_id}", json.dumps({"status": "transcript_done"}))
-    deliver_webhook.delay("transcription_completed", upload_id, {"transcript": sentences})
+    send_webhook_event("transcription_completed", upload_id, {"transcript": sentences})
 
     try:
         logger.info(f"[{upload_id}] GPU memory after: {torch.cuda.memory_reserved() if torch.cuda.is_available() else 'n/a'}")
@@ -504,7 +498,7 @@ def diarize_full(self, upload_id, correlation_id):
     logger.info(f"[{upload_id}] diarize_full started")
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
     r.publish(f"progress:{upload_id}", json.dumps({"status": "diarize_started"}))
-    deliver_webhook.delay("diarization_started", upload_id, None)
+    send_webhook_event("diarization_started", upload_id, None)
 
     wav, duration = prepare_wav(upload_id)
     raw_chunk_limit = int(getattr(settings, "DIARIZATION_CHUNK_LENGTH_S", 0))
@@ -512,8 +506,7 @@ def diarize_full(self, upload_id, correlation_id):
     pipeline        = get_diarization_pipeline()
     raw: List[Dict[str, Any]] = []
 
-    # determine padding in seconds
-    pad = getattr(settings, "DIARIZATION_CHUNK_PADDING_S", 0.0)
+    pad = float(getattr(settings, "DIARIZATION_CHUNK_PADDING_S", raw_chunk_limit * 0.1))
 
     if using_chunking:
         total_chunks = math.ceil(duration / raw_chunk_limit)
@@ -589,7 +582,7 @@ def diarize_full(self, upload_id, correlation_id):
     r.publish(f"progress:{upload_id}", json.dumps({
         "status": "diarization_done", "segments": len(diar_sentences)
     }))
-    deliver_webhook.delay("diarization_completed", upload_id, {"diarization": diar_sentences})
+    send_webhook_event("diarization_completed", upload_id, {"diarization": diar_sentences})
 
 @app.task(
     bind=True,
