@@ -256,14 +256,15 @@ def global_cluster_speakers(
         sr = 16000
 
     model = get_speaker_embedding_model()
-    # Определяем размер эмбеддинга один раз на «заглушечном» сегменте
+
+    # Определяем размер эмбеддинга на «заглушечном» сегменте
     try:
         with torch.no_grad():
             dummy = waveform[:, :sr] if waveform.size(1) >= sr else waveform
             dummy_emb = model.encode_batch(dummy).squeeze().flatten()
         embedding_size = dummy_emb.shape[0]
     except Exception:
-        embedding_size = 192
+        embedding_size = 192  # fallback для ECAPA-TDNN
 
     embeddings = []
     for seg in raw:
@@ -277,7 +278,7 @@ def global_cluster_speakers(
                     out = model.encode_batch(wf)
                 emb_tensor = out.squeeze()
                 emb = F.normalize(emb_tensor.flatten(), p=2, dim=0)
-            except RuntimeError as e:
+            except Exception as e:
                 logger.warning(
                     f"[{upload_id}] segment {seg['start']:.2f}-{seg['end']:.2f}s "
                     f"too short for embedding, using zero vector: {e}"
@@ -286,16 +287,33 @@ def global_cluster_speakers(
         embeddings.append(emb.cpu().numpy())
 
     X = np.vstack(embeddings)
-    thresh = 1 - SPEAKER_STITCH_MERGE_THRESHOLD
-    clustering = AgglomerativeClustering(
-        n_clusters=None,
-        metric="cosine",
-        linkage="average",
-        distance_threshold=thresh
-    ).fit(X)
+    # Обработка случаев с нулевыми векторами
+    nonzero_mask = np.any(X != 0, axis=1)
+    if nonzero_mask.sum() == 0:
+        # все сегменты нулевые: объединяем в один кластер
+        labels_full = np.zeros(len(raw), dtype=int)
+    else:
+        # кластеризуем только ненулевые эмбеддинги
+        X_nz = X[nonzero_mask]
+        if X_nz.shape[0] == 1:
+            labels_nz = np.array([0], dtype=int)
+            max_label = 0
+        else:
+            thresh = 1 - SPEAKER_STITCH_MERGE_THRESHOLD
+            clustering = AgglomerativeClustering(
+                n_clusters=None,
+                metric="cosine",
+                linkage="average",
+                distance_threshold=thresh
+            ).fit(X_nz)
+            labels_nz = clustering.labels_
+            max_label = labels_nz.max()
+        # заполняем полную метку
+        labels_full = np.full(len(raw), fill_value=max_label+1, dtype=int)
+        labels_full[nonzero_mask] = labels_nz
 
-    logger.info(f"[{upload_id}] clustered {len(raw)} segments into {len(set(clustering.labels_))} speakers")
-    for seg, lbl in zip(raw, clustering.labels_):
+    logger.info(f"[{upload_id}] clustered {len(raw)} segments into {len(set(labels_full))} speakers")
+    for seg, lbl in zip(raw, labels_full):
         seg["speaker"] = f"spk_{lbl}"
     return raw
 
