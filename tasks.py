@@ -3,6 +3,7 @@ import logging
 import subprocess
 import time
 import re
+import math
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional, List, Dict
@@ -302,7 +303,6 @@ def stitch_speakers(raw: List[Dict[str, Any]], wav: Path, upload_id: str) -> Lis
     if not SPEAKER_STITCH_ENABLED:
         return raw
 
-    # если pyannote выдал только одного исходного спикера — не трогаем
     unique_orig = set(seg.get("speaker") for seg in raw)
     if len(unique_orig) <= 1:
         logger.debug(f"[{upload_id}] only one original speaker {unique_orig}, skipping stitching")
@@ -315,7 +315,7 @@ def stitch_speakers(raw: List[Dict[str, Any]], wav: Path, upload_id: str) -> Lis
 
         model = get_speaker_embedding_model()
 
-        waveform, sr = torchaudio.load(str(wav))  # [channels, samples]
+        waveform, sr = torchaudio.load(str(wav))
         if sr != 16000:
             from torchaudio.transforms import Resample
             resampler = Resample(sr, 16000)
@@ -366,13 +366,11 @@ def stitch_speakers(raw: List[Dict[str, Any]], wav: Path, upload_id: str) -> Lis
                     assigned_label = canon_label
 
             if assigned_label is not None and best_sim >= SPEAKER_STITCH_THRESHOLD:
-                # обновляем центроид через EMA
                 old_centroid = stitch_centroids[assigned_label]
                 updated_centroid = F.normalize(
                     SPEAKER_STITCH_EMA_ALPHA * emb + (1 - SPEAKER_STITCH_EMA_ALPHA) * old_centroid, p=2, dim=0
                 )
                 stitch_centroids[assigned_label] = updated_centroid
-                # обновляем историю
                 hist = stitch_histories[assigned_label]
                 hist.append(emb)
                 if len(hist) > SPEAKER_STITCH_POOL_SIZE:
@@ -387,36 +385,29 @@ def stitch_speakers(raw: List[Dict[str, Any]], wav: Path, upload_id: str) -> Lis
             seg["speaker"] = assigned_label
             stitched.append(seg)
 
-        # Постобъединение лейблов с очень схожими центроидами
         label_centroids: Dict[str, torch.Tensor] = {}
         for label, hist in stitch_histories.items():
             centroid = torch.stack(hist).mean(dim=0)
             centroid = F.normalize(centroid, p=2, dim=0)
             label_centroids[label] = centroid
 
-        # строим граф схожести и находим компоненты для слияния
         adj: Dict[str, set] = {label: set() for label in label_centroids}
         labels = list(label_centroids.keys())
         for i in range(len(labels)):
             for j in range(i + 1, len(labels)):
-                a = labels[i]
-                b = labels[j]
+                a, b = labels[i], labels[j]
                 sim = torch.dot(label_centroids[a], label_centroids[b]).item()
                 if sim >= SPEAKER_STITCH_MERGE_THRESHOLD:
                     adj[a].add(b)
                     adj[b].add(a)
 
-        visited = set()
-        merge_map: Dict[str, str] = {}
+        visited, merge_map = set(), {}
         for label in adj:
-            if label in visited:
-                continue
-            stack = [label]
-            component = []
+            if label in visited: continue
+            stack, component = [label], []
             while stack:
                 l = stack.pop()
-                if l in visited:
-                    continue
+                if l in visited: continue
                 visited.add(l)
                 component.append(l)
                 stack.extend(adj[l] - visited)
@@ -569,28 +560,47 @@ def transcribe_segments(self, upload_id, correlation_id):
         logger.info(f"[{upload_id}] short audio ({duration:.1f}s) → single VAD pass")
         raw_segs = _transcribe_with_vad(str(wav))
     else:
-        logger.info(f"[{upload_id}] long audio ({duration:.1f}s) → chunking at {settings.CHUNK_LENGTH_S}s")
+        total_chunks = math.ceil(duration / settings.CHUNK_LENGTH_S)
+        processed_key = f"transcribe:processed_chunks:{upload_id}"
+        processed = {int(x) for x in r.smembers(processed_key)}
+
         offset = 0.0
         chunk_idx = 0
         while offset < duration:
-            length = min(settings.CHUNK_LENGTH_S, duration - offset)
-            logger.debug(f"[{upload_id}] chunk {chunk_idx} {offset:.1f}s→{offset+length:.1f}s")
-            p = subprocess.Popen(
-                [
-                    "ffmpeg", "-y",
-                    "-threads", str(settings.FFMPEG_THREADS),
-                    "-ss", str(offset), "-t", str(length),
-                    "-i", str(wav), "-f", "wav", "pipe:1"
-                ],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL
-            )
-            chunk_segs = _transcribe_with_vad(p.stdout, offset)
-            p.stdout.close(); p.wait()
+            if chunk_idx in processed:
+                logger.info(f"[{upload_id}] skip chunk {chunk_idx+1}/{total_chunks} (already done)")
+                offset += settings.CHUNK_LENGTH_S
+                chunk_idx += 1
+                continue
 
-            raw_segs.extend(chunk_segs)
-            offset += length
-            chunk_idx += 1
+            length = min(settings.CHUNK_LENGTH_S, duration - offset)
+            logger.info(f"[{upload_id}] transcribe chunk {chunk_idx+1}/{total_chunks}: {offset:.1f}s→{offset+length:.1f}s")
+            try:
+                p = subprocess.Popen(
+                    [
+                        "ffmpeg", "-y",
+                        "-threads", str(settings.FFMPEG_THREADS),
+                        "-ss", str(offset), "-t", str(length),
+                        "-i", str(wav), "-f", "wav", "pipe:1"
+                    ],
+                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+                )
+                chunk_segs = _transcribe_with_vad(p.stdout, offset)
+                p.stdout.close(); p.wait()
+
+                raw_segs.extend(chunk_segs)
+                r.sadd(processed_key, chunk_idx)
+            except Exception as e:
+                logger.error(f"[{upload_id}] error in transcribe chunk {chunk_idx+1}/{total_chunks}: {e}", exc_info=True)
+                try:
+                    import torch; torch.cuda.empty_cache()
+                except ImportError:
+                    pass
+            finally:
+                offset += length
+                chunk_idx += 1
+
+        r.delete(processed_key)
 
     flat = [{"start": s.start, "end": s.end, "text": s.text} for s in raw_segs]
     flat.sort(key=lambda x: x["start"])
@@ -632,7 +642,6 @@ def diarize_full(self, upload_id, correlation_id):
         chunk_limit = 0
 
     using_chunking = bool(chunk_limit and duration > chunk_limit)
-
     logger.info(f"[{upload_id}] WAV prepared for diarization, duration={duration:.1f}s; chunk_limit={chunk_limit}; using_chunking={using_chunking}")
 
     if not _PN_AVAILABLE:
@@ -643,70 +652,54 @@ def diarize_full(self, upload_id, correlation_id):
     pipeline = get_diarization_pipeline()
     raw: List[Dict[str, Any]] = []
 
-    MAX_RETRIES_PER_CHUNK = 2
-
     if using_chunking:
+        total_chunks = math.ceil(duration / chunk_limit)
+        processed_key = f"diarize:processed_chunks:{upload_id}"
+        processed = {int(x) for x in r.smembers(processed_key)}
+
         offset = 0.0
         chunk_idx = 0
         while offset < duration:
+            if chunk_idx in processed:
+                logger.info(f"[{upload_id}] skip diarize chunk {chunk_idx+1}/{total_chunks}")
+                offset += chunk_limit
+                chunk_idx += 1
+                continue
+
             this_len = min(chunk_limit, duration - offset)
-            logger.info(f"[{upload_id}] diarization chunk #{chunk_idx} start: {offset:.1f}s→{offset+this_len:.1f}s")
-            tmp = Path(settings.DIARIZER_CACHE_DIR) / f"{upload_id}_chunk_{int(offset)}.wav"
+            logger.info(f"[{upload_id}] diarize chunk {chunk_idx+1}/{total_chunks}: {offset:.1f}s→{offset+this_len:.1f}s")
+            tmp = Path(settings.DIARIZER_CACHE_DIR) / f"{upload_id}_chunk_{chunk_idx}.wav"
             subprocess.run([
                 "ffmpeg", "-y", "-threads", str(max(1, settings.FFMPEG_THREADS // 2)),
                 "-ss", str(offset), "-t", str(this_len),
                 "-i", str(wav), str(tmp)
             ], check=True, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
 
-            attempt = 0
-            success = False
-            while attempt < MAX_RETRIES_PER_CHUNK and not success:
+            try:
+                ann = pipeline(str(tmp))
+                before = len(raw)
+                for s, _, spk in ann.itertracks(yield_label=True):
+                    raw.append({"start": float(s.start) + offset, "end": float(s.end) + offset, "speaker": spk})
+                added = len(raw) - before
+                logger.info(f"[{upload_id}] diarize chunk {chunk_idx+1}/{total_chunks} done: added {added} segments")
+                r.sadd(processed_key, chunk_idx)
+            except Exception as e:
+                logger.error(f"[{upload_id}] error in diarize chunk {chunk_idx+1}/{total_chunks}: {e}", exc_info=True)
                 try:
-                    ann = pipeline(str(tmp))
-                    before = len(raw)
-                    for s, _, spk in ann.itertracks(yield_label=True):
-                        raw.append({
-                            "start": float(s.start) + offset,
-                            "end":   float(s.end)   + offset,
-                            "speaker": spk
-                        })
-                    added = len(raw) - before
-                    logger.info(f"[{upload_id}] diarization chunk #{chunk_idx} done: added {added} segments")
-                    r.publish(f"progress:{upload_id}", json.dumps({
-                        "status": "diarize_chunk_done",
-                        "chunk_index": chunk_idx,
-                        "offset": offset,
-                        "length": this_len,
-                        "added_segments": added,
-                    }))
-                    success = True
-                except Exception as e:
-                    attempt += 1
-                    logger.warning(f"[{upload_id}] error in diarization chunk #{chunk_idx}, attempt {attempt}: {e}")
-                    try:
-                        import torch
-                        torch.cuda.empty_cache()
-                    except ImportError:
-                        pass
-                    time.sleep(5)
+                    import torch; torch.cuda.empty_cache()
+                except ImportError:
+                    pass
+            finally:
+                tmp.unlink(missing_ok=True)
+                offset += this_len
+                chunk_idx += 1
 
-            if not success:
-                logger.error(f"[{upload_id}] failed diarization chunk #{chunk_idx} after {MAX_RETRIES_PER_CHUNK} attempts")
-                deliver_webhook.delay("processing_failed", upload_id, {"reason": "diarization_chunk_failure"})
-                return
-
-            tmp.unlink(missing_ok=True)
-            offset += this_len
-            chunk_idx += 1
+        r.delete(processed_key)
     else:
         logger.info(f"[{upload_id}] Short audio or chunking disabled, single diarization pass")
         ann = pipeline(str(wav))
         for s, _, spk in ann.itertracks(yield_label=True):
-            raw.append({
-                "start": float(s.start),
-                "end":   float(s.end),
-                "speaker": spk
-            })
+            raw.append({"start": float(s.start), "end": float(s.end), "speaker": spk})
 
     raw.sort(key=lambda x: x["start"])
 
