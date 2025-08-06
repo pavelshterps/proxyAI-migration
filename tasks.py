@@ -40,11 +40,11 @@ _diarization_pipeline = None
 _speaker_embedding_model = None  # type: ignore
 
 # --- Speaker stitching / embedding thresholds ---
-SPEAKER_STITCH_ENABLED      = getattr(settings, "SPEAKER_STITCH_ENABLED", True)
-SPEAKER_STITCH_THRESHOLD    = float(getattr(settings, "SPEAKER_STITCH_THRESHOLD", 0.75))
-SPEAKER_STITCH_POOL_SIZE    = int(getattr(settings, "SPEAKER_STITCH_POOL_SIZE", 5))
-SPEAKER_STITCH_EMA_ALPHA    = float(getattr(settings, "SPEAKER_STITCH_EMA_ALPHA", 0.4))
-SPEAKER_STITCH_MERGE_THRESHOLD = float(getattr(settings, "SPEAKER_STITCH_MERGE_THRESHOLD", 0.95))
+SPEAKER_STITCH_ENABLED         = getattr(settings, "SPEAKER_STITCH_ENABLED", False)
+SPEAKER_STITCH_THRESHOLD       = float(getattr(settings, "SPEAKER_STITCH_THRESHOLD", 0.75))
+SPEAKER_STITCH_POOL_SIZE       = int(getattr(settings, "SPEAKER_STITCH_POOL_SIZE", 5))
+SPEAKER_STITCH_EMA_ALPHA       = float(getattr(settings, "SPEAKER_STITCH_EMA_ALPHA", 0.4))
+SPEAKER_STITCH_MERGE_THRESHOLD = float(getattr(settings, "SPEAKER_STITCH_MERGE_THRESHOLD", 0.75))
 
 try:
     from faster_whisper import WhisperModel, download_model
@@ -146,7 +146,7 @@ def prepare_preview_segment(upload_id: str) -> subprocess.Popen:
 
 def group_into_sentences(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     SILENCE_GAP_S = getattr(settings, "SENTENCE_MAX_GAP_S", 0.5)
-    MAX_WORDS = getattr(settings, "SENTENCE_MAX_WORDS", 50)
+    MAX_WORDS     = getattr(settings, "SENTENCE_MAX_WORDS", 50)
     sentences, buf = [], {"start": None, "end": None, "speaker": None, "text": []}
     sentence_end_re = re.compile(r"[\.!\?]$")
     def flush_buffer():
@@ -181,7 +181,7 @@ def merge_speakers(
     if not diar:
         return [{**t, "speaker": None} for t in transcript]
     from bisect import bisect_left
-    diar_sorted       = sorted(diar,   key=lambda d: d["start"])
+    diar_sorted       = sorted(diar, key=lambda d: d["start"])
     transcript_sorted = sorted(transcript, key=lambda t: t["start"])
     starts            = [d["start"] for d in diar_sorted]
     def nearest(idx: int, t0: float, t1: float):
@@ -322,13 +322,11 @@ def global_cluster_speakers(
     for idx, is_valid in enumerate(nonzero_mask):
         if not is_valid:
             seg = raw[idx]
-            # выбираем всех валидных кандидатов
             candidates = [
                 (abs(seg["start"] - raw[j]["start"]), raw[j]["speaker"])
                 for j in range(len(raw)) if nonzero_mask[j]
             ]
             if candidates:
-                # ближайший по абсолютной разнице времени
                 nearest_spk = min(candidates, key=lambda x: x[0])[1]
                 seg["speaker"] = nearest_spk
 
@@ -509,20 +507,19 @@ def diarize_full(self, upload_id, correlation_id):
     deliver_webhook.delay("diarization_started", upload_id, None)
 
     wav, duration = prepare_wav(upload_id)
-    raw_chunk_limit = int(getattr(settings, "DIARIZATION_CHUNK_LENGTH_S", 0) or 0)
-    using_chunking = bool(raw_chunk_limit and duration > raw_chunk_limit)
-    pipeline = get_diarization_pipeline()
+    raw_chunk_limit = int(getattr(settings, "DIARIZATION_CHUNK_LENGTH_S", 0))
+    using_chunking  = bool(raw_chunk_limit and duration > raw_chunk_limit)
+    pipeline        = get_diarization_pipeline()
     raw: List[Dict[str, Any]] = []
 
-    # determine padding in seconds: either explicit or fraction of chunk
-    DIARIZATION_CHUNK_PADDING_S = float(getattr(settings, "DIARIZATION_CHUNK_PADDING_S", 0))
-    pad = DIARIZATION_CHUNK_PADDING_S or (raw_chunk_limit * 0.1)
+    # determine padding in seconds
+    pad = getattr(settings, "DIARIZATION_CHUNK_PADDING_S", 0.0)
 
     if using_chunking:
         total_chunks = math.ceil(duration / raw_chunk_limit)
-        offset = 0.0
+        offset       = 0.0
         for idx in range(total_chunks):
-            length = min(raw_chunk_limit, duration - offset)
+            length    = min(raw_chunk_limit, duration - offset)
             start_pad = max(0.0, offset - pad)
             end_pad   = min(duration, offset + length + pad)
             proc_dur  = end_pad - start_pad
@@ -570,11 +567,7 @@ def diarize_full(self, upload_id, correlation_id):
     else:
         ann = pipeline(str(wav))
         for s, _, spk in ann.itertracks(yield_label=True):
-            raw.append({
-                "start": float(s.start),
-                "end":   float(s.end),
-                "speaker": spk
-            })
+            raw.append({"start": float(s.start), "end": float(s.end), "speaker": spk})
 
     raw.sort(key=lambda x: x["start"])
     diar_sentences: List[Dict[str, Any]] = []

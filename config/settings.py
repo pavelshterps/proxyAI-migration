@@ -1,5 +1,5 @@
 import json
-from typing import List, Optional
+from typing import List, Optional, Tuple
 from pydantic import Field, HttpUrl
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -7,7 +7,7 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
-        extra="ignore",  # ignore any env vars not explicitly declared
+        extra="ignore",  # ignore любые переменные без явного объявления
     )
 
     # version
@@ -27,13 +27,14 @@ class Settings(BaseSettings):
     CELERY_RESULT_BACKEND: str = Field(..., env="CELERY_RESULT_BACKEND")
     CELERY_TIMEZONE: str = Field("UTC", env="CELERY_TIMEZONE")
     # Sentinel support
-    CELERY_SENTINELS: List[tuple[str, int]] = Field(
+    CELERY_SENTINELS: List[Tuple[str, int]] = Field(
         default=[("sentinel1", 26379), ("sentinel2", 26379)],
         env="CELERY_SENTINELS",
     )
     CELERY_SENTINEL_MASTER_NAME: str = Field("mymaster", env="CELERY_SENTINEL_MASTER_NAME")
     CELERY_SENTINEL_SOCKET_TIMEOUT: float = Field(0.1, env="CELERY_SENTINEL_SOCKET_TIMEOUT")
     REDIS_URL: str = Field(..., env="REDIS_URL")
+
     # concurrency tuning
     API_WORKERS: int = Field(1, env="API_WORKERS")
     CPU_CONCURRENCY: int = Field(1, env="CPU_CONCURRENCY")
@@ -52,8 +53,9 @@ class Settings(BaseSettings):
     WHISPER_BATCH_SIZE: int = Field(1, env="WHISPER_BATCH_SIZE")
     WHISPER_LANGUAGE: Optional[str] = Field(None, env="WHISPER_LANGUAGE")
 
-    # FS-EEND (unused by default)
+    # FS-EEND
     USE_FS_EEND: bool = Field(False, env="USE_FS_EEND")
+    FS_EEND_PIPELINE: Optional[str] = Field(None, env="FS_EEND_PIPELINE")
     FS_EEND_MODEL_PATH: Optional[str] = Field(None, env="FS_EEND_MODEL_PATH")
     FS_EEND_DEVICE: str = Field("cuda", env="FS_EEND_DEVICE")
     FRAME_SHIFT: float = Field(0.01, env="FRAME_SHIFT")
@@ -68,14 +70,21 @@ class Settings(BaseSettings):
 
     # preview / chunking
     PREVIEW_LENGTH_S: int = Field(60, env="PREVIEW_LENGTH_S")
+    SEGMENT_LENGTH_S: int = Field(..., env="SEGMENT_LENGTH_S")
     CHUNK_LENGTH_S: int = Field(..., env="CHUNK_LENGTH_S")
     DIARIZATION_CHUNK_LENGTH_S: int = Field(..., env="DIARIZATION_CHUNK_LENGTH_S")
+    DIARIZATION_CHUNK_PADDING_S: float = Field(0.0, env="DIARIZATION_CHUNK_PADDING_S")
+
+    # VAD
     VAD_MAX_LENGTH_S: int = Field(..., env="VAD_MAX_LENGTH_S")
+    VAD_LEVEL: int = Field(1, env="VAD_LEVEL")
+
+    # sentence grouping
     SENTENCE_MAX_GAP_S: float = Field(0.5, env="SENTENCE_MAX_GAP_S")
     SENTENCE_MAX_WORDS: int = Field(50, env="SENTENCE_MAX_WORDS")
 
-    # speaker stitching incremental merging (embedding-based)
-    SPEAKER_STITCH_ENABLED: bool = Field(True, env="SPEAKER_STITCH_ENABLED")
+    # speaker stitching
+    SPEAKER_STITCH_ENABLED: bool = Field(False, env="SPEAKER_STITCH_ENABLED")
     SPEAKER_STITCH_THRESHOLD: float = Field(0.75, env="SPEAKER_STITCH_THRESHOLD")
     SPEAKER_STITCH_POOL_SIZE: int = Field(5, env="SPEAKER_STITCH_POOL_SIZE")
 
@@ -97,17 +106,9 @@ class Settings(BaseSettings):
     EXTERNAL_POLL_INTERVAL_S: int = Field(5, env="EXTERNAL_POLL_INTERVAL_S")
     DEFAULT_TRANSCRIBE_MODE: str = Field("local", env="DEFAULT_TRANSCRIBE_MODE")
 
-    WEBHOOK_URL: Optional[HttpUrl] = Field(
-        None,
-        env="WEBHOOK_URL",
-        description="URL для POST-запросов вебхука"
-    )
-    # секрет для заголовка X-WebHook-Secret
-    WEBHOOK_SECRET: str = Field(
-        "",
-        env="WEBHOOK_SECRET",
-        description="Shared secret for X-WebHook-Secret header"
-    )
+    # webhook
+    WEBHOOK_URL: Optional[HttpUrl] = Field(None, env="WEBHOOK_URL")
+    WEBHOOK_SECRET: str = Field("", env="WEBHOOK_SECRET")
 
     @property
     def ALLOWED_ORIGINS_LIST(self) -> List[str]:
