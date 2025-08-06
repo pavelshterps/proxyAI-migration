@@ -14,6 +14,7 @@ from redis import Redis
 from celery.signals import worker_process_init
 from sklearn.cluster import AgglomerativeClustering
 import torch
+import torch.nn.functional as F
 from torchaudio.transforms import Resample
 from torchaudio import load as load_wav
 
@@ -245,29 +246,43 @@ def global_cluster_speakers(
     wav: Path,
     upload_id: str
 ) -> List[Dict[str, Any]]:
+    """
+    Собираем эмбеддинги каждого сегмента и кластеризуем их по cosine distance.
+    Если сегмент слишком короткий для модели, заменяем его на нулевой вектор.
+    """
     waveform, sr = load_wav(str(wav))
     if sr != 16000:
         waveform = Resample(sr, 16000)(waveform)
         sr = 16000
+
     model = get_speaker_embedding_model()
     embeddings = []
     for seg in raw:
-        s0, s1 = int(seg["start"]*sr), int(seg["end"]*sr)
+        s0, s1 = int(seg["start"] * sr), int(seg["end"] * sr)
         wf = waveform[:, s0:s1]
-        if wf.numel()==0:
+        if wf.numel() == 0:
             emb = torch.zeros(model.meta["embedding_size"])
         else:
-            if wf.size(0)>1:
-                wf = wf.mean(dim=0, keepdim=True)
-            with torch.no_grad():
-                emb = model.encode_batch(wf).squeeze()
-            emb = torch.nn.functional.normalize(emb.flatten(), p=2, dim=0)
+            # попытка вычислить эмбеддинг, с обработкой слишком коротких сегментов
+            try:
+                with torch.no_grad():
+                    out = model.encode_batch(wf)
+                emb_tensor = out.squeeze()
+                emb = F.normalize(emb_tensor.flatten(), p=2, dim=0)
+            except RuntimeError as e:
+                logger.warning(
+                    f"[{upload_id}] segment {seg['start']:.2f}-{seg['end']:.2f}s "
+                    f"too short for embedding, using zero vector: {e}"
+                )
+                emb = torch.zeros(model.meta["embedding_size"])
         embeddings.append(emb.cpu().numpy())
+
     X = np.vstack(embeddings)
     thresh = 1 - SPEAKER_STITCH_MERGE_THRESHOLD
     clustering = AgglomerativeClustering(
         n_clusters=None, affinity="cosine", linkage="average", distance_threshold=thresh
     ).fit(X)
+
     logger.info(f"[{upload_id}] clustered {len(raw)} segments into {len(set(clustering.labels_))} speakers")
     for seg, lbl in zip(raw, clustering.labels_):
         seg["speaker"] = f"spk_{lbl}"
