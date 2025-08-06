@@ -406,7 +406,6 @@ def preview_transcribe(self, upload_id, correlation_id):
 
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
     proc = prepare_wav(upload_id)[0].parent / f"{upload_id}.wav"
-    # full preview logic as in initial implementation:
     proc = subprocess.Popen([
         "ffmpeg", "-y", "-threads", str(max(1, settings.FFMPEG_THREADS // 2)),
         "-ss", "0", "-t", str(settings.PREVIEW_LENGTH_S),
@@ -493,7 +492,7 @@ def transcribe_segments(self, upload_id, correlation_id):
                 "min_silence_duration_ms": int(settings.SENTENCE_MAX_GAP_S * 1000),
                 "speech_pad_ms": 200,
             },
-            **({"language": settings.WHIS_PER_LANGUAGE} if settings.WHIS_PER_LANGUAGE else {}),
+            **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {}),
         )
         for s in segs:
             s.start += offset
@@ -599,7 +598,6 @@ def diarize_full(self, upload_id, correlation_id):
             tmp.unlink(missing_ok=True)
             offset += length
 
-        # Полный кластеринг по embedding для всех чанков
         raw = global_cluster_speakers(raw, wav, upload_id)
 
     else:
@@ -613,7 +611,6 @@ def diarize_full(self, upload_id, correlation_id):
 
     raw.sort(key=lambda x: x["start"])
 
-    # Собираем итоговые диар-сегменты
     diar_sentences: List[Dict[str, Any]] = []
     buf: Optional[Dict[str, Any]] = None
     for seg in raw:
