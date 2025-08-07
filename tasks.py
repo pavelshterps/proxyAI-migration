@@ -1,3 +1,4 @@
+import os
 import json
 import logging
 import subprocess
@@ -35,20 +36,15 @@ logger.setLevel(logging.INFO)
 
 # --- полировка через GPT ---
 def polish_with_gpt(text: str) -> str:
-    try:
-        resp = openai.chat.completions.create(
-            model="gpt-4",
-            temperature=0.3,
-            messages=[
-                {"role": "system", "content": "Ты редактор русского текста. Исправь ошибки и сделай текст читабельным."},
-                {"role": "user", "content": text},
-            ],
-        )
-        return resp.choices[0].message.content
-    except Exception as e:
-        logger.warning(f"[polish_with_gpt] OpenAI error: {e}")
-        # propagate so caller can fallback
-        raise
+    resp = openai.ChatCompletion.create(
+        model="gpt-4",
+        temperature=0.3,
+        messages=[
+            {"role": "system", "content": "Ты редактор русского текста. Исправь ошибки и сделай текст читабельным."},
+            {"role": "user", "content": text},
+        ],
+    )
+    return resp.choices[0].message.content
 
 # --- Model availability flags & holders ---
 _HF_AVAILABLE = False
@@ -94,21 +90,41 @@ def send_webhook_event(event_type: str, upload_id: str, data: Optional[Any]):
     }
     headers = {"Content-Type": "application/json", "X-WebHook-Secret": secret}
 
-    for attempt in range(1, 6):
+    max_attempts = 5
+    for attempt in range(1, max_attempts + 1):
         try:
             resp = requests.post(url, json=payload, headers=headers, timeout=(5, 30))
+        except requests.RequestException as e:
+            logger.warning(
+                f"[{datetime.utcnow().isoformat()}] [WEBHOOK] {event_type} network error "
+                f"(attempt {attempt}/{max_attempts}) for {upload_id}: {e}"
+            )
+        else:
             code = resp.status_code
             if 200 <= code < 300 or code == 405:
-                logger.info(f"[WEBHOOK] {event_type} succeeded for {upload_id} ({code})")
+                logger.info(
+                    f"[{datetime.utcnow().isoformat()}] [WEBHOOK] {event_type} "
+                    f"{'treated as success' if code == 405 else 'succeeded'} "
+                    f"(attempt {attempt}/{max_attempts}) for {upload_id}"
+                )
                 return
             if 400 <= code < 500:
-                logger.error(f"[WEBHOOK] {event_type} returned {code} for {upload_id}, aborting")
+                logger.error(
+                    f"[{datetime.utcnow().isoformat()}] [WEBHOOK] {event_type} returned {code} "
+                    f"for {upload_id}, aborting"
+                )
                 return
-            logger.warning(f"[WEBHOOK] {event_type} returned {code}, retrying ({attempt}/5)")
-        except Exception as e:
-            logger.warning(f"[WEBHOOK] network error on {attempt}/5 for {upload_id}: {e}")
-        time.sleep(30)
-    logger.error(f"[WEBHOOK] {event_type} failed after 5 attempts for {upload_id}")
+            logger.warning(
+                f"[{datetime.utcnow().isoformat()}] [WEBHOOK] {event_type} returned {code} "
+                f"(attempt {attempt}/{max_attempts}), retrying"
+            )
+        if attempt < max_attempts:
+            time.sleep(30)
+
+    logger.error(
+        f"[{datetime.utcnow().isoformat()}] [WEBHOOK] {event_type} failed after "
+        f"{max_attempts} attempts for {upload_id}"
+    )
 
 def probe_audio(src: Path) -> dict:
     res = subprocess.run(
@@ -182,7 +198,7 @@ def group_into_sentences(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                 "text": " ".join(buf["text"]),
             })
         buf["start"] = buf["end"] = buf["speaker"] = None
-        buf["text"].clear()
+        buf["text"] = []
 
     for seg in segments:
         txt = seg["text"].strip()
@@ -241,30 +257,22 @@ def merge_speakers(
             d for d in diar[max(0, i - 8): i + 8]
             if not (d["end"] <= t0 or d["start"] >= t1)
         ]
-        if cands:
-            best = max(
-                cands,
-                key=lambda d: max(0.0, min(d["end"], t1) - max(d["start"], t0))
-            )
-        else:
-            best = nearest(i, t0, t1)
+        best = max(cands, key=lambda d: max(0.0, min(d["end"], t1) - max(d["start"], t0))) \
+            if cands else nearest(i, t0, t1)
         out.append({**t, "speaker": best["speaker"]})
     return out
 
 def get_whisper_model(model_override: str = None):
     global _whisper_model
-    from faster_whisper import WhisperModel, download_model
-
     device = settings.WHISPER_DEVICE.lower()
     compute = getattr(
         settings,
         "WHISPER_COMPUTE_TYPE",
         "float16" if device.startswith("cuda") else "int8",
     ).lower()
-
     if model_override:
+        logger.info(f"[WHISPER] loading override model {model_override}")
         return WhisperModel(model_override, device=device, compute_type=compute)
-
     if _whisper_model is None:
         model_id = settings.WHISPER_MODEL_PATH
         try:
@@ -275,18 +283,14 @@ def get_whisper_model(model_override: str = None):
             )
         except Exception:
             path = model_id
-
         if device == "cpu" and compute in ("fp16", "float16"):
             compute = "int8"
-
         _whisper_model = WhisperModel(path, device=device, compute_type=compute)
-        logger.info(f"[WHISPER] loaded model from {path} on {device}")
+        logger.info(f"[WHISPER] loaded model from {path} on {device} with compute_type={compute}")
     return _whisper_model
 
 def get_diarization_pipeline():
     global _diarization_pipeline
-    from pyannote.audio import Pipeline as PyannotePipeline
-
     if _diarization_pipeline is None:
         model_id = getattr(settings, "PYANNOTE_PIPELINE", "pyannote/speaker-diarization-3.1")
         _diarization_pipeline = PyannotePipeline.from_pretrained(
@@ -297,20 +301,159 @@ def get_diarization_pipeline():
         logger.info(f"[DIARIZE] loaded pipeline {model_id}")
     return _diarization_pipeline
 
+def get_speaker_embedding_model():
+    global _speaker_embedding_model
+    if _speaker_embedding_model is None:
+        try:
+            from speechbrain.inference.speaker import EncoderClassifier
+        except ImportError as e:
+            logger.warning(f"[STITCH] speechbrain not available, cannot do speaker stitching: {e}")
+            raise
+        savedir = Path(settings.DIARIZER_CACHE_DIR) / "spkrec-ecapa-voxceleb"
+        _speaker_embedding_model = EncoderClassifier.from_hparams(
+            source="speechbrain/spkrec-ecapa-voxceleb",
+            savedir=str(savedir)
+        )
+        logger.info("[STITCH] loaded speaker embedding model from speechbrain/spkrec-ecapa-voxceleb")
+    return _speaker_embedding_model
+
+def stitch_speakers(raw: List[Dict[str, Any]], wav: Path, upload_id: str) -> List[Dict[str, Any]]:
+    if not SPEAKER_STITCH_ENABLED:
+        return raw
+
+    unique_orig = set(seg.get("speaker") for seg in raw)
+    if len(unique_orig) <= 1:
+        logger.debug(f"[{upload_id}] only one original speaker {unique_orig}, skipping stitching")
+        return raw
+
+    try:
+        import torch
+        import torchaudio
+        import torch.nn.functional as F
+
+        model = get_speaker_embedding_model()
+
+        waveform, sr = torchaudio.load(str(wav))
+        if sr != 16000:
+            from torchaudio.transforms import Resample
+            resampler = Resample(sr, 16000)
+            waveform = resampler(waveform)
+            sr = 16000
+
+        stitch_centroids: Dict[str, torch.Tensor] = {}
+        stitch_histories: Dict[str, List[torch.Tensor]] = {}
+        next_label_idx = 0
+
+        def new_canonical_label():
+            nonlocal next_label_idx
+            label = f"spk_{next_label_idx}"
+            next_label_idx += 1
+            return label
+
+        stitched: List[Dict[str, Any]] = []
+        raw_sorted = sorted(raw, key=lambda x: x["start"])
+        for seg in raw_sorted:
+            start, end = seg["start"], seg["end"]
+            if end <= start:
+                stitched.append(seg)
+                continue
+            start_sample = int(start * sr)
+            end_sample = int(end * sr)
+            if end_sample <= start_sample or start_sample >= waveform.size(1):
+                stitched.append(seg)
+                continue
+            segment_waveform = waveform[:, start_sample:end_sample]
+            if segment_waveform.numel() == 0:
+                stitched.append(seg)
+                continue
+            if segment_waveform.size(0) > 1:
+                segment_waveform = segment_waveform.mean(dim=0, keepdim=True)
+            with torch.no_grad():
+                emb = model.encode_batch(segment_waveform)
+            emb = emb.squeeze()
+            if emb.ndim > 1:
+                emb = emb.flatten()
+            emb = F.normalize(emb, p=2, dim=0)
+
+            assigned_label = None
+            best_sim = -1.0
+            for canon_label, centroid in stitch_centroids.items():
+                sim = torch.dot(emb, centroid).item()
+                if sim > best_sim:
+                    best_sim = sim
+                    assigned_label = canon_label
+
+            if assigned_label is not None and best_sim >= SPEAKER_STITCH_THRESHOLD:
+                old_centroid = stitch_centroids[assigned_label]
+                updated_centroid = F.normalize(
+                    SPEAKER_STITCH_EMA_ALPHA * emb + (1 - SPEAKER_STITCH_EMA_ALPHA) * old_centroid, p=2, dim=0
+                )
+                stitch_centroids[assigned_label] = updated_centroid
+                hist = stitch_histories[assigned_label]
+                hist.append(emb)
+                if len(hist) > SPEAKER_STITCH_POOL_SIZE:
+                    hist.pop(0)
+                logger.debug(f"[{upload_id}] reused speaker {assigned_label} (sim={best_sim:.3f})")
+            else:
+                assigned_label = new_canonical_label()
+                stitch_centroids[assigned_label] = emb
+                stitch_histories[assigned_label] = [emb]
+                logger.debug(f"[{upload_id}] created new speaker label {assigned_label}")
+
+            seg["speaker"] = assigned_label
+            stitched.append(seg)
+
+        label_centroids: Dict[str, torch.Tensor] = {}
+        for label, hist in stitch_histories.items():
+            centroid = torch.stack(hist).mean(dim=0)
+            centroid = F.normalize(centroid, p=2, dim=0)
+            label_centroids[label] = centroid
+
+        adj: Dict[str, set] = {label: set() for label in label_centroids}
+        labels = list(label_centroids.keys())
+        for i in range(len(labels)):
+            for j in range(i + 1, len(labels)):
+                a, b = labels[i], labels[j]
+                sim = torch.dot(label_centroids[a], label_centroids[b]).item()
+                if sim >= SPEAKER_STITCH_MERGE_THRESHOLD:
+                    adj[a].add(b)
+                    adj[b].add(a)
+
+        visited, merge_map = set(), {}
+        for label in adj:
+            if label in visited: continue
+            stack, component = [label], []
+            while stack:
+                l = stack.pop()
+                if l in visited: continue
+                visited.add(l)
+                component.append(l)
+                stack.extend(adj[l] - visited)
+            if len(component) > 1:
+                rep = sorted(component)[0]
+                for l in component:
+                    merge_map[l] = rep
+
+        if merge_map:
+            for seg in stitched:
+                old = seg["speaker"]
+                if old in merge_map:
+                    new = merge_map[old]
+                    if new != old:
+                        logger.debug(f"[{upload_id}] merged speaker {old} -> {new} based on centroid similarity")
+                        seg["speaker"] = new
+
+        return stitched
+    except Exception as e:
+        logger.warning(f"[{upload_id}] speaker stitching failed, falling back to original diarization labels: {e}")
+        return raw
+
 @worker_process_init.connect
 def preload_on_startup(**kwargs):
     if _HF_AVAILABLE:
         get_whisper_model()
     if _PN_AVAILABLE:
         get_diarization_pipeline()
-    # Ограничиваем фракцию памяти CUDA
-    try:
-        import torch
-        if torch.cuda.is_available():
-            torch.cuda.set_per_process_memory_fraction(0.5, device=0)
-            logger.info("[INIT] Set per-process CUDA memory fraction to 50%")
-    except ImportError:
-        pass
 
 # --- Celery tasks ---
 
@@ -332,25 +475,23 @@ def convert_to_wav_and_preview(self, upload_id, correlation_id):
 
     preview_transcribe.delay(upload_id, correlation_id)
 
-
 @app.task(bind=True, queue="transcribe_gpu")
 def preview_transcribe(self, upload_id, correlation_id):
     logger.info(f"[{upload_id}] preview_transcribe received")
     try:
         inspector = app.control.inspect()
         active = inspector.active() or {}
-        heavy = sum(
-            1
-            for tasks in active.values()
-            for t in tasks
-            if t["name"] in ("tasks.diarize_full", "tasks.transcribe_segments")
-        )
+        heavy = 0
+        for node_tasks in active.values():
+            for t in node_tasks:
+                if t["name"] in ("tasks.diarize_full", "tasks.transcribe_segments"):
+                    heavy += 1
         if heavy >= 2:
-            logger.info(f"[{upload_id}] GPUs busy ({heavy} heavy tasks), falling back to CPU preview")
+            logger.info(f"[{upload_id}] both GPUs busy (found {heavy} heavy tasks), falling back to CPU for transcription preview")
             transcribe_segments.apply_async((upload_id, correlation_id), queue="transcribe_cpu")
             return
     except Exception:
-        logger.warning(f"[{upload_id}] inspect failed, proceeding on GPU")
+        logger.warning(f"[{upload_id}] failed to inspect workers, proceeding on GPU")
 
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
     proc = prepare_preview_segment(upload_id)
@@ -381,33 +522,29 @@ def preview_transcribe(self, upload_id, correlation_id):
     deliver_webhook.delay("preview_completed", upload_id, {"preview": preview})
     transcribe_segments.delay(upload_id, correlation_id)
 
-
 @app.task(bind=True, queue="transcribe_gpu")
 def transcribe_segments(self, upload_id, correlation_id):
     logger.info(f"[{upload_id}] transcribe_segments received")
     try:
         import torch
-        logger.info(f"[{upload_id}] GPU reserved before transcription: "
-                    f"{torch.cuda.memory_reserved() if torch.cuda.is_available() else 'n/a'}")
+        logger.info(f"[{upload_id}] GPU memory reserved before transcription: {torch.cuda.memory_reserved() if torch.cuda.is_available() else 'n/a'}")
     except ImportError:
         pass
 
-    # fallback to CPU if GPUs busy
     try:
         inspector = app.control.inspect()
         active = inspector.active() or {}
-        heavy = sum(
-            1
-            for tasks in active.values()
-            for t in tasks
-            if t["name"] in ("tasks.diarize_full",)  # don't count this task itself
-        )
+        heavy = 0
+        for node_tasks in active.values():
+            for t in node_tasks:
+                if t["name"] in ("tasks.diarize_full", "tasks.transcribe_segments") and t["name"] != "tasks.transcribe_segments":
+                    heavy += 1
         if heavy >= 2 and self.request.delivery_info.get("routing_key") != "transcribe_cpu":
-            logger.info(f"[{upload_id}] GPUs busy ({heavy} heavy tasks), rescheduling to CPU")
+            logger.info(f"[{upload_id}] GPUs appear busy ({heavy} heavy tasks), rescheduling transcription to CPU")
             transcribe_segments.apply_async((upload_id, correlation_id), queue="transcribe_cpu")
             return
     except Exception:
-        logger.warning(f"[{upload_id}] inspect for fallback failed")
+        logger.warning(f"[{upload_id}] failed to inspect workers for fallback logic")
 
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
     wav, duration = prepare_wav(upload_id)
@@ -430,12 +567,15 @@ def transcribe_segments(self, upload_id, correlation_id):
             },
             **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {}),
         )
+        result = []
         for s in segs:
             s.start += offset
             s.end += offset
-        return list(segs)
+            result.append(s)
+        return result
 
     if duration <= settings.VAD_MAX_LENGTH_S:
+        logger.info(f"[{upload_id}] short audio ({duration:.1f}s) → single VAD pass")
         raw_segs = _transcribe_with_vad(str(wav))
     else:
         total_chunks = math.ceil(duration / settings.CHUNK_LENGTH_S)
@@ -446,23 +586,30 @@ def transcribe_segments(self, upload_id, correlation_id):
         chunk_idx = 0
         while offset < duration:
             if chunk_idx in processed:
+                logger.info(f"[{upload_id}] skip chunk {chunk_idx+1}/{total_chunks} (already done)")
                 offset += settings.CHUNK_LENGTH_S
                 chunk_idx += 1
                 continue
 
             length = min(settings.CHUNK_LENGTH_S, duration - offset)
+            logger.info(f"[{upload_id}] transcribe chunk {chunk_idx+1}/{total_chunks}: {offset:.1f}s→{offset+length:.1f}s")
             try:
                 p = subprocess.Popen(
-                    ["ffmpeg", "-y", "-threads", str(settings.FFMPEG_THREADS),
-                     "-ss", str(offset), "-t", str(length), "-i", str(wav), "-f", "wav", "pipe:1"],
+                    [
+                        "ffmpeg", "-y",
+                        "-threads", str(settings.FFMPEG_THREADS),
+                        "-ss", str(offset), "-t", str(length),
+                        "-i", str(wav), "-f", "wav", "pipe:1"
+                    ],
                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
                 )
                 chunk_segs = _transcribe_with_vad(p.stdout, offset)
                 p.stdout.close(); p.wait()
+
                 raw_segs.extend(chunk_segs)
                 r.sadd(processed_key, chunk_idx)
             except Exception as e:
-                logger.error(f"[{upload_id}] error in chunk {chunk_idx+1}/{total_chunks}: {e}", exc_info=True)
+                logger.error(f"[{upload_id}] error in transcribe chunk {chunk_idx+1}/{total_chunks}: {e}", exc_info=True)
                 try:
                     import torch; torch.cuda.empty_cache()
                 except ImportError:
@@ -477,36 +624,31 @@ def transcribe_segments(self, upload_id, correlation_id):
     flat.sort(key=lambda x: x["start"])
     sentences = group_into_sentences(flat)
 
-    # сохраняем оригинал
+    # сохраняем оригинальную структуру
     out = Path(settings.RESULTS_FOLDER) / upload_id
     out.mkdir(parents=True, exist_ok=True)
     (out / "transcript_original.json").write_text(json.dumps(sentences, ensure_ascii=False, indent=2))
     logger.info(f"[{upload_id}] saved original transcript ({len(sentences)} sentences)")
 
     # полировка и сохранение итогового transcript.json
-    raw_text = " ".join(s["text"] for s in sentences)
     try:
+        raw_text = " ".join(s["text"] for s in sentences)
         polished = polish_with_gpt(raw_text)
-        (out / "transcript.json").write_text(
-            json.dumps({"text": polished}, ensure_ascii=False, indent=2)
-        )
+        (out / "transcript.json").write_text(json.dumps({"text": polished}, ensure_ascii=False, indent=2))
         logger.info(f"[{upload_id}] saved polished transcript")
-    except Exception:
-        logger.warning(f"[{upload_id}] polishing failed, falling back to original text")
-        (out / "transcript.json").write_text(
-            json.dumps({"text": raw_text}, ensure_ascii=False, indent=2)
-        )
+    except Exception as e:
+        logger.warning(f"[{upload_id}] polishing failed: {e}")
+        # fallback: сохранить оригинал как финал
+        (out / "transcript.json").write_text(json.dumps(sentences, ensure_ascii=False, indent=2))
 
     r.publish(f"progress:{upload_id}", json.dumps({"status": "transcript_done"}))
     deliver_webhook.delay("transcription_completed", upload_id, {"transcript": sentences})
 
     try:
         import torch
-        logger.info(f"[{upload_id}] GPU reserved after transcription: "
-                    f"{torch.cuda.memory_reserved() if torch.cuda.is_available() else 'n/a'}")
+        logger.info(f"[{upload_id}] GPU memory reserved after transcription: {torch.cuda.memory_reserved() if torch.cuda.is_available() else 'n/a'}")
     except ImportError:
         pass
-
 
 @app.task(bind=True, queue="diarize_gpu")
 def diarize_full(self, upload_id, correlation_id):
@@ -517,22 +659,24 @@ def diarize_full(self, upload_id, correlation_id):
 
     try:
         import torch
-        logger.info(f"[{upload_id}] GPU reserved before diarization: "
-                    f"{torch.cuda.memory_reserved() if torch.cuda.is_available() else 'n/a'}")
+        logger.info(f"[{upload_id}] GPU memory reserved before diarization: {torch.cuda.memory_reserved() if torch.cuda.is_available() else 'n/a'}")
     except ImportError:
         pass
 
     wav, duration = prepare_wav(upload_id)
+
     raw_chunk_limit = getattr(settings, "DIARIZATION_CHUNK_LENGTH_S", 0)
     try:
         chunk_limit = int(raw_chunk_limit)
     except Exception:
-        logger.warning(f"[{upload_id}] invalid DIARIZATION_CHUNK_LENGTH_S={raw_chunk_limit!r}, using single pass")
+        logger.warning(f"[{upload_id}] invalid DIARIZATION_CHUNK_LENGTH_S={raw_chunk_limit!r}, falling back to 0")
         chunk_limit = 0
 
     using_chunking = bool(chunk_limit and duration > chunk_limit)
+    logger.info(f"[{upload_id}] WAV prepared for diarization, duration={duration:.1f}s; chunk_limit={chunk_limit}; using_chunking={using_chunking}")
+
     if not _PN_AVAILABLE:
-        logger.error(f"[{upload_id}] pyannote.audio not available, aborting")
+        logger.error(f"[{upload_id}] pyannote.audio not available, aborting diarization")
         deliver_webhook.delay("processing_failed", upload_id, None)
         return
 
@@ -548,11 +692,13 @@ def diarize_full(self, upload_id, correlation_id):
         chunk_idx = 0
         while offset < duration:
             if chunk_idx in processed:
+                logger.info(f"[{upload_id}] skip diarize chunk {chunk_idx+1}/{total_chunks}")
                 offset += chunk_limit
                 chunk_idx += 1
                 continue
 
             this_len = min(chunk_limit, duration - offset)
+            logger.info(f"[{upload_id}] diarize chunk {chunk_idx+1}/{total_chunks}: {offset:.1f}s→{offset+this_len:.1f}s")
             tmp = Path(settings.DIARIZER_CACHE_DIR) / f"{upload_id}_chunk_{chunk_idx}.wav"
             subprocess.run([
                 "ffmpeg", "-y", "-threads", str(max(1, settings.FFMPEG_THREADS // 2)),
@@ -562,47 +708,37 @@ def diarize_full(self, upload_id, correlation_id):
 
             try:
                 ann = pipeline(str(tmp))
-            except RuntimeError as e:
-                if "out of memory" in str(e).lower():
+                before = len(raw)
+                for s, _, spk in ann.itertracks(yield_label=True):
+                    raw.append({"start": float(s.start) + offset, "end": float(s.end) + offset, "speaker": spk})
+                added = len(raw) - before
+                logger.info(f"[{upload_id}] diarize chunk {chunk_idx+1}/{total_chunks} done: added {added} segments")
+                r.sadd(processed_key, chunk_idx)
+            except Exception as e:
+                logger.error(f"[{upload_id}] error in diarize chunk {chunk_idx+1}/{total_chunks}: {e}", exc_info=True)
+                try:
                     import torch; torch.cuda.empty_cache()
-                    logger.error(f"[{upload_id}] CUDA OOM in chunk {chunk_idx+1}, retry")
-                    time.sleep(5)
-                    ann = pipeline(str(tmp))
-                else:
-                    raise
-
-            before = len(raw)
-            for s, _, spk in ann.itertracks(yield_label=True):
-                raw.append({"start": float(s.start) + offset, "end": float(s.end) + offset, "speaker": spk})
-            added = len(raw) - before
-            logger.info(f"[{upload_id}] chunk {chunk_idx+1}/{total_chunks} added {added} segments")
-            r.sadd(processed_key, chunk_idx)
-
-            tmp.unlink(missing_ok=True)
-            offset += this_len
-            chunk_idx += 1
+                except ImportError:
+                    pass
+            finally:
+                tmp.unlink(missing_ok=True)
+                offset += this_len
+                chunk_idx += 1
 
         r.delete(processed_key)
     else:
-        try:
-            ann = pipeline(str(wav))
-        except RuntimeError as e:
-            if "out of memory" in str(e).lower():
-                import torch; torch.cuda.empty_cache()
-                logger.error(f"[{upload_id}] CUDA OOM in single pass, retry")
-                time.sleep(5)
-                ann = pipeline(str(wav))
-            else:
-                raise
+        logger.info(f"[{upload_id}] Short audio or chunking disabled, single diarization pass")
+        ann = pipeline(str(wav))
         for s, _, spk in ann.itertracks(yield_label=True):
             raw.append({"start": float(s.start), "end": float(s.end), "speaker": spk})
 
     raw.sort(key=lambda x: x["start"])
 
-    # optionally stitch speakers here if enabled...
-    # raw = stitch_speakers(raw, wav, upload_id)  # if you want stitching
+    if SPEAKER_STITCH_ENABLED and using_chunking:
+        raw = stitch_speakers(raw, wav, upload_id)
+    else:
+        logger.debug(f"[{upload_id}] skipping speaker stitching (using_chunking={using_chunking})")
 
-    # merge continuous segments per speaker
     diar_sentences = []
     buf = None
     for seg in raw:
@@ -619,9 +755,13 @@ def diarize_full(self, upload_id, correlation_id):
     out.mkdir(parents=True, exist_ok=True)
     (out / "diarization.json").write_text(json.dumps(diar_sentences, ensure_ascii=False, indent=2))
     logger.info(f"[{upload_id}] diarization_done, total segments: {len(diar_sentences)}")
+    try:
+        import torch
+        logger.info(f"[{upload_id}] GPU memory reserved after diarization: {torch.cuda.memory_reserved() if torch.cuda.is_available() else 'n/a'}")
+    except ImportError:
+        pass
     r.publish(f"progress:{upload_id}", json.dumps({"status": "diarization_done", "segments": len(diar_sentences)}))
     deliver_webhook.delay("diarization_completed", upload_id, {"diarization": diar_sentences})
-
 
 @app.task(
     bind=True,
@@ -631,7 +771,6 @@ def diarize_full(self, upload_id, correlation_id):
     default_retry_delay=30,
 )
 def deliver_webhook(self, event_type: str, upload_id: str, data: Optional[Any]):
-    # identical to send_webhook_event but retriable
     url = settings.WEBHOOK_URL
     secret = settings.WEBHOOK_SECRET
     if not url or not secret:
@@ -643,7 +782,10 @@ def deliver_webhook(self, event_type: str, upload_id: str, data: Optional[Any]):
         "timestamp": datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
         "data": data,
     }
-    headers = {"Content-Type": "application/json", "X-WebHook-Secret": secret}
+    headers = {
+        "Content-Type": "application/json",
+        "X-WebHook-Secret": secret,
+    }
 
     try:
         resp = requests.post(url, json=payload, headers=headers, timeout=(5, 30))
@@ -658,7 +800,6 @@ def deliver_webhook(self, event_type: str, upload_id: str, data: Optional[Any]):
     except Exception as exc:
         logger.warning(f"[WEBHOOK] {event_type} error for {upload_id}, retrying: {exc}")
         raise self.retry(exc=exc)
-
 
 @app.task(bind=True, queue="transcribe_cpu")
 def cleanup_old_files(self):
