@@ -36,7 +36,8 @@ logger.setLevel(logging.INFO)
 
 # --- полировка через GPT ---
 def polish_with_gpt(text: str) -> str:
-    resp = openai.ChatCompletion.create(
+    # Используем новый интерфейс openai-python>=1.0.0
+    resp = openai.chat.completions.create(
         model="gpt-4",
         temperature=0.3,
         messages=[
@@ -454,6 +455,14 @@ def preload_on_startup(**kwargs):
         get_whisper_model()
     if _PN_AVAILABLE:
         get_diarization_pipeline()
+    # Ограничиваем фракцию памяти CUDA
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.set_per_process_memory_fraction(0.5, device=0)
+            logger.info("[INIT] Set per-process CUDA memory fraction to 50%")
+    except ImportError:
+        pass
 
 # --- Celery tasks ---
 
@@ -576,7 +585,16 @@ def transcribe_segments(self, upload_id, correlation_id):
 
     if duration <= settings.VAD_MAX_LENGTH_S:
         logger.info(f"[{upload_id}] short audio ({duration:.1f}s) → single VAD pass")
-        raw_segs = _transcribe_with_vad(str(wav))
+        try:
+            raw_segs = _transcribe_with_vad(str(wav))
+        except RuntimeError as e:
+            if 'out of memory' in str(e).lower():
+                import torch; torch.cuda.empty_cache()
+                logger.error(f"[{upload_id}] CUDA OOM during transcription, falling back to CPU")
+                transcribe_segments.apply_async((upload_id, correlation_id), queue="transcribe_cpu")
+                return
+            else:
+                raise
     else:
         total_chunks = math.ceil(duration / settings.CHUNK_LENGTH_S)
         processed_key = f"transcribe:processed_chunks:{upload_id}"
@@ -608,12 +626,16 @@ def transcribe_segments(self, upload_id, correlation_id):
 
                 raw_segs.extend(chunk_segs)
                 r.sadd(processed_key, chunk_idx)
+            except RuntimeError as e:
+                if 'out of memory' in str(e).lower():
+                    import torch; torch.cuda.empty_cache()
+                    logger.error(f"[{upload_id}] CUDA OOM in chunk {chunk_idx+1}, falling back to CPU")
+                    transcribe_segments.apply_async((upload_id, correlation_id), queue="transcribe_cpu")
+                    return
+                else:
+                    logger.error(f"[{upload_id}] error in transcribe chunk {chunk_idx+1}/{total_chunks}: {e}", exc_info=True)
             except Exception as e:
                 logger.error(f"[{upload_id}] error in transcribe chunk {chunk_idx+1}/{total_chunks}: {e}", exc_info=True)
-                try:
-                    import torch; torch.cuda.empty_cache()
-                except ImportError:
-                    pass
             finally:
                 offset += length
                 chunk_idx += 1
@@ -638,7 +660,6 @@ def transcribe_segments(self, upload_id, correlation_id):
         logger.info(f"[{upload_id}] saved polished transcript")
     except Exception as e:
         logger.warning(f"[{upload_id}] polishing failed: {e}")
-        # fallback: сохранить оригинал как финал
         (out / "transcript.json").write_text(json.dumps(sentences, ensure_ascii=False, indent=2))
 
     r.publish(f"progress:{upload_id}", json.dumps({"status": "transcript_done"}))
@@ -669,11 +690,16 @@ def diarize_full(self, upload_id, correlation_id):
     try:
         chunk_limit = int(raw_chunk_limit)
     except Exception:
-        logger.warning(f"[{upload_id}] invalid DIARIZATION_CHUNK_LENGTH_S={raw_chunk_limit!r}, falling back to 0")
+        logger.warning(f"[{upload_id}] invalid DIARIZATION_CHUNK_LENGTH_S={raw_chunk_limit!r}, falling back to no chunking")
         chunk_limit = 0
 
     using_chunking = bool(chunk_limit and duration > chunk_limit)
-    logger.info(f"[{upload_id}] WAV prepared for diarization, duration={duration:.1f}s; chunk_limit={chunk_limit}; using_chunking={using_chunking}")
+    total_chunks = math.ceil(duration / chunk_limit) if using_chunking else 1
+    logger.info(
+        f"[{upload_id}] WAV prepared for diarization, duration={duration:.1f}s; "
+        f"chunk_limit={chunk_limit}; using_chunking={using_chunking}; "
+        f"total_chunks={total_chunks}"
+    )
 
     if not _PN_AVAILABLE:
         logger.error(f"[{upload_id}] pyannote.audio not available, aborting diarization")
@@ -684,7 +710,6 @@ def diarize_full(self, upload_id, correlation_id):
     raw: List[Dict[str, Any]] = []
 
     if using_chunking:
-        total_chunks = math.ceil(duration / chunk_limit)
         processed_key = f"diarize:processed_chunks:{upload_id}"
         processed = {int(x) for x in r.smembers(processed_key)}
 
@@ -692,7 +717,7 @@ def diarize_full(self, upload_id, correlation_id):
         chunk_idx = 0
         while offset < duration:
             if chunk_idx in processed:
-                logger.info(f"[{upload_id}] skip diarize chunk {chunk_idx+1}/{total_chunks}")
+                logger.info(f"[{upload_id}] skip diarize chunk {chunk_idx+1}/{total_chunks} (already done)")
                 offset += chunk_limit
                 chunk_idx += 1
                 continue
@@ -707,10 +732,23 @@ def diarize_full(self, upload_id, correlation_id):
             ], check=True, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
 
             try:
-                ann = pipeline(str(tmp))
+                try:
+                    ann = pipeline(str(tmp))
+                except RuntimeError as e:
+                    if 'out of memory' in str(e).lower():
+                        import torch; torch.cuda.empty_cache()
+                        logger.error(f"[{upload_id}] CUDA OOM during diarization chunk {chunk_idx+1}, retrying")
+                        time.sleep(5)
+                        ann = pipeline(str(tmp))
+                    else:
+                        raise
                 before = len(raw)
                 for s, _, spk in ann.itertracks(yield_label=True):
-                    raw.append({"start": float(s.start) + offset, "end": float(s.end) + offset, "speaker": spk})
+                    raw.append({
+                        "start": float(s.start) + offset,
+                        "end":   float(s.end)   + offset,
+                        "speaker": spk
+                    })
                 added = len(raw) - before
                 logger.info(f"[{upload_id}] diarize chunk {chunk_idx+1}/{total_chunks} done: added {added} segments")
                 r.sadd(processed_key, chunk_idx)
@@ -727,10 +765,21 @@ def diarize_full(self, upload_id, correlation_id):
 
         r.delete(processed_key)
     else:
-        logger.info(f"[{upload_id}] Short audio or chunking disabled, single diarization pass")
-        ann = pipeline(str(wav))
-        for s, _, spk in ann.itertracks(yield_label=True):
-            raw.append({"start": float(s.start), "end": float(s.end), "speaker": spk})
+        logger.info(f"[{upload_id}] single-pass diarization")
+        try:
+            ann = pipeline(str(wav))
+            for s, _, spk in ann.itertracks(yield_label=True):
+                raw.append({
+                    "start": float(s.start),
+                    "end":   float(s.end),
+                    "speaker": spk
+                })
+        except RuntimeError as e:
+            if 'out of memory' in str(e).lower():
+                import torch; torch.cuda.empty_cache()
+                logger.error(f"[{upload_id}] CUDA OOM during single-pass diarization, falling back to CPU")
+            else:
+                logger.error(f"[{upload_id}] single-pass diarization failed: {e}", exc_info=True)
 
     raw.sort(key=lambda x: x["start"])
 
@@ -755,11 +804,13 @@ def diarize_full(self, upload_id, correlation_id):
     out.mkdir(parents=True, exist_ok=True)
     (out / "diarization.json").write_text(json.dumps(diar_sentences, ensure_ascii=False, indent=2))
     logger.info(f"[{upload_id}] diarization_done, total segments: {len(diar_sentences)}")
+
     try:
         import torch
         logger.info(f"[{upload_id}] GPU memory reserved after diarization: {torch.cuda.memory_reserved() if torch.cuda.is_available() else 'n/a'}")
     except ImportError:
         pass
+
     r.publish(f"progress:{upload_id}", json.dumps({"status": "diarization_done", "segments": len(diar_sentences)}))
     deliver_webhook.delay("diarization_completed", upload_id, {"diarization": diar_sentences})
 
