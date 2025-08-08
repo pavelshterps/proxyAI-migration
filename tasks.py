@@ -656,23 +656,240 @@ def transcribe_segments(self, upload_id, correlation_id):
     except ImportError:
         pass
 
+
+# ---------------------- NEW: diarization subtasks ----------------------
+
+def _diarize_tmp_wav_path(upload_id: str, chunk_idx: int) -> Path:
+    return Path(settings.DIARIZER_CACHE_DIR) / f"{upload_id}_chunk_{chunk_idx}.wav"
+
+def _diarize_tmp_json_path(upload_id: str, chunk_idx: int) -> Path:
+    return Path(settings.DIARIZER_CACHE_DIR) / f"{upload_id}_chunk_{chunk_idx}.json"
+
+DIARIZATION_MAX_PARALLEL_CHUNKS = int(getattr(settings, "DIARIZATION_MAX_PARALLEL_CHUNKS", 1))
+DIARIZATION_SEMA_KEY = getattr(settings, "DIARIZATION_SEMAPHORE_KEY", "diarize:sema")
+DIARIZATION_CHUNK_SOFT_TIME_LIMIT = int(getattr(settings, "DIARIZATION_CHUNK_SOFT_TIME_LIMIT_S", 60 * 15))
+DIARIZATION_CHUNK_HARD_TIME_LIMIT = int(getattr(settings, "DIARIZATION_CHUNK_HARD_TIME_LIMIT_S", 60 * 20))
+
+@app.task(
+    bind=True,
+    queue="diarize_gpu",
+    acks_late=True,
+    autoretry_for=(Exception,),
+    retry_backoff=True,
+    retry_backoff_max=60,
+    retry_jitter=True,
+    retry_kwargs={"max_retries": 5},
+    soft_time_limit=DIARIZATION_CHUNK_SOFT_TIME_LIMIT,
+    time_limit=DIARIZATION_CHUNK_HARD_TIME_LIMIT,
+)
+def diarize_chunk(self, upload_id: str, chunk_idx: int, offset: float, length: float):
+    """
+    Обработка одного чанка диаризации. Пишет результат в JSON рядом с временным wav.
+    Использует кластерный семафор в Redis, чтобы ограничить параллелизм и не ловить OOM.
+    """
+    r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
+
+    # --- семафор параллелизма ---
+    acquired = False
+    if DIARIZATION_MAX_PARALLEL_CHUNKS > 0:
+        try:
+            val = r.incr(DIARIZATION_SEMA_KEY)
+            if val > DIARIZATION_MAX_PARALLEL_CHUNKS:
+                r.decr(DIARIZATION_SEMA_KEY)
+                raise self.retry(countdown=5)
+            acquired = True
+        except Exception:
+            # если Redis недоступен — перестрахуемся и уйдём в ретрай
+            raise self.retry(countdown=5)
+
+    try:
+        wav, duration = prepare_wav(upload_id)
+        pipeline = get_diarization_pipeline()
+
+        this_len = min(length, max(0.0, duration - offset))
+        if this_len <= 0:
+            # ничего делать не надо — помечаем как обработанный
+            processed_key = f"diarize:processed_chunks:{upload_id}"
+            r.sadd(processed_key, chunk_idx)
+            return
+
+        tmp_wav = _diarize_tmp_wav_path(upload_id, chunk_idx)
+        tmp_json = _diarize_tmp_json_path(upload_id, chunk_idx)
+
+        # ffmpeg нарезка
+        try:
+            subprocess.run([
+                "ffmpeg", "-y", "-threads", str(max(1, settings.FFMPEG_THREADS // 2)),
+                "-ss", str(offset), "-t", str(this_len),
+                "-i", str(wav), str(tmp_wav)
+            ], check=True, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+        except Exception as e:
+            logger.error(f"[{upload_id}] ffmpeg failed for chunk {chunk_idx+1}: {e}", exc_info=True)
+            _safe_empty_cuda_cache()
+            failed_key = f"diarize:failed_chunks:{upload_id}"
+            r.sadd(failed_key, chunk_idx)
+            raise
+
+        # сам пайплайн
+        MAX_RETRIES = int(getattr(settings, "DIARIZATION_CHUNK_MAX_RETRIES", 2))
+        RETRY_SLEEP = float(getattr(settings, "DIARIZATION_RETRY_SLEEP_S", 2.0))
+        retries_key = f"diarize:retries:{upload_id}"
+        processed_key = f"diarize:processed_chunks:{upload_id}"
+        failed_key = f"diarize:failed_chunks:{upload_id}"
+
+        attempts = int(r.hget(retries_key, str(chunk_idx)) or 0)
+        success = False
+
+        while attempts <= MAX_RETRIES and not success:
+            _safe_empty_cuda_cache()
+            try:
+                ann = pipeline(str(tmp_wav))
+                segs = []
+                for s, _, spk in ann.itertracks(yield_label=True):
+                    segs.append({"start": float(s.start) + offset, "end": float(s.end) + offset, "speaker": spk})
+
+                # сохраняем перчанк результаты
+                Path(settings.DIARIZER_CACHE_DIR).mkdir(parents=True, exist_ok=True)
+                Path(tmp_json).write_text(json.dumps(segs, ensure_ascii=False))
+
+                r.sadd(processed_key, chunk_idx)
+                r.srem(failed_key, chunk_idx)
+                logger.info(f"[{upload_id}] diarize chunk {chunk_idx+1} done: added {len(segs)} segments")
+                success = True
+            except Exception as e:
+                attempts += 1
+                r.hset(retries_key, str(chunk_idx), attempts)
+                logger.error(
+                    f"[{upload_id}] error in diarize chunk {chunk_idx+1} "
+                    f"(attempt {attempts}/{MAX_RETRIES}): {e}", exc_info=True
+                )
+                _safe_empty_cuda_cache()
+                if attempts <= MAX_RETRIES:
+                    time.sleep(RETRY_SLEEP)
+
+        try:
+            tmp_wav.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+        if not success:
+            r.sadd(failed_key, chunk_idx)
+            logger.error(f"[{upload_id}] giving up on chunk {chunk_idx+1} after {attempts} attempts")
+            raise Exception("diarize_chunk_failed")
+
+    finally:
+        # освободим семафор
+        if acquired:
+            try:
+                r.decr(DIARIZATION_SEMA_KEY)
+            except Exception:
+                pass
+
+
+@app.task(
+    bind=True,
+    queue="diarize_gpu",
+    acks_late=True,
+    autoretry_for=(Exception,),
+    retry_backoff=True,
+    retry_backoff_max=60,
+    retry_jitter=True,
+    retry_kwargs={"max_retries": 1000},  # ждём долго, пока все чанки догрызутся
+)
+def diarize_finalize(self, upload_id: str, total_chunks: int, using_chunking: bool, correlation_id: str):
+    """
+    Финальная сборка результатов по чанкам. Ждёт, пока processed == total_chunks и failed == 0.
+    Склеивает, (опц.) шьёт спикеров и пишет diarization.json + вебхук.
+    """
+    r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
+    processed_key = f"diarize:processed_chunks:{upload_id}"
+    failed_key = f"diarize:failed_chunks:{upload_id}"
+
+    processed = {int(x) for x in r.smembers(processed_key)}
+    failed_cnt = int(r.scard(failed_key) or 0)
+
+    if using_chunking:
+        if len(processed) < total_chunks or failed_cnt > 0:
+            # не готовы — подождём
+            logger.info(
+                f"[{upload_id}] finalize waiting: processed={len(processed)}/{total_chunks}, failed={failed_cnt}"
+            )
+            raise self.retry(countdown=15)
+
+    # собираем все сегменты
+    raw: List[Dict[str, Any]] = []
+    for idx in sorted(processed):
+        tmp_json = _diarize_tmp_json_path(upload_id, idx)
+        try:
+            if tmp_json.exists():
+                segs = json.loads(tmp_json.read_text() or "[]")
+                raw.extend(segs)
+        except Exception as e:
+            logger.warning(f"[{upload_id}] failed to read chunk json {idx}: {e}")
+
+    raw.sort(key=lambda x: x["start"])
+
+    # опционально шьём спикеров (если включено и был чанк-режим)
+    wav, _ = prepare_wav(upload_id)
+    if SPEAKER_STITCH_ENABLED and using_chunking:
+        raw = stitch_speakers(raw, wav, upload_id)
+    else:
+        logger.debug(f"[{upload_id}] skipping speaker stitching (using_chunking={using_chunking})")
+
+    # сшиваем соседние одинаковые спикеры
+    diar_sentences = []
+    buf = None
+    for seg in raw:
+        if buf and buf["speaker"] == seg["speaker"] and seg["start"] - buf["end"] < 0.1:
+            buf["end"] = seg["end"]
+        else:
+            if buf:
+                diar_sentences.append(buf)
+            buf = dict(seg)
+    if buf:
+        diar_sentences.append(buf)
+
+    out = Path(settings.RESULTS_FOLDER) / upload_id
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "diarization.json").write_text(json.dumps(diar_sentences, ensure_ascii=False, indent=2))
+    logger.info(f"[{upload_id}] diarization_done, total segments: {len(diar_sentences)}")
+
+    try:
+        import torch
+        logger.info(f"[{upload_id}] GPU memory reserved after diarization: {torch.cuda.memory_reserved() if torch.cuda.is_available() else 'n/a'}")
+    except ImportError:
+        pass
+
+    r.publish(f"progress:{upload_id}", json.dumps({"status": "diarization_done", "segments": len(diar_sentences)}))
+    deliver_webhook.delay("diarization_completed", upload_id, {"diarization": diar_sentences})
+
+    # чистим чекпойнты и временные файлы
+    try:
+        if using_chunking and len(processed) == total_chunks and failed_cnt == 0:
+            r.delete(processed_key)
+            r.delete(failed_key)
+            r.delete(f"diarize:retries:{upload_id}")
+            for idx in range(total_chunks):
+                _diarize_tmp_json_path(upload_id, idx).unlink(missing_ok=True)
+                _diarize_tmp_wav_path(upload_id, idx).unlink(missing_ok=True)
+            logger.info(f"[{upload_id}] diarization checkpoints cleaned: all {total_chunks} chunks done")
+    except Exception:
+        pass
+
+
 @app.task(bind=True, queue="diarize_gpu")
 def diarize_full(self, upload_id, correlation_id):
     """
-    Усиленная диаризация:
-    - per-chunk try/except с ограниченным числом ретраев;
-    - очистка CUDA-кеша перед попыткой и при ошибке;
-    - прогресс по chunk'ам хранится в Redis (resumable);
-    - безопасная запись результата даже при частичных сбоях.
+    Усиленная диаризация с сабтасками:
+    - каждый чанк — отдельный Celery task с acks_late и автретраями;
+    - кластерный семафор ограничивает параллельные чанки (не ловим OOM);
+    - прогресс по чанкам хранится в Redis (resumable);
+    - финализатор ждёт готовности и склеивает результат.
     """
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
     logger.info(f"[{upload_id}] diarize_full started")
     r.publish(f"progress:{upload_id}", json.dumps({"status": "diarize_started"}))
     deliver_webhook.delay("diarization_started", upload_id, None)
-
-    # параметры ретраев
-    MAX_RETRIES = int(getattr(settings, "DIARIZATION_CHUNK_MAX_RETRIES", 2))
-    RETRY_SLEEP = float(getattr(settings, "DIARIZATION_RETRY_SLEEP_S", 2.0))
 
     # общий try, чтобы не уронить воркер даже если что-то совсем пошло не так
     try:
@@ -699,105 +916,31 @@ def diarize_full(self, upload_id, correlation_id):
             deliver_webhook.delay("processing_failed", upload_id, None)
             return
 
-        pipeline = get_diarization_pipeline()
-        raw: List[Dict[str, Any]] = []
-
         if using_chunking:
-            total_chunks = math.ceil(duration / chunk_limit)
+            total_chunks = int(math.ceil(duration / chunk_limit))
             processed_key = f"diarize:processed_chunks:{upload_id}"
-            retries_key = f"diarize:retries:{upload_id}"
             failed_key = f"diarize:failed_chunks:{upload_id}"
+            r.sadd(processed_key, *[])  # ensure set exists
 
-            processed = {int(x) for x in r.smembers(processed_key)}
-            any_failures = False
-
+            # планируем все отсутствующие чанки
             offset = 0.0
             chunk_idx = 0
+            processed = {int(x) for x in r.smembers(processed_key)}
             while offset < duration:
                 this_len = min(chunk_limit, duration - offset)
-
-                if chunk_idx in processed:
-                    logger.info(f"[{upload_id}] skip diarize chunk {chunk_idx+1}/{total_chunks}")
-                    offset += this_len
-                    chunk_idx += 1
-                    continue
-
-                logger.info(f"[{upload_id}] diarize chunk {chunk_idx+1}/{total_chunks}: {offset:.1f}s→{offset+this_len:.1f}s")
-                tmp = Path(settings.DIARIZER_CACHE_DIR) / f"{upload_id}_chunk_{chunk_idx}.wav"
-                # готовим аудио для чанка
-                try:
-                    subprocess.run([
-                        "ffmpeg", "-y", "-threads", str(max(1, settings.FFMPEG_THREADS // 2)),
-                        "-ss", str(offset), "-t", str(this_len),
-                        "-i", str(wav), str(tmp)
-                    ], check=True, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
-                except Exception as e:
-                    logger.error(f"[{upload_id}] ffmpeg failed for chunk {chunk_idx+1}: {e}", exc_info=True)
-                    _safe_empty_cuda_cache()
-                    any_failures = True
-                    r.sadd(failed_key, chunk_idx)
-                    offset += this_len
-                    chunk_idx += 1
-                    continue
-
-                success = False
-                attempts = int(r.hget(retries_key, str(chunk_idx)) or 0)
-
-                while attempts <= MAX_RETRIES and not success:
-                    _safe_empty_cuda_cache()
-                    try:
-                        ann = pipeline(str(tmp))
-                        before = len(raw)
-                        for s, _, spk in ann.itertracks(yield_label=True):
-                            raw.append({"start": float(s.start) + offset, "end": float(s.end) + offset, "speaker": spk})
-                        added = len(raw) - before
-                        logger.info(f"[{upload_id}] diarize chunk {chunk_idx+1}/{total_chunks} done: added {added} segments")
-                        r.sadd(processed_key, chunk_idx)
-                        r.srem(failed_key, chunk_idx)
-                        success = True
-                    except Exception as e:
-                        attempts += 1
-                        r.hset(retries_key, str(chunk_idx), attempts)
-                        logger.error(
-                            f"[{upload_id}] error in diarize chunk {chunk_idx+1}/{total_chunks} "
-                            f"(attempt {attempts}/{MAX_RETRIES}): {e}", exc_info=True
-                        )
-                        _safe_empty_cuda_cache()
-                        if attempts <= MAX_RETRIES:
-                            time.sleep(RETRY_SLEEP)
-
-                try:
-                    tmp.unlink(missing_ok=True)
-                except Exception:
-                    pass
-
-                if not success:
-                    any_failures = True
-                    r.sadd(failed_key, chunk_idx)
-                    logger.error(f"[{upload_id}] giving up on chunk {chunk_idx+1}/{total_chunks} after {attempts} attempts")
-
+                if chunk_idx not in processed:
+                    logger.info(f"[{upload_id}] enqueue diarize chunk {chunk_idx+1}/{total_chunks}: {offset:.1f}s→{offset+this_len:.1f}s")
+                    diarize_chunk.apply_async((upload_id, chunk_idx, offset, this_len), queue="diarize_gpu")
                 offset += this_len
                 chunk_idx += 1
 
-            # финальная уборка служебных ключей: только если сделаны ВСЕ чанки и нет фейлов
-            try:
-                processed = {int(x) for x in r.smembers(processed_key)}
-                failed_cnt = int(r.scard(failed_key) or 0)
-                if len(processed) == total_chunks and failed_cnt == 0:
-                    r.delete(processed_key)
-                    r.delete(retries_key)
-                    r.delete(failed_key)
-                    logger.info(f"[{upload_id}] diarization checkpoints cleaned: all {total_chunks} chunks done")
-                else:
-                    logger.warning(
-                        f"[{upload_id}] diarization incomplete: processed={len(processed)}/{total_chunks}, "
-                        f"failed={failed_cnt}. Checkpoints preserved for resume."
-                    )
-            except Exception:
-                pass
+            # запустить финализатор (сам будет ждать/ретраить, пока всё не догрызётся)
+            diarize_finalize.apply_async((upload_id, total_chunks, True, correlation_id), queue="diarize_gpu")
 
         else:
-            # одиночный прогон тоже подстрахуем, чтобы не уронить весь пайплайн
+            # одиночный прогон (как раньше, но в защищённом блоке)
+            pipeline = get_diarization_pipeline()
+            raw: List[Dict[str, Any]] = []
             try:
                 _safe_empty_cuda_cache()
                 ann = pipeline(str(wav))
@@ -806,39 +949,39 @@ def diarize_full(self, upload_id, correlation_id):
             except Exception as e:
                 logger.error(f"[{upload_id}] single-pass diarization failed: {e}", exc_info=True)
                 _safe_empty_cuda_cache()
-                # безопасно завершить: raw остаётся пустым — сохраним пустой результат ниже
+                raw = []
 
-        raw.sort(key=lambda x: x["start"])
+            raw.sort(key=lambda x: x["start"])
 
-        if SPEAKER_STITCH_ENABLED and using_chunking:
-            raw = stitch_speakers(raw, wav, upload_id)
-        else:
-            logger.debug(f"[{upload_id}] skipping speaker stitching (using_chunking={using_chunking})")
-
-        # сшиваем соседние одинаковые спикеры
-        diar_sentences = []
-        buf = None
-        for seg in raw:
-            if buf and buf["speaker"] == seg["speaker"] and seg["start"] - buf["end"] < 0.1:
-                buf["end"] = seg["end"]
+            if SPEAKER_STITCH_ENABLED:
+                raw = stitch_speakers(raw, wav, upload_id)
             else:
-                if buf:
-                    diar_sentences.append(buf)
-                buf = dict(seg)
-        if buf:
-            diar_sentences.append(buf)
+                logger.debug(f"[{upload_id}] skipping speaker stitching (using_chunking={False})")
 
-        out = Path(settings.RESULTS_FOLDER) / upload_id
-        out.mkdir(parents=True, exist_ok=True)
-        (out / "diarization.json").write_text(json.dumps(diar_sentences, ensure_ascii=False, indent=2))
-        logger.info(f"[{upload_id}] diarization_done, total segments: {len(diar_sentences)}")
-        try:
-            import torch
-            logger.info(f"[{upload_id}] GPU memory reserved after diarization: {torch.cuda.memory_reserved() if torch.cuda.is_available() else 'n/a'}")
-        except ImportError:
-            pass
-        r.publish(f"progress:{upload_id}", json.dumps({"status": "diarization_done", "segments": len(diar_sentences)}))
-        deliver_webhook.delay("diarization_completed", upload_id, {"diarization": diar_sentences})
+            # сшиваем соседние одинаковые спикеры
+            diar_sentences = []
+            buf = None
+            for seg in raw:
+                if buf and buf["speaker"] == seg["speaker"] and seg["start"] - buf["end"] < 0.1:
+                    buf["end"] = seg["end"]
+                else:
+                    if buf:
+                        diar_sentences.append(buf)
+                    buf = dict(seg)
+            if buf:
+                diar_sentences.append(buf)
+
+            out = Path(settings.RESULTS_FOLDER) / upload_id
+            out.mkdir(parents=True, exist_ok=True)
+            (out / "diarization.json").write_text(json.dumps(diar_sentences, ensure_ascii=False, indent=2))
+            logger.info(f"[{upload_id}] diarization_done, total segments: {len(diar_sentences)}")
+            try:
+                import torch
+                logger.info(f"[{upload_id}] GPU memory reserved after diarization: {torch.cuda.memory_reserved() if torch.cuda.is_available() else 'n/a'}")
+            except ImportError:
+                pass
+            r.publish(f"progress:{upload_id}", json.dumps({"status": "diarization_done", "segments": len(diar_sentences)}))
+            deliver_webhook.delay("diarization_completed", upload_id, {"diarization": diar_sentences})
 
     except Exception as fatal:
         # финальная защита: пишем то, что есть (или пустое), чтобы фронт не падал
@@ -852,6 +995,7 @@ def diarize_full(self, upload_id, correlation_id):
             pass
         r.publish(f"progress:{upload_id}", json.dumps({"status": "diarization_done", "segments": 0}))
         deliver_webhook.delay("diarization_completed", upload_id, {"diarization": []})
+
 
 @app.task(
     bind=True,
