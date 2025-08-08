@@ -459,10 +459,38 @@ def stitch_speakers(raw: List[Dict[str, Any]], wav: Path, upload_id: str) -> Lis
 
 @worker_process_init.connect
 def preload_on_startup(**kwargs):
+    # Определяем роль воркера по env (обычно ты задаёшь CELERY_QUEUES в docker-compose)
+    queues = os.environ.get("CELERY_QUEUES", "")
+    is_webhooks_only = ("webhooks" in {q.strip() for q in queues.split(",") if q.strip()}) and \
+                       all(q.strip() == "webhooks" for q in queues.split(",") if q.strip())
+
+    # В webhook-воркере heavy-модели не поднимаем вовсе
+    if is_webhooks_only:
+        logger.info("[PRELOAD] skip model preload in webhooks worker")
+        return
+
+    # Остальным — грузим, но безопасно
     if _HF_AVAILABLE:
-        get_whisper_model()
+        try:
+            get_whisper_model()
+        except Exception as e:
+            # Фолбэк на CPU, если рухнули по CUDA/драйверу
+            try:
+                logger.warning(f"[PRELOAD] whisper GPU init failed, fallback to CPU: {e}")
+                # Жёстко принудим CPU-конфиг
+                device_backup = getattr(settings, "WHISPER_DEVICE", "cpu")
+                setattr(settings, "WHISPER_DEVICE", "cpu")
+                setattr(settings, "WHISPER_COMPUTE_TYPE", "int8")
+                get_whisper_model()
+                setattr(settings, "WHISPER_DEVICE", device_backup)
+            except Exception as e2:
+                logger.error(f"[PRELOAD] whisper CPU fallback failed: {e2}")
+
     if _PN_AVAILABLE:
-        get_diarization_pipeline()
+        try:
+            get_diarization_pipeline()
+        except Exception as e:
+            logger.error(f"[PRELOAD] diarization pipeline init failed: {e}")
 
 # --- Celery tasks ---
 
@@ -682,7 +710,19 @@ DIARIZATION_CHUNK_HARD_TIME_LIMIT = int(getattr(settings, "DIARIZATION_CHUNK_HAR
     soft_time_limit=DIARIZATION_CHUNK_SOFT_TIME_LIMIT,
     time_limit=DIARIZATION_CHUNK_HARD_TIME_LIMIT,
 )
-@app.task(bind=True, name="tasks.diarize_chunk", queue="diarize_gpu", acks_late=True)
+@app.task(bind=True, name="tasks.@app.task(
+    bind=True,
+    name="tasks.diarize_chunk",
+    queue="diarize_gpu",
+    acks_late=True,
+    autoretry_for=(Exception,),
+    retry_backoff=True,
+    retry_backoff_max=60,
+    retry_jitter=True,
+    retry_kwargs={"max_retries": 5},
+    soft_time_limit=DIARIZATION_CHUNK_SOFT_TIME_LIMIT,
+    time_limit=DIARIZATION_CHUNK_HARD_TIME_LIMIT,
+)
 def diarize_chunk(self, upload_id: str, chunk_idx: int, offset: float, length: float):
     """
     Обработчик одного чанка диаризации.
@@ -701,7 +741,6 @@ def diarize_chunk(self, upload_id: str, chunk_idx: int, offset: float, length: f
         wav, _ = prepare_wav(upload_id)
         tmp = Path(settings.DIARIZER_CACHE_DIR) / f"{upload_id}_chunk_{chunk_idx}.wav"
 
-        # подготовка чанка
         try:
             subprocess.run(
                 [
@@ -713,14 +752,12 @@ def diarize_chunk(self, upload_id: str, chunk_idx: int, offset: float, length: f
             )
         except Exception as e:
             logger.error(f"[{upload_id}] ffmpeg failed for chunk {chunk_idx+1}: {e}", exc_info=True)
-            # считать это «неисправимым» для этого чанка
             r.sadd(failed_key, chunk_idx)
             return
 
         _safe_empty_cuda_cache()
         pipeline = get_diarization_pipeline()
 
-        added_segments = 0
         try:
             ann = pipeline(str(tmp))
             raw_piece = []
@@ -730,30 +767,21 @@ def diarize_chunk(self, upload_id: str, chunk_idx: int, offset: float, length: f
                     "end":   float(s.end)   + offset,
                     "speaker": spk
                 })
-            # складываем кусочки на диск (per-chunk), чтобы потом финализатор их склеил
             out_dir = Path(settings.RESULTS_FOLDER) / upload_id / "diar_chunks"
             out_dir.mkdir(parents=True, exist_ok=True)
             (out_dir / f"{chunk_idx:05d}.json").write_text(json.dumps(raw_piece, ensure_ascii=False))
-            added_segments = len(raw_piece)
 
             r.sadd(processed_key, chunk_idx)
             r.hdel(retries_key, str(chunk_idx))
             r.srem(failed_key, chunk_idx)
-            logger.info(f"[{upload_id}] diarize_chunk {chunk_idx+1}: added {added_segments} segments")
+            logger.info(f"[{upload_id}] diarize_chunk {chunk_idx+1}: added {len(raw_piece)} segments")
         except Exception as e:
-            # управляем ретраями сами: инкрементим счётчик и решаем — ретраить или фейлить
             tries = int(r.hincrby(retries_key, str(chunk_idx), 1))
             logger.error(f"[{upload_id}] diarize_chunk {chunk_idx+1} error (try {tries}/{MAX_RETRIES}): {e}", exc_info=True)
             _safe_empty_cuda_cache()
-            try:
-                tmp.unlink(missing_ok=True)
-            except Exception:
-                pass
-
             if tries <= MAX_RETRIES:
                 raise self.retry(countdown=RETRY_SLEEP)
             else:
-                # финально помечаем чанк как упавший
                 r.sadd(failed_key, chunk_idx)
                 logger.error(f"[{upload_id}] diarize_chunk {chunk_idx+1} gave up after {tries} tries")
                 return
@@ -763,9 +791,10 @@ def diarize_chunk(self, upload_id: str, chunk_idx: int, offset: float, length: f
             except Exception:
                 pass
     except Exception as e:
-            logger.error(f"[startup] unexpected error in previous try-block: {e}", exc_info=True)
+        logger.error(f"[startup] unexpected error in previous try-block: {e}", exc_info=True)
     finally:
-            _safe_empty_cuda_cache()
+        _safe_empty_cuda_cache()
+
 
 @app.task(bind=True, name="tasks.diarize_finalize", queue="diarize_gpu", max_retries=None)
 def diarize_finalize(self, upload_id: str, total_chunks: int, using_chunking: bool, correlation_id: Optional[str] = None):
