@@ -764,7 +764,6 @@ def diarize_chunk(self, upload_id: str, chunk_idx: int, offset: float, length: f
                 pass
 
 
-
 @app.task(bind=True, name="tasks.diarize_finalize", queue="diarize_gpu", max_retries=None)
 def diarize_finalize(self, upload_id: str, total_chunks: int, using_chunking: bool, correlation_id: Optional[str] = None):
     """
