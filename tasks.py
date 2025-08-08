@@ -710,7 +710,7 @@ DIARIZATION_CHUNK_HARD_TIME_LIMIT = int(getattr(settings, "DIARIZATION_CHUNK_HAR
     soft_time_limit=DIARIZATION_CHUNK_SOFT_TIME_LIMIT,
     time_limit=DIARIZATION_CHUNK_HARD_TIME_LIMIT,
 )
-@app.task(bind=True, name="tasks.@app.task(
+@app.task(
     bind=True,
     name="tasks.diarize_chunk",
     queue="diarize_gpu",
