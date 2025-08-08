@@ -762,10 +762,10 @@ def diarize_chunk(self, upload_id: str, chunk_idx: int, offset: float, length: f
                 tmp.unlink(missing_ok=True)
             except Exception:
                 pass
-            except Exception as e:
-                logger.error(f"[startup] unexpected error in previous try-block: {e}", exc_info=True)
-            finally:
-                _safe_empty_cuda_cache()
+    except Exception as e:
+            logger.error(f"[startup] unexpected error in previous try-block: {e}", exc_info=True)
+    finally:
+            _safe_empty_cuda_cache()
 
 @app.task(bind=True, name="tasks.diarize_finalize", queue="diarize_gpu", max_retries=None)
 def diarize_finalize(self, upload_id: str, total_chunks: int, using_chunking: bool, correlation_id: Optional[str] = None):
