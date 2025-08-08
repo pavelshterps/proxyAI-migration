@@ -920,7 +920,6 @@ def diarize_full(self, upload_id, correlation_id):
             total_chunks = int(math.ceil(duration / chunk_limit))
             processed_key = f"diarize:processed_chunks:{upload_id}"
             failed_key = f"diarize:failed_chunks:{upload_id}"
-            r.sadd(processed_key, *[])  # ensure set exists
 
             # планируем все отсутствующие чанки
             offset = 0.0
@@ -995,7 +994,6 @@ def diarize_full(self, upload_id, correlation_id):
             pass
         r.publish(f"progress:{upload_id}", json.dumps({"status": "diarization_done", "segments": 0}))
         deliver_webhook.delay("diarization_completed", upload_id, {"diarization": []})
-
 
 @app.task(
     bind=True,
