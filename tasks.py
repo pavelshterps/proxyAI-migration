@@ -706,7 +706,10 @@ def diarize_full(self, upload_id, correlation_id):
             total_chunks = math.ceil(duration / chunk_limit)
             processed_key = f"diarize:processed_chunks:{upload_id}"
             retries_key = f"diarize:retries:{upload_id}"
+            failed_key = f"diarize:failed_chunks:{upload_id}"
+
             processed = {int(x) for x in r.smembers(processed_key)}
+            any_failures = False
 
             offset = 0.0
             chunk_idx = 0
@@ -731,7 +734,8 @@ def diarize_full(self, upload_id, correlation_id):
                 except Exception as e:
                     logger.error(f"[{upload_id}] ffmpeg failed for chunk {chunk_idx+1}: {e}", exc_info=True)
                     _safe_empty_cuda_cache()
-                    # даже если ffmpeg упал, переходим к следующему чанку
+                    any_failures = True
+                    r.sadd(failed_key, chunk_idx)
                     offset += this_len
                     chunk_idx += 1
                     continue
@@ -749,6 +753,7 @@ def diarize_full(self, upload_id, correlation_id):
                         added = len(raw) - before
                         logger.info(f"[{upload_id}] diarize chunk {chunk_idx+1}/{total_chunks} done: added {added} segments")
                         r.sadd(processed_key, chunk_idx)
+                        r.srem(failed_key, chunk_idx)
                         success = True
                     except Exception as e:
                         attempts += 1
@@ -766,17 +771,28 @@ def diarize_full(self, upload_id, correlation_id):
                 except Exception:
                     pass
 
-                # если не удалось — продолжаем дальше (чтобы не блокировать весь файл)
                 if not success:
+                    any_failures = True
+                    r.sadd(failed_key, chunk_idx)
                     logger.error(f"[{upload_id}] giving up on chunk {chunk_idx+1}/{total_chunks} after {attempts} attempts")
 
                 offset += this_len
                 chunk_idx += 1
 
-            # очистим служебные ключи, если дошли до конца
+            # финальная уборка служебных ключей: только если сделаны ВСЕ чанки и нет фейлов
             try:
-                r.delete(processed_key)
-                r.delete(retries_key)
+                processed = {int(x) for x in r.smembers(processed_key)}
+                failed_cnt = int(r.scard(failed_key) or 0)
+                if len(processed) == total_chunks and failed_cnt == 0:
+                    r.delete(processed_key)
+                    r.delete(retries_key)
+                    r.delete(failed_key)
+                    logger.info(f"[{upload_id}] diarization checkpoints cleaned: all {total_chunks} chunks done")
+                else:
+                    logger.warning(
+                        f"[{upload_id}] diarization incomplete: processed={len(processed)}/{total_chunks}, "
+                        f"failed={failed_cnt}. Checkpoints preserved for resume."
+                    )
             except Exception:
                 pass
 
@@ -830,7 +846,6 @@ def diarize_full(self, upload_id, correlation_id):
         try:
             out = Path(settings.RESULTS_FOLDER) / upload_id
             out.mkdir(parents=True, exist_ok=True)
-            # если что-то накопили выше, оно будет в diar_sentences, но на всякий — пустой список
             if not (out / "diarization.json").exists():
                 (out / "diarization.json").write_text(json.dumps([], ensure_ascii=False, indent=2))
         except Exception:
