@@ -61,7 +61,7 @@ services:
       - upload_data:${UPLOAD_FOLDER}
       - results_data:${RESULTS_FOLDER}
       - diarizer_cache:${DIARIZER_CACHE_DIR}
-      - ./data/hf_cache:/hf_cache
+      - /root/proxyAI-migration/data/hf_cache:/hf_cache
     ports:
       - "8000:8000"
     depends_on:
@@ -102,7 +102,7 @@ services:
       - upload_data:${UPLOAD_FOLDER}
       - results_data:${RESULTS_FOLDER}
       - diarizer_cache:${DIARIZER_CACHE_DIR}
-      - ./data/hf_cache:/hf_cache
+      - /root/proxyAI-migration/data/hf_cache:/hf_cache
     depends_on:
       - api
       - redis
@@ -147,52 +147,7 @@ services:
       - upload_data:${UPLOAD_FOLDER}
       - results_data:${RESULTS_FOLDER}
       - diarizer_cache:${DIARIZER_CACHE_DIR}
-      - ./data/hf_cache:/hf_cache
-    depends_on:
-      - api
-      - redis
-    networks:
-      - proxyai_net
-    restart: unless-stopped
-
-  worker_gpu_2:
-    build:
-      context: .
-      dockerfile: Dockerfile.gpu
-    container_name: proxyai_worker_gpu_2
-    runtime: nvidia
-    mem_limit: 8g
-    env_file: .env
-    command:
-      - celery
-      - -A
-      - celery_app:app
-      - worker
-      - -E
-      - --loglevel=info
-      - --concurrency=${GPU_CONCURRENCY}
-      - --prefetch-multiplier=1
-      - --max-tasks-per-child=12
-      - --queues=transcribe_gpu,diarize_gpu
-    environment:
-      - CELERY_BROKER_URL=${CELERY_BROKER_URL}
-      - CELERY_RESULT_BACKEND=${CELERY_RESULT_BACKEND}
-      - REDIS_URL=${REDIS_URL}
-      - UPLOAD_FOLDER=${UPLOAD_FOLDER}
-      - RESULTS_FOLDER=${RESULTS_FOLDER}
-      - DIARIZER_CACHE_DIR=${DIARIZER_CACHE_DIR}
-      - HUGGINGFACE_CACHE_DIR=${HUGGINGFACE_CACHE_DIR}
-      - WHISPER_MODEL_PATH=${WHISPER_MODEL_PATH}
-      - WHISPER_DEVICE=cuda
-      - NVIDIA_VISIBLE_DEVICES=0
-      - WEBHOOK_URL=${WEBHOOK_URL}
-      - WEBHOOK_SECRET=${WEBHOOK_SECRET}
-    volumes:
-      - ./:/app:delegated
-      - upload_data:${UPLOAD_FOLDER}
-      - results_data:${RESULTS_FOLDER}
-      - diarizer_cache:${DIARIZER_CACHE_DIR}
-      - ./data/hf_cache:/hf_cache
+      - /root/proxyAI-migration/data/hf_cache:/hf_cache
     depends_on:
       - api
       - redis
@@ -292,7 +247,6 @@ services:
       - redis
       - worker_cpu
       - worker_gpu_1
-      - worker_gpu_2
     networks:
       - proxyai_net
     restart: unless-stopped
