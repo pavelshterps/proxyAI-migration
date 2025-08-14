@@ -6,7 +6,7 @@ import re
 import math
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Optional, List, Dict
+from typing import Any, Optional, List, Dict, Tuple
 
 import requests
 from redis import Redis
@@ -33,11 +33,11 @@ _whisper_model = None
 _diarization_pipeline = None
 
 # --- Speaker stitching / embedding ---
-SPEAKER_STITCH_ENABLED = getattr(settings, "SPEAKER_STITCH_ENABLED", False)
-SPEAKER_STITCH_THRESHOLD = float(getattr(settings, "SPEAKER_STITCH_THRESHOLD", 0.75))
-SPEAKER_STITCH_POOL_SIZE = int(getattr(settings, "SPEAKER_STITCH_POOL_SIZE", 5))
-SPEAKER_STITCH_EMA_ALPHA = float(getattr(settings, "SPEAKER_STITCH_EMA_ALPHA", 0.4))
-SPEAKER_STITCH_MERGE_THRESHOLD = float(getattr(settings, "SPEAKER_STITCH_MERGE_THRESHOLD", 0.95))
+SPEAKER_STITCH_ENABLED = getattr(settings, "SPEAKER_STITCH_ENABLED", True)
+SPEAKER_STITCH_THRESHOLD = float(getattr(settings, "SPEAKER_STITCH_THRESHOLD", 0.85))
+SPEAKER_STITCH_POOL_SIZE = int(getattr(settings, "SPEAKER_STITCH_POOL_SIZE", 8))
+SPEAKER_STITCH_EMA_ALPHA = float(getattr(settings, "SPEAKER_STITCH_EMA_ALPHA", 0.5))
+SPEAKER_STITCH_MERGE_THRESHOLD = float(getattr(settings, "SPEAKER_STITCH_MERGE_THRESHOLD", 0.98))
 _speaker_embedding_model = None  # type: ignore
 
 try:
@@ -130,27 +130,46 @@ def probe_audio(src: Path) -> dict:
         pass
     return info
 
-def prepare_wav(upload_id: str) -> (Path, float):
+# --- audio cleanup parameters (can be overridden in env via settings if добавишь позже) ---
+AUDIO_HP_F = int(getattr(settings, "AUDIO_HP_F", 120))  # Hz
+AUDIO_AFFTDN_NR = int(getattr(settings, "AUDIO_AFFTDN_NR", 12))  # 6..24 мягко
+AUDIO_USE_LOUDNORM = bool(getattr(settings, "AUDIO_USE_LOUDNORM", True))
+AUDIO_LOUDNORM = getattr(settings, "AUDIO_LOUDNORM", "I=-23:TP=-2:LRA=11")  # broadcast-ish
+
+def _ffmpeg_filter_chain() -> str:
+    chain = [f"highpass=f={AUDIO_HP_F}", f"afftdn=nr={AUDIO_AFFTDN_NR}"]
+    if AUDIO_USE_LOUDNORM:
+        chain.append(f"loudnorm={AUDIO_LOUDNORM}")
+    return ",".join(chain)
+
+def prepare_wav(upload_id: str) -> Tuple[Path, float]:
+    """
+    Готовим wav 16k mono PCM с мягкой очисткой:
+    highpass -> afftdn -> loudnorm. Всегда перекодируем в целевой файл.
+    """
     src = next(Path(settings.UPLOAD_FOLDER).glob(f"{upload_id}.*"))
     target = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
     info = probe_audio(src)
     duration = info["duration"]
 
-    if (
-        src.suffix.lower() == ".wav"
-        and info.get("codec_name") == "pcm_s16le"
-        and info.get("sample_rate") == 16000
-        and info.get("channels") == 1
-    ):
-        if src != target:
-            src.rename(target)
-        return target, duration
+    # всегда прогоняем через фильтры и приводим к нужному формату
+    af = _ffmpeg_filter_chain()
+    try:
+        subprocess.run([
+            "ffmpeg", "-y", "-threads", str(settings.FFMPEG_THREADS),
+            "-i", str(src),
+            "-af", af,
+            "-acodec", "pcm_s16le", "-ac", "1", "-ar", "16000", str(target),
+        ], check=True, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+        logger.info(f"[{upload_id}] audio preproc applied: -af \"{af}\" → mono/16k/pcm_s16le")
+    except subprocess.CalledProcessError as e:
+        logger.warning(f"[{upload_id}] ffmpeg filters failed ({e}). Falling back to plain resample.")
+        subprocess.run([
+            "ffmpeg", "-y", "-threads", str(settings.FFMPEG_THREADS),
+            "-i", str(src),
+            "-acodec", "pcm_s16le", "-ac", "1", "-ar", "16000", str(target),
+        ], check=True, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
 
-    subprocess.run([
-        "ffmpeg", "-y", "-threads", str(settings.FFMPEG_THREADS),
-        "-i", str(src),
-        "-acodec", "pcm_s16le", "-ac", "1", "-ar", "16000", str(target),
-    ], check=True, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
     return target, duration
 
 def prepare_preview_segment(upload_id: str) -> subprocess.Popen:
@@ -437,6 +456,94 @@ def preload_on_startup(**kwargs):
     if _PN_AVAILABLE:
         get_diarization_pipeline()
 
+# ---------------------- Post-processing for diarization ----------------------
+
+def _merge_short_segments(segments: List[Dict[str, Any]],
+                          min_dur: float = 0.35,
+                          max_gap_to_merge: float = 0.2) -> List[Dict[str, Any]]:
+    """
+    Сливает слишком короткие сегменты (<min_dur) к ближайшему соседу
+    с тем же спикером, иначе — к более длительному соседу.
+    Также склеивает соседние сегменты одного спикера, разделённые крошечной паузой (<max_gap_to_merge).
+    """
+    if not segments:
+        return segments
+
+    segs = sorted(segments, key=lambda s: (s["start"], s["end"]))
+    # 1) склеить микропауы между одинаковыми спикерами
+    merged: List[Dict[str, Any]] = []
+    prev = None
+    for s in segs:
+        if prev and prev["speaker"] == s["speaker"] and (s["start"] - prev["end"]) <= max_gap_to_merge:
+            prev["end"] = max(prev["end"], s["end"])
+        else:
+            if prev:
+                merged.append(prev)
+            prev = dict(s)
+    if prev:
+        merged.append(prev)
+
+    # 2) перекинуть очень короткие сегменты
+    if len(merged) <= 1:
+        return merged
+
+    def dur(x): return x["end"] - x["start"]
+    i = 0
+    while i < len(merged):
+        s = merged[i]
+        if dur(s) >= min_dur:
+            i += 1
+            continue
+        # кандидаты — соседи
+        left = merged[i - 1] if i - 1 >= 0 else None
+        right = merged[i + 1] if i + 1 < len(merged) else None
+
+        # приоритет: сосед с тем же спикером, иначе — более длинный
+        def choose_target():
+            same_left = left and left["speaker"] == s["speaker"]
+            same_right = right and right["speaker"] == s["speaker"]
+            if same_left and same_right:
+                return left if dur(left) >= dur(right) else right
+            if same_left:
+                return left
+            if same_right:
+                return right
+            # иначе — длиннейший из соседей
+            if left and right:
+                return left if dur(left) >= dur(right) else right
+            return left or right
+
+        tgt = choose_target()
+        if not tgt:
+            i += 1
+            continue
+
+        # присоединяем по времени
+        if tgt is left:
+            left["end"] = max(left["end"], s["end"])
+            merged.pop(i)
+            # не двигаем i, т.к. текущий индекс стал слит с предыдущим
+        elif tgt is right:
+            right["start"] = min(right["start"], s["start"])
+            merged.pop(i)
+            # следующий стал шире, остаёмся на i, чтобы переоценить
+        else:
+            i += 1
+
+    # финальная склейка подряд идущих одинаковых спикеров
+    final_out: List[Dict[str, Any]] = []
+    prev = None
+    for s in merged:
+        if prev and prev["speaker"] == s["speaker"] and (s["start"] - prev["end"]) <= max_gap_to_merge:
+            prev["end"] = max(prev["end"], s["end"])
+        else:
+            if prev:
+                final_out.append(prev)
+            prev = dict(s)
+    if prev:
+        final_out.append(prev)
+    return final_out
+
 # --- Celery tasks ---
 
 @app.task(bind=True, queue="transcribe_cpu")
@@ -621,19 +728,25 @@ def transcribe_segments(self, upload_id, correlation_id):
 
 @app.task(bind=True, queue="diarize_gpu")
 def diarize_full(self, upload_id, correlation_id):
+    import gc
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
     logger.info(f"[{upload_id}] diarize_full started")
     r.publish(f"progress:{upload_id}", json.dumps({"status": "diarize_started"}))
     deliver_webhook.delay("diarization_started", upload_id, None)
 
+    # ---- GPU mem before
     try:
         import torch
-        logger.info(f"[{upload_id}] GPU memory reserved before diarization: {torch.cuda.memory_reserved() if torch.cuda.is_available() else 'n/a'}")
+        logger.info(
+            f"[{upload_id}] GPU memory reserved before diarization: "
+            f"{torch.cuda.memory_reserved() if torch.cuda.is_available() else 'n/a'}"
+        )
     except ImportError:
-        pass
+        torch = None  # type: ignore
 
     wav, duration = prepare_wav(upload_id)
 
+    # --- chunking params from env ---
     raw_chunk_limit = getattr(settings, "DIARIZATION_CHUNK_LENGTH_S", 0)
     try:
         chunk_limit = int(raw_chunk_limit)
@@ -641,8 +754,33 @@ def diarize_full(self, upload_id, correlation_id):
         logger.warning(f"[{upload_id}] invalid DIARIZATION_CHUNK_LENGTH_S={raw_chunk_limit!r}, falling back to 0")
         chunk_limit = 0
 
+    pad = float(getattr(settings, "DIARIZATION_CHUNK_PADDING_S", 0.0) or 0.0)
     using_chunking = bool(chunk_limit and duration > chunk_limit)
-    logger.info(f"[{upload_id}] WAV prepared for diarization, duration={duration:.1f}s; chunk_limit={chunk_limit}; using_chunking={using_chunking}")
+    total_chunks = math.ceil(duration / chunk_limit) if using_chunking else 1
+
+    # --- optional hints: exact / min-max speakers
+    infer_kwargs: Dict[str, Any] = {}
+    if getattr(settings, "PYANNOTE_NUM_SPEAKERS", None):
+        try:
+            infer_kwargs["num_speakers"] = int(getattr(settings, "PYANNOTE_NUM_SPEAKERS"))
+        except Exception:
+            pass
+    else:
+        if getattr(settings, "PYANNOTE_MIN_SPEAKERS", None):
+            try:
+                infer_kwargs["min_speakers"] = int(getattr(settings, "PYANNOTE_MIN_SPEAKERS"))
+            except Exception:
+                pass
+        if getattr(settings, "PYANNOTE_MAX_SPEAKERS", None):
+            try:
+                infer_kwargs["max_speakers"] = int(getattr(settings, "PYANNOTE_MAX_SPEAKERS"))
+            except Exception:
+                pass
+
+    logger.info(
+        f"[{upload_id}] diarization plan: chunk_length={chunk_limit}s, "
+        f"padding={pad}s, total_chunks={total_chunks}, infer_kwargs={infer_kwargs or '{}'}"
+    )
 
     if not _PN_AVAILABLE:
         logger.error(f"[{upload_id}] pyannote.audio not available, aborting diarization")
@@ -653,65 +791,221 @@ def diarize_full(self, upload_id, correlation_id):
     raw: List[Dict[str, Any]] = []
 
     if using_chunking:
-        total_chunks = math.ceil(duration / chunk_limit)
         processed_key = f"diarize:processed_chunks:{upload_id}"
         processed = {int(x) for x in r.smembers(processed_key)}
 
         offset = 0.0
         chunk_idx = 0
         while offset < duration:
+            this_len = min(chunk_limit, duration - offset)
+            # compute left/right pad inside available audio range
+            left_pad = pad if offset > 0 else 0.0
+            right_pad = pad if (offset + this_len) < duration else 0.0
+
+            # already done?
             if chunk_idx in processed:
                 logger.info(f"[{upload_id}] skip diarize chunk {chunk_idx+1}/{total_chunks}")
-                offset += chunk_limit
+                offset += this_len
                 chunk_idx += 1
                 continue
 
-            this_len = min(chunk_limit, duration - offset)
-            logger.info(f"[{upload_id}] diarize chunk {chunk_idx+1}/{total_chunks}: {offset:.1f}s→{offset+this_len:.1f}s")
+            # ---- start log for chunk
+            log_start = max(0.0, offset - left_pad)
+            log_end = min(duration, offset + this_len + right_pad)
+            logger.info(
+                f"[{upload_id}] diarize chunk {chunk_idx+1}/{total_chunks}: "
+                f"{log_start:.1f}s→{log_end:.1f}s (core {offset:.1f}s→{offset+this_len:.1f}s, pad L={left_pad:.1f}s R={right_pad:.1f}s)"
+            )
+
+            # cut chunk to temp wav (with pads around)
             tmp = Path(settings.DIARIZER_CACHE_DIR) / f"{upload_id}_chunk_{chunk_idx}.wav"
-            subprocess.run([
-                "ffmpeg", "-y", "-threads", str(max(1, settings.FFMPEG_THREADS // 2)),
-                "-ss", str(offset), "-t", str(this_len),
-                "-i", str(wav), str(tmp)
-            ], check=True, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+            subprocess.run(
+                [
+                    "ffmpeg", "-y",
+                    "-threads", str(max(1, settings.FFMPEG_THREADS // 2)),
+                    "-ss", str(log_start),
+                    "-t", str(log_end - log_start),
+                    "-i", str(wav),
+                    str(tmp),
+                ],
+                check=True, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL
+            )
 
             try:
-                ann = pipeline(str(tmp))
+                # inference w/o grads to reduce mem
+                if torch:
+                    with torch.inference_mode():
+                        ann = pipeline(str(tmp), **infer_kwargs)
+                else:
+                    ann = pipeline(str(tmp), **infer_kwargs)
+
                 before = len(raw)
+                # Convert local chunk timeline to global timeline via log_start (start of file cut)
                 for s, _, spk in ann.itertracks(yield_label=True):
-                    raw.append({"start": float(s.start) + offset, "end": float(s.end) + offset, "speaker": spk})
+                    g_start = float(s.start) + log_start
+                    g_end = float(s.end) + log_start
+                    # Optionally trim to core region (avoid double counting overlap from pads)
+                    # keep only parts that intersect [offset, offset+this_len]
+                    if g_end <= offset or g_start >= (offset + this_len):
+                        continue
+                    g_start = max(g_start, offset)
+                    g_end = min(g_end, offset + this_len)
+                    if g_end > g_start:
+                        raw.append({"start": g_start, "end": g_end, "speaker": spk})
                 added = len(raw) - before
+
                 logger.info(f"[{upload_id}] diarize chunk {chunk_idx+1}/{total_chunks} done: added {added} segments")
                 r.sadd(processed_key, chunk_idx)
+
             except Exception as e:
                 logger.error(f"[{upload_id}] error in diarize chunk {chunk_idx+1}/{total_chunks}: {e}", exc_info=True)
-                try:
-                    import torch; torch.cuda.empty_cache()
-                except ImportError:
-                    pass
             finally:
-                tmp.unlink(missing_ok=True)
+                # cleanup temp + memory between chunks
+                try:
+                    tmp.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                try:
+                    del ann  # type: ignore
+                except Exception:
+                    pass
+                gc.collect()
+                if torch and torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
                 offset += this_len
                 chunk_idx += 1
 
         r.delete(processed_key)
+
     else:
         logger.info(f"[{upload_id}] Short audio or chunking disabled, single diarization pass")
-        ann = pipeline(str(wav))
+        if torch:
+            with torch.inference_mode():
+                ann = pipeline(str(wav), **infer_kwargs)
+        else:
+            ann = pipeline(str(wav), **infer_kwargs)
         for s, _, spk in ann.itertracks(yield_label=True):
             raw.append({"start": float(s.start), "end": float(s.end), "speaker": spk})
+        # cleanup
+        try:
+            del ann
+        except Exception:
+            pass
+        gc.collect()
+        if torch and torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     raw.sort(key=lambda x: x["start"])
 
+    # ---------- Optional FS-EEND refinement (safe no-op if disabled/missing) ----------
+    def _refine_with_fs_eend(_raw: List[Dict[str, Any]], _wav: Path) -> List[Dict[str, Any]]:
+        try:
+            if not bool(getattr(settings, "USE_FS_EEND", False)):
+                logger.info(f"[{upload_id}] FS-EEND disabled → skipping refinement")
+                return _raw
+
+            model_id = getattr(settings, "FS_EEND_MODEL_PATH", None)
+            if not model_id:
+                logger.info(f"[{upload_id}] FS-EEND path not set → skipping refinement")
+                return _raw
+
+            # NOTE: реальный FS-EEND пайплайн может отличаться в вашей среде.
+            # Оставляем безопасную попытку через pyannote Pipeline, чтобы не ломать рантайм.
+            from pyannote.audio import Pipeline as _TmpPipe  # uses same lib already in image
+            logger.info(f"[{upload_id}] FS-EEND refinement started with {model_id}")
+            if torch:
+                with torch.inference_mode():
+                    eend = _TmpPipe.from_pretrained(model_id, use_auth_token=settings.HUGGINGFACE_TOKEN,
+                                                    cache_dir=settings.DIARIZER_CACHE_DIR,
+                                                    device=getattr(settings, "FS_EEND_DEVICE", "cuda"))
+                    ann = eend(str(_wav))
+            else:
+                eend = _TmpPipe.from_pretrained(model_id, use_auth_token=settings.HUGGINGFACE_TOKEN,
+                                                cache_dir=settings.DIARIZER_CACHE_DIR,
+                                                device=getattr(settings, "FS_EEND_DEVICE", "cuda"))
+                ann = eend(str(_wav))
+
+            refined: List[Dict[str, Any]] = []
+            for s, _, spk in ann.itertracks(yield_label=True):
+                refined.append({"start": float(s.start), "end": float(s.end), "speaker": spk})
+            refined.sort(key=lambda x: x["start"])
+
+            # Простая стратегия: если FS-EEND дал большее число одновременных говорящих
+            # на существенной доле времени — используем его; иначе остаёмся на исходном.
+            def _overlap_score(items: List[Dict[str, Any]]) -> float:
+                # измерим долю времени, где активны >=2 говорящих
+                # грубая оценка по дискретизации 20 Гц
+                if not items:
+                    return 0.0
+                step = 0.05
+                t0 = min(x["start"] for x in items)
+                t1 = max(x["end"] for x in items)
+                pts = int((t1 - t0) / step) + 1
+                cnt2 = 0
+                for i in range(pts):
+                    t = t0 + i * step
+                    active = sum(1 for x in items if x["start"] <= t < x["end"])
+                    if active >= 2:
+                        cnt2 += 1
+                return cnt2 / max(1, pts)
+
+            base_ovl = _overlap_score(_raw)
+            eend_ovl = _overlap_score(refined)
+            logger.info(f"[{upload_id}] FS-EEND overlap score: base={base_ovl:.3f}, eend={eend_ovl:.3f}")
+
+            # если eend раскрывает перекрытия лучше — берём его
+            if eend_ovl > base_ovl + 0.05:
+                logger.info(f"[{upload_id}] FS-EEND accepted")
+                return refined
+            logger.info(f"[{upload_id}] FS-EEND rejected (kept base diarization)")
+            return _raw
+
+        except Exception as e:
+            logger.warning(f"[{upload_id}] FS-EEND refinement failed: {e}")
+            return _raw
+
+    raw = _refine_with_fs_eend(raw, wav)
+
+    # ---------- Light post-processing to stabilize segments ----------
+    # 1) drop ultra-short blips (<0.20s)
+    MIN_SEG = float(getattr(settings, "DIARIZATION_MIN_SEGMENT_S", 0.20))
+    filtered = [s for s in raw if s["end"] - s["start"] >= MIN_SEG]
+    dropped = len(raw) - len(filtered)
+    if dropped:
+        logger.info(f"[{upload_id}] dropped {dropped} ultra-short segments (<{MIN_SEG:.2f}s)")
+    raw = filtered
+
+    # 2) merge same-speaker segments with tiny gaps (<0.20s)
+    GAP_MERGE = float(getattr(settings, "DIARIZATION_MERGE_GAP_S", 0.20))
+    raw.sort(key=lambda x: (x["speaker"], x["start"]))
+    merged: List[Dict[str, Any]] = []
+    cur = None
+    for seg in sorted(raw, key=lambda x: x["start"]):
+        if cur and cur["speaker"] == seg["speaker"] and seg["start"] - cur["end"] <= GAP_MERGE:
+            cur["end"] = max(cur["end"], seg["end"])
+        else:
+            if cur:
+                merged.append(cur)
+            cur = dict(seg)
+    if cur:
+        merged.append(cur)
+    raw = merged
+
+    # 3) final sort
+    raw.sort(key=lambda x: x["start"])
+
+    # ---------- Optional stitching (works best with chunking) ----------
     if SPEAKER_STITCH_ENABLED and using_chunking:
         raw = stitch_speakers(raw, wav, upload_id)
     else:
         logger.debug(f"[{upload_id}] skipping speaker stitching (using_chunking={using_chunking})")
 
-    diar_sentences = []
-    buf = None
+    # ---------- Collapse contiguous same-speaker segments ----------
+    diar_sentences: List[Dict[str, Any]] = []
+    buf: Optional[Dict[str, Any]] = None
     for seg in raw:
-        if buf and buf["speaker"] == seg["speaker"] and seg["start"] - buf["end"] < 0.1:
+        if buf and buf["speaker"] == seg["speaker"] and (seg["start"] - buf["end"]) < 0.10:
             buf["end"] = seg["end"]
         else:
             if buf:
@@ -720,17 +1014,30 @@ def diarize_full(self, upload_id, correlation_id):
     if buf:
         diar_sentences.append(buf)
 
+    # ---------- Save results ----------
     out = Path(settings.RESULTS_FOLDER) / upload_id
     out.mkdir(parents=True, exist_ok=True)
     (out / "diarization.json").write_text(json.dumps(diar_sentences, ensure_ascii=False, indent=2))
-    logger.info(f"[{upload_id}] diarization_done, total segments: {len(diar_sentences)}")
-    try:
-        import torch
-        logger.info(f"[{upload_id}] GPU memory reserved after diarization: {torch.cuda.memory_reserved() if torch.cuda.is_available() else 'n/a'}")
-    except ImportError:
-        pass
-    r.publish(f"progress:{upload_id}", json.dumps({"status": "diarization_done", "segments": len(diar_sentences)}))
+
+    speakers = sorted({seg["speaker"] for seg in diar_sentences if seg.get("speaker") is not None})
+    logger.info(
+        f"[{upload_id}] diarization_done, total segments: {len(diar_sentences)}, "
+        f"speakers_detected={len(speakers)}"
+    )
+    if torch and torch.cuda.is_available():
+        logger.info(f"[{upload_id}] GPU memory reserved after diarization: {torch.cuda.memory_reserved()}")
+
+    r.publish(
+        f"progress:{upload_id}",
+        json.dumps({
+            "status": "diarization_done",
+            "segments": len(diar_sentences),
+            "speakers": len(speakers),
+            "total_chunks": total_chunks
+        })
+    )
     deliver_webhook.delay("diarization_completed", upload_id, {"diarization": diar_sentences})
+
 
 @app.task(
     bind=True,
@@ -769,6 +1076,7 @@ def deliver_webhook(self, event_type: str, upload_id: str, data: Optional[Any]):
     except Exception as exc:
         logger.warning(f"[WEBHOOK] {event_type} error for {upload_id}, retrying: {exc}")
         raise self.retry(exc=exc)
+
 
 @app.task(bind=True, queue="transcribe_cpu")
 def cleanup_old_files(self):
