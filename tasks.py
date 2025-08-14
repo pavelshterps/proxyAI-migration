@@ -142,33 +142,109 @@ def _ffmpeg_filter_chain() -> str:
         chain.append(f"loudnorm={AUDIO_LOUDNORM}")
     return ",".join(chain)
 
-def prepare_wav(upload_id: str) -> Tuple[Path, float]:
+def prepare_wav(upload_id: str) -> (Path, float):
     """
-    Готовим wav 16k mono PCM с мягкой очисткой:
-    highpass -> afftdn -> loudnorm. Всегда перекодируем в целевой файл.
+    Готовит / нормализует WAV 16kHz mono PCM.
+    Безопасно обрабатывает случай, когда вход уже .wav (не пишет "поверх").
+    Пробует мягкий денойз+highpass+loudnorm, при неудаче — plain ресемпл.
     """
+    # исходник (любое расширение)
     src = next(Path(settings.UPLOAD_FOLDER).glob(f"{upload_id}.*"))
     target = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
-    info = probe_audio(src)
-    duration = info["duration"]
+    tmp_out = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.tmp.wav"
 
-    # всегда прогоняем через фильтры и приводим к нужному формату
-    af = _ffmpeg_filter_chain()
+    info = probe_audio(src)
+    duration = float(info.get("duration", 0.0) or 0.0)
+
+    # если уже готовый wav 16k mono pcm — просто убедимся в названии
+    if (
+        src.suffix.lower() == ".wav"
+        and info.get("codec_name") == "pcm_s16le"
+        and int(info.get("sample_rate", 0)) == 16000
+        and int(info.get("channels", 0)) == 1
+    ):
+        if src != target:
+            # переименуем в целевое имя
+            src.rename(target)
+        return target, duration
+
+    # Готовим входной путь для ffmpeg
+    in_path = str(src)
+
+    # Всегда пишем во временный файл (никогда не пишем поверх входа)
+    if tmp_out.exists():
+        try:
+            tmp_out.unlink()
+        except Exception:
+            pass
+
+    # Попытка 1: фильтры (мягкие)
+    # highpass режет гул/низ, afftdn — частотный денойз,
+    # loudnorm — нормализация громкости (однопроходный режим).
+    filters = "highpass=f=120,afftdn=nr=12,loudnorm=I=-23:TP=-2:LRA=11"
+    ffmpeg_base = [
+        "ffmpeg", "-y",
+        "-threads", str(settings.FFMPEG_THREADS),
+        "-hide_banner", "-nostdin",
+        "-i", in_path,
+        "-vn",  # только аудио
+    ]
+
     try:
-        subprocess.run([
-            "ffmpeg", "-y", "-threads", str(settings.FFMPEG_THREADS),
-            "-i", str(src),
-            "-af", af,
-            "-acodec", "pcm_s16le", "-ac", "1", "-ar", "16000", str(target),
-        ], check=True, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
-        logger.info(f"[{upload_id}] audio preproc applied: -af \"{af}\" → mono/16k/pcm_s16le")
+        cmd = ffmpeg_base + [
+            "-af", filters,
+            "-acodec", "pcm_s16le", "-ac", "1", "-ar", "16000",
+            str(tmp_out),
+        ]
+        res = subprocess.run(
+            cmd,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        logger.info(f"[{upload_id}] ffmpeg filtered OK")
     except subprocess.CalledProcessError as e:
-        logger.warning(f"[{upload_id}] ffmpeg filters failed ({e}). Falling back to plain resample.")
-        subprocess.run([
-            "ffmpeg", "-y", "-threads", str(settings.FFMPEG_THREADS),
-            "-i", str(src),
-            "-acodec", "pcm_s16le", "-ac", "1", "-ar", "16000", str(target),
-        ], check=True, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+        logger.warning(
+            f"[{upload_id}] ffmpeg filters failed ({e}). "
+            f"stderr: {e.stderr[:5000] if e.stderr else 'no-stderr'}. "
+            f"Falling back to plain resample."
+        )
+        # Попытка 2: чистая перекодировка без фильтров
+        try:
+            cmd2 = ffmpeg_base + [
+                "-acodec", "pcm_s16le", "-ac", "1", "-ar", "16000",
+                str(tmp_out),
+            ]
+            res2 = subprocess.run(
+                cmd2,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            logger.info(f"[{upload_id}] ffmpeg plain resample OK")
+        except subprocess.CalledProcessError as e2:
+            logger.error(
+                f"[{upload_id}] ffmpeg plain resample failed. "
+                f"stderr: {e2.stderr[:5000] if e2.stderr else 'no-stderr'}"
+            )
+            raise
+
+    # Атомарно заменим целевой файл
+    try:
+        if target.exists():
+            target.unlink()
+    except Exception:
+        pass
+    tmp_out.replace(target)
+
+    # Обновим длительность после перекодировки (по желанию можно не делать)
+    try:
+        info2 = probe_audio(target)
+        duration = float(info2.get("duration", duration) or duration)
+    except Exception:
+        pass
 
     return target, duration
 
