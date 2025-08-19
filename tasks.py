@@ -367,6 +367,10 @@ def get_whisper_model(model_override: str = None):
     return _whisper_model
 
 def get_diarization_pipeline():
+    """
+    Загружаем pyannote Pipeline и, если возможно, отправляем на GPU через .to("cuda").
+    Важно: у from_pretrained НЕТ параметра device — перенос делается .to(...).
+    """
     global _diarization_pipeline
     if _diarization_pipeline is None:
         model_id = getattr(settings, "PYANNOTE_PIPELINE", "pyannote/speaker-diarization-3.1")
@@ -375,7 +379,16 @@ def get_diarization_pipeline():
             use_auth_token=settings.HUGGINGFACE_TOKEN,
             cache_dir=settings.DIARIZER_CACHE_DIR,
         )
-        logger.info(f"[DIARIZE] loaded pipeline {model_id}")
+        # Перевод на нужное устройство (если указано и доступно)
+        try:
+            import torch
+            target = getattr(settings, "DIARIZER_DEVICE", None)  # "cuda" | "cpu" | "mps"
+            if target is None:
+                target = "cuda" if torch.cuda.is_available() else "cpu"
+            _diarization_pipeline.to(target)
+            logger.info(f"[DIARIZE] loaded pipeline {model_id} and moved to device={target}")
+        except Exception as e:
+            logger.warning(f"[DIARIZE] could not move pipeline to device: {e}")
     return _diarization_pipeline
 
 def get_speaker_embedding_model():
@@ -395,6 +408,12 @@ def get_speaker_embedding_model():
     return _speaker_embedding_model
 
 def stitch_speakers(raw: List[Dict[str, Any]], wav: Path, upload_id: str) -> List[Dict[str, Any]]:
+    """
+    Ускоренная склейка спикеров между чанками:
+    - считаем эмбеддинг не для каждого сегмента (сэмплирование),
+    - используем центральное окно фиксированной длины для эмбеддинга,
+    - поддерживаем mapping исходной метки (pyannote) → канонической без повторного эмбеддинга.
+    """
     if not SPEAKER_STITCH_ENABLED:
         return raw
 
@@ -402,6 +421,12 @@ def stitch_speakers(raw: List[Dict[str, Any]], wav: Path, upload_id: str) -> Lis
     if len(unique_orig) <= 1:
         logger.debug(f"[{upload_id}] only one original speaker {unique_orig}, skipping stitching")
         return raw
+
+    # --- параметры (можно вынести в settings) ---
+    MIN_SEG_FOR_EMB = float(getattr(settings, "STITCH_MIN_SEG_FOR_EMB_S", 1.2))  # считать эмбеддинг, если сегмент >= 1.2 s
+    EMB_EVERY_N = int(getattr(settings, "STITCH_EMB_EVERY_N", 2))               # эмбеддим каждый N-й сегмент
+    EMB_WINDOW_S = float(getattr(settings, "STITCH_EMB_WINDOW_S", 2.4))         # длина окна для эмбеддинга
+    MAX_EMB_PER_ORIG = int(getattr(settings, "STITCH_MAX_EMB_PER_ORIG", 2000))  # safeguard
 
     try:
         import torch
@@ -417,41 +442,98 @@ def stitch_speakers(raw: List[Dict[str, Any]], wav: Path, upload_id: str) -> Lis
             waveform = resampler(waveform)
             sr = 16000
 
+        # моно
+        if waveform.size(0) > 1:
+            waveform = waveform.mean(dim=0, keepdim=True)
+
+        # хранение центроидов и истории
         stitch_centroids: Dict[str, torch.Tensor] = {}
         stitch_histories: Dict[str, List[torch.Tensor]] = {}
-        next_label_idx = 0
+        # map из "исходная метка pyannote" → "каноническая"
+        orig2canon: Dict[str, str] = {}
+        # счетчик эмбеддингов на исходную метку (safeguard)
+        orig_emb_count: Dict[str, int] = {}
 
+        next_label_idx = 0
         def new_canonical_label():
             nonlocal next_label_idx
             label = f"spk_{next_label_idx}"
             next_label_idx += 1
             return label
 
-        stitched: List[Dict[str, Any]] = []
-        raw_sorted = sorted(raw, key=lambda x: x["start"])
-        for seg in raw_sorted:
-            start, end = seg["start"], seg["end"]
-            if end <= start:
-                stitched.append(seg)
-                continue
-            start_sample = int(start * sr)
-            end_sample = int(end * sr)
-            if end_sample <= start_sample or start_sample >= waveform.size(1):
-                stitched.append(seg)
-                continue
-            segment_waveform = waveform[:, start_sample:end_sample]
-            if segment_waveform.numel() == 0:
-                stitched.append(seg)
-                continue
-            if segment_waveform.size(0) > 1:
-                segment_waveform = segment_waveform.mean(dim=0, keepdim=True)
+        def _segment_crop_center(start: float, end: float) -> torch.Tensor:
+            """Возвращает центральное окно фиксированной длительности для эмбеддинга."""
+            dur = end - start
+            if dur <= 0:
+                return waveform[:, 0:0]
+            win = EMB_WINDOW_S if dur >= EMB_WINDOW_S else dur
+            mid = (start + end) * 0.5
+            s = max(0.0, mid - win * 0.5)
+            e = min(float(waveform.size(1) / sr), mid + win * 0.5)
+            start_sample = int(s * sr)
+            end_sample = int(e * sr)
+            if end_sample <= start_sample:
+                end_sample = min(start_sample + int(0.2 * sr), waveform.size(1))
+            return waveform[:, start_sample:end_sample]
+
+        def _embed(wav_chunk: torch.Tensor) -> Optional[torch.Tensor]:
+            if wav_chunk.numel() == 0:
+                return None
             with torch.no_grad():
-                emb = model.encode_batch(segment_waveform)
+                emb = model.encode_batch(wav_chunk)  # [1, D] или [D]
             emb = emb.squeeze()
             if emb.ndim > 1:
                 emb = emb.flatten()
             emb = F.normalize(emb, p=2, dim=0)
+            return emb
 
+        stitched: List[Dict[str, Any]] = []
+        raw_sorted = sorted(raw, key=lambda x: x["start"])
+
+        for idx, seg in enumerate(raw_sorted):
+            start, end = float(seg["start"]), float(seg["end"])
+            if end <= start:
+                stitched.append(seg)
+                continue
+
+            orig_label = seg.get("speaker")
+            seg_dur = end - start
+
+            # Если у этой исходной метки уже есть каноническая — можно проставить её без эмбеддинга
+            fast_mapped = False
+            if orig_label in orig2canon and (idx % EMB_EVERY_N != 0 or seg_dur < MIN_SEG_FOR_EMB):
+                seg["speaker"] = orig2canon[orig_label]
+                stitched.append(seg)
+                fast_mapped = True
+
+            if fast_mapped:
+                continue
+
+            # Safeguard: ограничим число эмбеддингов на одну исходную метку
+            if orig_label is not None:
+                cnt = orig_emb_count.get(orig_label, 0)
+                if cnt >= MAX_EMB_PER_ORIG and orig_label in orig2canon:
+                    seg["speaker"] = orig2canon[orig_label]
+                    stitched.append(seg)
+                    continue
+
+            # Кусок для эмбеддинга (центральное окно)
+            chunk = _segment_crop_center(start, end)
+            if chunk.numel() == 0:
+                # не удалось — если есть маппинг, используем его
+                if orig_label in orig2canon:
+                    seg["speaker"] = orig2canon[orig_label]
+                stitched.append(seg)
+                continue
+
+            emb = _embed(chunk)
+            if emb is None:
+                if orig_label in orig2canon:
+                    seg["speaker"] = orig2canon[orig_label]
+                stitched.append(seg)
+                continue
+
+            # Поиск ближайшего канонического центроида
             assigned_label = None
             best_sim = -1.0
             for canon_label, centroid in stitch_centroids.items():
@@ -460,30 +542,35 @@ def stitch_speakers(raw: List[Dict[str, Any]], wav: Path, upload_id: str) -> Lis
                     best_sim = sim
                     assigned_label = canon_label
 
+            # Решение: присоединяемся к существующему центроиду или создаём новый
             if assigned_label is not None and best_sim >= SPEAKER_STITCH_THRESHOLD:
                 old_centroid = stitch_centroids[assigned_label]
-                updated_centroid = F.normalize(
+                updated_centroid = torch.nn.functional.normalize(
                     SPEAKER_STITCH_EMA_ALPHA * emb + (1 - SPEAKER_STITCH_EMA_ALPHA) * old_centroid, p=2, dim=0
                 )
                 stitch_centroids[assigned_label] = updated_centroid
-                hist = stitch_histories[assigned_label]
+                hist = stitch_histories.setdefault(assigned_label, [])
                 hist.append(emb)
                 if len(hist) > SPEAKER_STITCH_POOL_SIZE:
                     hist.pop(0)
-                logger.debug(f"[{upload_id}] reused speaker {assigned_label} (sim={best_sim:.3f})")
             else:
                 assigned_label = new_canonical_label()
                 stitch_centroids[assigned_label] = emb
                 stitch_histories[assigned_label] = [emb]
-                logger.debug(f"[{upload_id}] created new speaker label {assigned_label}")
 
+            # Проставляем метку сегменту и запоминаем mapping для этой исходной метки
             seg["speaker"] = assigned_label
             stitched.append(seg)
 
+            if orig_label is not None:
+                orig2canon[orig_label] = assigned_label
+                orig_emb_count[orig_label] = orig_emb_count.get(orig_label, 0) + 1
+
+        # --- финальный merge похожих канонических центроидов (как раньше) ---
         label_centroids: Dict[str, torch.Tensor] = {}
         for label, hist in stitch_histories.items():
             centroid = torch.stack(hist).mean(dim=0)
-            centroid = F.normalize(centroid, p=2, dim=0)
+            centroid = torch.nn.functional.normalize(centroid, p=2, dim=0)
             label_centroids[label] = centroid
 
         adj: Dict[str, set] = {label: set() for label in label_centroids}
@@ -498,11 +585,13 @@ def stitch_speakers(raw: List[Dict[str, Any]], wav: Path, upload_id: str) -> Lis
 
         visited, merge_map = set(), {}
         for label in adj:
-            if label in visited: continue
+            if label in visited:
+                continue
             stack, component = [label], []
             while stack:
                 l = stack.pop()
-                if l in visited: continue
+                if l in visited:
+                    continue
                 visited.add(l)
                 component.append(l)
                 stack.extend(adj[l] - visited)
@@ -517,10 +606,10 @@ def stitch_speakers(raw: List[Dict[str, Any]], wav: Path, upload_id: str) -> Lis
                 if old in merge_map:
                     new = merge_map[old]
                     if new != old:
-                        logger.debug(f"[{upload_id}] merged speaker {old} -> {new} based on centroid similarity")
                         seg["speaker"] = new
 
         return stitched
+
     except Exception as e:
         logger.warning(f"[{upload_id}] speaker stitching failed, falling back to original diarization labels: {e}")
         return raw
@@ -874,18 +963,15 @@ def diarize_full(self, upload_id, correlation_id):
         chunk_idx = 0
         while offset < duration:
             this_len = min(chunk_limit, duration - offset)
-            # compute left/right pad inside available audio range
             left_pad = pad if offset > 0 else 0.0
             right_pad = pad if (offset + this_len) < duration else 0.0
 
-            # already done?
             if chunk_idx in processed:
                 logger.info(f"[{upload_id}] skip diarize chunk {chunk_idx+1}/{total_chunks}")
                 offset += this_len
                 chunk_idx += 1
                 continue
 
-            # ---- start log for chunk
             log_start = max(0.0, offset - left_pad)
             log_end = min(duration, offset + this_len + right_pad)
             logger.info(
@@ -893,7 +979,6 @@ def diarize_full(self, upload_id, correlation_id):
                 f"{log_start:.1f}s→{log_end:.1f}s (core {offset:.1f}s→{offset+this_len:.1f}s, pad L={left_pad:.1f}s R={right_pad:.1f}s)"
             )
 
-            # cut chunk to temp wav (with pads around)
             tmp = Path(settings.DIARIZER_CACHE_DIR) / f"{upload_id}_chunk_{chunk_idx}.wav"
             subprocess.run(
                 [
@@ -908,7 +993,6 @@ def diarize_full(self, upload_id, correlation_id):
             )
 
             try:
-                # inference w/o grads to reduce mem
                 if torch:
                     with torch.inference_mode():
                         ann = pipeline(str(tmp), **infer_kwargs)
@@ -916,12 +1000,10 @@ def diarize_full(self, upload_id, correlation_id):
                     ann = pipeline(str(tmp), **infer_kwargs)
 
                 before = len(raw)
-                # Convert local chunk timeline to global timeline via log_start (start of file cut)
                 for s, _, spk in ann.itertracks(yield_label=True):
                     g_start = float(s.start) + log_start
                     g_end = float(s.end) + log_start
-                    # Optionally trim to core region (avoid double counting overlap from pads)
-                    # keep only parts that intersect [offset, offset+this_len]
+                    # держим только пересечение с «ядром» чанка
                     if g_end <= offset or g_start >= (offset + this_len):
                         continue
                     g_start = max(g_start, offset)
@@ -936,7 +1018,6 @@ def diarize_full(self, upload_id, correlation_id):
             except Exception as e:
                 logger.error(f"[{upload_id}] error in diarize chunk {chunk_idx+1}/{total_chunks}: {e}", exc_info=True)
             finally:
-                # cleanup temp + memory between chunks
                 try:
                     tmp.unlink(missing_ok=True)
                 except Exception:
@@ -963,7 +1044,6 @@ def diarize_full(self, upload_id, correlation_id):
             ann = pipeline(str(wav), **infer_kwargs)
         for s, _, spk in ann.itertracks(yield_label=True):
             raw.append({"start": float(s.start), "end": float(s.end), "speaker": spk})
-        # cleanup
         try:
             del ann
         except Exception:
@@ -974,7 +1054,7 @@ def diarize_full(self, upload_id, correlation_id):
 
     raw.sort(key=lambda x: x["start"])
 
-    # ---------- Optional FS-EEND refinement (safe no-op if disabled/missing) ----------
+    # ---------- FS-EEND refinement (исправлено: без device=..., используем .to(...)) ----------
     def _refine_with_fs_eend(_raw: List[Dict[str, Any]], _wav: Path) -> List[Dict[str, Any]]:
         try:
             if not bool(getattr(settings, "USE_FS_EEND", False)):
@@ -986,20 +1066,28 @@ def diarize_full(self, upload_id, correlation_id):
                 logger.info(f"[{upload_id}] FS-EEND path not set → skipping refinement")
                 return _raw
 
-            # NOTE: реальный FS-EEND пайплайн может отличаться в вашей среде.
-            # Оставляем безопасную попытку через pyannote Pipeline, чтобы не ломать рантайм.
-            from pyannote.audio import Pipeline as _TmpPipe  # uses same lib already in image
+            from pyannote.audio import Pipeline as _TmpPipe
             logger.info(f"[{upload_id}] FS-EEND refinement started with {model_id}")
+
+            # загружаем и переводим на девайс корректно
+            eend = _TmpPipe.from_pretrained(
+                model_id,
+                use_auth_token=settings.HUGGINGFACE_TOKEN,
+                cache_dir=settings.DIARIZER_CACHE_DIR,
+            )
+            try:
+                import torch as _t
+                device = getattr(settings, "FS_EEND_DEVICE", None)
+                if device is None:
+                    device = "cuda" if _t.cuda.is_available() else "cpu"
+                eend.to(device)
+            except Exception as e:
+                logger.warning(f"[{upload_id}] FS-EEND .to(device) failed, staying on CPU: {e}")
+
             if torch:
                 with torch.inference_mode():
-                    eend = _TmpPipe.from_pretrained(model_id, use_auth_token=settings.HUGGINGFACE_TOKEN,
-                                                    cache_dir=settings.DIARIZER_CACHE_DIR,
-                                                    device=getattr(settings, "FS_EEND_DEVICE", "cuda"))
                     ann = eend(str(_wav))
             else:
-                eend = _TmpPipe.from_pretrained(model_id, use_auth_token=settings.HUGGINGFACE_TOKEN,
-                                                cache_dir=settings.DIARIZER_CACHE_DIR,
-                                                device=getattr(settings, "FS_EEND_DEVICE", "cuda"))
                 ann = eend(str(_wav))
 
             refined: List[Dict[str, Any]] = []
@@ -1007,11 +1095,8 @@ def diarize_full(self, upload_id, correlation_id):
                 refined.append({"start": float(s.start), "end": float(s.end), "speaker": spk})
             refined.sort(key=lambda x: x["start"])
 
-            # Простая стратегия: если FS-EEND дал большее число одновременных говорящих
-            # на существенной доле времени — используем его; иначе остаёмся на исходном.
+            # сравним, действительно ли стало лучше по перекрытиям
             def _overlap_score(items: List[Dict[str, Any]]) -> float:
-                # измерим долю времени, где активны >=2 говорящих
-                # грубая оценка по дискретизации 20 Гц
                 if not items:
                     return 0.0
                 step = 0.05
@@ -1030,12 +1115,7 @@ def diarize_full(self, upload_id, correlation_id):
             eend_ovl = _overlap_score(refined)
             logger.info(f"[{upload_id}] FS-EEND overlap score: base={base_ovl:.3f}, eend={eend_ovl:.3f}")
 
-            # если eend раскрывает перекрытия лучше — берём его
-            if eend_ovl > base_ovl + 0.05:
-                logger.info(f"[{upload_id}] FS-EEND accepted")
-                return refined
-            logger.info(f"[{upload_id}] FS-EEND rejected (kept base diarization)")
-            return _raw
+            return refined if eend_ovl > base_ovl + 0.05 else _raw
 
         except Exception as e:
             logger.warning(f"[{upload_id}] FS-EEND refinement failed: {e}")
@@ -1043,22 +1123,22 @@ def diarize_full(self, upload_id, correlation_id):
 
     raw = _refine_with_fs_eend(raw, wav)
 
-    # ---------- Light post-processing to stabilize segments ----------
-    # 1) drop ultra-short blips (<0.20s)
+    # ---------- Stabilization pipeline ----------
+    # 1) drop ultra-short blips (< MIN_SEG)
     MIN_SEG = float(getattr(settings, "DIARIZATION_MIN_SEGMENT_S", 0.20))
-    filtered = [s for s in raw if s["end"] - s["start"] >= MIN_SEG]
+    filtered = [s for s in raw if (s["end"] - s["start"]) >= MIN_SEG]
     dropped = len(raw) - len(filtered)
     if dropped:
         logger.info(f"[{upload_id}] dropped {dropped} ultra-short segments (<{MIN_SEG:.2f}s)")
     raw = filtered
 
-    # 2) merge same-speaker segments with tiny gaps (<0.20s)
+    # 2) merge same-speaker segments with tiny gaps (<= GAP_MERGE)
     GAP_MERGE = float(getattr(settings, "DIARIZATION_MERGE_GAP_S", 0.20))
-    raw.sort(key=lambda x: (x["speaker"], x["start"]))
+    raw.sort(key=lambda x: x["start"])
     merged: List[Dict[str, Any]] = []
     cur = None
-    for seg in sorted(raw, key=lambda x: x["start"]):
-        if cur and cur["speaker"] == seg["speaker"] and seg["start"] - cur["end"] <= GAP_MERGE:
+    for seg in raw:
+        if cur and cur["speaker"] == seg["speaker"] and (seg["start"] - cur["end"]) <= GAP_MERGE:
             cur["end"] = max(cur["end"], seg["end"])
         else:
             if cur:
@@ -1068,16 +1148,40 @@ def diarize_full(self, upload_id, correlation_id):
         merged.append(cur)
     raw = merged
 
-    # 3) final sort
-    raw.sort(key=lambda x: x["start"])
+    # 3) anti-flip: если крошечный «островок» другого спикера окружён одним и тем же соседом — поглощаем
+    def _stabilize_labels(segments: List[Dict[str, Any]],
+                          island_max: float = float(getattr(settings, "DIARIZATION_ISLAND_MAX_S", 0.60))) -> List[Dict[str, Any]]:
+        if len(segments) < 3:
+            return segments
+        out: List[Dict[str, Any]] = []
+        i = 0
+        while i < len(segments):
+            if 0 < i < len(segments) - 1:
+                prev, cur, nxt = segments[i - 1], segments[i], segments[i + 1]
+                cur_dur = cur["end"] - cur["start"]
+                # тот же спикер по бокам и «островок» короткий -> поглощаем
+                if prev["speaker"] == nxt["speaker"] != cur["speaker"] and cur_dur <= island_max:
+                    # расширяем соседа
+                    prev["end"] = nxt["end"] = max(prev["end"], nxt["end"])
+                    # выкидываем текущий, сливаем prev и nxt
+                    merged_prev = {"start": prev["start"], "end": nxt["end"], "speaker": prev["speaker"]}
+                    out.pop() if out else None  # убрать прежний prev из out
+                    out.append(merged_prev)
+                    i += 2  # перескочить через nxt
+                    continue
+            out.append(segments[i])
+            i += 1
+        return out
 
-    # ---------- Optional stitching (works best with chunking) ----------
+    raw = _stabilize_labels(raw)
+
+    # 4) Optional stitching across chunks
     if SPEAKER_STITCH_ENABLED and using_chunking:
         raw = stitch_speakers(raw, wav, upload_id)
     else:
         logger.debug(f"[{upload_id}] skipping speaker stitching (using_chunking={using_chunking})")
 
-    # ---------- Collapse contiguous same-speaker segments ----------
+    # 5) collapse contiguous same-speaker segments (последняя уборка)
     diar_sentences: List[Dict[str, Any]] = []
     buf: Optional[Dict[str, Any]] = None
     for seg in raw:
@@ -1090,7 +1194,7 @@ def diarize_full(self, upload_id, correlation_id):
     if buf:
         diar_sentences.append(buf)
 
-    # ---------- Save results ----------
+    # --- save ---
     out = Path(settings.RESULTS_FOLDER) / upload_id
     out.mkdir(parents=True, exist_ok=True)
     (out / "diarization.json").write_text(json.dumps(diar_sentences, ensure_ascii=False, indent=2))
@@ -1113,7 +1217,6 @@ def diarize_full(self, upload_id, correlation_id):
         })
     )
     deliver_webhook.delay("diarization_completed", upload_id, {"diarization": diar_sentences})
-
 
 @app.task(
     bind=True,
