@@ -4,10 +4,13 @@ import subprocess
 import time
 import re
 import math
+import os
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional, List, Dict, Tuple
 
+import warnings
+import logging as _logging
 import requests
 from redis import Redis
 from celery.signals import worker_process_init
@@ -25,6 +28,13 @@ formatter = logging.Formatter(
 handler.setFormatter(formatter)
 logger.addHandler(handler)
 logger.setLevel(logging.INFO)
+
+# скрыть массивные DeprecationWarning от torchaudio/Lightning
+warnings.filterwarnings("ignore", message=".*torchaudio._backend.list_audio_backends has been deprecated.*")
+warnings.filterwarnings("ignore", message=".*torch.cuda.amp.custom_fwd.*deprecated.*")
+# можно понизить болтливость Lightning
+_logging.getLogger("lightning.pytorch.utilities.upgrade_checkpoint").setLevel(_logging.ERROR)
+_logging.getLogger("pytorch_lightning.utilities.upgrade_checkpoint").setLevel(_logging.ERROR)
 
 # --- Model availability flags & holders ---
 _HF_AVAILABLE = False
@@ -130,25 +140,53 @@ def probe_audio(src: Path) -> dict:
         pass
     return info
 
-# --- audio cleanup parameters (can be overridden in env via settings if добавишь позже) ---
+# === audio filters: управляем шумодавом/нормализацией/гейном через settings ===
+
+AUDIO_ENABLE_HIGHPASS = bool(getattr(settings, "AUDIO_ENABLE_HIGHPASS", False))
 AUDIO_HP_F = int(getattr(settings, "AUDIO_HP_F", 120))  # Hz
-AUDIO_AFFTDN_NR = int(getattr(settings, "AUDIO_AFFTDN_NR", 12))  # 6..24 мягко
-AUDIO_USE_LOUDNORM = bool(getattr(settings, "AUDIO_USE_LOUDNORM", True))
-AUDIO_LOUDNORM = getattr(settings, "AUDIO_LOUDNORM", "I=-23:TP=-2:LRA=11")  # broadcast-ish
+
+AUDIO_ENABLE_DENOISE = bool(getattr(settings, "AUDIO_ENABLE_DENOISE", True))
+# afftdn сила подавления шума: 0..64 (в ffmpeg), 6..24 — мягко; повышай для сильнее
+AUDIO_AFFTDN_NR = int(getattr(settings, "AUDIO_AFFTDN_NR", 6))
+
+AUDIO_ENABLE_LOUDNORM = bool(getattr(settings, "AUDIO_ENABLE_LOUDNORM", True))
+# Параметры EBU R128 loudnorm
+AUDIO_LOUDNORM = getattr(settings, "AUDIO_LOUDNORM", "I=-23:TP=-2:LRA=11")
+
+# Доп. вариант: чистый гейн без нормализации/шумодава (для экспериментов)
+AUDIO_ENABLE_GAIN = bool(getattr(settings, "AUDIO_ENABLE_GAIN", False))
+AUDIO_GAIN_DB = float(getattr(settings, "AUDIO_GAIN_DB", 6.0))  # +6 dB по умолчанию
+
 
 def _ffmpeg_filter_chain() -> str:
-    chain = [f"highpass=f={AUDIO_HP_F}", f"afftdn=nr={AUDIO_AFFTDN_NR}"]
-    if AUDIO_USE_LOUDNORM:
+    """
+    Собираем -af фильтры динамически по флагам settings:
+      - AUDIO_ENABLE_HIGHPASS (highpass=f=...)
+      - AUDIO_ENABLE_DENOISE (afftdn=nr=...)
+      - AUDIO_ENABLE_LOUDNORM (loudnorm=...)
+      - AUDIO_ENABLE_GAIN (volume=...dB) — обычно ВМЕСТО loudnorm, но можем и вместе.
+    """
+    chain = []
+    if AUDIO_ENABLE_HIGHPASS:
+        chain.append(f"highpass=f={AUDIO_HP_F}")
+    if AUDIO_ENABLE_DENOISE:
+        chain.append(f"afftdn=nr={AUDIO_AFFTDN_NR}")
+    if AUDIO_ENABLE_LOUDNORM:
         chain.append(f"loudnorm={AUDIO_LOUDNORM}")
+    if AUDIO_ENABLE_GAIN:
+        chain.append(f"volume={AUDIO_GAIN_DB}dB")
     return ",".join(chain)
+
 
 def prepare_wav(upload_id: str) -> (Path, float):
     """
     Готовит / нормализует WAV 16kHz mono PCM.
-    Безопасно обрабатывает случай, когда вход уже .wav (не пишет "поверх").
-    Пробует мягкий денойз+highpass+loudnorm, при неудаче — plain ресемпл.
+    Экспериментальные режимы включаются флагами:
+      - AUDIO_ENABLE_HIGHPASS      (True/False)
+      - AUDIO_ENABLE_DENOISE       (True/False)
+      - AUDIO_ENABLE_LOUDNORM      (True/False)
+      - AUDIO_ENABLE_GAIN (+ AUDIO_GAIN_DB) — просто сделать громче.
     """
-    # исходник (любое расширение)
     src = next(Path(settings.UPLOAD_FOLDER).glob(f"{upload_id}.*"))
     target = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.wav"
     tmp_out = Path(settings.UPLOAD_FOLDER) / f"{upload_id}.tmp.wav"
@@ -156,7 +194,6 @@ def prepare_wav(upload_id: str) -> (Path, float):
     info = probe_audio(src)
     duration = float(info.get("duration", 0.0) or 0.0)
 
-    # если уже готовый wav 16k mono pcm — просто убедимся в названии
     if (
         src.suffix.lower() == ".wav"
         and info.get("codec_name") == "pcm_s16le"
@@ -164,59 +201,50 @@ def prepare_wav(upload_id: str) -> (Path, float):
         and int(info.get("channels", 0)) == 1
     ):
         if src != target:
-            # переименуем в целевое имя
             src.rename(target)
         return target, duration
 
-    # Готовим входной путь для ffmpeg
-    in_path = str(src)
-
-    # Всегда пишем во временный файл (никогда не пишем поверх входа)
     if tmp_out.exists():
         try:
             tmp_out.unlink()
         except Exception:
             pass
 
-    # Попытка 1: фильтры (мягкие)
-    # highpass режет гул/низ, afftdn — частотный денойз,
-    # loudnorm — нормализация громкости (однопроходный режим).
-    filters = "highpass=f=120,afftdn=nr=12,loudnorm=I=-23:TP=-2:LRA=11"
     ffmpeg_base = [
         "ffmpeg", "-y",
         "-threads", str(settings.FFMPEG_THREADS),
         "-hide_banner", "-nostdin",
-        "-i", in_path,
-        "-vn",  # только аудио
+        "-i", str(src),
+        "-vn",
     ]
 
+    # 1) Пытаемся с фильтрами из текущего профиля
+    filters = _ffmpeg_filter_chain()
     try:
-        cmd = ffmpeg_base + [
-            "-af", filters,
+        cmd = ffmpeg_base + (["-af", filters] if filters else []) + [
             "-acodec", "pcm_s16le", "-ac", "1", "-ar", "16000",
             str(tmp_out),
         ]
-        res = subprocess.run(
+        subprocess.run(
             cmd,
             check=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
         )
-        logger.info(f"[{upload_id}] ffmpeg filtered OK")
+        logger.info(f"[{upload_id}] ffmpeg OK with filters: {filters or '(none)'}")
     except subprocess.CalledProcessError as e:
         logger.warning(
-            f"[{upload_id}] ffmpeg filters failed ({e}). "
-            f"stderr: {e.stderr[:5000] if e.stderr else 'no-stderr'}. "
-            f"Falling back to plain resample."
+            f"[{upload_id}] ffmpeg with filters failed: {e}. "
+            f"stderr: {e.stderr[:3000] if e.stderr else 'no-stderr'}. Falling back to plain resample."
         )
-        # Попытка 2: чистая перекодировка без фильтров
+        # 2) fallback — без фильтров
         try:
             cmd2 = ffmpeg_base + [
                 "-acodec", "pcm_s16le", "-ac", "1", "-ar", "16000",
                 str(tmp_out),
             ]
-            res2 = subprocess.run(
+            subprocess.run(
                 cmd2,
                 check=True,
                 stdout=subprocess.PIPE,
@@ -227,11 +255,10 @@ def prepare_wav(upload_id: str) -> (Path, float):
         except subprocess.CalledProcessError as e2:
             logger.error(
                 f"[{upload_id}] ffmpeg plain resample failed. "
-                f"stderr: {e2.stderr[:5000] if e2.stderr else 'no-stderr'}"
+                f"stderr: {e2.stderr[:3000] if e2.stderr else 'no-stderr'}"
             )
             raise
 
-    # Атомарно заменим целевой файл
     try:
         if target.exists():
             target.unlink()
@@ -239,7 +266,6 @@ def prepare_wav(upload_id: str) -> (Path, float):
         pass
     tmp_out.replace(target)
 
-    # Обновим длительность после перекодировки (по желанию можно не делать)
     try:
         info2 = probe_audio(target)
         duration = float(info2.get("duration", duration) or duration)
@@ -259,7 +285,7 @@ def prepare_preview_segment(upload_id: str) -> subprocess.Popen:
     ], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
 
 def group_into_sentences(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    SILENCE_GAP_S = getattr(settings, "SENTENCE_MAX_GAP_S", 0.5)
+    SILENCE_GAP_S = getattr(settings, "SENTENCE_MAX_GAP_S", 0.35)
     MAX_WORDS = getattr(settings, "SENTENCE_MAX_WORDS", 50)
 
     sentences = []
@@ -368,8 +394,8 @@ def get_whisper_model(model_override: str = None):
 
 def get_diarization_pipeline():
     """
-    Загружаем pyannote Pipeline и, если возможно, отправляем на GPU через .to("cuda").
-    Важно: у from_pretrained НЕТ параметра device — перенос делается .to(...).
+    Загружаем pyannote Pipeline и переводим на нужное устройство через .to(...).
+    ВАЖНО: у Pipeline.from_pretrained НЕТ аргумента device — его передавать нельзя.
     """
     global _diarization_pipeline
     if _diarization_pipeline is None:
@@ -379,7 +405,6 @@ def get_diarization_pipeline():
             use_auth_token=settings.HUGGINGFACE_TOKEN,
             cache_dir=settings.DIARIZER_CACHE_DIR,
         )
-        # Перевод на нужное устройство (если указано и доступно)
         try:
             import torch
             target = getattr(settings, "DIARIZER_DEVICE", None)  # "cuda" | "cpu" | "mps"
@@ -614,13 +639,51 @@ def stitch_speakers(raw: List[Dict[str, Any]], wav: Path, upload_id: str) -> Lis
         logger.warning(f"[{upload_id}] speaker stitching failed, falling back to original diarization labels: {e}")
         return raw
 
+# + NEW: helper определяет, что этот процесс — "чистый" webhooks-воркер
+def _is_webhooks_worker() -> bool:
+    # стандартные имена env-переменных, через которые часто пробрасывают список очередей
+    q = (
+        os.environ.get("CELERY_QUEUES")
+        or os.environ.get("CELERY_WORKER_QUEUES")
+        or os.environ.get("CELERYD_QUEUES")
+    )
+    if q:
+        qs = [x.strip() for x in q.split(",") if x.strip()]
+        # считаем webhooks-воркером, если он слушает ТОЛЬКО webhooks
+        if qs and all(x == "webhooks" for x in qs):
+            return True
+
+    # запасной путь: явная роль из настроек, если используешь
+    role = str(getattr(settings, "WORKER_ROLE", "")).lower()
+    if role == "webhooks":
+        return True
+
+    # можно также распознать по имени воркера, если в нем есть "webhooks"
+    name = (os.environ.get("CELERY_WORKER_NAME") or os.environ.get("HOSTNAME") or "").lower()
+    if "webhooks" in name:
+        return True
+
+    return False
+
+# ️ было:
+# @worker_process_init.connect
+# def preload_on_startup(**kwargs):
+#     if _HF_AVAILABLE:
+#         get_whisper_model()
+#     if _PN_AVAILABLE:
+#         get_diarization_pipeline()
+
+#  стало:
 @worker_process_init.connect
 def preload_on_startup(**kwargs):
+    # важное условие: webhooks-воркеру не нужны модели и GPU
+    if _is_webhooks_worker():
+        logger.info("[PRELOAD] webhooks worker detected → skip model preload")
+        return
     if _HF_AVAILABLE:
         get_whisper_model()
     if _PN_AVAILABLE:
         get_diarization_pipeline()
-
 # ---------------------- Post-processing for diarization ----------------------
 
 def _merge_short_segments(segments: List[Dict[str, Any]],
@@ -791,7 +854,7 @@ def transcribe_segments(self, upload_id, correlation_id):
         heavy = 0
         for node_tasks in active.values():
             for t in node_tasks:
-                if t["name"] in ("tasks.diarize_full", "tasks.transcribe_segments") and t["name"] != "tasks.transcribe_segments":
+                if t["name"] in ("tasks.diarize_full", "tasks.transcribe_segments"):
                     heavy += 1
         if heavy >= 2 and self.request.delivery_info.get("routing_key") != "transcribe_cpu":
             logger.info(f"[{upload_id}] GPUs appear busy ({heavy} heavy tasks), rescheduling transcription to CPU")
@@ -893,13 +956,18 @@ def transcribe_segments(self, upload_id, correlation_id):
 
 @app.task(bind=True, queue="diarize_gpu")
 def diarize_full(self, upload_id, correlation_id):
+    """
+    Теперь поддерживает два режима:
+      - Обычный: pyannote (с чанкингом, стабилизацией и опциональным FS-EEND как рефайнмент).
+      - Только FS-EEND: если settings.USE_ONLY_FS_EEND=True (pyannote не используется вовсе).
+    Также исправлен вызов FS-EEND: .from_pretrained(...) БЕЗ device=..., перевод на устройство через .to(...).
+    """
     import gc
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
     logger.info(f"[{upload_id}] diarize_full started")
     r.publish(f"progress:{upload_id}", json.dumps({"status": "diarize_started"}))
     deliver_webhook.delay("diarization_started", upload_id, None)
 
-    # ---- GPU mem before
     try:
         import torch
         logger.info(
@@ -911,19 +979,18 @@ def diarize_full(self, upload_id, correlation_id):
 
     wav, duration = prepare_wav(upload_id)
 
-    # --- chunking params from env ---
+    # Настройки чанкинга
     raw_chunk_limit = getattr(settings, "DIARIZATION_CHUNK_LENGTH_S", 0)
     try:
         chunk_limit = int(raw_chunk_limit)
     except Exception:
         logger.warning(f"[{upload_id}] invalid DIARIZATION_CHUNK_LENGTH_S={raw_chunk_limit!r}, falling back to 0")
         chunk_limit = 0
-
     pad = float(getattr(settings, "DIARIZATION_CHUNK_PADDING_S", 0.0) or 0.0)
     using_chunking = bool(chunk_limit and duration > chunk_limit)
     total_chunks = math.ceil(duration / chunk_limit) if using_chunking else 1
 
-    # --- optional hints: exact / min-max speakers
+    # Подсказки по числу спикеров для pyannote
     infer_kwargs: Dict[str, Any] = {}
     if getattr(settings, "PYANNOTE_NUM_SPEAKERS", None):
         try:
@@ -931,146 +998,32 @@ def diarize_full(self, upload_id, correlation_id):
         except Exception:
             pass
     else:
-        if getattr(settings, "PYANNOTE_MIN_SPEAKERS", None):
-            try:
-                infer_kwargs["min_speakers"] = int(getattr(settings, "PYANNOTE_MIN_SPEAKERS"))
-            except Exception:
-                pass
-        if getattr(settings, "PYANNOTE_MAX_SPEAKERS", None):
-            try:
-                infer_kwargs["max_speakers"] = int(getattr(settings, "PYANNOTE_MAX_SPEAKERS"))
-            except Exception:
-                pass
+        for key_src, key_dst in (
+            ("PYANNOTE_MIN_SPEAKERS", "min_speakers"),
+            ("PYANNOTE_MAX_SPEAKERS", "max_speakers"),
+        ):
+            val = getattr(settings, key_src, None)
+            if val is not None:
+                try:
+                    infer_kwargs[key_dst] = int(val)
+                except Exception:
+                    pass
 
-    logger.info(
-        f"[{upload_id}] diarization plan: chunk_length={chunk_limit}s, "
-        f"padding={pad}s, total_chunks={total_chunks}, infer_kwargs={infer_kwargs or '{}'}"
-    )
-
-    if not _PN_AVAILABLE:
-        logger.error(f"[{upload_id}] pyannote.audio not available, aborting diarization")
-        deliver_webhook.delay("processing_failed", upload_id, None)
-        return
-
-    pipeline = get_diarization_pipeline()
+    use_only_fs_eend = bool(getattr(settings, "USE_ONLY_FS_EEND", True))
     raw: List[Dict[str, Any]] = []
 
-    if using_chunking:
-        processed_key = f"diarize:processed_chunks:{upload_id}"
-        processed = {int(x) for x in r.smembers(processed_key)}
-
-        offset = 0.0
-        chunk_idx = 0
-        while offset < duration:
-            this_len = min(chunk_limit, duration - offset)
-            left_pad = pad if offset > 0 else 0.0
-            right_pad = pad if (offset + this_len) < duration else 0.0
-
-            if chunk_idx in processed:
-                logger.info(f"[{upload_id}] skip diarize chunk {chunk_idx+1}/{total_chunks}")
-                offset += this_len
-                chunk_idx += 1
-                continue
-
-            log_start = max(0.0, offset - left_pad)
-            log_end = min(duration, offset + this_len + right_pad)
-            logger.info(
-                f"[{upload_id}] diarize chunk {chunk_idx+1}/{total_chunks}: "
-                f"{log_start:.1f}s→{log_end:.1f}s (core {offset:.1f}s→{offset+this_len:.1f}s, pad L={left_pad:.1f}s R={right_pad:.1f}s)"
-            )
-
-            tmp = Path(settings.DIARIZER_CACHE_DIR) / f"{upload_id}_chunk_{chunk_idx}.wav"
-            subprocess.run(
-                [
-                    "ffmpeg", "-y",
-                    "-threads", str(max(1, settings.FFMPEG_THREADS // 2)),
-                    "-ss", str(log_start),
-                    "-t", str(log_end - log_start),
-                    "-i", str(wav),
-                    str(tmp),
-                ],
-                check=True, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL
-            )
-
-            try:
-                if torch:
-                    with torch.inference_mode():
-                        ann = pipeline(str(tmp), **infer_kwargs)
-                else:
-                    ann = pipeline(str(tmp), **infer_kwargs)
-
-                before = len(raw)
-                for s, _, spk in ann.itertracks(yield_label=True):
-                    g_start = float(s.start) + log_start
-                    g_end = float(s.end) + log_start
-                    # держим только пересечение с «ядром» чанка
-                    if g_end <= offset or g_start >= (offset + this_len):
-                        continue
-                    g_start = max(g_start, offset)
-                    g_end = min(g_end, offset + this_len)
-                    if g_end > g_start:
-                        raw.append({"start": g_start, "end": g_end, "speaker": spk})
-                added = len(raw) - before
-
-                logger.info(f"[{upload_id}] diarize chunk {chunk_idx+1}/{total_chunks} done: added {added} segments")
-                r.sadd(processed_key, chunk_idx)
-
-            except Exception as e:
-                logger.error(f"[{upload_id}] error in diarize chunk {chunk_idx+1}/{total_chunks}: {e}", exc_info=True)
-            finally:
-                try:
-                    tmp.unlink(missing_ok=True)
-                except Exception:
-                    pass
-                try:
-                    del ann  # type: ignore
-                except Exception:
-                    pass
-                gc.collect()
-                if torch and torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-
-                offset += this_len
-                chunk_idx += 1
-
-        r.delete(processed_key)
-
-    else:
-        logger.info(f"[{upload_id}] Short audio or chunking disabled, single diarization pass")
-        if torch:
-            with torch.inference_mode():
-                ann = pipeline(str(wav), **infer_kwargs)
-        else:
-            ann = pipeline(str(wav), **infer_kwargs)
-        for s, _, spk in ann.itertracks(yield_label=True):
-            raw.append({"start": float(s.start), "end": float(s.end), "speaker": spk})
+    # ---------- Ветка 1: ТОЛЬКО FS-EEND ----------
+    if use_only_fs_eend:
         try:
-            del ann
-        except Exception:
-            pass
-        gc.collect()
-        if torch and torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-    raw.sort(key=lambda x: x["start"])
-
-    # ---------- FS-EEND refinement (исправлено: без device=..., используем .to(...)) ----------
-    def _refine_with_fs_eend(_raw: List[Dict[str, Any]], _wav: Path) -> List[Dict[str, Any]]:
-        try:
-            if not bool(getattr(settings, "USE_FS_EEND", False)):
-                logger.info(f"[{upload_id}] FS-EEND disabled → skipping refinement")
-                return _raw
-
+            from pyannote.audio import Pipeline as _EEND
             model_id = getattr(settings, "FS_EEND_MODEL_PATH", None)
             if not model_id:
-                logger.info(f"[{upload_id}] FS-EEND path not set → skipping refinement")
-                return _raw
+                logger.error(f"[{upload_id}] USE_ONLY_FS_EEND=True, но FS_EEND_MODEL_PATH не задан")
+                deliver_webhook.delay("processing_failed", upload_id, None)
+                return
 
-            from pyannote.audio import Pipeline as _TmpPipe
-            logger.info(f"[{upload_id}] FS-EEND refinement started with {model_id}")
-
-            # загружаем и переводим на девайс корректно
-            eend = _TmpPipe.from_pretrained(
+            logger.info(f"[{upload_id}] FS-EEND-only diarization with {model_id}")
+            eend = _EEND.from_pretrained(
                 model_id,
                 use_auth_token=settings.HUGGINGFACE_TOKEN,
                 cache_dir=settings.DIARIZER_CACHE_DIR,
@@ -1086,58 +1039,212 @@ def diarize_full(self, upload_id, correlation_id):
 
             if torch:
                 with torch.inference_mode():
-                    ann = eend(str(_wav))
+                    ann = eend(str(wav))
             else:
-                ann = eend(str(_wav))
+                ann = eend(str(wav))
 
-            refined: List[Dict[str, Any]] = []
             for s, _, spk in ann.itertracks(yield_label=True):
-                refined.append({"start": float(s.start), "end": float(s.end), "speaker": spk})
-            refined.sort(key=lambda x: x["start"])
+                raw.append({"start": float(s.start), "end": float(s.end), "speaker": spk})
 
-            # сравним, действительно ли стало лучше по перекрытиям
-            def _overlap_score(items: List[Dict[str, Any]]) -> float:
-                if not items:
-                    return 0.0
-                step = 0.05
-                t0 = min(x["start"] for x in items)
-                t1 = max(x["end"] for x in items)
-                pts = int((t1 - t0) / step) + 1
-                cnt2 = 0
-                for i in range(pts):
-                    t = t0 + i * step
-                    active = sum(1 for x in items if x["start"] <= t < x["end"])
-                    if active >= 2:
-                        cnt2 += 1
-                return cnt2 / max(1, pts)
-
-            base_ovl = _overlap_score(_raw)
-            eend_ovl = _overlap_score(refined)
-            logger.info(f"[{upload_id}] FS-EEND overlap score: base={base_ovl:.3f}, eend={eend_ovl:.3f}")
-
-            return refined if eend_ovl > base_ovl + 0.05 else _raw
+            # cleanup
+            try:
+                del ann
+            except Exception:
+                pass
+            gc.collect()
+            if torch and torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         except Exception as e:
-            logger.warning(f"[{upload_id}] FS-EEND refinement failed: {e}")
-            return _raw
+            logger.error(f"[{upload_id}] FS-EEND-only failed: {e}", exc_info=True)
+            deliver_webhook.delay("processing_failed", upload_id, None)
+            return
 
-    raw = _refine_with_fs_eend(raw, wav)
+    # ---------- Ветка 2: Обычный pyannote (+ опц. FS-EEND рефайнмент) ----------
+    else:
+        if not _PN_AVAILABLE:
+            logger.error(f"[{upload_id}] pyannote.audio not available, aborting diarization")
+            deliver_webhook.delay("processing_failed", upload_id, None)
+            return
 
-    # ---------- Stabilization pipeline ----------
-    # 1) drop ultra-short blips (< MIN_SEG)
-    MIN_SEG = float(getattr(settings, "DIARIZATION_MIN_SEGMENT_S", 0.20))
-    filtered = [s for s in raw if (s["end"] - s["start"]) >= MIN_SEG]
-    dropped = len(raw) - len(filtered)
-    if dropped:
-        logger.info(f"[{upload_id}] dropped {dropped} ultra-short segments (<{MIN_SEG:.2f}s)")
-    raw = filtered
+        pipeline = get_diarization_pipeline()
 
-    # 2) merge same-speaker segments with tiny gaps (<= GAP_MERGE)
-    GAP_MERGE = float(getattr(settings, "DIARIZATION_MERGE_GAP_S", 0.20))
+        if using_chunking:
+            processed_key = f"diarize:processed_chunks:{upload_id}"
+            processed = {int(x) for x in r.smembers(processed_key)}
+
+            offset = 0.0
+            chunk_idx = 0
+            while offset < duration:
+                this_len = min(chunk_limit, duration - offset)
+                left_pad = pad if offset > 0 else 0.0
+                right_pad = pad if (offset + this_len) < duration else 0.0
+
+                if chunk_idx in processed:
+                    logger.info(f"[{upload_id}] skip diarize chunk {chunk_idx+1}/{total_chunks}")
+                    offset += this_len
+                    chunk_idx += 1
+                    continue
+
+                log_start = max(0.0, offset - left_pad)
+                log_end = min(duration, offset + this_len + right_pad)
+                logger.info(
+                    f"[{upload_id}] diarize chunk {chunk_idx+1}/{total_chunks}: "
+                    f"{log_start:.1f}s→{log_end:.1f}s (core {offset:.1f}s→{offset+this_len:.1f}s, pad L={left_pad:.1f}s R={right_pad:.1f}s)"
+                )
+
+                tmp = Path(settings.DIARIZER_CACHE_DIR) / f"{upload_id}_chunk_{chunk_idx}.wav"
+                subprocess.run(
+                    [
+                        "ffmpeg", "-y",
+                        "-threads", str(max(1, settings.FFMPEG_THREADS // 2)),
+                        "-ss", str(log_start),
+                        "-t", str(log_end - log_start),
+                        "-i", str(wav),
+                        str(tmp),
+                    ],
+                    check=True, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL
+                )
+
+                try:
+                    if torch:
+                        with torch.inference_mode():
+                            ann = pipeline(str(tmp), **infer_kwargs)
+                    else:
+                        ann = pipeline(str(tmp), **infer_kwargs)
+
+                    before = len(raw)
+                    for s, _, spk in ann.itertracks(yield_label=True):
+                        g_start = float(s.start) + log_start
+                        g_end = float(s.end) + log_start
+                        if g_end <= offset or g_start >= (offset + this_len):
+                            continue
+                        g_start = max(g_start, offset)
+                        g_end = min(g_end, offset + this_len)
+                        if g_end > g_start:
+                            raw.append({"start": g_start, "end": g_end, "speaker": spk})
+                    added = len(raw) - before
+
+                    logger.info(f"[{upload_id}] diarize chunk {chunk_idx+1}/{total_chunks} done: added {added} segments")
+                    r.sadd(processed_key, chunk_idx)
+
+                except Exception as e:
+                    logger.error(f"[{upload_id}] error in diarize chunk {chunk_idx+1}/{total_chunks}: {e}", exc_info=True)
+                finally:
+                    try:
+                        tmp.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                    try:
+                        del ann  # type: ignore
+                    except Exception:
+                        pass
+                    gc.collect()
+                    if torch and torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+
+                    offset += this_len
+                    chunk_idx += 1
+
+            r.delete(processed_key)
+
+        else:
+            logger.info(f"[{upload_id}] Short audio or chunking disabled, single diarization pass")
+            if torch:
+                with torch.inference_mode():
+                    ann = pipeline(str(wav), **infer_kwargs)
+            else:
+                ann = pipeline(str(wav), **infer_kwargs)
+            for s, _, spk in ann.itertracks(yield_label=True):
+                raw.append({"start": float(s.start), "end": float(s.end), "speaker": spk})
+            try:
+                del ann
+            except Exception:
+                pass
+            gc.collect()
+            if torch and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        # --- Optional FS-EEND REFINE поверх pyannote ---
+        def _refine_with_fs_eend(_raw: List[Dict[str, Any]], _wav: Path) -> List[Dict[str, Any]]:
+            try:
+                if not bool(getattr(settings, "USE_FS_EEND", False)):
+                    logger.info(f"[{upload_id}] FS-EEND disabled → skipping refinement")
+                    return _raw
+
+                model_id = getattr(settings, "FS_EEND_MODEL_PATH", None)
+                if not model_id:
+                    logger.info(f"[{upload_id}] FS-EEND path not set → skipping refinement")
+                    return _raw
+
+                from pyannote.audio import Pipeline as _TmpPipe
+                logger.info(f"[{upload_id}] FS-EEND refinement started with {model_id}")
+
+                eend = _TmpPipe.from_pretrained(
+                    model_id,
+                    use_auth_token=settings.HUGGINGFACE_TOKEN,
+                    cache_dir=settings.DIARIZER_CACHE_DIR,
+                )
+                try:
+                    import torch as _t
+                    device = getattr(settings, "FS_EEND_DEVICE", None)
+                    if device is None:
+                        device = "cuda" if _t.cuda.is_available() else "cpu"
+                    eend.to(device)
+                except Exception as e:
+                    logger.warning(f"[{upload_id}] FS-EEND .to(device) failed, staying on CPU: {e}")
+
+                if torch:
+                    with torch.inference_mode():
+                        ann = eend(str(_wav))
+                else:
+                    ann = eend(str(_wav))
+
+                refined: List[Dict[str, Any]] = []
+                for s, _, spk in ann.itertracks(yield_label=True):
+                    refined.append({"start": float(s.start), "end": float(s.end), "speaker": spk})
+                refined.sort(key=lambda x: x["start"])
+
+                # простая метрика: доля времени с >=2 активными спикерами
+                def _overlap_score(items: List[Dict[str, Any]]) -> float:
+                    if not items:
+                        return 0.0
+                    step = 0.05
+                    t0 = min(x["start"] for x in items)
+                    t1 = max(x["end"] for x in items)
+                    pts = int((t1 - t0) / step) + 1
+                    cnt2 = 0
+                    for i in range(pts):
+                        t = t0 + i * step
+                        active = sum(1 for x in items if x["start"] <= t < x["end"])
+                        if active >= 2:
+                            cnt2 += 1
+                    return cnt2 / max(1, pts)
+
+                base_ovl = _overlap_score(_raw)
+                eend_ovl = _overlap_score(refined)
+                logger.info(f"[{upload_id}] FS-EEND overlap score: base={base_ovl:.3f}, eend={eend_ovl:.3f}")
+
+                return refined if eend_ovl > base_ovl + 0.05 else _raw
+
+            except Exception as e:
+                logger.warning(f"[{upload_id}] FS-EEND refinement failed: {e}")
+                return _raw
+
+        raw = _refine_with_fs_eend(raw, wav)
+
+    # ---------- Stabilization & save (общая для обеих веток) ----------
     raw.sort(key=lambda x: x["start"])
+
+    # 1) дропим совсем короткие
+    MIN_SEG = float(getattr(settings, "DIARIZATION_MIN_SEGMENT_S", 0.20))
+    raw = [s for s in raw if (s["end"] - s["start"]) >= MIN_SEG]
+
+    # 2) склейка одинаковых с маленькими паузами
+    GAP_MERGE = float(getattr(settings, "DIARIZATION_MERGE_GAP_S", 0.20))
     merged: List[Dict[str, Any]] = []
     cur = None
-    for seg in raw:
+    for seg in sorted(raw, key=lambda x: x["start"]):
         if cur and cur["speaker"] == seg["speaker"] and (seg["start"] - cur["end"]) <= GAP_MERGE:
             cur["end"] = max(cur["end"], seg["end"])
         else:
@@ -1148,7 +1255,7 @@ def diarize_full(self, upload_id, correlation_id):
         merged.append(cur)
     raw = merged
 
-    # 3) anti-flip: если крошечный «островок» другого спикера окружён одним и тем же соседом — поглощаем
+    # 3) анти-flip: поглощаем короткий «островок» между одинаковыми соседями
     def _stabilize_labels(segments: List[Dict[str, Any]],
                           island_max: float = float(getattr(settings, "DIARIZATION_ISLAND_MAX_S", 0.60))) -> List[Dict[str, Any]]:
         if len(segments) < 3:
@@ -1159,15 +1266,11 @@ def diarize_full(self, upload_id, correlation_id):
             if 0 < i < len(segments) - 1:
                 prev, cur, nxt = segments[i - 1], segments[i], segments[i + 1]
                 cur_dur = cur["end"] - cur["start"]
-                # тот же спикер по бокам и «островок» короткий -> поглощаем
                 if prev["speaker"] == nxt["speaker"] != cur["speaker"] and cur_dur <= island_max:
-                    # расширяем соседа
                     prev["end"] = nxt["end"] = max(prev["end"], nxt["end"])
-                    # выкидываем текущий, сливаем prev и nxt
-                    merged_prev = {"start": prev["start"], "end": nxt["end"], "speaker": prev["speaker"]}
-                    out.pop() if out else None  # убрать прежний prev из out
-                    out.append(merged_prev)
-                    i += 2  # перескочить через nxt
+                    out.pop() if out else None
+                    out.append({"start": prev["start"], "end": nxt["end"], "speaker": prev["speaker"]})
+                    i += 2
                     continue
             out.append(segments[i])
             i += 1
@@ -1175,16 +1278,10 @@ def diarize_full(self, upload_id, correlation_id):
 
     raw = _stabilize_labels(raw)
 
-    # 4) Optional stitching across chunks
-    if SPEAKER_STITCH_ENABLED and using_chunking:
-        raw = stitch_speakers(raw, wav, upload_id)
-    else:
-        logger.debug(f"[{upload_id}] skipping speaker stitching (using_chunking={using_chunking})")
-
-    # 5) collapse contiguous same-speaker segments (последняя уборка)
+    # 4) схлопывание подряд идущих одинаковых меток после стабилизации
     diar_sentences: List[Dict[str, Any]] = []
     buf: Optional[Dict[str, Any]] = None
-    for seg in raw:
+    for seg in sorted(raw, key=lambda x: x["start"]):
         if buf and buf["speaker"] == seg["speaker"] and (seg["start"] - buf["end"]) < 0.10:
             buf["end"] = seg["end"]
         else:
@@ -1194,7 +1291,6 @@ def diarize_full(self, upload_id, correlation_id):
     if buf:
         diar_sentences.append(buf)
 
-    # --- save ---
     out = Path(settings.RESULTS_FOLDER) / upload_id
     out.mkdir(parents=True, exist_ok=True)
     (out / "diarization.json").write_text(json.dumps(diar_sentences, ensure_ascii=False, indent=2))
