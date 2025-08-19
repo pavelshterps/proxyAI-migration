@@ -5,6 +5,7 @@ import time
 import re
 import math
 import os
+import torch
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional, List, Dict, Tuple
@@ -411,7 +412,7 @@ def get_diarization_pipeline():
             target = getattr(settings, "DIARIZER_DEVICE", None)  # "cuda" | "cpu" | "mps"
             if target is None:
                 target = "cuda" if torch.cuda.is_available() else "cpu"
-            _diarization_pipeline.to(target)
+            _diarization_pipeline.to(torch.device(target))
             logger.info(f"[DIARIZE] loaded pipeline {model_id} and moved to device={target}")
         except Exception as e:
             logger.warning(f"[DIARIZE] could not move pipeline to device: {e}")
@@ -989,10 +990,9 @@ def transcribe_segments(self, upload_id, correlation_id):
 @app.task(bind=True, queue="diarize_gpu")
 def diarize_full(self, upload_id, correlation_id):
     """
-    Теперь поддерживает два режима:
-      - Обычный: pyannote (с чанкингом, стабилизацией и опциональным FS-EEND как рефайнмент).
-      - Только FS-EEND: если settings.USE_ONLY_FS_EEND=True (pyannote не используется вовсе).
-    Также исправлен вызов FS-EEND: .from_pretrained(...) БЕЗ device=..., перевод на устройство через .to(...).
+    Диаризация с безопасной попыткой FS-EEND и фолбэком на pyannote/speaker-diarization-3.1.
+    - Умеет работать с чанками и паддингом в pyannote-ветке.
+    - Не падает, если FS-EEND недоступен (гейт/нет токена) — логирует и уходит в фолбэк.
     """
     import gc
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
@@ -1011,12 +1011,11 @@ def diarize_full(self, upload_id, correlation_id):
 
     wav, duration = prepare_wav(upload_id)
 
-    # Настройки чанкинга
-    raw_chunk_limit = getattr(settings, "DIARIZATION_CHUNK_LENGTH_S", 0)
+    # Настройки чанкинга для pyannote-ветки
     try:
-        chunk_limit = int(raw_chunk_limit)
+        chunk_limit = int(getattr(settings, "DIARIZATION_CHUNK_LENGTH_S", 0) or 0)
     except Exception:
-        logger.warning(f"[{upload_id}] invalid DIARIZATION_CHUNK_LENGTH_S={raw_chunk_limit!r}, falling back to 0")
+        logger.warning(f"[{upload_id}] invalid DIARIZATION_CHUNK_LENGTH_S, falling back to 0")
         chunk_limit = 0
     pad = float(getattr(settings, "DIARIZATION_CHUNK_PADDING_S", 0.0) or 0.0)
     using_chunking = bool(chunk_limit and duration > chunk_limit)
@@ -1030,10 +1029,8 @@ def diarize_full(self, upload_id, correlation_id):
         except Exception:
             pass
     else:
-        for key_src, key_dst in (
-            ("PYANNOTE_MIN_SPEAKERS", "min_speakers"),
-            ("PYANNOTE_MAX_SPEAKERS", "max_speakers"),
-        ):
+        for key_src, key_dst in (("PYANNOTE_MIN_SPEAKERS", "min_speakers"),
+                                 ("PYANNOTE_MAX_SPEAKERS", "max_speakers")):
             val = getattr(settings, key_src, None)
             if val is not None:
                 try:
@@ -1044,63 +1041,75 @@ def diarize_full(self, upload_id, correlation_id):
     use_only_fs_eend = bool(getattr(settings, "USE_ONLY_FS_EEND", True))
     raw: List[Dict[str, Any]] = []
 
-    # ---------- Ветка 1: ТОЛЬКО FS-EEND ----------
-    if use_only_fs_eend:
+    def _run_fs_eend(_wav: Path) -> Optional[List[Dict[str, Any]]]:
+        """Пробует запустить FS-EEND; возвращает список сегментов или None при любой проблеме."""
         try:
             from pyannote.audio import Pipeline as _EEND
-            model_id = getattr(settings, "FS_EEND_MODEL_PATH", None)
-            if not model_id:
-                logger.error(f"[{upload_id}] USE_ONLY_FS_EEND=True, но FS_EEND_MODEL_PATH не задан")
-                deliver_webhook.delay("processing_failed", upload_id, None)
-                return
+        except Exception as e:
+            logger.warning(f"[{upload_id}] FS-EEND import failed: {e}")
+            return None
 
-            logger.info(f"[{upload_id}] FS-EEND-only diarization with {model_id}")
+        model_id = getattr(settings, "FS_EEND_MODEL_PATH", None)
+        if not model_id:
+            logger.warning(f"[{upload_id}] FS_EEND_MODEL_PATH not set → skipping FS-EEND")
+            return None
+
+        try:
             eend = _EEND.from_pretrained(
                 model_id,
-                use_auth_token=settings.HUGGINGFACE_TOKEN,
+                use_auth_token=settings.HUGGINGFACE_TOKEN,   # обязателен для гейтед моделей
                 cache_dir=settings.DIARIZER_CACHE_DIR,
             )
-            try:
-                import torch as _t
-                device = getattr(settings, "FS_EEND_DEVICE", None)
-                if device is None:
-                    device = "cuda" if _t.cuda.is_available() else "cpu"
-                eend.to(device)
-            except Exception as e:
-                logger.warning(f"[{upload_id}] FS-EEND .to(device) failed, staying on CPU: {e}")
+        except Exception as e:
+            logger.warning(
+                f"[{upload_id}] Could not download FS-EEND pipeline '{model_id}'. "
+                f"Likely gated/private or bad token. Error: {e}"
+            )
+            return None
 
+        # Перевод на нужное устройство
+        try:
+            dev = getattr(settings, "FS_EEND_DEVICE", None)
+            if torch:
+                if dev is None:
+                    dev = "cuda" if torch.cuda.is_available() else "cpu"
+                eend.to(torch.device(dev))
+        except Exception as e:
+            logger.warning(f"[{upload_id}] FS-EEND .to(device) failed, staying on CPU: {e}")
+
+        try:
             if torch:
                 with torch.inference_mode():
-                    ann = eend(str(wav))
+                    ann = eend(str(_wav))
             else:
-                ann = eend(str(wav))
+                ann = eend(str(_wav))
+        except Exception as e:
+            logger.error(f"[{upload_id}] FS-EEND inference failed: {e}", exc_info=True)
+            return None
 
+        out: List[Dict[str, Any]] = []
+        try:
             for s, _, spk in ann.itertracks(yield_label=True):
-                raw.append({"start": float(s.start), "end": float(s.end), "speaker": spk})
-
-            # cleanup
+                out.append({"start": float(s.start), "end": float(s.end), "speaker": spk})
+            out.sort(key=lambda x: x["start"])
+            return out
+        except Exception as e:
+            logger.error(f"[{upload_id}] FS-EEND output parse failed: {e}", exc_info=True)
+            return None
+        finally:
             try:
                 del ann
             except Exception:
                 pass
-            gc.collect()
-            if torch and torch.cuda.is_available():
-                torch.cuda.empty_cache()
 
-        except Exception as e:
-            logger.error(f"[{upload_id}] FS-EEND-only failed: {e}", exc_info=True)
-            deliver_webhook.delay("processing_failed", upload_id, None)
-            return
-
-    # ---------- Ветка 2: Обычный pyannote (+ опц. FS-EEND рефайнмент) ----------
-    else:
+    def _run_pyannote(_wav: Path) -> List[Dict[str, Any]]:
+        """Обычный pyannote с чанками/паддингом."""
         if not _PN_AVAILABLE:
-            logger.error(f"[{upload_id}] pyannote.audio not available, aborting diarization")
-            deliver_webhook.delay("processing_failed", upload_id, None)
-            return
+            raise RuntimeError("pyannote.audio not available")
 
-        pipeline = get_diarization_pipeline()
+        pipeline = get_diarization_pipeline()  # внутри поправьте .to(torch.device(...))
 
+        res: List[Dict[str, Any]] = []
         if using_chunking:
             processed_key = f"diarize:processed_chunks:{upload_id}"
             processed = {int(x) for x in r.smembers(processed_key)}
@@ -1132,7 +1141,7 @@ def diarize_full(self, upload_id, correlation_id):
                         "-threads", str(max(1, settings.FFMPEG_THREADS // 2)),
                         "-ss", str(log_start),
                         "-t", str(log_end - log_start),
-                        "-i", str(wav),
+                        "-i", str(_wav),
                         str(tmp),
                     ],
                     check=True, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL
@@ -1145,7 +1154,7 @@ def diarize_full(self, upload_id, correlation_id):
                     else:
                         ann = pipeline(str(tmp), **infer_kwargs)
 
-                    before = len(raw)
+                    before = len(res)
                     for s, _, spk in ann.itertracks(yield_label=True):
                         g_start = float(s.start) + log_start
                         g_end = float(s.end) + log_start
@@ -1154,8 +1163,8 @@ def diarize_full(self, upload_id, correlation_id):
                         g_start = max(g_start, offset)
                         g_end = min(g_end, offset + this_len)
                         if g_end > g_start:
-                            raw.append({"start": g_start, "end": g_end, "speaker": spk})
-                    added = len(raw) - before
+                            res.append({"start": g_start, "end": g_end, "speaker": spk})
+                    added = len(res) - before
 
                     logger.info(f"[{upload_id}] diarize chunk {chunk_idx+1}/{total_chunks} done: added {added} segments")
                     r.sadd(processed_key, chunk_idx)
@@ -1184,11 +1193,11 @@ def diarize_full(self, upload_id, correlation_id):
             logger.info(f"[{upload_id}] Short audio or chunking disabled, single diarization pass")
             if torch:
                 with torch.inference_mode():
-                    ann = pipeline(str(wav), **infer_kwargs)
+                    ann = pipeline(str(_wav), **infer_kwargs)
             else:
-                ann = pipeline(str(wav), **infer_kwargs)
+                ann = pipeline(str(_wav), **infer_kwargs)
             for s, _, spk in ann.itertracks(yield_label=True):
-                raw.append({"start": float(s.start), "end": float(s.end), "speaker": spk})
+                res.append({"start": float(s.start), "end": float(s.end), "speaker": spk})
             try:
                 del ann
             except Exception:
@@ -1197,76 +1206,46 @@ def diarize_full(self, upload_id, correlation_id):
             if torch and torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-        # --- Optional FS-EEND REFINE поверх pyannote ---
-        def _refine_with_fs_eend(_raw: List[Dict[str, Any]], _wav: Path) -> List[Dict[str, Any]]:
+        res.sort(key=lambda x: x["start"])
+        return res
+
+    # --- Пытаемся FS-EEND (если попросили), иначе сразу pyannote
+    used_backend = None
+    if use_only_fs_eend:
+        logger.info(f"[{upload_id}] FS-EEND-only diarization with {getattr(settings, 'FS_EEND_MODEL_PATH', None)}")
+        attempt = _run_fs_eend(wav)
+        if attempt is not None:
+            raw = attempt
+            used_backend = "fs-eend"
+        else:
+            # Автофолбэк на pyannote вместо немедленного провала
+            logger.warning(f"[{upload_id}] FS-EEND unavailable → falling back to pyannote/speaker-diarization-3.1")
             try:
-                if not bool(getattr(settings, "USE_FS_EEND", False)):
-                    logger.info(f"[{upload_id}] FS-EEND disabled → skipping refinement")
-                    return _raw
-
-                model_id = getattr(settings, "FS_EEND_MODEL_PATH", None)
-                if not model_id:
-                    logger.info(f"[{upload_id}] FS-EEND path not set → skipping refinement")
-                    return _raw
-
-                from pyannote.audio import Pipeline as _TmpPipe
-                logger.info(f"[{upload_id}] FS-EEND refinement started with {model_id}")
-
-                eend = _TmpPipe.from_pretrained(
-                    model_id,
-                    use_auth_token=settings.HUGGINGFACE_TOKEN,
-                    cache_dir=settings.DIARIZER_CACHE_DIR,
-                )
-                try:
-                    import torch as _t
-                    device = getattr(settings, "FS_EEND_DEVICE", None)
-                    if device is None:
-                        device = "cuda" if _t.cuda.is_available() else "cpu"
-                    eend.to(device)
-                except Exception as e:
-                    logger.warning(f"[{upload_id}] FS-EEND .to(device) failed, staying on CPU: {e}")
-
-                if torch:
-                    with torch.inference_mode():
-                        ann = eend(str(_wav))
-                else:
-                    ann = eend(str(_wav))
-
-                refined: List[Dict[str, Any]] = []
-                for s, _, spk in ann.itertracks(yield_label=True):
-                    refined.append({"start": float(s.start), "end": float(s.end), "speaker": spk})
-                refined.sort(key=lambda x: x["start"])
-
-                # простая метрика: доля времени с >=2 активными спикерами
-                def _overlap_score(items: List[Dict[str, Any]]) -> float:
-                    if not items:
-                        return 0.0
-                    step = 0.05
-                    t0 = min(x["start"] for x in items)
-                    t1 = max(x["end"] for x in items)
-                    pts = int((t1 - t0) / step) + 1
-                    cnt2 = 0
-                    for i in range(pts):
-                        t = t0 + i * step
-                        active = sum(1 for x in items if x["start"] <= t < x["end"])
-                        if active >= 2:
-                            cnt2 += 1
-                    return cnt2 / max(1, pts)
-
-                base_ovl = _overlap_score(_raw)
-                eend_ovl = _overlap_score(refined)
-                logger.info(f"[{upload_id}] FS-EEND overlap score: base={base_ovl:.3f}, eend={eend_ovl:.3f}")
-
-                return refined if eend_ovl > base_ovl + 0.05 else _raw
-
+                raw = _run_pyannote(wav)
+                used_backend = "pyannote"
             except Exception as e:
-                logger.warning(f"[{upload_id}] FS-EEND refinement failed: {e}")
-                return _raw
+                logger.error(f"[{upload_id}] diarization failed in fallback: {e}", exc_info=True)
+                deliver_webhook.delay("processing_failed", upload_id, None)
+                return
+    else:
+        try:
+            raw = _run_pyannote(wav)
+            used_backend = "pyannote"
+        except Exception as e:
+            logger.error(f"[{upload_id}] pyannote diarization failed: {e}", exc_info=True)
+            # попробуем FS-EEND как запасной
+            attempt = _run_fs_eend(wav)
+            if attempt is None:
+                deliver_webhook.delay("processing_failed", upload_id, None)
+                return
+            raw = attempt
+            used_backend = "fs-eend"
 
-        raw = _refine_with_fs_eend(raw, wav)
-
-    # ---------- Stabilization & save (общая для обеих веток) ----------
-    raw.sort(key=lambda x: x["start"])
+    # ---------- Stabilization & save (общая) ----------
+    if not raw:
+        logger.error(f"[{upload_id}] empty diarization result")
+        deliver_webhook.delay("processing_failed", upload_id, None)
+        return
 
     # 1) дропим совсем короткие
     MIN_SEG = float(getattr(settings, "DIARIZATION_MIN_SEGMENT_S", 0.20))
@@ -1308,43 +1287,49 @@ def diarize_full(self, upload_id, correlation_id):
             i += 1
         return out
 
-    raw = _stabilize_labels(raw)
+    diar_sentences: List[Dict[str, Any]] = _stabilize_labels(raw)
 
-    # 4) схлопывание подряд идущих одинаковых меток после стабилизации
-    diar_sentences: List[Dict[str, Any]] = []
+    # 4) схлопывание подряд идущих одинаковых меток
+    final_out: List[Dict[str, Any]] = []
     buf: Optional[Dict[str, Any]] = None
-    for seg in sorted(raw, key=lambda x: x["start"]):
+    for seg in sorted(diar_sentences, key=lambda x: x["start"]):
         if buf and buf["speaker"] == seg["speaker"] and (seg["start"] - buf["end"]) < 0.10:
             buf["end"] = seg["end"]
         else:
             if buf:
-                diar_sentences.append(buf)
+                final_out.append(buf)
             buf = dict(seg)
     if buf:
-        diar_sentences.append(buf)
+        final_out.append(buf)
 
     out = Path(settings.RESULTS_FOLDER) / upload_id
     out.mkdir(parents=True, exist_ok=True)
-    (out / "diarization.json").write_text(json.dumps(diar_sentences, ensure_ascii=False, indent=2))
+    (out / "diarization.json").write_text(json.dumps(final_out, ensure_ascii=False, indent=2))
 
-    speakers = sorted({seg["speaker"] for seg in diar_sentences if seg.get("speaker") is not None})
+    speakers = sorted({seg["speaker"] for seg in final_out if seg.get("speaker") is not None})
     logger.info(
-        f"[{upload_id}] diarization_done, total segments: {len(diar_sentences)}, "
+        f"[{upload_id}] diarization_done by {used_backend}, total segments: {len(final_out)}, "
         f"speakers_detected={len(speakers)}"
     )
-    if torch and torch.cuda.is_available():
-        logger.info(f"[{upload_id}] GPU memory reserved after diarization: {torch.cuda.memory_reserved()}")
 
     r.publish(
         f"progress:{upload_id}",
         json.dumps({
             "status": "diarization_done",
-            "segments": len(diar_sentences),
+            "backend": used_backend,
+            "segments": len(final_out),
             "speakers": len(speakers),
             "total_chunks": total_chunks
         })
     )
-    deliver_webhook.delay("diarization_completed", upload_id, {"diarization": diar_sentences})
+    deliver_webhook.delay("diarization_completed", upload_id, {"diarization": final_out})
+
+    try:
+        if torch and torch.cuda.is_available():
+            logger.info(f"[{upload_id}] GPU memory reserved after diarization: {torch.cuda.memory_reserved()}")
+    except Exception:
+        pass
+
 
 @app.task(
     bind=True,
