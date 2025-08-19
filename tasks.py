@@ -48,6 +48,7 @@ SPEAKER_STITCH_THRESHOLD = float(getattr(settings, "SPEAKER_STITCH_THRESHOLD", 0
 SPEAKER_STITCH_POOL_SIZE = int(getattr(settings, "SPEAKER_STITCH_POOL_SIZE", 8))
 SPEAKER_STITCH_EMA_ALPHA = float(getattr(settings, "SPEAKER_STITCH_EMA_ALPHA", 0.5))
 SPEAKER_STITCH_MERGE_THRESHOLD = float(getattr(settings, "SPEAKER_STITCH_MERGE_THRESHOLD", 0.98))
+TRANSCRIPTION_CHUNK_PAD_S = float(getattr(settings, "TRANSCRIPTION_CHUNK_PAD_S", 10.0))
 _speaker_embedding_model = None  # type: ignore
 
 try:
@@ -839,6 +840,7 @@ def preview_transcribe(self, upload_id, correlation_id):
     deliver_webhook.delay("preview_completed", upload_id, {"preview": preview})
     transcribe_segments.delay(upload_id, correlation_id)
 
+# ЗАМЕНИ функцию transcribe_segments целиком на эту версию
 @app.task(bind=True, queue="transcribe_gpu")
 def transcribe_segments(self, upload_id, correlation_id):
     logger.info(f"[{upload_id}] transcribe_segments received")
@@ -848,6 +850,7 @@ def transcribe_segments(self, upload_id, correlation_id):
     except ImportError:
         pass
 
+    # GPU busy → fallback на CPU
     try:
         inspector = app.control.inspect()
         active = inspector.active() or {}
@@ -873,7 +876,7 @@ def transcribe_segments(self, upload_id, correlation_id):
     model = get_whisper_model()
     raw_segs: List[Any] = []
 
-    def _transcribe_with_vad(source, offset: float = 0.0):
+    def _transcribe_with_vad(source, offset: float = 0.0, core_start: float = None, core_end: float = None):
         segs, _ = model.transcribe(
             source,
             word_timestamps=True,
@@ -884,13 +887,23 @@ def transcribe_segments(self, upload_id, correlation_id):
             },
             **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {}),
         )
+
         result = []
         for s in segs:
             s.start += offset
             s.end += offset
+            # Если задано ядро чанка — обрежем к его границам (чтобы не было дублей из overlap)
+            if core_start is not None and core_end is not None:
+                if s.end <= core_start or s.start >= core_end:
+                    continue
+                s.start = max(s.start, core_start)
+                s.end = min(s.end, core_end)
+                if s.end <= s.start:
+                    continue
             result.append(s)
         return result
 
+    # Короткое аудио — одним проходом, overlap не нужен
     if duration <= settings.VAD_MAX_LENGTH_S:
         logger.info(f"[{upload_id}] short audio ({duration:.1f}s) → single VAD pass")
         raw_segs = _transcribe_with_vad(str(wav))
@@ -899,28 +912,46 @@ def transcribe_segments(self, upload_id, correlation_id):
         processed_key = f"transcribe:processed_chunks:{upload_id}"
         processed = {int(x) for x in r.smembers(processed_key)}
 
-        offset = 0.0
         chunk_idx = 0
-        while offset < duration:
+        core_start = 0.0
+        pad = float(getattr(settings, "TRANSCRIPTION_CHUNK_PAD_S", 10.0))
+
+        while core_start < duration:
             if chunk_idx in processed:
                 logger.info(f"[{upload_id}] skip chunk {chunk_idx+1}/{total_chunks} (already done)")
-                offset += settings.CHUNK_LENGTH_S
+                core_start += settings.CHUNK_LENGTH_S
                 chunk_idx += 1
                 continue
 
-            length = min(settings.CHUNK_LENGTH_S, duration - offset)
-            logger.info(f"[{upload_id}] transcribe chunk {chunk_idx+1}/{total_chunks}: {offset:.1f}s→{offset+length:.1f}s")
+            core_len = min(settings.CHUNK_LENGTH_S, duration - core_start)
+            core_end = core_start + core_len
+
+            # добавляем паддинг только если не первый/не последний чанк
+            left_pad = pad if core_start > 0 else 0.0
+            right_pad = pad if core_end < duration else 0.0
+
+            read_start = max(0.0, core_start - left_pad)
+            read_end = min(duration, core_end + right_pad)
+            read_len = max(0.0, read_end - read_start)
+
+            logger.info(
+                f"[{upload_id}] transcribe chunk {chunk_idx+1}/{total_chunks}: "
+                f"{read_start:.1f}s→{read_end:.1f}s (core {core_start:.1f}s→{core_end:.1f}s, "
+                f"pad L={left_pad:.1f}s R={right_pad:.1f}s)"
+            )
+
             try:
                 p = subprocess.Popen(
                     [
                         "ffmpeg", "-y",
                         "-threads", str(settings.FFMPEG_THREADS),
-                        "-ss", str(offset), "-t", str(length),
+                        "-ss", str(read_start), "-t", str(read_len),
                         "-i", str(wav), "-f", "wav", "pipe:1"
                     ],
                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
                 )
-                chunk_segs = _transcribe_with_vad(p.stdout, offset)
+                # offset = read_start (смещаем таймкоды от начала файла)
+                chunk_segs = _transcribe_with_vad(p.stdout, offset=read_start, core_start=core_start, core_end=core_end)
                 p.stdout.close(); p.wait()
 
                 raw_segs.extend(chunk_segs)
@@ -932,11 +963,12 @@ def transcribe_segments(self, upload_id, correlation_id):
                 except ImportError:
                     pass
             finally:
-                offset += length
+                core_start += core_len
                 chunk_idx += 1
 
         r.delete(processed_key)
 
+    # → группируем в предложения и сохраняем, как раньше
     flat = [{"start": s.start, "end": s.end, "text": s.text} for s in raw_segs]
     flat.sort(key=lambda x: x["start"])
     sentences = group_into_sentences(flat)
