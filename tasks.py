@@ -1060,15 +1060,15 @@ def transcribe_segments(self, upload_id, correlation_id):
 def diarize_full(self, upload_id, correlation_id):
     """
     Диаризация с приоритетом DiariZen:
-      1) Сначала пробуем BUT-FIT/diarizen-wavlm-large-s80-mlc (целый файл).
-      2) При любой проблеме — фолбэк на pyannote/speaker-diarization-3.1
-         (с поддержкой чанкинга и паддинга).
-    Постобработка: отбрасывание коротких сегментов, склейка пауз, анти-flip, схлопывание подряд идущих.
+      1) BUT-FIT/diarizen-wavlm-large-s80-mlc (целиком).
+      2) Фолбэк на pyannote/speaker-diarization-3.1 (с чанкингом/паддингом).
+      3) Последний шанс: один сегмент 0..duration (один спикер), чтобы не падать.
+    Постобработка: дроп коротких, склейка пауз, анти-flip, схлопывание подряд идущих.
     """
-    import gc
-    import torch
+    import gc, json, math, subprocess, torch
     from pathlib import Path
     from typing import Optional, List, Dict, Any
+    from redis import Redis
 
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
     logger.info(f"[{upload_id}] diarize_full started")
@@ -1083,10 +1083,10 @@ def diarize_full(self, upload_id, correlation_id):
     except Exception:
         pass
 
-    # Подготовка WAV и длительность
+    # --- Подготовка WAV и длительность
     wav, duration = prepare_wav(upload_id)
 
-    # ------- Настройки чанкинга/паддинга (для pyannote-ветки) -------
+    # --- Настройки чанкинга/паддинга (для pyannote-ветки)
     try:
         chunk_limit = int(getattr(settings, "DIARIZATION_CHUNK_LENGTH_S", 300) or 0)
     except Exception:
@@ -1096,31 +1096,115 @@ def diarize_full(self, upload_id, correlation_id):
     use_chunking = bool(chunk_limit and duration > chunk_limit)
     total_chunks = math.ceil(duration / chunk_limit) if use_chunking else 1
 
-    # Подсказки по числу спикеров для pyannote
+    # --- Подсказки для pyannote
     infer_kwargs: Dict[str, Any] = {}
-    if getattr(settings, "PYANNOTE_NUM_SPEAKERS", None):
-        try:
-            infer_kwargs["num_speakers"] = int(getattr(settings, "PYANNOTE_NUM_SPEAKERS"))
-        except Exception:
-            pass
-    else:
-        for key_src, key_dst in (("PYANNOTE_MIN_SPEAKERS", "min_speakers"),
-                                 ("PYANNOTE_MAX_SPEAKERS", "max_speakers")):
-            val = getattr(settings, key_src, None)
-            if val is not None:
-                try:
-                    infer_kwargs[key_dst] = int(val)
-                except Exception:
-                    pass
+    try:
+        if getattr(settings, "PYANNOTE_NUM_SPEAKERS", None):
+            infer_kwargs["num_speakers"] = int(settings.PYANNOTE_NUM_SPEAKERS)
+        else:
+            v = getattr(settings, "PYANNOTE_MIN_SPEAKERS", None)
+            if v is not None:
+                infer_kwargs["min_speakers"] = int(v)
+            v = getattr(settings, "PYANNOTE_MAX_SPEAKERS", None)
+            if v is not None:
+                infer_kwargs["max_speakers"] = int(v)
+    except Exception:
+        pass
 
-    # ------- Диаризация: приоритет DiariZen -------
     used_backend = None
     diar_segments: List[Dict[str, Any]] = []
 
-    def _run_diarizen(_wav: Path) -> Optional[List[Dict[str, Any]]]:
-        """DiariZen: одна проходка на весь файл. Возвращает список сегментов или None при ошибке."""
+    # --------- helpers
+    def _patch_diarizen_config(pipeline) -> None:
+        """
+        Безопасно патчит pipeline.config/clustering.args для auto speakers.
+        Поддерживает dict и OmegaConf/объектный доступ. Ничего не бросает наружу.
+        """
         try:
-            # см. пример в README модели на HF
+            # вычисляем целевые значения
+            fixed = getattr(settings, "DIARIZEN_NUM_SPEAKERS", None)
+            if fixed is not None and int(fixed) > 0:
+                min_spk = max_spk = int(fixed)
+            else:
+                min_spk = int(getattr(settings, "DIARIZEN_MIN_SPEAKERS", 1) or 1)
+                max_spk = int(getattr(settings, "DIARIZEN_MAX_SPEAKERS", 8) or 8)
+                if max_spk < min_spk:
+                    max_spk = min_spk
+
+            thr = None
+            try:
+                # поддерживаем старое имя переменной: DIARIZEN_CLUSTER_THRESHOLD
+                thr = float(getattr(settings, "DIARIZEN_CLUSTER_THRESHOLD", None))
+            except Exception:
+                thr = None
+
+            mcs = getattr(settings, "DIARIZEN_MIN_CLUSTER_SIZE", None)
+            mcs = int(mcs) if mcs is not None else None
+
+            cfg = getattr(pipeline, "config", None)
+
+            def _apply_to_args(_args: Any):
+                try:
+                    # dict-путь
+                    if isinstance(_args, dict):
+                        _args["min_speakers"] = min_spk
+                        _args["max_speakers"] = max_spk
+                        if thr is not None:
+                            _args["ahc_threshold"] = thr
+                            _args["cluster_threshold"] = thr
+                        if mcs is not None:
+                            _args["min_cluster_size"] = mcs
+                        return True
+                    # объектный путь (OmegaConf / DictConfig)
+                    if _args is not None:
+                        setattr(_args, "min_speakers", min_spk)
+                        setattr(_args, "max_speakers", max_spk)
+                        if thr is not None:
+                            setattr(_args, "ahc_threshold", thr)
+                            setattr(_args, "cluster_threshold", thr)
+                        if mcs is not None:
+                            setattr(_args, "min_cluster_size", mcs)
+                        return True
+                except Exception:
+                    return False
+                return False
+
+            changed = False
+            # 1) config.clustering.args
+            if isinstance(cfg, dict):
+                cl = cfg.setdefault("clustering", {})
+                args = cl.setdefault("args", {})
+                if _apply_to_args(args):
+                    changed = True
+            else:
+                try:
+                    cl = getattr(cfg, "clustering", None)
+                    args = getattr(cl, "args", None) if cl is not None else None
+                    if _apply_to_args(args):
+                        changed = True
+                except Exception:
+                    pass
+
+            # 2) runtime pipeline.clustering.args (если есть)
+            try:
+                clrt = getattr(pipeline, "clustering", None)
+                clrt_args = getattr(clrt, "args", None)
+                if _apply_to_args(clrt_args):
+                    changed = True
+            except Exception:
+                pass
+
+            logger.info(
+                f"[DIARIZE] DiariZen speaker range: min={min_spk}, max={max_spk}"
+                + (f", thr={thr}" if thr is not None else "")
+                + (", config_patched" if changed else ", config_unchanged")
+            )
+        except Exception as e:
+            logger.warning(f"[{upload_id}] could not adjust DiariZen clustering params: {e}")
+
+    def _run_diarizen(_wav: Path) -> Optional[List[Dict[str, Any]]]:
+        """Одна проходка DiariZen на весь файл."""
+        try:
             from diarizen.pipelines.inference import DiariZenPipeline  # type: ignore
         except Exception as e:
             logger.warning(f"[{upload_id}] DiariZen import failed: {e}")
@@ -1128,96 +1212,12 @@ def diarize_full(self, upload_id, correlation_id):
 
         model_id = getattr(settings, "DIARIZEN_MODEL_ID", "BUT-FIT/diarizen-wavlm-large-s80-mlc")
         try:
-            pipeline = DiariZenPipeline.from_pretrained(model_id)  # публичная модель, токен не требуется
-            # --- allow automatic number of speakers (overridable via settings) ---
+            pipeline = DiariZenPipeline.from_pretrained(model_id)
+            # патчим конфиг (auto speakers)
+            _patch_diarizen_config(pipeline)
+            # опционально выставим устройство
             try:
-                # 0) Вычисляем желаемые границы
-                fixed = getattr(settings, "DIARIZEN_NUM_SPEAKERS", None)
-                if fixed is not None and int(fixed) > 0:
-                    min_spk = max_spk = int(fixed)
-                else:
-                    # дефолт 1..8 если не задано
-                    min_spk = int(getattr(settings, "DIARIZEN_MIN_SPEAKERS", 1) or 1)
-                    max_spk = int(getattr(settings, "DIARIZEN_MAX_SPEAKERS", 8) or 8)
-                    if max_spk < min_spk:
-                        max_spk = min_spk
-
-                thr = None
-                # можно переопределить порог кластеризации
-                try:
-                    thr = float(getattr(settings, "DIARIZEN_CLUSTER_THRESHOLD", None))
-                except Exception:
-                    thr = None
-
-                # 1) Попробуем изменить pipeline.config (dict или OmegaConf)
-                cfg = getattr(pipeline, "config", None)
-
-                def _set_in_args(args: dict):
-                    args["min_speakers"] = min_spk
-                    args["max_speakers"] = max_spk
-                    if thr is not None:
-                        # поддержим оба ключа, какой-то один точно подхватится
-                        args["ahc_threshold"] = thr
-                        args["cluster_threshold"] = thr
-                    # позволим переопределять минимальный размер кластера
-                    mcs = getattr(settings, "DIARIZEN_MIN_CLUSTER_SIZE", None)
-                    if mcs is not None:
-                        args["min_cluster_size"] = int(mcs)
-
-                changed = False
-                if isinstance(cfg, dict):
-                    cl = cfg.setdefault("clustering", {})
-                    args = cl.setdefault("args", {})
-                    if isinstance(args, dict):
-                        _set_in_args(args)
-                        changed = True
-                else:
-                    # OmegaConf / объектная форма
-                    try:
-                        cl = getattr(cfg, "clustering", None)
-                        args = getattr(cl, "args", None) if cl is not None else None
-                        if isinstance(args, dict):
-                            _set_in_args(args)
-                            changed = True
-                        elif args is not None:
-                            # у некоторых реализаций args может быть omegaconf.DictConfig
-                            try:
-                                args.min_speakers = min_spk
-                                args.max_speakers = max_spk
-                                if thr is not None:
-                                    setattr(args, "ahc_threshold", thr)
-                                    setattr(args, "cluster_threshold", thr)
-                                mcs = getattr(settings, "DIARIZEN_MIN_CLUSTER_SIZE", None)
-                                if mcs is not None:
-                                    args.min_cluster_size = int(mcs)
-                                changed = True
-                            except Exception:
-                                pass
-                    except Exception:
-                        pass
-
-                # 2) Если у пайплайна есть runtime-объект clustering с .args — пропишем и туда
-                try:
-                    clrt = getattr(pipeline, "clustering", None)
-                    clrt_args = getattr(clrt, "args", None)
-                    if isinstance(clrt_args, dict):
-                        _set_in_args(clrt_args)
-                        changed = True
-                except Exception:
-                    pass
-
-                logger.info(f"[DIARIZE] DiariZen speaker range: min={min_spk}, max={max_spk}"
-                            + (f", thr={thr}" if thr is not None else "")
-                            + (", config_patched" if changed else ", config_unchanged"))
-            except Exception as _e:
-                logger.warning(f"[{upload_id}] could not adjust DiariZen clustering params: {_e}")
-
-            # Попытка перенести на GPU (если поддерживается)
-            try:
-                dev = getattr(settings, "DIARIZER_DEVICE", None)
-                if dev is None:
-                    dev = "cuda" if torch.cuda.is_available() else "cpu"
-                # не у всех пайплайнов есть .to(...): пробуем и игнорируем, если не поддерживает
+                dev = getattr(settings, "DIARIZER_DEVICE", None) or ("cuda" if torch.cuda.is_available() else "cpu")
                 if hasattr(pipeline, "to"):
                     pipeline.to(torch.device(dev))  # type: ignore[attr-defined]
             except Exception as e:
@@ -1228,10 +1228,8 @@ def diarize_full(self, upload_id, correlation_id):
 
         try:
             with torch.inference_mode():
-                # В этой ревизии DiariZen __call__ не принимает min/max_speakers → не передаём kwargs
-                with torch.inference_mode():
-                    ann = pipeline(str(_wav))
-
+                # Важно: __call__ НЕ принимает min/max_speakers — никаких kwargs!
+                ann = pipeline(str(_wav))
         except Exception as e:
             logger.error(f"[{upload_id}] DiariZen inference failed: {e}", exc_info=True)
             return None
@@ -1251,11 +1249,20 @@ def diarize_full(self, upload_id, correlation_id):
             except Exception:
                 pass
 
-    def _run_pyannote(_wav: Path) -> List[Dict[str, Any]]:
-        """pyannote с чанками и паддингом."""
-        if not _PN_AVAILABLE:
-            raise RuntimeError("pyannote.audio not available")
-        pipeline = get_diarization_pipeline()
+    def _run_pyannote(_wav: Path) -> Optional[List[Dict[str, Any]]]:
+        """pyannote с чанками и паддингом. Возвращает None, если пайплайн недоступен."""
+        try:
+            from pyannote.audio import Pipeline as PyannotePipeline  # noqa
+        except Exception as e:
+            logger.warning(f"[{upload_id}] pyannote import failed: {e}")
+            return None
+
+        # пробуем собрать пайплайн (в окружениях с vendored pyannote это может падать)
+        try:
+            pipeline = get_diarization_pipeline()  # у тебя уже есть эта функция
+        except Exception as e:
+            logger.error(f"[{upload_id}] pyannote pipeline unavailable: {e}")
+            return None
 
         res: List[Dict[str, Any]] = []
         if use_chunking:
@@ -1282,11 +1289,11 @@ def diarize_full(self, upload_id, correlation_id):
                     f"{st:.1f}s→{en:.1f}s (core {offset:.1f}s→{offset+core_len:.1f}s, pad L={left_pad:.1f}s R={right_pad:.1f}s)"
                 )
 
-                tmp = Path(settings.DIARIZER_CACHE_DIR) / f"{upload_id}_chunk_{chunk_idx}.wav"
+                tmp = Path(getattr(settings, "DIARIZER_CACHE_DIR", "/tmp")) / f"{upload_id}_chunk_{chunk_idx}.wav"
                 subprocess.run(
                     [
                         "ffmpeg", "-y",
-                        "-threads", str(max(1, settings.FFMPEG_THREADS // 2)),
+                        "-threads", str(max(1, int(getattr(settings, "FFMPEG_THREADS", 2)) // 2)),
                         "-ss", str(st), "-t", str(en - st),
                         "-i", str(_wav), str(tmp),
                     ],
@@ -1300,7 +1307,7 @@ def diarize_full(self, upload_id, correlation_id):
                     before = len(res)
                     for s, _, spk in ann.itertracks(yield_label=True):
                         g0, g1 = float(s.start) + st, float(s.end) + st
-                        # вырезаем только «ядро» чанка, чтобы не дублировать overlap-части
+                        # вырезаем только «ядро» чанка, чтобы не дублировать overlap
                         if g1 <= offset or g0 >= (offset + core_len):
                             continue
                         g0 = max(g0, offset)
@@ -1311,7 +1318,6 @@ def diarize_full(self, upload_id, correlation_id):
                     added = len(res) - before
                     logger.info(f"[{upload_id}] diarize chunk {chunk_idx+1}/{total_chunks} done: added {added} segments")
                     r.sadd(processed_key, chunk_idx)
-
                 except Exception as e:
                     logger.error(f"[{upload_id}] error in diarize chunk {chunk_idx+1}/{total_chunks}: {e}", exc_info=True)
                 finally:
@@ -1331,7 +1337,6 @@ def diarize_full(self, upload_id, correlation_id):
                 chunk_idx += 1
 
             r.delete(processed_key)
-
         else:
             logger.info(f"[{upload_id}] Short audio or chunking disabled, single diarization pass")
             with torch.inference_mode():
@@ -1349,7 +1354,13 @@ def diarize_full(self, upload_id, correlation_id):
         res.sort(key=lambda x: x["start"])
         return res
 
-    # 1) Пытаемся DiariZen
+    def _degenerate_one_speaker() -> List[Dict[str, Any]]:
+        """Последний шанс: не падаем, а возвращаем один сегмент на весь файл."""
+        speaker_label = getattr(settings, "DIARIZATION_DEGRADED_SPEAKER", "SPEAKER_00")
+        logger.warning(f"[{upload_id}] DEGRADATION: returning single full-span segment (no diarization backend available)")
+        return [{"start": 0.0, "end": float(duration), "speaker": speaker_label}]
+
+    # --------- Запуск: 1) DiariZen
     try:
         if bool(getattr(settings, "USE_DIARIZEN", True)):
             attempt = _run_diarizen(wav)
@@ -1361,30 +1372,33 @@ def diarize_full(self, upload_id, correlation_id):
     except Exception as e:
         logger.warning(f"[{upload_id}] DiariZen unexpected error (fallback to pyannote): {e}")
 
-    # 2) Фолбэк на pyannote
+    # --------- 2) pyannote
     if not diar_segments:
         try:
-            diar_segments = _run_pyannote(wav)
-            used_backend = "pyannote"
+            attempt = _run_pyannote(wav)
+            if attempt:
+                diar_segments = attempt
+                used_backend = "pyannote"
         except Exception as e:
             logger.error(f"[{upload_id}] diarization failed in fallback: {e}", exc_info=True)
+
+    # --------- 3) Деградация (гарантируем отсутствие падений)
+    if not diar_segments:
+        if bool(getattr(settings, "DIARIZATION_ALLOW_DEGRADED", True)):
+            diar_segments = _degenerate_one_speaker()
+            used_backend = "degraded"
+        else:
+            logger.error(f"[{upload_id}] empty diarization result and degraded mode disabled")
             deliver_webhook.delay("processing_failed", upload_id, None)
             return
 
-    if not diar_segments:
-        logger.error(f"[{upload_id}] empty diarization result")
-        deliver_webhook.delay("processing_failed", upload_id, None)
-        return
-
-    # ------- Постобработка (стабилизация) -------
+    # ------- Постобработка
     MIN_SEG = float(getattr(settings, "DIARIZATION_MIN_SEGMENT_S", 0.20))
     GAP_MERGE = float(getattr(settings, "DIARIZATION_MERGE_GAP_S", 0.20))
     ISLAND_MAX = float(getattr(settings, "DIARIZATION_ISLAND_MAX_S", 0.60))
 
-    # 1) дропим короткие
     diar_segments = [s for s in diar_segments if (s["end"] - s["start"]) >= MIN_SEG]
 
-    # 2) начальная склейка одинаковых с маленькими паузами
     merged: List[Dict[str, Any]] = []
     cur = None
     for seg in sorted(diar_segments, key=lambda x: x["start"]):
@@ -1398,7 +1412,6 @@ def diarize_full(self, upload_id, correlation_id):
         merged.append(cur)
     diar_segments = merged
 
-    # 3) анти-flip: поглощаем короткий «островок» между одинаковыми соседями
     def _stabilize_labels(segments: List[Dict[str, Any]], island_max: float = ISLAND_MAX) -> List[Dict[str, Any]]:
         if len(segments) < 3:
             return segments
@@ -1409,7 +1422,7 @@ def diarize_full(self, upload_id, correlation_id):
                 prev, cur, nxt = segments[i - 1], segments[i], segments[i + 1]
                 cur_dur = cur["end"] - cur["start"]
                 if prev["speaker"] == nxt["speaker"] != cur["speaker"] and cur_dur <= island_max:
-                    prev["end"] = nxt["end"] = max(prev["end"], nxt["end"])
+                    # поглощаем островок
                     if out:
                         out.pop()
                     out.append({"start": prev["start"], "end": nxt["end"], "speaker": prev["speaker"]})
@@ -1421,7 +1434,6 @@ def diarize_full(self, upload_id, correlation_id):
 
     diar_segments = _stabilize_labels(diar_segments)
 
-    # 4) финальное схлопывание подряд идущих одинаковых
     final_out: List[Dict[str, Any]] = []
     buf: Optional[Dict[str, Any]] = None
     for seg in sorted(diar_segments, key=lambda x: x["start"]):
@@ -1434,7 +1446,7 @@ def diarize_full(self, upload_id, correlation_id):
     if buf:
         final_out.append(buf)
 
-    # ------- Сохранение и события -------
+    # ------- Сохранение/ивенты
     out_dir = Path(settings.RESULTS_FOLDER) / upload_id
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "diarization.json").write_text(json.dumps(final_out, ensure_ascii=False, indent=2))
