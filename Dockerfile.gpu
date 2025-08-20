@@ -1,28 +1,61 @@
-# --- infra (если воркер сам поднимает Celery/логирование/HTTP-запросы) ---
-celery>=5.5.3
-redis>=4.5.0
-python-dotenv>=1.1.0
-structlog>=23.3.0
-yamlargparse>=0.27.0
-httpx>=0.24.0
+FROM nvidia/cuda:12.9.1-cudnn-runtime-ubuntu22.04
 
-# --- аудио утилиты по нужде ---
-webrtcvad>=2.0.10
-pydub>=0.25.1
-librosa>=0.10.0
-soundfile>=0.12.1
-numpy<2.0
-h5py>=3.0.0
+WORKDIR /app
 
-# --- ASR (GPU) ---
-# Совместимо с Torch 2.1.1 + CUDA 12.1 + cuDNN 8
-faster-whisper[cuda12]==1.1.1
-ctranslate2[cuda12]==4.4.0
+# — Неинтерактивный apt и тихий pip
+ARG DEBIAN_FRONTEND=noninteractive
+ENV DEBIAN_FRONTEND=${DEBIAN_FRONTEND}
+ENV PIP_NO_PROGRESS_BAR=1
 
-# --- НЕ СТАВИМ из PyPI ---
-# pyannote.audio        # ставится из сабмодуля DiariZen в Dockerfile
-# cupy-cuda12x          # не требуется
-# ctranslate2>=4.5      # cuDNN 9 / CUDA >= 12.3 (нам не подходит)
-# chainer               # если специально не нужен — убрать
-# transformers          # только если действительно используешь здесь
-# fastapi/uvicorn/...   # обычно не нужны в GPU-воркере
+# 1) Системные зависимости
+RUN apt-get update -qq && \
+    apt-get install -y -qq --no-install-recommends \
+      python3-pip python3-dev build-essential \
+      ffmpeg libsndfile1 git \
+      libavformat-dev libavcodec-dev libavutil-dev libswscale-dev \
+      libportaudio2 && \
+    rm -rf /var/lib/apt/lists/*
+
+# 2) (ВАЖНО) Ставим согласованный стек PyTorch заранее
+#    Колёса torch с cu121 включают CUDA-рантайм и работают на этой базе.
+RUN pip3 install -q --upgrade pip && \
+    pip3 install -q --no-cache-dir \
+      torch==2.1.1+cu121 torchvision==0.16.1+cu121 torchaudio==2.1.1+cu121 \
+      --index-url https://download.pytorch.org/whl/cu121
+
+# 3) Приложенческие зависимости (без тяжёлых ML, если они у тебя в этом файле — лучше убрать pyannote.audio здесь)
+COPY requirements.txt ./
+RUN pip3 install -q --no-cache-dir -r requirements.txt && \
+    rm -rf /root/.cache/pip
+
+# 4) Whisper-стек под cuDNN 9 / CUDA12
+#    faster-whisper 1.1.1 + CTranslate2 4.6.x (ветка с cuDNN 9)
+RUN pip3 install -q --no-cache-dir \
+      "faster-whisper[cuda12]==1.1.1" \
+      "ctranslate2[cuda12]==4.6.0"
+
+# 5) DiariZen из исходников + их pyannote-audio (сабмодуль)
+RUN git clone --depth 1 https://github.com/BUTSpeechFIT/DiariZen.git /opt/DiariZen && \
+    cd /opt/DiariZen && \
+    git submodule update --init --recursive && \
+    pip3 install -q --no-cache-dir -r requirements.txt && \
+    pip3 install -q --no-cache-dir -e . && \
+    cd /opt/DiariZen/pyannote-audio && \
+    pip3 install -q --no-cache-dir -e .
+
+# 6) Копируем приложение
+COPY . .
+
+# 7) Окружение для GPU-воркера
+ENV WHISPER_DEVICE=cuda \
+    WHISPER_COMPUTE_TYPE=float16 \
+    HUGGINGFACE_CACHE_DIR=/hf_cache \
+    CELERY_BROKER_URL=${CELERY_BROKER_URL} \
+    UPLOAD_FOLDER=/app/uploads \
+    RESULTS_FOLDER=/app/results
+
+# 8) Запуск Celery GPU-воркера
+CMD ["celery", "-A", "tasks", "worker", \
+     "--loglevel=info", \
+     "--concurrency=${GPU_CONCURRENCY}", \
+     "--queues=transcribe_gpu,diarize_gpu"]
