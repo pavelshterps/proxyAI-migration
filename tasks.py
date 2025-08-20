@@ -176,7 +176,12 @@ AUDIO_LOUDNORM = getattr(settings, "AUDIO_LOUDNORM", "I=-23:TP=-2:LRA=11")
 # Доп. вариант: чистый гейн без нормализации/шумодава (для экспериментов)
 AUDIO_ENABLE_GAIN = bool(getattr(settings, "AUDIO_ENABLE_GAIN", False))
 AUDIO_GAIN_DB = float(getattr(settings, "AUDIO_GAIN_DB", 6.0))  # +6 dB по умолчанию
-
+# --- Whisper decoding/timing flags ---
+WHISPER_WORD_TIMESTAMPS = bool(getattr(settings, "WHISPER_WORD_TIMESTAMPS", False))
+WHISPER_BEAM_SIZE = int(getattr(settings, "WHISPER_BEAM_SIZE", 1))
+WHISPER_BEST_OF = int(getattr(settings, "WHISPER_BEST_OF", 1))
+WHISPER_TEMPERATURE = float(getattr(settings, "WHISPER_TEMPERATURE", 0.0))
+WHISPER_CONDITION_ON_PREV_TEXT = bool(getattr(settings, "WHISPER_CONDITION_ON_PREV_TEXT", True))
 
 def _ffmpeg_filter_chain() -> str:
     """
@@ -866,7 +871,10 @@ def preview_transcribe(self, upload_id, correlation_id):
     model = get_whisper_model()
     segments_gen, _ = model.transcribe(
         proc.stdout,
-        word_timestamps=True,
+        word_timestamps=True,  # для превью оставляем пометки по словам
+        beam_size=1,
+        best_of=1,
+        temperature=0.0,
         **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {}),
     )
     proc.stdout.close(); proc.wait()
@@ -935,12 +943,16 @@ def transcribe_segments(self, upload_id, correlation_id):
     def _transcribe_with_vad(source, offset: float = 0.0, core_start: Optional[float] = None, core_end: Optional[float] = None):
         segs, _ = model.transcribe(
             source,
-            word_timestamps=True,
+            word_timestamps=WHISPER_WORD_TIMESTAMPS,
             vad_filter=True,
             vad_parameters={
                 "min_silence_duration_ms": int(getattr(settings, "SENTENCE_MAX_GAP_S", 0.35) * 1000),
                 "speech_pad_ms": 200,
             },
+            beam_size=WHISPER_BEAM_SIZE,
+            best_of=WHISPER_BEST_OF,
+            temperature=WHISPER_TEMPERATURE,
+            condition_on_previous_text=WHISPER_CONDITION_ON_PREV_TEXT,
             **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {}),
         )
         result = []
@@ -1117,6 +1129,48 @@ def diarize_full(self, upload_id, correlation_id):
         model_id = getattr(settings, "DIARIZEN_MODEL_ID", "BUT-FIT/diarizen-wavlm-large-s80-mlc")
         try:
             pipeline = DiariZenPipeline.from_pretrained(model_id)  # публичная модель, токен не требуется
+            # --- allow automatic number of speakers (overridable via settings) ---
+            try:
+                cfg = getattr(pipeline, "config", None)
+                if isinstance(cfg, dict) and "clustering" in cfg and isinstance(cfg["clustering"], dict):
+                    args = cfg["clustering"].setdefault("args", {})
+
+                    # 1) Фиксированное число спикеров (min=max), если задано
+                    fixed = getattr(settings, "DIARIZEN_NUM_SPEAKERS", None)
+                    if fixed is not None and int(fixed) > 0:
+                        fixed = int(fixed)
+                        args["min_speakers"] = fixed
+                        args["max_speakers"] = fixed
+                    else:
+                        # 2) Автоопределение в диапазоне [min..max]
+                        min_spk = int(getattr(settings, "DIARIZEN_MIN_SPEAKERS", args.get("min_speakers", 1)) or 1)
+                        max_spk = int(getattr(settings, "DIARIZEN_MAX_SPEAKERS", args.get("max_speakers", 8)) or 8)
+                        if max_spk < min_spk:
+                            max_spk = min_spk
+                        args["min_speakers"] = min_spk
+                        args["max_speakers"] = max_spk
+
+                    # 3) Порог кластеризации: поддержим и 'ahc_threshold', и 'cluster_threshold'
+                    default_thr = args.get("ahc_threshold", args.get("cluster_threshold", 0.6647095879538272))
+                    thr = float(getattr(settings, "DIARIZEN_CLUSTER_THRESHOLD", default_thr))
+                    # Если в конфиге уже есть одно из полей — переопределим его; второе поставим про запас
+                    if "ahc_threshold" in args or args.get("method") == "AgglomerativeClustering":
+                        args["ahc_threshold"] = thr
+                    args["cluster_threshold"] = thr  # безопасно иметь и этот ключ
+
+                    # 4) Минимальный размер кластера
+                    args["min_cluster_size"] = int(getattr(
+                        settings, "DIARIZEN_MIN_CLUSTER_SIZE", args.get("min_cluster_size", 16)
+                    ))
+
+                    logger.info(
+                        f"[DIARIZE] DiariZen clustering params → "
+                        f"min={args['min_speakers']}, max={args['max_speakers']}, "
+                        f"thr={thr}, min_cluster={args.get('min_cluster_size')}"
+                    )
+            except Exception as _e:
+                logger.warning(f"[{upload_id}] could not adjust DiariZen clustering params: {_e}")
+
             # Попытка перенести на GPU (если поддерживается)
             try:
                 dev = getattr(settings, "DIARIZER_DEVICE", None)
