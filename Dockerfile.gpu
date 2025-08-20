@@ -1,65 +1,52 @@
-FROM nvidia/cuda:12.9.1-cudnn-runtime-ubuntu22.04
+# === GPU worker image: PyTorch 2.1.1 + CUDA 12.1 + cuDNN 8 ===
+FROM pytorch/pytorch:2.1.1-cuda12.1-cudnn8-runtime
 
 WORKDIR /app
 
-# чтобы apt не пытался взаимодействовать с терминалом
 ARG DEBIAN_FRONTEND=noninteractive
 ENV DEBIAN_FRONTEND=${DEBIAN_FRONTEND}
+ENV PIP_NO_PROGRESS_BAR=1
 
-# 1) Системные зависимости в тихом режиме
+# 1) System deps
 RUN apt-get update -qq && \
     apt-get install -y -qq --no-install-recommends \
-      python3-pip python3-dev build-essential \
-      ffmpeg libsndfile1 git \
+      python3-dev build-essential ffmpeg libsndfile1 git \
       libavformat-dev libavcodec-dev libavutil-dev libswscale-dev \
       libportaudio2 && \
     rm -rf /var/lib/apt/lists/*
 
-# 2) Настроим pip на тихий режим
-ENV PIP_NO_PROGRESS_BAR=1
-
-# 3) Все питон-зависимости (heavy + light)
+# 2) Python deps (общие)
 COPY requirements.txt ./
-RUN pip3 install --upgrade pip -q && \
-    pip3 install -q --no-cache-dir --progress-bar off -r requirements.txt && \
-    rm -rf /root/.cache/pip
+RUN pip install -q --upgrade pip && \
+    pip install -q --no-cache-dir -r requirements.txt
 
-# 4) GPU-специфичные оптимизации тоже в тихом режиме
-RUN pip3 install --no-cache-dir -q --progress-bar off \
-      faster-whisper[cuda12]==1.1.1 \
-      ctranslate2[cuda12]>=4.6.0
+# 3) Faster-Whisper stack, совместимый с CUDA 12.1 + cuDNN 8
+#    ВАЖНО: фиксируем CT2 на 4.4.0 (см. требования CUDA/cuDNN)
+RUN pip install -q --no-cache-dir \
+      "ctranslate2[cuda12]==4.4.0" \
+      "faster-whisper[cuda12]==1.1.1"
 
-RUN apt-get update && apt-get install -y --no-install-recommends git \
- && rm -rf /var/lib/apt/lists/*
-
-# Клонируем DiariZen и его сабмодули
+# 4) DiariZen из исходников + их pyannote-audio сабмодуль
 RUN git clone --depth 1 https://github.com/BUTSpeechFIT/DiariZen.git /opt/DiariZen \
  && cd /opt/DiariZen \
- && git submodule update --init --recursive
+ && git submodule update --init --recursive \
+ && pip install -q --no-cache-dir -r requirements.txt \
+ && pip install -q --no-cache-dir -e . \
+ && cd /opt/DiariZen/pyannote-audio \
+ && pip install -q --no-cache-dir -e .
 
-# Ставим зависимости и сам пакет (editable)
-RUN cd /opt/DiariZen \
- && pip install --no-cache-dir -r requirements.txt \
- && pip install --no-cache-dir -e .
-
-# У DiariZen сабмодуль pyannote-audio — поставим его тоже из исходников
-RUN cd /opt/DiariZen/pyannote-audio \
- && pip install --no-cache-dir -e .
-
-# 5) Копируем приложение
+# 5) App
 COPY . .
 
-# 6) Окружение для GPU-воркера
+# 6) Runtime env (GPU workers only)
 ENV WHISPER_DEVICE=cuda \
     WHISPER_COMPUTE_TYPE=float16 \
     HUGGINGFACE_CACHE_DIR=/hf_cache \
-    CELERY_BROKER_URL=${CELERY_BROKER_URL} \
     UPLOAD_FOLDER=/app/uploads \
     RESULTS_FOLDER=/app/results
 
-# 7) Запуск GPU-воркера
+# 7) Start GPU worker
 CMD ["celery", "-A", "tasks", "worker", \
      "--loglevel=info", \
-     "--concurrency=${GPU_CONCURRENCY}", \
-     "--queues=transcribe_gpu,diarize_gpu" \
-]
+     "--concurrency=1", \
+     "--queues=transcribe_gpu,diarize_gpu"]
