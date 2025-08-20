@@ -1,52 +1,28 @@
-# === GPU worker image: PyTorch 2.1.1 + CUDA 12.1 + cuDNN 8 ===
-FROM pytorch/pytorch:2.1.1-cuda12.1-cudnn8-runtime
+# --- infra (если воркер сам поднимает Celery/логирование/HTTP-запросы) ---
+celery>=5.5.3
+redis>=4.5.0
+python-dotenv>=1.1.0
+structlog>=23.3.0
+yamlargparse>=0.27.0
+httpx>=0.24.0
 
-WORKDIR /app
+# --- аудио утилиты по нужде ---
+webrtcvad>=2.0.10
+pydub>=0.25.1
+librosa>=0.10.0
+soundfile>=0.12.1
+numpy<2.0
+h5py>=3.0.0
 
-ARG DEBIAN_FRONTEND=noninteractive
-ENV DEBIAN_FRONTEND=${DEBIAN_FRONTEND}
-ENV PIP_NO_PROGRESS_BAR=1
+# --- ASR (GPU) ---
+# Совместимо с Torch 2.1.1 + CUDA 12.1 + cuDNN 8
+faster-whisper[cuda12]==1.1.1
+ctranslate2[cuda12]==4.4.0
 
-# 1) System deps
-RUN apt-get update -qq && \
-    apt-get install -y -qq --no-install-recommends \
-      python3-dev build-essential ffmpeg libsndfile1 git \
-      libavformat-dev libavcodec-dev libavutil-dev libswscale-dev \
-      libportaudio2 && \
-    rm -rf /var/lib/apt/lists/*
-
-# 2) Python deps (общие)
-COPY requirements.txt ./
-RUN pip install -q --upgrade pip && \
-    pip install -q --no-cache-dir -r requirements.txt
-
-# 3) Faster-Whisper stack, совместимый с CUDA 12.1 + cuDNN 8
-#    ВАЖНО: фиксируем CT2 на 4.4.0 (см. требования CUDA/cuDNN)
-RUN pip install -q --no-cache-dir \
-      "ctranslate2[cuda12]==4.4.0" \
-      "faster-whisper[cuda12]==1.1.1"
-
-# 4) DiariZen из исходников + их pyannote-audio сабмодуль
-RUN git clone --depth 1 https://github.com/BUTSpeechFIT/DiariZen.git /opt/DiariZen \
- && cd /opt/DiariZen \
- && git submodule update --init --recursive \
- && pip install -q --no-cache-dir -r requirements.txt \
- && pip install -q --no-cache-dir -e . \
- && cd /opt/DiariZen/pyannote-audio \
- && pip install -q --no-cache-dir -e .
-
-# 5) App
-COPY . .
-
-# 6) Runtime env (GPU workers only)
-ENV WHISPER_DEVICE=cuda \
-    WHISPER_COMPUTE_TYPE=float16 \
-    HUGGINGFACE_CACHE_DIR=/hf_cache \
-    UPLOAD_FOLDER=/app/uploads \
-    RESULTS_FOLDER=/app/results
-
-# 7) Start GPU worker
-CMD ["celery", "-A", "tasks", "worker", \
-     "--loglevel=info", \
-     "--concurrency=1", \
-     "--queues=transcribe_gpu,diarize_gpu"]
+# --- НЕ СТАВИМ из PyPI ---
+# pyannote.audio        # ставится из сабмодуля DiariZen в Dockerfile
+# cupy-cuda12x          # не требуется
+# ctranslate2>=4.5      # cuDNN 9 / CUDA >= 12.3 (нам не подходит)
+# chainer               # если специально не нужен — убрать
+# transformers          # только если действительно используешь здесь
+# fastapi/uvicorn/...   # обычно не нужны в GPU-воркере
