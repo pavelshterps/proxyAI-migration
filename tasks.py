@@ -841,17 +841,18 @@ def preview_transcribe(self, upload_id, correlation_id):
     deliver_webhook.delay("preview_completed", upload_id, {"preview": preview})
     transcribe_segments.delay(upload_id, correlation_id)
 
-# ЗАМЕНИ функцию transcribe_segments целиком на эту версию
+
 @app.task(bind=True, queue="transcribe_gpu")
 def transcribe_segments(self, upload_id, correlation_id):
     logger.info(f"[{upload_id}] transcribe_segments received")
     try:
         import torch
-        logger.info(f"[{upload_id}] GPU memory reserved before transcription: {torch.cuda.memory_reserved() if torch.cuda.is_available() else 'n/a'}")
+        logger.info(f"[{upload_id}] GPU memory reserved before transcription: "
+                    f"{torch.cuda.memory_reserved() if torch.cuda.is_available() else 'n/a'}")
     except ImportError:
         pass
 
-    # GPU busy → fallback на CPU
+    # Если GPU перегружены — уходим на CPU
     try:
         inspector = app.control.inspect()
         active = inspector.active() or {}
@@ -877,23 +878,22 @@ def transcribe_segments(self, upload_id, correlation_id):
     model = get_whisper_model()
     raw_segs: List[Any] = []
 
-    def _transcribe_with_vad(source, offset: float = 0.0, core_start: float = None, core_end: float = None):
+    def _transcribe_with_vad(source, offset: float = 0.0, core_start: Optional[float] = None, core_end: Optional[float] = None):
         segs, _ = model.transcribe(
             source,
             word_timestamps=True,
             vad_filter=True,
             vad_parameters={
-                "min_silence_duration_ms": int(settings.SENTENCE_MAX_GAP_S * 1000),
+                "min_silence_duration_ms": int(getattr(settings, "SENTENCE_MAX_GAP_S", 0.35) * 1000),
                 "speech_pad_ms": 200,
             },
             **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {}),
         )
-
         result = []
         for s in segs:
             s.start += offset
             s.end += offset
-            # Если задано ядро чанка — обрежем к его границам (чтобы не было дублей из overlap)
+            # если задано ядро чанка — отрежем только попадающее внутрь ядра
             if core_start is not None and core_end is not None:
                 if s.end <= core_start or s.start >= core_end:
                     continue
@@ -904,7 +904,7 @@ def transcribe_segments(self, upload_id, correlation_id):
             result.append(s)
         return result
 
-    # Короткое аудио — одним проходом, overlap не нужен
+    # короткое аудио — одним проходом
     if duration <= settings.VAD_MAX_LENGTH_S:
         logger.info(f"[{upload_id}] short audio ({duration:.1f}s) → single VAD pass")
         raw_segs = _transcribe_with_vad(str(wav))
@@ -913,9 +913,9 @@ def transcribe_segments(self, upload_id, correlation_id):
         processed_key = f"transcribe:processed_chunks:{upload_id}"
         processed = {int(x) for x in r.smembers(processed_key)}
 
+        pad = float(getattr(settings, "TRANSCRIPTION_CHUNK_PAD_S", TRANSCRIPTION_CHUNK_PAD_S))
         chunk_idx = 0
         core_start = 0.0
-        pad = float(getattr(settings, "TRANSCRIPTION_CHUNK_PAD_S", 10.0))
 
         while core_start < duration:
             if chunk_idx in processed:
@@ -927,7 +927,6 @@ def transcribe_segments(self, upload_id, correlation_id):
             core_len = min(settings.CHUNK_LENGTH_S, duration - core_start)
             core_end = core_start + core_len
 
-            # добавляем паддинг только если не первый/не последний чанк
             left_pad = pad if core_start > 0 else 0.0
             right_pad = pad if core_end < duration else 0.0
 
@@ -947,12 +946,14 @@ def transcribe_segments(self, upload_id, correlation_id):
                         "ffmpeg", "-y",
                         "-threads", str(settings.FFMPEG_THREADS),
                         "-ss", str(read_start), "-t", str(read_len),
-                        "-i", str(wav), "-f", "wav", "pipe:1"
+                        "-i", str(wav),
+                        "-f", "wav", "pipe:1"
                     ],
                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
                 )
-                # offset = read_start (смещаем таймкоды от начала файла)
-                chunk_segs = _transcribe_with_vad(p.stdout, offset=read_start, core_start=core_start, core_end=core_end)
+                chunk_segs = _transcribe_with_vad(
+                    p.stdout, offset=read_start, core_start=core_start, core_end=core_end
+                )
                 p.stdout.close(); p.wait()
 
                 raw_segs.extend(chunk_segs)
@@ -969,7 +970,7 @@ def transcribe_segments(self, upload_id, correlation_id):
 
         r.delete(processed_key)
 
-    # → группируем в предложения и сохраняем, как раньше
+    # группируем в предложения
     flat = [{"start": s.start, "end": s.end, "text": s.text} for s in raw_segs]
     flat.sort(key=lambda x: x["start"])
     sentences = group_into_sentences(flat)
@@ -983,43 +984,51 @@ def transcribe_segments(self, upload_id, correlation_id):
 
     try:
         import torch
-        logger.info(f"[{upload_id}] GPU memory reserved after transcription: {torch.cuda.memory_reserved() if torch.cuda.is_available() else 'n/a'}")
+        logger.info(f"[{upload_id}] GPU memory reserved after transcription: "
+                    f"{torch.cuda.memory_reserved() if torch.cuda.is_available() else 'n/a'}")
     except ImportError:
         pass
+
 
 @app.task(bind=True, queue="diarize_gpu")
 def diarize_full(self, upload_id, correlation_id):
     """
-    Диаризация с безопасной попыткой FS-EEND и фолбэком на pyannote/speaker-diarization-3.1.
-    - Умеет работать с чанками и паддингом в pyannote-ветке.
-    - Не падает, если FS-EEND недоступен (гейт/нет токена) — логирует и уходит в фолбэк.
+    Диаризация с приоритетом DiariZen:
+      1) Сначала пробуем BUT-FIT/diarizen-wavlm-large-s80-mlc (целый файл).
+      2) При любой проблеме — фолбэк на pyannote/speaker-diarization-3.1
+         (с поддержкой чанкинга и паддинга).
+    Постобработка: отбрасывание коротких сегментов, склейка пауз, анти-flip, схлопывание подряд идущих.
     """
     import gc
+    import torch
+    from pathlib import Path
+    from typing import Optional, List, Dict, Any
+
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
     logger.info(f"[{upload_id}] diarize_full started")
     r.publish(f"progress:{upload_id}", json.dumps({"status": "diarize_started"}))
     deliver_webhook.delay("diarization_started", upload_id, None)
 
     try:
-        import torch
         logger.info(
             f"[{upload_id}] GPU memory reserved before diarization: "
             f"{torch.cuda.memory_reserved() if torch.cuda.is_available() else 'n/a'}"
         )
-    except ImportError:
-        torch = None  # type: ignore
+    except Exception:
+        pass
 
+    # Подготовка WAV и длительность
     wav, duration = prepare_wav(upload_id)
 
-    # Настройки чанкинга для pyannote-ветки
+    # ------- Настройки чанкинга/паддинга (для pyannote-ветки) -------
     try:
-        chunk_limit = int(getattr(settings, "DIARIZATION_CHUNK_LENGTH_S", 0) or 0)
+        chunk_limit = int(getattr(settings, "DIARIZATION_CHUNK_LENGTH_S", 300) or 0)
     except Exception:
-        logger.warning(f"[{upload_id}] invalid DIARIZATION_CHUNK_LENGTH_S, falling back to 0")
+        logger.warning(f"[{upload_id}] invalid DIARIZATION_CHUNK_LENGTH_S, fallback to 0")
         chunk_limit = 0
-    pad = float(getattr(settings, "DIARIZATION_CHUNK_PADDING_S", 0.0) or 0.0)
-    using_chunking = bool(chunk_limit and duration > chunk_limit)
-    total_chunks = math.ceil(duration / chunk_limit) if using_chunking else 1
+    pad = float(getattr(settings, "DIARIZATION_CHUNK_PADDING_S", 10.0) or 0.0)
+    use_chunking = bool(chunk_limit and duration > chunk_limit)
+    total_chunks = math.ceil(duration / chunk_limit) if use_chunking else 1
 
     # Подсказки по числу спикеров для pyannote
     infer_kwargs: Dict[str, Any] = {}
@@ -1038,53 +1047,41 @@ def diarize_full(self, upload_id, correlation_id):
                 except Exception:
                     pass
 
-    use_only_fs_eend = bool(getattr(settings, "USE_ONLY_FS_EEND", True))
-    raw: List[Dict[str, Any]] = []
+    # ------- Диаризация: приоритет DiariZen -------
+    used_backend = None
+    diar_segments: List[Dict[str, Any]] = []
 
-    def _run_fs_eend(_wav: Path) -> Optional[List[Dict[str, Any]]]:
-        """Пробует запустить FS-EEND; возвращает список сегментов или None при любой проблеме."""
+    def _run_diarizen(_wav: Path) -> Optional[List[Dict[str, Any]]]:
+        """DiariZen: одна проходка на весь файл. Возвращает список сегментов или None при ошибке."""
         try:
-            from pyannote.audio import Pipeline as _EEND
+            # см. пример в README модели на HF
+            from diarizen.pipelines.inference import DiariZenPipeline  # type: ignore
         except Exception as e:
-            logger.warning(f"[{upload_id}] FS-EEND import failed: {e}")
+            logger.warning(f"[{upload_id}] DiariZen import failed: {e}")
             return None
 
-        model_id = getattr(settings, "FS_EEND_MODEL_PATH", None)
-        if not model_id:
-            logger.warning(f"[{upload_id}] FS_EEND_MODEL_PATH not set → skipping FS-EEND")
-            return None
-
+        model_id = getattr(settings, "DIARIZEN_MODEL_ID", "BUT-FIT/diarizen-wavlm-large-s80-mlc")
         try:
-            eend = _EEND.from_pretrained(
-                model_id,
-                use_auth_token=settings.HUGGINGFACE_TOKEN,   # обязателен для гейтед моделей
-                cache_dir=settings.DIARIZER_CACHE_DIR,
-            )
-        except Exception as e:
-            logger.warning(
-                f"[{upload_id}] Could not download FS-EEND pipeline '{model_id}'. "
-                f"Likely gated/private or bad token. Error: {e}"
-            )
-            return None
-
-        # Перевод на нужное устройство
-        try:
-            dev = getattr(settings, "FS_EEND_DEVICE", None)
-            if torch:
+            pipeline = DiariZenPipeline.from_pretrained(model_id)  # публичная модель, токен не требуется
+            # Попытка перенести на GPU (если поддерживается)
+            try:
+                dev = getattr(settings, "DIARIZER_DEVICE", None)
                 if dev is None:
                     dev = "cuda" if torch.cuda.is_available() else "cpu"
-                eend.to(torch.device(dev))
+                # не у всех пайплайнов есть .to(...): пробуем и игнорируем, если не поддерживает
+                if hasattr(pipeline, "to"):
+                    pipeline.to(torch.device(dev))  # type: ignore[attr-defined]
+            except Exception as e:
+                logger.warning(f"[{upload_id}] DiariZen .to(device) failed (will run as-is): {e}")
         except Exception as e:
-            logger.warning(f"[{upload_id}] FS-EEND .to(device) failed, staying on CPU: {e}")
+            logger.warning(f"[{upload_id}] DiariZen load failed for {model_id}: {e}")
+            return None
 
         try:
-            if torch:
-                with torch.inference_mode():
-                    ann = eend(str(_wav))
-            else:
-                ann = eend(str(_wav))
+            with torch.inference_mode():
+                ann = pipeline(str(_wav))  # ожидается pyannote.Annotation-совместимый вывод
         except Exception as e:
-            logger.error(f"[{upload_id}] FS-EEND inference failed: {e}", exc_info=True)
+            logger.error(f"[{upload_id}] DiariZen inference failed: {e}", exc_info=True)
             return None
 
         out: List[Dict[str, Any]] = []
@@ -1094,7 +1091,7 @@ def diarize_full(self, upload_id, correlation_id):
             out.sort(key=lambda x: x["start"])
             return out
         except Exception as e:
-            logger.error(f"[{upload_id}] FS-EEND output parse failed: {e}", exc_info=True)
+            logger.error(f"[{upload_id}] DiariZen output parse failed: {e}", exc_info=True)
             return None
         finally:
             try:
@@ -1103,35 +1100,34 @@ def diarize_full(self, upload_id, correlation_id):
                 pass
 
     def _run_pyannote(_wav: Path) -> List[Dict[str, Any]]:
-        """Обычный pyannote с чанками/паддингом."""
+        """pyannote с чанками и паддингом."""
         if not _PN_AVAILABLE:
             raise RuntimeError("pyannote.audio not available")
-
-        pipeline = get_diarization_pipeline()  # внутри поправьте .to(torch.device(...))
+        pipeline = get_diarization_pipeline()
 
         res: List[Dict[str, Any]] = []
-        if using_chunking:
+        if use_chunking:
             processed_key = f"diarize:processed_chunks:{upload_id}"
             processed = {int(x) for x in r.smembers(processed_key)}
 
             offset = 0.0
             chunk_idx = 0
             while offset < duration:
-                this_len = min(chunk_limit, duration - offset)
+                core_len = min(chunk_limit, duration - offset)
                 left_pad = pad if offset > 0 else 0.0
-                right_pad = pad if (offset + this_len) < duration else 0.0
+                right_pad = pad if (offset + core_len) < duration else 0.0
+                st = max(0.0, offset - left_pad)
+                en = min(duration, offset + core_len + right_pad)
 
                 if chunk_idx in processed:
                     logger.info(f"[{upload_id}] skip diarize chunk {chunk_idx+1}/{total_chunks}")
-                    offset += this_len
+                    offset += core_len
                     chunk_idx += 1
                     continue
 
-                log_start = max(0.0, offset - left_pad)
-                log_end = min(duration, offset + this_len + right_pad)
                 logger.info(
                     f"[{upload_id}] diarize chunk {chunk_idx+1}/{total_chunks}: "
-                    f"{log_start:.1f}s→{log_end:.1f}s (core {offset:.1f}s→{offset+this_len:.1f}s, pad L={left_pad:.1f}s R={right_pad:.1f}s)"
+                    f"{st:.1f}s→{en:.1f}s (core {offset:.1f}s→{offset+core_len:.1f}s, pad L={left_pad:.1f}s R={right_pad:.1f}s)"
                 )
 
                 tmp = Path(settings.DIARIZER_CACHE_DIR) / f"{upload_id}_chunk_{chunk_idx}.wav"
@@ -1139,33 +1135,28 @@ def diarize_full(self, upload_id, correlation_id):
                     [
                         "ffmpeg", "-y",
                         "-threads", str(max(1, settings.FFMPEG_THREADS // 2)),
-                        "-ss", str(log_start),
-                        "-t", str(log_end - log_start),
-                        "-i", str(_wav),
-                        str(tmp),
+                        "-ss", str(st), "-t", str(en - st),
+                        "-i", str(_wav), str(tmp),
                     ],
                     check=True, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL
                 )
 
                 try:
-                    if torch:
-                        with torch.inference_mode():
-                            ann = pipeline(str(tmp), **infer_kwargs)
-                    else:
+                    with torch.inference_mode():
                         ann = pipeline(str(tmp), **infer_kwargs)
 
                     before = len(res)
                     for s, _, spk in ann.itertracks(yield_label=True):
-                        g_start = float(s.start) + log_start
-                        g_end = float(s.end) + log_start
-                        if g_end <= offset or g_start >= (offset + this_len):
+                        g0, g1 = float(s.start) + st, float(s.end) + st
+                        # вырезаем только «ядро» чанка, чтобы не дублировать overlap-части
+                        if g1 <= offset or g0 >= (offset + core_len):
                             continue
-                        g_start = max(g_start, offset)
-                        g_end = min(g_end, offset + this_len)
-                        if g_end > g_start:
-                            res.append({"start": g_start, "end": g_end, "speaker": spk})
-                    added = len(res) - before
+                        g0 = max(g0, offset)
+                        g1 = min(g1, offset + core_len)
+                        if g1 > g0:
+                            res.append({"start": g0, "end": g1, "speaker": spk})
 
+                    added = len(res) - before
                     logger.info(f"[{upload_id}] diarize chunk {chunk_idx+1}/{total_chunks} done: added {added} segments")
                     r.sadd(processed_key, chunk_idx)
 
@@ -1181,20 +1172,17 @@ def diarize_full(self, upload_id, correlation_id):
                     except Exception:
                         pass
                     gc.collect()
-                    if torch and torch.cuda.is_available():
+                    if torch.cuda.is_available():
                         torch.cuda.empty_cache()
 
-                    offset += this_len
-                    chunk_idx += 1
+                offset += core_len
+                chunk_idx += 1
 
             r.delete(processed_key)
 
         else:
             logger.info(f"[{upload_id}] Short audio or chunking disabled, single diarization pass")
-            if torch:
-                with torch.inference_mode():
-                    ann = pipeline(str(_wav), **infer_kwargs)
-            else:
+            with torch.inference_mode():
                 ann = pipeline(str(_wav), **infer_kwargs)
             for s, _, spk in ann.itertracks(yield_label=True):
                 res.append({"start": float(s.start), "end": float(s.end), "speaker": spk})
@@ -1203,59 +1191,51 @@ def diarize_full(self, upload_id, correlation_id):
             except Exception:
                 pass
             gc.collect()
-            if torch and torch.cuda.is_available():
+            if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
         res.sort(key=lambda x: x["start"])
         return res
 
-    # --- Пытаемся FS-EEND (если попросили), иначе сразу pyannote
-    used_backend = None
-    if use_only_fs_eend:
-        logger.info(f"[{upload_id}] FS-EEND-only diarization with {getattr(settings, 'FS_EEND_MODEL_PATH', None)}")
-        attempt = _run_fs_eend(wav)
-        if attempt is not None:
-            raw = attempt
-            used_backend = "fs-eend"
-        else:
-            # Автофолбэк на pyannote вместо немедленного провала
-            logger.warning(f"[{upload_id}] FS-EEND unavailable → falling back to pyannote/speaker-diarization-3.1")
-            try:
-                raw = _run_pyannote(wav)
-                used_backend = "pyannote"
-            except Exception as e:
-                logger.error(f"[{upload_id}] diarization failed in fallback: {e}", exc_info=True)
-                deliver_webhook.delay("processing_failed", upload_id, None)
-                return
-    else:
+    # 1) Пытаемся DiariZen
+    try:
+        if bool(getattr(settings, "USE_DIARIZEN", True)):
+            attempt = _run_diarizen(wav)
+            if attempt:
+                diar_segments = attempt
+                used_backend = "diarizen"
+            else:
+                logger.warning(f"[{upload_id}] DiariZen unavailable → fallback to pyannote")
+    except Exception as e:
+        logger.warning(f"[{upload_id}] DiariZen unexpected error (fallback to pyannote): {e}")
+
+    # 2) Фолбэк на pyannote
+    if not diar_segments:
         try:
-            raw = _run_pyannote(wav)
+            diar_segments = _run_pyannote(wav)
             used_backend = "pyannote"
         except Exception as e:
-            logger.error(f"[{upload_id}] pyannote diarization failed: {e}", exc_info=True)
-            # попробуем FS-EEND как запасной
-            attempt = _run_fs_eend(wav)
-            if attempt is None:
-                deliver_webhook.delay("processing_failed", upload_id, None)
-                return
-            raw = attempt
-            used_backend = "fs-eend"
+            logger.error(f"[{upload_id}] diarization failed in fallback: {e}", exc_info=True)
+            deliver_webhook.delay("processing_failed", upload_id, None)
+            return
 
-    # ---------- Stabilization & save (общая) ----------
-    if not raw:
+    if not diar_segments:
         logger.error(f"[{upload_id}] empty diarization result")
         deliver_webhook.delay("processing_failed", upload_id, None)
         return
 
-    # 1) дропим совсем короткие
+    # ------- Постобработка (стабилизация) -------
     MIN_SEG = float(getattr(settings, "DIARIZATION_MIN_SEGMENT_S", 0.20))
-    raw = [s for s in raw if (s["end"] - s["start"]) >= MIN_SEG]
-
-    # 2) склейка одинаковых с маленькими паузами
     GAP_MERGE = float(getattr(settings, "DIARIZATION_MERGE_GAP_S", 0.20))
+    ISLAND_MAX = float(getattr(settings, "DIARIZATION_ISLAND_MAX_S", 0.60))
+
+    # 1) дропим короткие
+    diar_segments = [s for s in diar_segments if (s["end"] - s["start"]) >= MIN_SEG]
+
+    # 2) начальная склейка одинаковых с маленькими паузами
     merged: List[Dict[str, Any]] = []
     cur = None
-    for seg in sorted(raw, key=lambda x: x["start"]):
+    for seg in sorted(diar_segments, key=lambda x: x["start"]):
         if cur and cur["speaker"] == seg["speaker"] and (seg["start"] - cur["end"]) <= GAP_MERGE:
             cur["end"] = max(cur["end"], seg["end"])
         else:
@@ -1264,11 +1244,10 @@ def diarize_full(self, upload_id, correlation_id):
             cur = dict(seg)
     if cur:
         merged.append(cur)
-    raw = merged
+    diar_segments = merged
 
     # 3) анти-flip: поглощаем короткий «островок» между одинаковыми соседями
-    def _stabilize_labels(segments: List[Dict[str, Any]],
-                          island_max: float = float(getattr(settings, "DIARIZATION_ISLAND_MAX_S", 0.60))) -> List[Dict[str, Any]]:
+    def _stabilize_labels(segments: List[Dict[str, Any]], island_max: float = ISLAND_MAX) -> List[Dict[str, Any]]:
         if len(segments) < 3:
             return segments
         out: List[Dict[str, Any]] = []
@@ -1279,7 +1258,8 @@ def diarize_full(self, upload_id, correlation_id):
                 cur_dur = cur["end"] - cur["start"]
                 if prev["speaker"] == nxt["speaker"] != cur["speaker"] and cur_dur <= island_max:
                     prev["end"] = nxt["end"] = max(prev["end"], nxt["end"])
-                    out.pop() if out else None
+                    if out:
+                        out.pop()
                     out.append({"start": prev["start"], "end": nxt["end"], "speaker": prev["speaker"]})
                     i += 2
                     continue
@@ -1287,12 +1267,12 @@ def diarize_full(self, upload_id, correlation_id):
             i += 1
         return out
 
-    diar_sentences: List[Dict[str, Any]] = _stabilize_labels(raw)
+    diar_segments = _stabilize_labels(diar_segments)
 
-    # 4) схлопывание подряд идущих одинаковых меток
+    # 4) финальное схлопывание подряд идущих одинаковых
     final_out: List[Dict[str, Any]] = []
     buf: Optional[Dict[str, Any]] = None
-    for seg in sorted(diar_sentences, key=lambda x: x["start"]):
+    for seg in sorted(diar_segments, key=lambda x: x["start"]):
         if buf and buf["speaker"] == seg["speaker"] and (seg["start"] - buf["end"]) < 0.10:
             buf["end"] = seg["end"]
         else:
@@ -1302,14 +1282,15 @@ def diarize_full(self, upload_id, correlation_id):
     if buf:
         final_out.append(buf)
 
-    out = Path(settings.RESULTS_FOLDER) / upload_id
-    out.mkdir(parents=True, exist_ok=True)
-    (out / "diarization.json").write_text(json.dumps(final_out, ensure_ascii=False, indent=2))
+    # ------- Сохранение и события -------
+    out_dir = Path(settings.RESULTS_FOLDER) / upload_id
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "diarization.json").write_text(json.dumps(final_out, ensure_ascii=False, indent=2))
 
     speakers = sorted({seg["speaker"] for seg in final_out if seg.get("speaker") is not None})
     logger.info(
-        f"[{upload_id}] diarization_done by {used_backend}, total segments: {len(final_out)}, "
-        f"speakers_detected={len(speakers)}"
+        f"[{upload_id}] diarization_done by {used_backend}, "
+        f"total segments: {len(final_out)}, speakers_detected={len(speakers)}"
     )
 
     r.publish(
@@ -1325,8 +1306,7 @@ def diarize_full(self, upload_id, correlation_id):
     deliver_webhook.delay("diarization_completed", upload_id, {"diarization": final_out})
 
     try:
-        if torch and torch.cuda.is_available():
-            logger.info(f"[{upload_id}] GPU memory reserved after diarization: {torch.cuda.memory_reserved()}")
+        logger.info(f"[{upload_id}] GPU memory reserved after diarization: {torch.cuda.memory_reserved() if torch.cuda.is_available() else 'n/a'}")
     except Exception:
         pass
 

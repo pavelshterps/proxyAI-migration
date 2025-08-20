@@ -3,6 +3,7 @@ from typing import List, Optional, Tuple
 from pydantic import Field, HttpUrl
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -39,6 +40,9 @@ class Settings(BaseSettings):
     API_WORKERS: int = Field(1, env="API_WORKERS")
     CPU_CONCURRENCY: int = Field(1, env="CPU_CONCURRENCY")
     GPU_CONCURRENCY: int = Field(1, env="GPU_CONCURRENCY")
+    # добавлены поля, которые уже есть в .env
+    GPU_CONCURRENCY_TRANSCRIBE: int = Field(1, env="GPU_CONCURRENCY_TRANSCRIBE")
+    GPU_CONCURRENCY_DIARIZE: int = Field(1, env="GPU_CONCURRENCY_DIARIZE")
     FFMPEG_THREADS: int = Field(4, env="FFMPEG_THREADS")
 
     # file paths
@@ -53,7 +57,14 @@ class Settings(BaseSettings):
     WHISPER_BATCH_SIZE: int = Field(1, env="WHISPER_BATCH_SIZE")
     WHISPER_LANGUAGE: Optional[str] = Field(None, env="WHISPER_LANGUAGE")
 
-    # FS-EEND
+    # ==== Диаризация: DiariZen + pyannote ====
+    # приоритетный бэкенд DiariZen
+    USE_DIARIZEN: bool = Field(True, env="USE_DIARIZEN")
+    DIARIZEN_MODEL_ID: str = Field("BUT-FIT/diarizen-wavlm-large-s80-mlc", env="DIARIZEN_MODEL_ID")
+    # общее устройство для пайплайна диаризации (используется для pyannote и DiariZen при наличии .to)
+    DIARIZER_DEVICE: str = Field("cuda", env="DIARIZER_DEVICE")
+
+    # FS-EEND (оставляем как есть, вдруг используешь где-то ещё)
     USE_FS_EEND: bool = Field(False, env="USE_FS_EEND")
     FS_EEND_PIPELINE: Optional[str] = Field(None, env="FS_EEND_PIPELINE")
     FS_EEND_MODEL_PATH: Optional[str] = Field(None, env="FS_EEND_MODEL_PATH")
@@ -64,7 +75,7 @@ class Settings(BaseSettings):
     HUGGINGFACE_CACHE_DIR: Optional[str] = Field(None, env="HUGGINGFACE_CACHE_DIR")
     HUGGINGFACE_TOKEN: str = Field(..., env="HUGGINGFACE_TOKEN")
 
-    # diarization pipeline
+    # diarization pipeline (pyannote)
     PYANNOTE_PIPELINE: str = Field(..., env="PYANNOTE_PIPELINE")
     VAD_MODEL_PATH: str = Field(..., env="VAD_MODEL_PATH")
 
@@ -75,6 +86,9 @@ class Settings(BaseSettings):
     DIARIZATION_CHUNK_LENGTH_S: int = Field(..., env="DIARIZATION_CHUNK_LENGTH_S")
     DIARIZATION_CHUNK_PADDING_S: float = Field(0.0, env="DIARIZATION_CHUNK_PADDING_S")
 
+    # Паддинг транскрипционных чанков (overlap для Whisper)
+    TRANSCRIPTION_CHUNK_PAD_S: float = Field(10.0, env="TRANSCRIPTION_CHUNK_PAD_S")
+
     # VAD
     VAD_MAX_LENGTH_S: int = Field(..., env="VAD_MAX_LENGTH_S")
     VAD_LEVEL: int = Field(1, env="VAD_LEVEL")
@@ -83,10 +97,18 @@ class Settings(BaseSettings):
     SENTENCE_MAX_GAP_S: float = Field(0.5, env="SENTENCE_MAX_GAP_S")
     SENTENCE_MAX_WORDS: int = Field(50, env="SENTENCE_MAX_WORDS")
 
+    # постобработка диаризации (пороговые значения)
+    DIARIZATION_MIN_SEGMENT_S: float = Field(0.20, env="DIARIZATION_MIN_SEGMENT_S")
+    DIARIZATION_MERGE_GAP_S: float = Field(0.20, env="DIARIZATION_MERGE_GAP_S")
+    DIARIZATION_ISLAND_MAX_S: float = Field(0.60, env="DIARIZATION_ISLAND_MAX_S")
+
     # speaker stitching
     SPEAKER_STITCH_ENABLED: bool = Field(False, env="SPEAKER_STITCH_ENABLED")
     SPEAKER_STITCH_THRESHOLD: float = Field(0.75, env="SPEAKER_STITCH_THRESHOLD")
     SPEAKER_STITCH_POOL_SIZE: int = Field(5, env="SPEAKER_STITCH_POOL_SIZE")
+    # дополнительные настройки, которые использует код
+    SPEAKER_STITCH_EMA_ALPHA: float = Field(0.5, env="SPEAKER_STITCH_EMA_ALPHA")
+    SPEAKER_STITCH_MERGE_THRESHOLD: float = Field(0.98, env="SPEAKER_STITCH_MERGE_THRESHOLD")
 
     # limits & retention
     MAX_FILE_SIZE: int = Field(1_073_741_824, env="MAX_FILE_SIZE")
@@ -106,6 +128,7 @@ class Settings(BaseSettings):
     EXTERNAL_POLL_INTERVAL_S: int = Field(5, env="EXTERNAL_POLL_INTERVAL_S")
     DEFAULT_TRANSCRIBE_MODE: str = Field("local", env="DEFAULT_TRANSCRIBE_MODE")
     OPENAI_API_KEY: str = Field(..., env="OPENAI_API_KEY")
+
     # webhook
     WEBHOOK_URL: Optional[HttpUrl] = Field(None, env="WEBHOOK_URL")
     WEBHOOK_SECRET: str = Field("", env="WEBHOOK_SECRET")
@@ -116,5 +139,6 @@ class Settings(BaseSettings):
             return json.loads(self.ALLOWED_ORIGINS)
         except Exception:
             return [o.strip() for o in self.ALLOWED_ORIGINS.split(",") if o.strip()]
+
 
 settings = Settings()
