@@ -1228,19 +1228,9 @@ def diarize_full(self, upload_id, correlation_id):
 
         try:
             with torch.inference_mode():
-                # Передаем min/max спикеров в рантайм на случай, если пайплайн читает kwargs поверх конфига
-                call_kwargs = {}
-                try:
-                    call_kwargs["min_speakers"] = min_spk  # из блока выше
-                    call_kwargs["max_speakers"] = max_spk
-                    if thr is not None:
-                        call_kwargs["ahc_threshold"] = thr
-                        call_kwargs["cluster_threshold"] = thr
-                except Exception:
-                    pass
-
+                # В этой ревизии DiariZen __call__ не принимает min/max_speakers → не передаём kwargs
                 with torch.inference_mode():
-                    ann = pipeline(str(_wav), **call_kwargs)
+                    ann = pipeline(str(_wav))
 
         except Exception as e:
             logger.error(f"[{upload_id}] DiariZen inference failed: {e}", exc_info=True)
