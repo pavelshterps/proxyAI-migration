@@ -415,26 +415,51 @@ def get_whisper_model(model_override: str = None):
 def get_diarization_pipeline():
     """
     Загружаем pyannote Pipeline и переводим на нужное устройство через .to(...).
-    ВАЖНО: у Pipeline.from_pretrained НЕТ аргумента device — его передавать нельзя.
+    Если активен DiariZen и в sys.path попался его форк pyannote-audio,
+    может прилететь AttributeError(PyanNet.load_from_checkpoint). В этом случае
+    не падаем, а логгируем и поднимаем осмысленную ошибку, чтобы диаризация
+    попробовала DiariZen/остальные пути.
     """
     global _diarization_pipeline
-    if _diarization_pipeline is None:
-        model_id = getattr(settings, "PYANNOTE_PIPELINE", "pyannote/speaker-diarization-3.1")
-        _diarization_pipeline = PyannotePipeline.from_pretrained(
+    if _diarization_pipeline is not None:
+        return _diarization_pipeline
+
+    model_id = getattr(settings, "PYANNOTE_PIPELINE", "pyannote/speaker-diarization-3.1")
+    try:
+        pipeline = PyannotePipeline.from_pretrained(
             model_id,
             use_auth_token=settings.HUGGINGFACE_TOKEN,
             cache_dir=settings.DIARIZER_CACHE_DIR,
         )
+        # перенос на нужное устройство
+        target = getattr(settings, "DIARIZER_DEVICE", None)
+        if target is None:
+            target = "cuda" if torch.cuda.is_available() else "cpu"
         try:
-            import torch
-            target = getattr(settings, "DIARIZER_DEVICE", None)  # "cuda" | "cpu" | "mps"
-            if target is None:
-                target = "cuda" if torch.cuda.is_available() else "cpu"
-            _diarization_pipeline.to(torch.device(target))
-            logger.info(f"[DIARIZE] loaded pipeline {model_id} and moved to device={target}")
+            pipeline.to(torch.device(target))  # у Pipeline есть .to(...)
         except Exception as e:
             logger.warning(f"[DIARIZE] could not move pipeline to device: {e}")
-    return _diarization_pipeline
+
+        _diarization_pipeline = pipeline
+        logger.info(f"[DIARIZE] loaded pipeline {model_id} and moved to device={target}")
+        return _diarization_pipeline
+
+    except AttributeError as e:
+        # ключевой признак конфликта с форком DiariZen
+        if "PyanNet" in str(e) and "load_from_checkpoint" in str(e):
+            logger.error(
+                "[DIARIZE] pyannote preload failed due to DiariZen's vendored pyannote-audio "
+                "(PyanNet.load_from_checkpoint missing). Will rely on DiariZen backend and "
+                "only try pyannote as a last-chance fallback in a clean env."
+            )
+        else:
+            logger.error(f"[DIARIZE] pyannote pipeline load AttributeError: {e}")
+        # пробрасываем дальше как «нет доступного pyannote»
+        raise RuntimeError("pyannote pipeline unavailable in current env") from e
+
+    except Exception as e:
+        logger.error(f"[DIARIZE] pyannote pipeline load failed: {e}", exc_info=True)
+        raise
 
 def get_speaker_embedding_model():
     global _speaker_embedding_model
@@ -696,13 +721,14 @@ def _is_webhooks_worker() -> bool:
 #  стало:
 @worker_process_init.connect
 def preload_on_startup(**kwargs):
-    # важное условие: webhooks-воркеру не нужны модели и GPU
+    # webhooks-воркер не грузит модели
     if _is_webhooks_worker():
         logger.info("[PRELOAD] webhooks worker detected → skip model preload")
         return
     if _HF_AVAILABLE:
         get_whisper_model()
-    if _PN_AVAILABLE:
+    # ВАЖНО: если используем DiariZen — не трогаем pyannote на этапе прелоада
+    if _PN_AVAILABLE and not bool(getattr(settings, "USE_DIARIZEN", True)):
         get_diarization_pipeline()
 # ---------------------- Post-processing for diarization ----------------------
 
