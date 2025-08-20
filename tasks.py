@@ -120,6 +120,24 @@ def send_webhook_event(event_type: str, upload_id: str, data: Optional[Any]):
         f"{max_attempts} attempts for {upload_id}"
     )
 
+# ---- helper для корректного подсчёта занятости GPU ----
+def _count_gpu_heavy_tasks(inspector, exclude_task_id: str = None) -> int:
+    active = inspector.active() or {}
+    heavy_gpu = 0
+    for worker, tasks in active.items():
+        for t in tasks:
+            # не считаем самих себя
+            if exclude_task_id and t.get("id") == exclude_task_id:
+                continue
+            # считаем только задачи, пришедшие в GPU-очереди
+            rk = ((t.get("delivery_info") or {}).get("routing_key") or "")
+            if rk not in ("transcribe_gpu", "diarize_gpu"):
+                continue
+            if t.get("name") in ("tasks.diarize_full", "tasks.transcribe_segments"):
+                heavy_gpu += 1
+    return heavy_gpu
+
+
 def probe_audio(src: Path) -> dict:
     res = subprocess.run(
         ["ffprobe", "-v", "error", "-print_format", "json", "-show_format", "-show_streams", str(src)],
@@ -799,18 +817,23 @@ def preview_transcribe(self, upload_id, correlation_id):
     logger.info(f"[{upload_id}] preview_transcribe received")
     try:
         inspector = app.control.inspect()
-        active = inspector.active() or {}
-        heavy = 0
-        for node_tasks in active.values():
-            for t in node_tasks:
-                if t["name"] in ("tasks.diarize_full", "tasks.transcribe_segments"):
-                    heavy += 1
-        if heavy >= 2:
-            logger.info(f"[{upload_id}] both GPUs busy (found {heavy} heavy tasks), falling back to CPU for transcription preview")
+        # сколько тяжёлых сейчас именно на GPU (без учёта этой задачи)
+        heavy_gpu = _count_gpu_heavy_tasks(inspector, exclude_task_id=self.request.id)
+
+        # лимит GPU слотов на «тяжёлые» задачи
+        # можно тоньше: отдельно транс/диар, но базово ок суммарный лимит
+        limit = int(getattr(settings, "GPU_CONCURRENCY_TRANSCRIBE", 1)) + int(
+            getattr(settings, "GPU_CONCURRENCY_DIARIZE", 1))
+        limit = max(1, limit)  # защита от 0
+
+        if heavy_gpu >= limit and self.request.delivery_info.get("routing_key") != "transcribe_cpu":
+            logger.info(f"[{upload_id}] GPUs busy: heavy_gpu={heavy_gpu} >= limit={limit} → reschedule to CPU")
             transcribe_segments.apply_async((upload_id, correlation_id), queue="transcribe_cpu")
             return
+        else:
+            logger.info(f"[{upload_id}] GPU check ok: heavy_gpu={heavy_gpu} < limit={limit} (stay on GPU)")
     except Exception:
-        logger.warning(f"[{upload_id}] failed to inspect workers, proceeding on GPU")
+        logger.warning(f"[{upload_id}] failed to inspect workers for fallback logic")
 
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
     proc = prepare_preview_segment(upload_id)
@@ -855,16 +878,21 @@ def transcribe_segments(self, upload_id, correlation_id):
     # Если GPU перегружены — уходим на CPU
     try:
         inspector = app.control.inspect()
-        active = inspector.active() or {}
-        heavy = 0
-        for node_tasks in active.values():
-            for t in node_tasks:
-                if t["name"] in ("tasks.diarize_full", "tasks.transcribe_segments"):
-                    heavy += 1
-        if heavy >= 2 and self.request.delivery_info.get("routing_key") != "transcribe_cpu":
-            logger.info(f"[{upload_id}] GPUs appear busy ({heavy} heavy tasks), rescheduling transcription to CPU")
+        # сколько тяжёлых сейчас именно на GPU (без учёта этой задачи)
+        heavy_gpu = _count_gpu_heavy_tasks(inspector, exclude_task_id=self.request.id)
+
+        # лимит GPU слотов на «тяжёлые» задачи
+        # можно тоньше: отдельно транс/диар, но базово ок суммарный лимит
+        limit = int(getattr(settings, "GPU_CONCURRENCY_TRANSCRIBE", 1)) + int(
+            getattr(settings, "GPU_CONCURRENCY_DIARIZE", 1))
+        limit = max(1, limit)  # защита от 0
+
+        if heavy_gpu >= limit and self.request.delivery_info.get("routing_key") != "transcribe_cpu":
+            logger.info(f"[{upload_id}] GPUs busy: heavy_gpu={heavy_gpu} >= limit={limit} → reschedule to CPU")
             transcribe_segments.apply_async((upload_id, correlation_id), queue="transcribe_cpu")
             return
+        else:
+            logger.info(f"[{upload_id}] GPU check ok: heavy_gpu={heavy_gpu} < limit={limit} (stay on GPU)")
     except Exception:
         logger.warning(f"[{upload_id}] failed to inspect workers for fallback logic")
 

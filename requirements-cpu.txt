@@ -33,3 +33,4 @@ httpx>=0.24.0
 sse-starlette>=2.4.1
 psycopg2-binary
 yt-dlp
+diarizen
