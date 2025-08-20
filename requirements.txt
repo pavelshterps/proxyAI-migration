@@ -35,4 +35,3 @@ chainer>=7.8.0
 numpy<2.0
 cupy-cuda12x
 h5py>=3.0.0
-diarizen

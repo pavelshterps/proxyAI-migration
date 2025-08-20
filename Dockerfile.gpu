@@ -29,6 +29,23 @@ RUN pip3 install --no-cache-dir -q --progress-bar off \
       faster-whisper[cuda12]==1.1.1 \
       ctranslate2[cuda12]>=4.6.0
 
+RUN apt-get update && apt-get install -y --no-install-recommends git \
+ && rm -rf /var/lib/apt/lists/*
+
+# Клонируем DiariZen и его сабмодули
+RUN git clone --depth 1 https://github.com/BUTSpeechFIT/DiariZen.git /opt/DiariZen \
+ && cd /opt/DiariZen \
+ && git submodule update --init --recursive
+
+# Ставим зависимости и сам пакет (editable)
+RUN cd /opt/DiariZen \
+ && pip install --no-cache-dir -r requirements.txt \
+ && pip install --no-cache-dir -e .
+
+# У DiariZen сабмодуль pyannote-audio — поставим его тоже из исходников
+RUN cd /opt/DiariZen/pyannote-audio \
+ && pip install --no-cache-dir -e .
+
 # 5) Копируем приложение
 COPY . .
 
