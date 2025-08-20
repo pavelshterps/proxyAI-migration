@@ -1131,43 +1131,84 @@ def diarize_full(self, upload_id, correlation_id):
             pipeline = DiariZenPipeline.from_pretrained(model_id)  # публичная модель, токен не требуется
             # --- allow automatic number of speakers (overridable via settings) ---
             try:
+                # 0) Вычисляем желаемые границы
+                fixed = getattr(settings, "DIARIZEN_NUM_SPEAKERS", None)
+                if fixed is not None and int(fixed) > 0:
+                    min_spk = max_spk = int(fixed)
+                else:
+                    # дефолт 1..8 если не задано
+                    min_spk = int(getattr(settings, "DIARIZEN_MIN_SPEAKERS", 1) or 1)
+                    max_spk = int(getattr(settings, "DIARIZEN_MAX_SPEAKERS", 8) or 8)
+                    if max_spk < min_spk:
+                        max_spk = min_spk
+
+                thr = None
+                # можно переопределить порог кластеризации
+                try:
+                    thr = float(getattr(settings, "DIARIZEN_CLUSTER_THRESHOLD", None))
+                except Exception:
+                    thr = None
+
+                # 1) Попробуем изменить pipeline.config (dict или OmegaConf)
                 cfg = getattr(pipeline, "config", None)
-                if isinstance(cfg, dict) and "clustering" in cfg and isinstance(cfg["clustering"], dict):
-                    args = cfg["clustering"].setdefault("args", {})
 
-                    # 1) Фиксированное число спикеров (min=max), если задано
-                    fixed = getattr(settings, "DIARIZEN_NUM_SPEAKERS", None)
-                    if fixed is not None and int(fixed) > 0:
-                        fixed = int(fixed)
-                        args["min_speakers"] = fixed
-                        args["max_speakers"] = fixed
-                    else:
-                        # 2) Автоопределение в диапазоне [min..max]
-                        min_spk = int(getattr(settings, "DIARIZEN_MIN_SPEAKERS", args.get("min_speakers", 1)) or 1)
-                        max_spk = int(getattr(settings, "DIARIZEN_MAX_SPEAKERS", args.get("max_speakers", 8)) or 8)
-                        if max_spk < min_spk:
-                            max_spk = min_spk
-                        args["min_speakers"] = min_spk
-                        args["max_speakers"] = max_spk
-
-                    # 3) Порог кластеризации: поддержим и 'ahc_threshold', и 'cluster_threshold'
-                    default_thr = args.get("ahc_threshold", args.get("cluster_threshold", 0.6647095879538272))
-                    thr = float(getattr(settings, "DIARIZEN_CLUSTER_THRESHOLD", default_thr))
-                    # Если в конфиге уже есть одно из полей — переопределим его; второе поставим про запас
-                    if "ahc_threshold" in args or args.get("method") == "AgglomerativeClustering":
+                def _set_in_args(args: dict):
+                    args["min_speakers"] = min_spk
+                    args["max_speakers"] = max_spk
+                    if thr is not None:
+                        # поддержим оба ключа, какой-то один точно подхватится
                         args["ahc_threshold"] = thr
-                    args["cluster_threshold"] = thr  # безопасно иметь и этот ключ
+                        args["cluster_threshold"] = thr
+                    # позволим переопределять минимальный размер кластера
+                    mcs = getattr(settings, "DIARIZEN_MIN_CLUSTER_SIZE", None)
+                    if mcs is not None:
+                        args["min_cluster_size"] = int(mcs)
 
-                    # 4) Минимальный размер кластера
-                    args["min_cluster_size"] = int(getattr(
-                        settings, "DIARIZEN_MIN_CLUSTER_SIZE", args.get("min_cluster_size", 16)
-                    ))
+                changed = False
+                if isinstance(cfg, dict):
+                    cl = cfg.setdefault("clustering", {})
+                    args = cl.setdefault("args", {})
+                    if isinstance(args, dict):
+                        _set_in_args(args)
+                        changed = True
+                else:
+                    # OmegaConf / объектная форма
+                    try:
+                        cl = getattr(cfg, "clustering", None)
+                        args = getattr(cl, "args", None) if cl is not None else None
+                        if isinstance(args, dict):
+                            _set_in_args(args)
+                            changed = True
+                        elif args is not None:
+                            # у некоторых реализаций args может быть omegaconf.DictConfig
+                            try:
+                                args.min_speakers = min_spk
+                                args.max_speakers = max_spk
+                                if thr is not None:
+                                    setattr(args, "ahc_threshold", thr)
+                                    setattr(args, "cluster_threshold", thr)
+                                mcs = getattr(settings, "DIARIZEN_MIN_CLUSTER_SIZE", None)
+                                if mcs is not None:
+                                    args.min_cluster_size = int(mcs)
+                                changed = True
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
 
-                    logger.info(
-                        f"[DIARIZE] DiariZen clustering params → "
-                        f"min={args['min_speakers']}, max={args['max_speakers']}, "
-                        f"thr={thr}, min_cluster={args.get('min_cluster_size')}"
-                    )
+                # 2) Если у пайплайна есть runtime-объект clustering с .args — пропишем и туда
+                try:
+                    clrt = getattr(pipeline, "clustering", None)
+                    clrt_args = getattr(clrt, "args", None)
+                    if isinstance(clrt_args, dict):
+                        _set_in_args(clrt_args)
+                        changed = True
+                except Exception:
+                    pass
+
+                logger.info(f"[DIARIZE] DiariZen speaker range: min={min_spk}, max={max_spk}"
+                            + (f", thr={thr}" if thr is not None else "")
+                            + (", config_patched" if changed else ", config_unchanged"))
             except Exception as _e:
                 logger.warning(f"[{upload_id}] could not adjust DiariZen clustering params: {_e}")
 
@@ -1187,7 +1228,20 @@ def diarize_full(self, upload_id, correlation_id):
 
         try:
             with torch.inference_mode():
-                ann = pipeline(str(_wav))  # ожидается pyannote.Annotation-совместимый вывод
+                # Передаем min/max спикеров в рантайм на случай, если пайплайн читает kwargs поверх конфига
+                call_kwargs = {}
+                try:
+                    call_kwargs["min_speakers"] = min_spk  # из блока выше
+                    call_kwargs["max_speakers"] = max_spk
+                    if thr is not None:
+                        call_kwargs["ahc_threshold"] = thr
+                        call_kwargs["cluster_threshold"] = thr
+                except Exception:
+                    pass
+
+                with torch.inference_mode():
+                    ann = pipeline(str(_wav), **call_kwargs)
+
         except Exception as e:
             logger.error(f"[{upload_id}] DiariZen inference failed: {e}", exc_info=True)
             return None
