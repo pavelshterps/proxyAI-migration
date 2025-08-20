@@ -1059,18 +1059,19 @@ def transcribe_segments(self, upload_id, correlation_id):
 @app.task(bind=True, queue="diarize_gpu")
 def diarize_full(self, upload_id, correlation_id):
     """
-    Диаризация (DiariZen, авто-спикеры):
-      • Жёстко переводим DiariZen в авто-режим (min<max), снимаем cap max_speakers_per_chunk.
-      • НИКАКИХ kwargs (min/max_speakers) в __call__.
-      • Если DiariZen недоступен — деградация: 1 спикер на весь файл, чтобы задача не падала.
-    Постобработка: дроп коротких, склейка пауз, анти-flip, схлопывание подряд идущих.
+    Диаризация (DiariZen → pyannote → деградация), авто-число спикеров:
+      • Насильный авто-режим для DiariZen (min<max), снятие cap max_speakers_per_chunk, сброс фикс. n_clusters.
+      • НИКАКИХ kwargs (min/max_speakers) в DiariZen.__call__.
+      • Безопасный фолбэк на pyannote (чанкинг/паддинг), если доступен.
+      • Если всё недоступно — деградация: 1 спикер на весь файл (не падаем).
+    Постобработка: дроп коротких, склейка пауз, анти-flip, схлопывание подряд идущих + эвристика “моно-коллапса”.
     """
-    import gc, json, math, torch
+    import gc, json, math, torch, subprocess
     from pathlib import Path
     from typing import Optional, List, Dict, Any
     from redis import Redis
 
-    # ----------------- helpers: авто-спикеры -----------------
+    # ----------------- авто-спикеры (DiariZen) -----------------
 
     def _force_set(obj, key, value):
         try:
@@ -1114,11 +1115,12 @@ def diarize_full(self, upload_id, correlation_id):
     def _patch_diarizen_for_auto(pipeline):
         # целевые значения
         min_spk, max_spk = _get_auto_bounds()
-        # агрессивнее схлопывать в 1 спикера на моно: можно поднять до 0.85–0.90
+        # для моно-треков помогает чуть более высокий порог слияния
         try:
             thr = float(getattr(settings, "DIARIZEN_CLUSTER_THRESHOLD", 0.88))
         except Exception:
             thr = 0.88
+        # минимальный размер кластера (опционально)
         mcs = getattr(settings, "DIARIZEN_MIN_CLUSTER_SIZE", None)
         try:
             mcs = int(mcs) if mcs is not None else None
@@ -1128,7 +1130,7 @@ def diarize_full(self, upload_id, correlation_id):
         changed = False
         cfg = getattr(pipeline, "config", None)
 
-        # 1) Снимаем CAP в модели (max_speakers_per_chunk)
+        # 1) снимем CAP в модели (max_speakers_per_chunk)
         try:
             if isinstance(cfg, dict):
                 md = cfg.setdefault("model", {})
@@ -1189,8 +1191,7 @@ def diarize_full(self, upload_id, correlation_id):
             + (f"thr={thr:.2f}, " if thr is not None else "")
             + ("config_patched" if changed else "config_unchanged")
         )
-
-        # Доп. отладка: выведем фактические значения после патча
+        # Отладка (не критично, но полезно)
         try:
             if isinstance(cfg, dict):
                 dbg = cfg.get("clustering", {}).get("args", {})
@@ -1209,7 +1210,138 @@ def diarize_full(self, upload_id, correlation_id):
         except Exception:
             pass
 
-    # ----------------- helpers: запуск DiariZen -----------------
+    # ----------------- pyannote (безопасный фолбэк) -----------------
+
+    def _run_pyannote(_wav: Path, duration: float) -> Optional[List[Dict[str, Any]]]:
+        try:
+            from pyannote.audio import Pipeline as _PN  # noqa: F401
+        except Exception as e:
+            logger.warning(f"[{upload_id}] pyannote import failed: {e}")
+            return None
+
+        try:
+            pipeline = get_diarization_pipeline()  # может бросить в этом окружении
+        except Exception as e:
+            logger.error(f"[{upload_id}] pyannote pipeline unavailable: {e}")
+            return None
+
+        # Настройки чанкинга/паддинга
+        try:
+            chunk_limit = int(getattr(settings, "DIARIZATION_CHUNK_LENGTH_S", 300) or 0)
+        except Exception:
+            logger.warning(f"[{upload_id}] invalid DIARIZATION_CHUNK_LENGTH_S, fallback to 0")
+            chunk_limit = 0
+        pad = float(getattr(settings, "DIARIZATION_CHUNK_PADDING_S", 10.0) or 0.0)
+        use_chunking = bool(chunk_limit and duration > chunk_limit)
+
+        # Подсказки для pyannote
+        infer_kwargs: Dict[str, Any] = {}
+        try:
+            if getattr(settings, "PYANNOTE_NUM_SPEAKERS", None):
+                infer_kwargs["num_speakers"] = int(settings.PYANNOTE_NUM_SPEAKERS)
+            else:
+                v = getattr(settings, "PYANNOTE_MIN_SPEAKERS", None)
+                if v is not None:
+                    infer_kwargs["min_speakers"] = int(v)
+                v = getattr(settings, "PYANNOTE_MAX_SPEAKERS", None)
+                if v is not None:
+                    infer_kwargs["max_speakers"] = int(v)
+        except Exception:
+            pass
+
+        res: List[Dict[str, Any]] = []
+        if use_chunking:
+            r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
+            processed_key = f"diarize:processed_chunks:{upload_id}"
+            processed = {int(x) for x in r.smembers(processed_key)}
+
+            total_chunks = math.ceil(duration / chunk_limit)
+            offset = 0.0
+            chunk_idx = 0
+            while offset < duration:
+                core_len = min(chunk_limit, duration - offset)
+                left_pad = pad if offset > 0 else 0.0
+                right_pad = pad if (offset + core_len) < duration else 0.0
+                st = max(0.0, offset - left_pad)
+                en = min(duration, offset + core_len + right_pad)
+
+                if chunk_idx in processed:
+                    logger.info(f"[{upload_id}] skip diarize chunk {chunk_idx+1}/{total_chunks}")
+                    offset += core_len
+                    chunk_idx += 1
+                    continue
+
+                logger.info(
+                    f"[{upload_id}] diarize chunk {chunk_idx+1}/{total_chunks}: "
+                    f"{st:.1f}s→{en:.1f}s (core {offset:.1f}s→{offset+core_len:.1f}s, pad L={left_pad:.1f}s R={right_pad:.1f}s)"
+                )
+
+                tmp = Path(getattr(settings, "DIARIZER_CACHE_DIR", "/tmp")) / f"{upload_id}_chunk_{chunk_idx}.wav"
+                subprocess.run(
+                    [
+                        "ffmpeg", "-y",
+                        "-threads", str(max(1, int(getattr(settings, "FFMPEG_THREADS", 2)) // 2)),
+                        "-ss", str(st), "-t", str(en - st),
+                        "-i", str(_wav), str(tmp),
+                    ],
+                    check=True, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL
+                )
+
+                try:
+                    with torch.inference_mode():
+                        ann = pipeline(str(tmp), **infer_kwargs)
+
+                    before = len(res)
+                    for s, _, spk in ann.itertracks(yield_label=True):
+                        g0, g1 = float(s.start) + st, float(s.end) + st
+                        # берём только ядро чанка
+                        if g1 <= offset or g0 >= (offset + core_len):
+                            continue
+                        g0 = max(g0, offset)
+                        g1 = min(g1, offset + core_len)
+                        if g1 > g0:
+                            res.append({"start": g0, "end": g1, "speaker": spk})
+
+                    added = len(res) - before
+                    logger.info(f"[{upload_id}] diarize chunk {chunk_idx+1}/{total_chunks} done: added {added} segments")
+                    r.sadd(processed_key, chunk_idx)
+                except Exception as e:
+                    logger.error(f"[{upload_id}] error in diarize chunk {chunk_idx+1}/{total_chunks}: {e}", exc_info=True)
+                finally:
+                    try:
+                        tmp.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                    try:
+                        del ann  # type: ignore
+                    except Exception:
+                        pass
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+
+                offset += core_len
+                chunk_idx += 1
+
+            r.delete(processed_key)
+        else:
+            logger.info(f"[{upload_id}] Short audio or chunking disabled, single diarization pass")
+            with torch.inference_mode():
+                ann = pipeline(str(_wav), **infer_kwargs)
+            for s, _, spk in ann.itertracks(yield_label=True):
+                res.append({"start": float(s.start), "end": float(s.end), "speaker": spk})
+            try:
+                del ann
+            except Exception:
+                pass
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        res.sort(key=lambda x: x["start"])
+        return res
+
+    # ----------------- запуск DiariZen -----------------
 
     def _run_diarizen(_wav: Path) -> Optional[List[Dict[str, Any]]]:
         try:
@@ -1264,6 +1396,44 @@ def diarize_full(self, upload_id, correlation_id):
         logger.warning(f"[{upload_id}] DEGRADATION: returning single full-span segment (no diarization backend available)")
         return [{"start": 0.0, "end": float(duration), "speaker": speaker_label}]
 
+    # эвристика: схлопнуть в одного, если “второй” очень мал
+    def _maybe_collapse_to_one(segments: List[Dict[str, Any]], total_dur: float) -> List[Dict[str, Any]]:
+        if not segments:
+            return segments
+        if not bool(getattr(settings, "MONO_COLLAPSE_ENABLED", True)):
+            return segments
+
+        # параметры
+        min_share = float(getattr(settings, "MONO_COLLAPSE_MIN_SHARE", 0.10))  # если minor < 10%
+        max_flips = int(getattr(settings, "MONO_COLLAPSE_MAX_FLIPS", 3))       # и мало переключений
+
+        # доли по спикерам
+        dur_by = {}
+        for s in segments:
+            dur_by[s["speaker"]] = dur_by.get(s["speaker"], 0.0) + (s["end"] - s["start"])
+        if len(dur_by) <= 1:
+            return segments
+
+        total = sum(dur_by.values()) or total_dur or 1.0
+        minor_share = min(dur_by.values()) / total
+
+        # посчитаем количество переключений
+        flips = 0
+        prev = None
+        for s in sorted(segments, key=lambda x: x["start"]):
+            if prev is not None and prev != s["speaker"]:
+                flips += 1
+            prev = s["speaker"]
+
+        if minor_share < min_share and flips <= max_flips:
+            # схлопываем в один (метка основного)
+            main_spk = max(dur_by.items(), key=lambda kv: kv[1])[0]
+            logger.info(
+                f"[{upload_id}] MONO-COLLAPSE: minor_share={minor_share:.3f} < {min_share}, flips={flips} <= {max_flips} → collapse to 1 speaker"
+            )
+            return [{"start": 0.0, "end": float(total_dur), "speaker": main_spk}]
+        return segments
+
     # ----------------- основная логика -----------------
 
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
@@ -1289,11 +1459,23 @@ def diarize_full(self, upload_id, correlation_id):
             diar_segments = attempt
             used_backend = "diarizen"
         else:
-            logger.warning(f"[{upload_id}] DiariZen unavailable → degraded fallback")
+            logger.warning(f"[{upload_id}] DiariZen unavailable → try pyannote")
     except Exception as e:
         logger.warning(f"[{upload_id}] DiariZen unexpected error: {e}")
 
-    # 2) Деградация (не падаем)
+    # 2) pyannote (безопасный фолбэк)
+    if not diar_segments:
+        try:
+            attempt = _run_pyannote(wav, duration)
+            if attempt:
+                diar_segments = attempt
+                used_backend = "pyannote"
+            else:
+                logger.warning(f"[{upload_id}] pyannote unavailable → degraded fallback")
+        except Exception as e:
+            logger.error(f"[{upload_id}] pyannote fallback failed: {e}", exc_info=True)
+
+    # 3) Деградация (не падаем)
     if not diar_segments:
         if bool(getattr(settings, "DIARIZATION_ALLOW_DEGRADED", True)):
             diar_segments = _degraded_one_speaker(duration)
@@ -1348,7 +1530,10 @@ def diarize_full(self, upload_id, correlation_id):
 
     diar_segments = _stabilize_labels(diar_segments)
 
-    # 4) финальное схлопывание подряд идущих одинаковых
+    # 4) эвристика “моно-коллапса” (если DiariZen всё же дал 2 на моно)
+    diar_segments = _maybe_collapse_to_one(diar_segments, duration)
+
+    # 5) финальное схлопывание подряд идущих одинаковых
     final_out: List[Dict[str, Any]] = []
     buf: Optional[Dict[str, Any]] = None
     for seg in sorted(diar_segments, key=lambda x: x["start"]):
