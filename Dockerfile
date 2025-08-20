@@ -9,7 +9,7 @@ RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends \
       ca-certificates curl && \
     rm -rf /var/lib/apt/lists/*
 
-COPY requirements-webhooks.txt ./requirements.txt
+COPY requirements-cpu.txt ./requirements-cpu.txt
 RUN pip install -q --upgrade pip && pip install -q --no-cache-dir -r requirements.txt
 
 COPY . .
