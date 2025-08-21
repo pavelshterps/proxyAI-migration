@@ -4,6 +4,7 @@ import subprocess
 import time
 import re
 import math
+import warnings
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional, List, Dict, Tuple
@@ -25,6 +26,27 @@ formatter = logging.Formatter(
 handler.setFormatter(formatter)
 logger.addHandler(handler)
 logger.setLevel(logging.INFO)
+
+# точечно глушим де-прекашен из torchaudio
+warnings.filterwarnings(
+    "ignore",
+    category=UserWarning,
+    module=r"torchaudio(\.|$)"
+)
+
+# точечно глушим предупреждения чтения аудио из pyannote
+warnings.filterwarnings(
+    "ignore",
+    category=UserWarning,
+    module=r"pyannote\.audio(\.|$)"
+)
+
+# убираем конкретный спам про "degrees of freedom is <= 0"
+warnings.filterwarnings(
+    "ignore",
+    category=UserWarning,
+    message=r".*degrees of freedom is <= 0.*"
+)
 
 # --- Model availability flags & holders ---
 _HF_AVAILABLE = False
