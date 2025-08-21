@@ -882,7 +882,6 @@ def transcribe_segments(self, upload_id, correlation_id):
             },
             beam_size=beam_size,
             temperature=temperature,
-            batch_size=batch_size,
             **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {}),
         )
         result = []
