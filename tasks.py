@@ -34,8 +34,8 @@ _diarization_pipeline = None
 
 # --- Speaker stitching / embedding ---
 SPEAKER_STITCH_ENABLED = getattr(settings, "SPEAKER_STITCH_ENABLED", True)
-SPEAKER_STITCH_THRESHOLD = float(getattr(settings, "SPEAKER_STITCH_THRESHOLD", 0.85))
-SPEAKER_STITCH_POOL_SIZE = int(getattr(settings, "SPEAKER_STITCH_POOL_SIZE", 8))
+SPEAKER_STITCH_THRESHOLD = float(getattr(settings, "SPEAKER_STITCH_THRESHOLD", 0.80))
+SPEAKER_STITCH_POOL_SIZE = int(getattr(settings, "SPEAKER_STITCH_POOL_SIZE", 14))
 SPEAKER_STITCH_EMA_ALPHA = float(getattr(settings, "SPEAKER_STITCH_EMA_ALPHA", 0.5))
 SPEAKER_STITCH_MERGE_THRESHOLD = float(getattr(settings, "SPEAKER_STITCH_MERGE_THRESHOLD", 0.98))
 _speaker_embedding_model = None  # type: ignore
@@ -1026,7 +1026,7 @@ def diarize_full(self, upload_id, correlation_id):
         logger.warning(f"[{upload_id}] invalid DIARIZATION_CHUNK_LENGTH_S={raw_chunk_limit!r}, falling back to 0")
         chunk_limit = 0
 
-    pad = float(getattr(settings, "DIARIZATION_CHUNK_PADDING_S", 0.0) or 0.0)
+    pad = float(getattr(settings, "DIARIZATION_CHUNK_PADDING_S", 2.0) or 0.0)
     using_chunking = bool(chunk_limit and duration > chunk_limit)
     total_chunks = math.ceil(duration / chunk_limit) if using_chunking else 1
 
@@ -1227,7 +1227,7 @@ def diarize_full(self, upload_id, correlation_id):
 
     # ---------- Light post-processing to stabilize segments ----------
     # 1) drop ultra-short blips (<0.20s)
-    MIN_SEG = float(getattr(settings, "DIARIZATION_MIN_SEGMENT_S", 0.20))
+    MIN_SEG = float(getattr(settings, "DIARIZATION_MIN_SEGMENT_S", 0.35))
     filtered = [s for s in raw if s["end"] - s["start"] >= MIN_SEG]
     dropped = len(raw) - len(filtered)
     if dropped:
@@ -1235,7 +1235,7 @@ def diarize_full(self, upload_id, correlation_id):
     raw = filtered
 
     # 2) merge same-speaker segments with tiny gaps (<0.20s)
-    GAP_MERGE = float(getattr(settings, "DIARIZATION_MERGE_GAP_S", 0.20))
+    GAP_MERGE = float(getattr(settings, "DIARIZATION_MERGE_GAP_S", 0.25))
     raw.sort(key=lambda x: (x["speaker"], x["start"]))
     merged: List[Dict[str, Any]] = []
     cur = None
@@ -1256,12 +1256,12 @@ def diarize_full(self, upload_id, correlation_id):
     # ---- NEW post-fixes: перекрашивание «ошибочных» коротышей/сэндвичей
     raw = _fix_sandwich_flips(
         raw,
-        max_len=float(getattr(settings, "DIARIZATION_FIX_SANDWICH_S", 1.0))
+        max_len=float(getattr(settings, "DIARIZATION_FIX_SANDWICH_S", 2.0))
     )
     raw = _glue_stray_shorts(
         raw,
-        max_len=float(getattr(settings, "DIARIZATION_GLUE_MAX_S", 0.6)),
-        max_gap=float(getattr(settings, "DIARIZATION_GLUE_GAP_S", 0.15))
+        max_len=float(getattr(settings, "DIARIZATION_GLUE_MAX_S", 0.8)),
+        max_gap=float(getattr(settings, "DIARIZATION_GLUE_GAP_S", 0.2))
     )
 
     # ---------- Optional stitching across chunks ----------
@@ -1306,7 +1306,7 @@ def diarize_full(self, upload_id, correlation_id):
                     aligned = merge_speakers(
                         sentences,
                         diar_sentences,
-                        pad=float(getattr(settings, "ALIGN_PAD_S", 0.2))
+                        pad=float(getattr(settings, "ALIGN_PAD_S", 0.3))
                     )
                     # ВАЖНО: сохраняем в ТОТ ЖЕ ФАЙЛ и в ТОЙ ЖЕ СХЕМЕ
                     tx_path.write_text(json.dumps(aligned, ensure_ascii=False, indent=2))
