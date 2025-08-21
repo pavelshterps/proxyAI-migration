@@ -40,6 +40,9 @@ SPEAKER_STITCH_EMA_ALPHA = float(getattr(settings, "SPEAKER_STITCH_EMA_ALPHA", 0
 SPEAKER_STITCH_MERGE_THRESHOLD = float(getattr(settings, "SPEAKER_STITCH_MERGE_THRESHOLD", 0.98))
 _speaker_embedding_model = None  # type: ignore
 
+USE_VAD_IN_FULL = bool(getattr(settings, "USE_VAD_IN_FULL", False))
+TRANSCRIBE_OVERLAP_S = float(getattr(settings, "TRANSCRIBE_OVERLAP_S", 0.5))
+
 try:
     from faster_whisper import WhisperModel, download_model
 
@@ -839,6 +842,7 @@ def transcribe_segments(self, upload_id, correlation_id):
     except ImportError:
         pass
 
+    # попытка авто-дауншифта на CPU если GPU перегружены
     try:
         inspector = app.control.inspect()
         active = inspector.active() or {}
@@ -864,67 +868,106 @@ def transcribe_segments(self, upload_id, correlation_id):
     model = get_whisper_model()
     raw_segs: List[Any] = []
 
-    def _transcribe_with_vad(source, offset: float = 0.0):
-        # NEW: читаем «мягкие» дефолты из настроек (можно регулировать без кода)
-        vad_min_sil_ms = int(getattr(settings, "VAD_MIN_SIL_MS", int(settings.SENTENCE_MAX_GAP_S * 1000)))
-        vad_pad_ms = int(getattr(settings, "VAD_SPEECH_PAD_MS", 200))
-        beam_size = int(getattr(settings, "WHISPER_BEAM_SIZE", 1))  # 1 = быстро и стабильно
-        temperature = float(getattr(settings, "WHISPER_TEMPERATURE", 0.0))  # 0.0 = детерминированно/быстро
-        batch_size = int(getattr(settings, "WHISPER_BATCH_SIZE", 1))
+    # общие параметры декодера — чтобы совпадать по стилю с превью
+    beam_size = int(getattr(settings, "WHISPER_BEAM_SIZE", 1))
+    temperature = float(getattr(settings, "WHISPER_TEMPERATURE", 0.0))
+    use_vad = bool(USE_VAD_IN_FULL)  # по умолчанию False, как в превью
+    vad_min_sil_ms = int(getattr(settings, "VAD_MIN_SIL_MS", int(settings.SENTENCE_MAX_GAP_S * 1000)))
+    vad_pad_ms = int(getattr(settings, "VAD_SPEECH_PAD_MS", 200))
+    overlap = max(0.0, float(TRANSCRIBE_OVERLAP_S))
+    chunk_len = float(getattr(settings, "CHUNK_LENGTH_S", 120.0))
 
-        segs, _ = model.transcribe(
-            source,
+    def _decode(source, start_shift: float = 0.0):
+        kw = dict(
             word_timestamps=True,
-            vad_filter=True,
-            vad_parameters={
-                "min_silence_duration_ms": vad_min_sil_ms,
-                "speech_pad_ms": vad_pad_ms,
-            },
+            condition_on_previous_text=False,
             beam_size=beam_size,
             temperature=temperature,
-            **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {}),
         )
-        result = []
-        for s in segs:
-            s.start += offset
-            s.end += offset
-            result.append(s)
-        return result
+        if use_vad:
+            kw.update(
+                vad_filter=True,
+                vad_parameters={
+                    "min_silence_duration_ms": vad_min_sil_ms,
+                    "speech_pad_ms": vad_pad_ms,
+                }
+            )
+        # язык опционально
+        if settings.WHISPER_LANGUAGE:
+            kw.update(language=settings.WHISPER_LANGUAGE)
 
-    if duration <= settings.VAD_MAX_LENGTH_S:
-        logger.info(f"[{upload_id}] short audio ({duration:.1f}s) → single VAD pass")
-        raw_segs = _transcribe_with_vad(str(wav))
+        segs_gen, _ = model.transcribe(source, **kw)
+
+        out = []
+        for s in segs_gen:
+            s.start += start_shift
+            s.end += start_shift
+            out.append(s)
+        return out
+
+    if duration <= max(chunk_len, 1.0):
+        logger.info(f"[{upload_id}] short audio ({duration:.1f}s) → single pass (overlap={overlap}s)")
+        raw_segs = _decode(str(wav), 0.0)
     else:
-        total_chunks = math.ceil(duration / settings.CHUNK_LENGTH_S)
         processed_key = f"transcribe:processed_chunks:{upload_id}"
         processed = {int(x) for x in r.smembers(processed_key)}
 
+        total_chunks = int(math.ceil((duration + overlap) / (chunk_len)))
         offset = 0.0
         chunk_idx = 0
+
         while offset < duration:
+            # ядро чанка и его «пэды» на вход ffmpeg
+            core_len = min(chunk_len, duration - offset)
+            left_pad = overlap if offset > 0 else 0.0
+            right_pad = overlap if (offset + core_len) < duration else 0.0
+
+            # пропуск уже готовых
             if chunk_idx in processed:
                 logger.info(f"[{upload_id}] skip chunk {chunk_idx+1}/{total_chunks} (already done)")
-                offset += settings.CHUNK_LENGTH_S
+                offset += core_len
                 chunk_idx += 1
                 continue
 
-            length = min(settings.CHUNK_LENGTH_S, duration - offset)
-            logger.info(f"[{upload_id}] transcribe chunk {chunk_idx+1}/{total_chunks}: {offset:.1f}s→{offset+length:.1f}s")
+            # фактический временной срез, который режем в pipe
+            cut_start = max(0.0, offset - left_pad)
+            cut_dur = min(duration, offset + core_len + right_pad) - cut_start
+
+            logger.info(
+                f"[{upload_id}] transcribe chunk {chunk_idx+1}/{total_chunks}: "
+                f"cut {cut_start:.1f}s→{cut_start+cut_dur:.1f}s (core {offset:.1f}s→{offset+core_len:.1f}s, pad L={left_pad:.1f}s R={right_pad:.1f}s)"
+            )
+
             try:
                 p = subprocess.Popen(
                     [
                         "ffmpeg", "-y",
                         "-threads", str(settings.FFMPEG_THREADS),
-                        "-ss", str(offset), "-t", str(length),
-                        "-i", str(wav), "-f", "wav", "pipe:1"
+                        "-ss", str(cut_start),
+                        "-t", str(cut_dur),
+                        "-i", str(wav),
+                        "-f", "wav", "pipe:1"
                     ],
                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
                 )
-                chunk_segs = _transcribe_with_vad(p.stdout, offset)
+
+                # декодируем и смещаем таймкоды к абсолютным
+                segs = _decode(p.stdout, cut_start)
                 p.stdout.close(); p.wait()
 
-                raw_segs.extend(chunk_segs)
+                # оставляем только сегменты, пересекающие ядро чанка
+                core_start = offset
+                core_end = offset + core_len
+                for s in segs:
+                    if s.end <= core_start or s.start >= core_end:
+                        continue
+                    # подрезаем к границам ядра, чтобы убрать влияние перекрытий
+                    s.start = max(s.start, core_start)
+                    s.end = min(s.end, core_end)
+                    raw_segs.append(s)
+
                 r.sadd(processed_key, chunk_idx)
+
             except Exception as e:
                 logger.error(f"[{upload_id}] error in transcribe chunk {chunk_idx+1}/{total_chunks}: {e}", exc_info=True)
                 try:
@@ -932,11 +975,12 @@ def transcribe_segments(self, upload_id, correlation_id):
                 except ImportError:
                     pass
             finally:
-                offset += length
+                offset += core_len
                 chunk_idx += 1
 
         r.delete(processed_key)
 
+    # плоский вид + группировка в предложения
     flat = [{"start": s.start, "end": s.end, "text": s.text} for s in raw_segs]
     flat.sort(key=lambda x: x["start"])
     sentences = group_into_sentences(flat)
@@ -1063,6 +1107,7 @@ def diarize_full(self, upload_id, correlation_id):
                     ann = pipeline(str(tmp), **infer_kwargs)
 
                 before = len(raw)
+                # перенос локальных координат в глобальные; обрезаем к ядру
                 for s, _, spk in ann.itertracks(yield_label=True):
                     g_start = float(s.start) + log_start
                     g_end = float(s.end) + log_start
@@ -1114,9 +1159,10 @@ def diarize_full(self, upload_id, correlation_id):
         if torch and torch.cuda.is_available():
             torch.cuda.empty_cache()
 
+    # ---- базовая сортировка
     raw.sort(key=lambda x: x["start"])
 
-    # ---------- Optional FS-EEND refinement (safe no-op if disabled/missing) ----------
+    # ---------- Optional FS-EEND refinement ----------
     def _refine_with_fs_eend(_raw: List[Dict[str, Any]], _wav: Path) -> List[Dict[str, Any]]:
         try:
             if not bool(getattr(settings, "USE_FS_EEND", False)):
@@ -1147,6 +1193,7 @@ def diarize_full(self, upload_id, correlation_id):
                 refined.append({"start": float(s.start), "end": float(s.end), "speaker": spk})
             refined.sort(key=lambda x: x["start"])
 
+            # простая метрика: доля времени с >=2 активными говорящими
             def _overlap_score(items: List[Dict[str, Any]]) -> float:
                 if not items:
                     return 0.0
@@ -1203,10 +1250,10 @@ def diarize_full(self, upload_id, correlation_id):
         merged.append(cur)
     raw = merged
 
-    # 3) final sort
+    # 3) финальная сортировка
     raw.sort(key=lambda x: x["start"])
 
-    # ---- NEW post-fixes (ставить сразу после финальной сортировки) ----
+    # ---- NEW post-fixes: перекрашивание «ошибочных» коротышей/сэндвичей
     raw = _fix_sandwich_flips(
         raw,
         max_len=float(getattr(settings, "DIARIZATION_FIX_SANDWICH_S", 1.0))
@@ -1216,9 +1263,8 @@ def diarize_full(self, upload_id, correlation_id):
         max_len=float(getattr(settings, "DIARIZATION_GLUE_MAX_S", 0.6)),
         max_gap=float(getattr(settings, "DIARIZATION_GLUE_GAP_S", 0.15))
     )
-    # ---------------------------------------------------------------
 
-    # ---------- Optional stitching (works best with chunking) ----------
+    # ---------- Optional stitching across chunks ----------
     if SPEAKER_STITCH_ENABLED and using_chunking:
         raw = stitch_speakers(raw, wav, upload_id)
     else:
@@ -1237,7 +1283,7 @@ def diarize_full(self, upload_id, correlation_id):
     if buf:
         diar_sentences.append(buf)
 
-    # ---------- Save results ----------
+    # ---------- Save diarization ----------
     out = Path(settings.RESULTS_FOLDER) / upload_id
     out.mkdir(parents=True, exist_ok=True)
     (out / "diarization.json").write_text(json.dumps(diar_sentences, ensure_ascii=False, indent=2))
@@ -1250,6 +1296,29 @@ def diarize_full(self, upload_id, correlation_id):
     if torch and torch.cuda.is_available():
         logger.info(f"[{upload_id}] GPU memory reserved after diarization: {torch.cuda.memory_reserved()}")
 
+    # ---------- «Склейка» спикеров к фразам транскрипта (перезаписываем transcript.json) ----------
+    try:
+        tx_path = out / "transcript.json"
+        if tx_path.exists():
+            try:
+                sentences = json.loads(tx_path.read_text())
+                if isinstance(sentences, list):
+                    aligned = merge_speakers(
+                        sentences,
+                        diar_sentences,
+                        pad=float(getattr(settings, "ALIGN_PAD_S", 0.2))
+                    )
+                    # ВАЖНО: сохраняем в ТОТ ЖЕ ФАЙЛ и в ТОЙ ЖЕ СХЕМЕ
+                    tx_path.write_text(json.dumps(aligned, ensure_ascii=False, indent=2))
+                    logger.info(f"[{upload_id}] transcript.json overwritten with speakers ({len(aligned)} sentences)")
+            except Exception as e:
+                logger.warning(f"[{upload_id}] failed to align transcript.json: {e}")
+        else:
+            logger.info(f"[{upload_id}] transcript.json not found; skipping alignment")
+    except Exception as e:
+        logger.warning(f"[{upload_id}] speaker-to-phrase alignment failed: {e}")
+
+    # ---------- notify ----------
     r.publish(
         f"progress:{upload_id}",
         json.dumps({
