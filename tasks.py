@@ -370,11 +370,19 @@ def get_diarization_pipeline():
     global _diarization_pipeline
     if _diarization_pipeline is None:
         model_id = getattr(settings, "PYANNOTE_PIPELINE", "pyannote/speaker-diarization-3.1")
-        _diarization_pipeline = PyannotePipeline.from_pretrained(
+        pipe = PyannotePipeline.from_pretrained(
             model_id,
             use_auth_token=settings.HUGGINGFACE_TOKEN,
             cache_dir=settings.DIARIZER_CACHE_DIR,
         )
+        # <- ВАЖНО: на GPU
+        try:
+            import torch
+            if torch.cuda.is_available():
+                pipe = pipe.to("cuda")
+        except Exception:
+            pass
+        _diarization_pipeline = pipe
         logger.info(f"[DIARIZE] loaded pipeline {model_id}")
     return _diarization_pipeline
 
@@ -383,15 +391,27 @@ def get_speaker_embedding_model():
     if _speaker_embedding_model is None:
         try:
             from speechbrain.inference.speaker import EncoderClassifier
+            import torch  # NEW
         except ImportError as e:
             logger.warning(f"[STITCH] speechbrain not available, cannot do speaker stitching: {e}")
             raise
+
         savedir = Path(settings.DIARIZER_CACHE_DIR) / "spkrec-ecapa-voxceleb"
+
+        # NEW: если доступен CUDA — явно просим SpeechBrain работать на GPU
+        run_opts = {}
+        try:
+            if torch.cuda.is_available():
+                run_opts = {"device": "cuda"}
+        except Exception:
+            pass
+
         _speaker_embedding_model = EncoderClassifier.from_hparams(
             source="speechbrain/spkrec-ecapa-voxceleb",
-            savedir=str(savedir)
+            savedir=str(savedir),
+            run_opts=run_opts  # NEW
         )
-        logger.info("[STITCH] loaded speaker embedding model from speechbrain/spkrec-ecapa-voxceleb")
+        logger.info("[STITCH] loaded ECAPA (SpeechBrain) with run_opts=%s", run_opts or "{}")
     return _speaker_embedding_model
 
 def stitch_speakers(raw: List[Dict[str, Any]], wav: Path, upload_id: str) -> List[Dict[str, Any]]:
@@ -407,6 +427,7 @@ def stitch_speakers(raw: List[Dict[str, Any]], wav: Path, upload_id: str) -> Lis
         import torch
         import torchaudio
         import torch.nn.functional as F
+        from torch.utils.data import DataLoader  # NEW
 
         model = get_speaker_embedding_model()
 
@@ -417,6 +438,104 @@ def stitch_speakers(raw: List[Dict[str, Any]], wav: Path, upload_id: str) -> Lis
             waveform = resampler(waveform)
             sr = 16000
 
+        # mono
+        if waveform.size(0) > 1:
+            waveform = waveform.mean(dim=0, keepdim=True)
+
+        # NEW: параметры извлечения эмбеддингов
+        WIN_SEC = float(getattr(settings, "STITCH_EMB_WINDOW_S", 1.5))       # центр-окно, даёт устойчивость
+        MAX_SEC = float(getattr(settings, "STITCH_EMB_MAX_WINDOW_S", 3.0))   # ограничим длину окна
+        HOP_STRIDE = float(getattr(settings, "STITCH_EMB_HOP_S", 1.5))       # если сегмент длинный — возьмём несколько окон
+        BATCH = int(getattr(settings, "STITCH_EMB_BATCH", 16))               # батчим ради скорости
+
+        def _center_crop(start_s: float, end_s: float) -> List[Tuple[int, int]]:
+            """Вернём список [начало, конец) сэмплов под окна для эмбеддинга."""
+            dur = end_s - start_s
+            if dur <= 0:
+                return []
+            # если сегмент слишком длинный — берём несколько окон через шаг
+            win = min(MAX_SEC, WIN_SEC)
+            if dur <= win:
+                mid = (start_s + end_s) * 0.5
+                s0 = max(0, int((mid - win * 0.5) * sr))
+                s1 = min(waveform.size(1), s0 + int(win * sr))
+                return [(s0, s1)]
+            else:
+                # разреженно по центру сегмента
+                out = []
+                cur = start_s + (dur - win) * 0.5  # старт из центра
+                # сдвинем влево/вправо на несколько окон
+                starts = [cur + k * HOP_STRIDE for k in (-1, 0, 1)]
+                for st in starts:
+                    st = max(start_s, min(st, end_s - win))
+                    s0 = int(st * sr)
+                    s1 = min(waveform.size(1), s0 + int(win * sr))
+                    out.append((s0, s1))
+                # уникализируем
+                uniq = []
+                seen = set()
+                for s0, s1 in out:
+                    key = (s0, s1)
+                    if key not in seen:
+                        uniq.append(key); seen.add(key)
+                return uniq
+
+        # NEW: готовим «задания» на эмбеддинги
+        jobs = []
+        for seg in sorted(raw, key=lambda x: x["start"]):
+            start, end = seg["start"], seg["end"]
+            if end <= start:
+                continue
+            for s0, s1 in _center_crop(start, end):
+                if s1 > s0:
+                    jobs.append((seg, s0, s1))
+
+        # батч-энкодинг
+        embeddings_by_seg: Dict[int, List[torch.Tensor]] = {}
+        for i in range(0, len(jobs), BATCH):
+            batch = jobs[i:i+BATCH]
+            batch_wavs = []
+            for _, s0, s1 in batch:
+                piece = waveform[:, s0:s1]
+                if piece.numel() == 0:
+                    # заглушка — пропустим потом
+                    batch_wavs.append(torch.zeros(1, int(WIN_SEC * sr)))
+                else:
+                    batch_wavs.append(piece)
+
+            # паддинг до одной длины — требуется многим энкодерам
+            max_len = max(w.size(1) for w in batch_wavs) if batch_wavs else 0
+            padded = []
+            for w in batch_wavs:
+                if w.size(1) < max_len:
+                    pad = torch.zeros(1, max_len - w.size(1), dtype=w.dtype, device=w.device)
+                    w = torch.cat([w, pad], dim=1)
+                padded.append(w)
+            if not padded:
+                continue
+            x = torch.stack(padded, dim=0)  # [B, 1, T]
+
+            with torch.no_grad():
+                embs = model.encode_batch(x)  # SpeechBrain вернёт [B, 1, D] или [B, D]
+            embs = embs.squeeze(1) if embs.ndim == 3 else embs
+            embs = torch.nn.functional.normalize(embs, p=2, dim=1)
+
+            for (seg, _, _), e in zip(batch, embs):
+                idx = id(seg)
+                embeddings_by_seg.setdefault(idx, []).append(e.cpu())
+
+        # агрегируем по сегменту (среднее)
+        seg_centroids: Dict[int, torch.Tensor] = {}
+        for seg in raw:
+            idx = id(seg)
+            lst = embeddings_by_seg.get(idx, None)
+            if not lst:
+                continue
+            c = torch.stack(lst, dim=0).mean(dim=0)
+            c = torch.nn.functional.normalize(c, p=2, dim=0)
+            seg_centroids[idx] = c
+
+        # онлайн-кластеризация сегментов по косинусной близости (как у тебя, но на усреднённых центрах)
         stitch_centroids: Dict[str, torch.Tensor] = {}
         stitch_histories: Dict[str, List[torch.Tensor]] = {}
         next_label_idx = 0
@@ -429,33 +548,18 @@ def stitch_speakers(raw: List[Dict[str, Any]], wav: Path, upload_id: str) -> Lis
 
         stitched: List[Dict[str, Any]] = []
         raw_sorted = sorted(raw, key=lambda x: x["start"])
+
         for seg in raw_sorted:
-            start, end = seg["start"], seg["end"]
-            if end <= start:
+            idx = id(seg)
+            emb = seg_centroids.get(idx, None)
+            if emb is None:
                 stitched.append(seg)
                 continue
-            start_sample = int(start * sr)
-            end_sample = int(end * sr)
-            if end_sample <= start_sample or start_sample >= waveform.size(1):
-                stitched.append(seg)
-                continue
-            segment_waveform = waveform[:, start_sample:end_sample]
-            if segment_waveform.numel() == 0:
-                stitched.append(seg)
-                continue
-            if segment_waveform.size(0) > 1:
-                segment_waveform = segment_waveform.mean(dim=0, keepdim=True)
-            with torch.no_grad():
-                emb = model.encode_batch(segment_waveform)
-            emb = emb.squeeze()
-            if emb.ndim > 1:
-                emb = emb.flatten()
-            emb = F.normalize(emb, p=2, dim=0)
 
             assigned_label = None
             best_sim = -1.0
             for canon_label, centroid in stitch_centroids.items():
-                sim = torch.dot(emb, centroid).item()
+                sim = float(torch.dot(emb, centroid).item())
                 if sim > best_sim:
                     best_sim = sim
                     assigned_label = canon_label
@@ -480,6 +584,7 @@ def stitch_speakers(raw: List[Dict[str, Any]], wav: Path, upload_id: str) -> Lis
             seg["speaker"] = assigned_label
             stitched.append(seg)
 
+        # пост-слияние очень похожих центроид
         label_centroids: Dict[str, torch.Tensor] = {}
         for label, hist in stitch_histories.items():
             centroid = torch.stack(hist).mean(dim=0)
@@ -491,7 +596,7 @@ def stitch_speakers(raw: List[Dict[str, Any]], wav: Path, upload_id: str) -> Lis
         for i in range(len(labels)):
             for j in range(i + 1, len(labels)):
                 a, b = labels[i], labels[j]
-                sim = torch.dot(label_centroids[a], label_centroids[b]).item()
+                sim = float(torch.dot(label_centroids[a], label_centroids[b]).item())
                 if sim >= SPEAKER_STITCH_MERGE_THRESHOLD:
                     adj[a].add(b)
                     adj[b].add(a)
@@ -533,6 +638,44 @@ def preload_on_startup(**kwargs):
         get_diarization_pipeline()
 
 # ---------------------- Post-processing for diarization ----------------------
+# NEW: если короткий сегмент B зажат между A и A — перекрашиваем в A
+def _fix_sandwich_flips(segments: List[Dict[str, Any]],
+                        max_len: float = 1.0) -> List[Dict[str, Any]]:
+    if not segments:
+        return segments
+    segs = sorted(segments, key=lambda s: s["start"])
+    out = []
+    for i, s in enumerate(segs):
+        if 0 < i < len(segs)-1:
+            prev_s, next_s = segs[i-1], segs[i+1]
+            if (s["end"] - s["start"]) <= max_len \
+               and prev_s["speaker"] == next_s["speaker"] != s["speaker"]:
+                # перекрашиваем
+                s = dict(s); s["speaker"] = prev_s["speaker"]
+        out.append(s)
+    return out
+
+# NEW: если короткий «чужой» фрагмент примыкает к длинному «своему» — перекрашиваем
+def _glue_stray_shorts(segments: List[Dict[str, Any]],
+                       max_len: float = 0.6, max_gap: float = 0.15) -> List[Dict[str, Any]]:
+    if not segments:
+        return segments
+    segs = sorted(segments, key=lambda s: s["start"])
+    out = []
+    for i, s in enumerate(segs):
+        dur = s["end"] - s["start"]
+        if dur <= max_len:
+            left = segs[i-1] if i-1 >= 0 else None
+            right = segs[i+1] if i+1 < len(segs) else None
+            def gap(a,b):
+                return max(0.0, (b["start"] - a["end"])) if a and b else 1e9
+            # если коротыш прижат к одному из соседей и сосед длинный — красим в соседа
+            if left and left["speaker"] != s["speaker"] and gap(left,s) <= max_gap and (left["end"]-left["start"]) >= (dur*2):
+                s = dict(s); s["speaker"] = left["speaker"]
+            elif right and right["speaker"] != s["speaker"] and gap(s,right) <= max_gap and (right["end"]-right["start"]) >= (dur*2):
+                s = dict(s); s["speaker"] = right["speaker"]
+        out.append(s)
+    return out
 
 def _merge_short_segments(segments: List[Dict[str, Any]],
                           min_dur: float = 0.35,
@@ -722,14 +865,24 @@ def transcribe_segments(self, upload_id, correlation_id):
     raw_segs: List[Any] = []
 
     def _transcribe_with_vad(source, offset: float = 0.0):
+        # NEW: читаем «мягкие» дефолты из настроек (можно регулировать без кода)
+        vad_min_sil_ms = int(getattr(settings, "VAD_MIN_SIL_MS", int(settings.SENTENCE_MAX_GAP_S * 1000)))
+        vad_pad_ms = int(getattr(settings, "VAD_SPEECH_PAD_MS", 200))
+        beam_size = int(getattr(settings, "WHISPER_BEAM_SIZE", 1))  # 1 = быстро и стабильно
+        temperature = float(getattr(settings, "WHISPER_TEMPERATURE", 0.0))  # 0.0 = детерминированно/быстро
+        batch_size = int(getattr(settings, "WHISPER_BATCH_SIZE", 1))
+
         segs, _ = model.transcribe(
             source,
             word_timestamps=True,
             vad_filter=True,
             vad_parameters={
-                "min_silence_duration_ms": int(settings.SENTENCE_MAX_GAP_S * 1000),
-                "speech_pad_ms": 200,
+                "min_silence_duration_ms": vad_min_sil_ms,
+                "speech_pad_ms": vad_pad_ms,
             },
+            beam_size=beam_size,
+            temperature=temperature,
+            batch_size=batch_size,
             **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {}),
         )
         result = []
@@ -874,18 +1027,15 @@ def diarize_full(self, upload_id, correlation_id):
         chunk_idx = 0
         while offset < duration:
             this_len = min(chunk_limit, duration - offset)
-            # compute left/right pad inside available audio range
             left_pad = pad if offset > 0 else 0.0
             right_pad = pad if (offset + this_len) < duration else 0.0
 
-            # already done?
             if chunk_idx in processed:
                 logger.info(f"[{upload_id}] skip diarize chunk {chunk_idx+1}/{total_chunks}")
                 offset += this_len
                 chunk_idx += 1
                 continue
 
-            # ---- start log for chunk
             log_start = max(0.0, offset - left_pad)
             log_end = min(duration, offset + this_len + right_pad)
             logger.info(
@@ -893,7 +1043,6 @@ def diarize_full(self, upload_id, correlation_id):
                 f"{log_start:.1f}s→{log_end:.1f}s (core {offset:.1f}s→{offset+this_len:.1f}s, pad L={left_pad:.1f}s R={right_pad:.1f}s)"
             )
 
-            # cut chunk to temp wav (with pads around)
             tmp = Path(settings.DIARIZER_CACHE_DIR) / f"{upload_id}_chunk_{chunk_idx}.wav"
             subprocess.run(
                 [
@@ -908,7 +1057,6 @@ def diarize_full(self, upload_id, correlation_id):
             )
 
             try:
-                # inference w/o grads to reduce mem
                 if torch:
                     with torch.inference_mode():
                         ann = pipeline(str(tmp), **infer_kwargs)
@@ -916,12 +1064,9 @@ def diarize_full(self, upload_id, correlation_id):
                     ann = pipeline(str(tmp), **infer_kwargs)
 
                 before = len(raw)
-                # Convert local chunk timeline to global timeline via log_start (start of file cut)
                 for s, _, spk in ann.itertracks(yield_label=True):
                     g_start = float(s.start) + log_start
                     g_end = float(s.end) + log_start
-                    # Optionally trim to core region (avoid double counting overlap from pads)
-                    # keep only parts that intersect [offset, offset+this_len]
                     if g_end <= offset or g_start >= (offset + this_len):
                         continue
                     g_start = max(g_start, offset)
@@ -936,7 +1081,6 @@ def diarize_full(self, upload_id, correlation_id):
             except Exception as e:
                 logger.error(f"[{upload_id}] error in diarize chunk {chunk_idx+1}/{total_chunks}: {e}", exc_info=True)
             finally:
-                # cleanup temp + memory between chunks
                 try:
                     tmp.unlink(missing_ok=True)
                 except Exception:
@@ -963,7 +1107,6 @@ def diarize_full(self, upload_id, correlation_id):
             ann = pipeline(str(wav), **infer_kwargs)
         for s, _, spk in ann.itertracks(yield_label=True):
             raw.append({"start": float(s.start), "end": float(s.end), "speaker": spk})
-        # cleanup
         try:
             del ann
         except Exception:
@@ -986,9 +1129,7 @@ def diarize_full(self, upload_id, correlation_id):
                 logger.info(f"[{upload_id}] FS-EEND path not set → skipping refinement")
                 return _raw
 
-            # NOTE: реальный FS-EEND пайплайн может отличаться в вашей среде.
-            # Оставляем безопасную попытку через pyannote Pipeline, чтобы не ломать рантайм.
-            from pyannote.audio import Pipeline as _TmpPipe  # uses same lib already in image
+            from pyannote.audio import Pipeline as _TmpPipe
             logger.info(f"[{upload_id}] FS-EEND refinement started with {model_id}")
             if torch:
                 with torch.inference_mode():
@@ -1007,11 +1148,7 @@ def diarize_full(self, upload_id, correlation_id):
                 refined.append({"start": float(s.start), "end": float(s.end), "speaker": spk})
             refined.sort(key=lambda x: x["start"])
 
-            # Простая стратегия: если FS-EEND дал большее число одновременных говорящих
-            # на существенной доле времени — используем его; иначе остаёмся на исходном.
             def _overlap_score(items: List[Dict[str, Any]]) -> float:
-                # измерим долю времени, где активны >=2 говорящих
-                # грубая оценка по дискретизации 20 Гц
                 if not items:
                     return 0.0
                 step = 0.05
@@ -1030,7 +1167,6 @@ def diarize_full(self, upload_id, correlation_id):
             eend_ovl = _overlap_score(refined)
             logger.info(f"[{upload_id}] FS-EEND overlap score: base={base_ovl:.3f}, eend={eend_ovl:.3f}")
 
-            # если eend раскрывает перекрытия лучше — берём его
             if eend_ovl > base_ovl + 0.05:
                 logger.info(f"[{upload_id}] FS-EEND accepted")
                 return refined
@@ -1070,6 +1206,18 @@ def diarize_full(self, upload_id, correlation_id):
 
     # 3) final sort
     raw.sort(key=lambda x: x["start"])
+
+    # ---- NEW post-fixes (ставить сразу после финальной сортировки) ----
+    raw = _fix_sandwich_flips(
+        raw,
+        max_len=float(getattr(settings, "DIARIZATION_FIX_SANDWICH_S", 1.0))
+    )
+    raw = _glue_stray_shorts(
+        raw,
+        max_len=float(getattr(settings, "DIARIZATION_GLUE_MAX_S", 0.6)),
+        max_gap=float(getattr(settings, "DIARIZATION_GLUE_GAP_S", 0.15))
+    )
+    # ---------------------------------------------------------------
 
     # ---------- Optional stitching (works best with chunking) ----------
     if SPEAKER_STITCH_ENABLED and using_chunking:
