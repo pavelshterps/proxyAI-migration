@@ -819,15 +819,18 @@ def preview_transcribe(self, upload_id, correlation_id):
             for t in node_tasks:
                 if t["name"] in ("tasks.diarize_full", "tasks.transcribe_segments"):
                     heavy += 1
-        if heavy >= 2:
-            logger.info(f"[{upload_id}] both GPUs busy (found {heavy} heavy tasks), falling back to CPU for transcription preview")
-            transcribe_segments.apply_async((upload_id, correlation_id), queue="transcribe_cpu")
+        # ВАЖНО: если GPU заняты — перекидываем ИМЕННО превью на CPU, а не запускаем полную транскрипцию
+        if heavy >= 2 and self.request.delivery_info.get("routing_key") != "transcribe_cpu":
+            logger.info(f"[{upload_id}] GPUs busy ({heavy} heavy tasks), requeueing PREVIEW to CPU")
+            preview_transcribe.apply_async((upload_id, correlation_id), queue="transcribe_cpu")
             return
     except Exception:
-        logger.warning(f"[{upload_id}] failed to inspect workers, proceeding on GPU")
+        logger.warning(f"[{upload_id}] failed to inspect workers, proceeding on current worker")
 
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
     proc = prepare_preview_segment(upload_id)
+
+    # Загружаем модель под текущий воркер (GPU или CPU — по env)
     model = get_whisper_model()
     segments_gen, _ = model.transcribe(
         proc.stdout,
@@ -835,6 +838,7 @@ def preview_transcribe(self, upload_id, correlation_id):
         **({"language": settings.WHISPER_LANGUAGE} if settings.WHISPER_LANGUAGE else {}),
     )
     proc.stdout.close(); proc.wait()
+
     segments = list(segments_gen)
     for seg in segments:
         r.publish(
@@ -853,6 +857,8 @@ def preview_transcribe(self, upload_id, correlation_id):
     (out / "preview_transcript.json").write_text(json.dumps(preview, ensure_ascii=False, indent=2))
     r.publish(f"progress:{upload_id}", json.dumps({"status": "preview_done", "preview": preview}))
     deliver_webhook.delay("preview_completed", upload_id, {"preview": preview})
+
+    # Как и раньше — запускаем полную транскрипцию следующей задачей
     transcribe_segments.delay(upload_id, correlation_id)
 
 @app.task(bind=True, queue="transcribe_gpu")
@@ -926,33 +932,43 @@ def transcribe_segments(self, upload_id, correlation_id):
             out.append(s)
         return out
 
-    # 1) пробуем single-pass всегда (даже на длинных),
-    #    при OOM/ошибке уходим на «твой» chunked режим.
+    # 1) пробуем single-pass…
     tried_single = False
     try:
         tried_single = True
         logger.info(f"[{upload_id}] trying single-pass transcription on whole file")
         raw_segs = _decode(str(wav), 0.0)
         logger.info(f"[{upload_id}] single-pass transcription ok: {len(raw_segs)} segments")
-    except RuntimeError as e:
-        msg = str(e)
-        if ("cuda" in msg.lower() or "out of memory" in msg.lower()) and self.request.delivery_info.get("routing_key") != "transcribe_cpu":
-            logger.warning(f"[{upload_id}] single-pass OOM on GPU, falling back to chunked transcription")
+    except Exception as e:
+        msg = str(e).lower()
+        is_gpu_oom = any(s in msg for s in (
+            "cuda", "out of memory", "cublas", "cudnn", "failed to allocate"
+        ))
+        # torch-specific OOM класс (если доступен)
+        try:
+            import torch
+            is_gpu_oom = is_gpu_oom or isinstance(e, getattr(torch.cuda, "OutOfMemoryError", ()))
+        except Exception:
+            pass
+        # ctranslate2 OOM
+        try:
+            import ctranslate2
+            is_gpu_oom = is_gpu_oom or isinstance(e, getattr(ctranslate2, "RuntimeError", ()))
+        except Exception:
+            pass
+
+        if is_gpu_oom and self.request.delivery_info.get("routing_key") != "transcribe_cpu":
+            logger.warning(f"[{upload_id}] single-pass GPU OOM/reset, falling back to chunked: {e}")
             raw_segs = []
-            if torch and torch.cuda.is_available():
-                try:
-                    torch.cuda.empty_cache()
-                except Exception:
-                    pass
         else:
             logger.error(f"[{upload_id}] single-pass transcription failed: {e}", exc_info=True)
             deliver_webhook.delay("processing_failed", upload_id, None)
             return
-    except Exception as e:
-        logger.warning(f"[{upload_id}] single-pass transcription failed ({e}), will try chunked", exc_info=True)
-        raw_segs = []
+    finally:
+        # на всякий случай освобождаем память
         try:
-            if torch and torch.cuda.is_available():
+            import torch
+            if torch.cuda.is_available():
                 torch.cuda.empty_cache()
         except Exception:
             pass
