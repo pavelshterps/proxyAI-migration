@@ -1022,36 +1022,43 @@ def transcribe_segments(self, upload_id, correlation_id):
 
 @app.task(bind=True, queue="diarize_gpu")
 def diarize_full(self, upload_id, correlation_id):
-    import gc
+    import gc, math, json, subprocess, contextlib
+    from pathlib import Path
+    from typing import Dict, Any, List, Optional, Tuple
+    from redis import Redis
+    from datetime import datetime
+
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
-    logger.info(f"[{upload_id}] diarize_full started")
+    logger.info(f"[{upload_id}] diarize_full (minimal) started")
     r.publish(f"progress:{upload_id}", json.dumps({"status": "diarize_started"}))
     deliver_webhook.delay("diarization_started", upload_id, None)
 
-    # ---- GPU mem before
+    # ---- torch (optional)
     try:
         import torch
         _torch = torch
-        logger.info(f"[{upload_id}] GPU memory reserved before diarization: "
-                    f"{torch.cuda.memory_reserved() if torch.cuda.is_available() else 'n/a'}")
-    except ImportError:
-        _torch = None  # type: ignore
+        logger.info(f"[{upload_id}] GPU reserved before: {torch.cuda.memory_reserved() if torch.cuda.is_available() else 'n/a'}")
+    except Exception:
+        _torch = None
 
+    # ---- prepare wav (используем уже готовый 16kHz mono PCM из prepare_wav)
     wav, duration = prepare_wav(upload_id)
 
-    # --- chunking params ---
-    raw_chunk_limit = getattr(settings, "DIARIZATION_CHUNK_LENGTH_S", 0)
+    # ---- pyannote pipeline
+    if not _PN_AVAILABLE:
+        logger.error(f"[{upload_id}] pyannote.audio not available")
+        deliver_webhook.delay("processing_failed", upload_id, None)
+        return
+
+    pipeline = get_diarization_pipeline()  # должен делать Pipeline.from_pretrained(..., use_auth_token=...)
+    # офиц. способ переноса на GPU — отдельно .to("cuda")
     try:
-        chunk_limit = int(raw_chunk_limit)
-    except Exception:
-        logger.warning(f"[{upload_id}] invalid DIARIZATION_CHUNK_LENGTH_S={raw_chunk_limit!r}, falling back to 0")
-        chunk_limit = 0
+        if _torch and _torch.cuda.is_available():
+            pipeline = pipeline.to("cuda")
+    except Exception as e:
+        logger.warning(f"[{upload_id}] pipeline.to(cuda) failed: {e}")
 
-    pad = float(getattr(settings, "DIARIZATION_CHUNK_PADDING_S", 20.0) or 0.0)
-    using_chunking = bool(chunk_limit and duration > chunk_limit)
-    total_chunks = math.ceil(duration / chunk_limit) if using_chunking else 1
-
-    # --- speaker count hints ---
+    # ---- optional hints (как есть)
     infer_kwargs: Dict[str, Any] = {}
     if getattr(settings, "PYANNOTE_NUM_SPEAKERS", None):
         try:
@@ -1066,266 +1073,195 @@ def diarize_full(self, upload_id, correlation_id):
                 try: infer_kwargs[k_arg] = int(v)
                 except Exception: pass
 
-    logger.info(
-        f"[{upload_id}] diarization plan: chunk_length={chunk_limit}s, "
-        f"padding={pad}s, total_chunks={total_chunks}, infer_kwargs={infer_kwargs or '{}'}"
-    )
+    # ---- strategy: try single pass, else chunked
+    SINGLE_LIMIT_S = float(getattr(settings, "DIARIZATION_SINGLE_LIMIT_S", 0))  # 0 => всегда пробуем single
+    CHUNK_LEN_S    = int(getattr(settings, "DIARIZATION_CHUNK_LENGTH_S", 900) or 900)
+    PAD_S          = float(getattr(settings, "DIARIZATION_CHUNK_PADDING_S", 30.0) or 30.0)
 
-    if not _PN_AVAILABLE:
-        logger.error(f"[{upload_id}] pyannote.audio not available, aborting diarization")
-        deliver_webhook.delay("processing_failed", upload_id, None)
-        return
-
-    pipeline = get_diarization_pipeline()
-    try:
-        if _torch is not None and _torch.cuda.is_available():
-            pipeline = pipeline.to("cuda")  # pyannote 3.x: перенос на CUDA отдельно
-    except Exception as e:
-        logger.warning(f"[{upload_id}] failed to move diarization pipeline to CUDA: {e}")
-
-    raw: List[Dict[str, Any]] = []
-
-    def _run_pyannote(path: str):
-        if _torch is not None:
+    def _run_pipe(path_or_mem):
+        if _torch:
             with _torch.inference_mode():
-                return pipeline(path, **infer_kwargs)
-        return pipeline(path, **infer_kwargs)
+                return pipeline(path_or_mem, **infer_kwargs)
+        return pipeline(path_or_mem, **infer_kwargs)
 
-    # -------- run diarization (chunked or single) --------
-    if using_chunking:
-        processed_key = f"diarize:processed_chunks:{upload_id}"
-        processed = {int(x) for x in r.smembers(processed_key)}
-        offset = 0.0; chunk_idx = 0
+    # попытка одним куском
+    diar_segments: List[Dict[str, Any]] = []
+    tried_single = False
+    if SINGLE_LIMIT_S == 0 or duration <= SINGLE_LIMIT_S:
+        tried_single = True
+        try:
+            logger.info(f"[{upload_id}] trying single-pass diarization")
+            ann = _run_pipe(str(wav))
+            for s, _, spk in ann.itertracks(yield_label=True):
+                diar_segments.append({"start": float(s.start), "end": float(s.end), "speaker": spk})
+        except RuntimeError as e:
+            # если это CUDA OOM — уйдём на чанки
+            if "CUDA" in str(e).upper() or "out of memory" in str(e).lower():
+                logger.warning(f"[{upload_id}] single-pass OOM, falling back to chunked")
+                diar_segments = []
+            else:
+                logger.error(f"[{upload_id}] diarization failed: {e}", exc_info=True)
+                deliver_webhook.delay("processing_failed", upload_id, None)
+                return
+        except Exception as e:
+            logger.error(f"[{upload_id}] diarization failed: {e}", exc_info=True)
+            deliver_webhook.delay("processing_failed", upload_id, None)
+            return
+        finally:
+            try:
+                del ann
+            except Exception:
+                pass
+            if _torch and _torch.cuda.is_available():
+                _torch.cuda.empty_cache()
+
+    # chunked fallback
+    if not diar_segments:
+        total_chunks = math.ceil(duration / CHUNK_LEN_S)
+        logger.info(f"[{upload_id}] chunked diarization: chunk={CHUNK_LEN_S}s pad={PAD_S}s total={total_chunks}")
+        # глобальные имена
+        next_spk_id = 0
+        global_segments: List[Dict[str, Any]] = []
+        prev_tail: List[Dict[str, Any]] = []  # последние T секунд предыдущего чанка
+        TAIL_S = float(getattr(settings, "DIAR_TAIL_MATCH_S", 20.0))
+
+        offset = 0.0
+        chunk_idx = 0
         while offset < duration:
-            this_len = min(chunk_limit, duration - offset)
-            left_pad = pad if offset > 0 else 0.0
-            right_pad = pad if (offset + this_len) < duration else 0.0
-
-            if chunk_idx in processed:
-                logger.info(f"[{upload_id}] skip diarize chunk {chunk_idx+1}/{total_chunks}")
-                offset += this_len; chunk_idx += 1; continue
-
+            core_len = min(CHUNK_LEN_S, duration - offset)
+            left_pad = PAD_S if offset > 0 else 0.0
+            right_pad = PAD_S if (offset + core_len) < duration else 0.0
             log_start = max(0.0, offset - left_pad)
-            log_end = min(duration, offset + this_len + right_pad)
-            logger.info(
-                f"[{upload_id}] diarize chunk {chunk_idx+1}/{total_chunks}: "
-                f"{log_start:.1f}s→{log_end:.1f}s (core {offset:.1f}s→{offset+this_len:.1f}s, pad L={left_pad:.1f}s R={right_pad:.1f}s)"
-            )
+            log_end   = min(duration, offset + core_len + right_pad)
 
             tmp = Path(settings.DIARIZER_CACHE_DIR) / f"{upload_id}_chunk_{chunk_idx}.wav"
             subprocess.run(
                 ["ffmpeg","-y","-threads",str(max(1, settings.FFMPEG_THREADS // 2)),
-                 "-ss",str(log_start),"-t",str(log_end - log_start),
-                 "-i",str(wav), str(tmp)],
+                 "-ss",str(log_start),"-t",str(log_end - log_start), "-i",str(wav), str(tmp)],
                 check=True, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL
             )
 
             try:
-                ann = _run_pyannote(str(tmp))
-                core_start, core_end = offset, offset + this_len
-                added = 0
+                ann = _run_pipe(str(tmp))
+
+                # локальные сегменты с обрезкой к «ядру» (без паддингов)
+                core_start, core_end = offset, offset + core_len
+                local: List[Dict[str, Any]] = []
                 for s, _, spk in ann.itertracks(yield_label=True):
                     g0 = float(s.start) + log_start
                     g1 = float(s.end)   + log_start
-                    if g1 <= core_start or g0 >= core_end: continue
+                    if g1 <= core_start or g0 >= core_end:
+                        continue
                     g0 = max(g0, core_start); g1 = min(g1, core_end)
                     if g1 > g0:
-                        raw.append({"start": g0, "end": g1, "speaker": spk}); added += 1
-                logger.info(f"[{upload_id}] chunk {chunk_idx+1}/{total_chunks} added {added} segments")
-                r.sadd(processed_key, chunk_idx)
+                        local.append({"start": g0, "end": g1, "speaker": spk})
+                local.sort(key=lambda x: (x["start"], x["end"]))
+
+                # сопоставляем локальные имена с глобальными по перекрытию с хвостом prev_tail
+                def _overlap(a0,a1,b0,b1):
+                    return max(0.0, min(a1,b1) - max(a0,b0))
+
+                # хвост: берем сегменты глобальных из последних TAIL_S секунд
+                tail_start = max(0.0, core_start - TAIL_S)
+                tail = [s for s in global_segments if s["end"] > tail_start]
+
+                # карта: local_label -> global_label
+                map_l2g: Dict[str,str] = {}
+                # суммарные перекрытия пар (лок.имя, глоб.имя)
+                score: Dict[Tuple[str,str], float] = {}
+                for l in local:
+                    for g in tail:
+                        o = _overlap(l["start"], l["end"], g["start"], g["end"])
+                        if o > 0:
+                            score[(l["speaker"], g["speaker"])] = score.get((l["speaker"], g["speaker"]), 0.0) + o
+                # жадное сопоставление: для каждого локального берём свободного глобального с макс. перекрытием
+                used_globals = set()
+                for l_spk in {s["speaker"] for s in local}:
+                    candidates = [(g_spk, sc) for (ls,g_spk), sc in score.items() if ls == l_spk]
+                    if candidates:
+                        candidates.sort(key=lambda x: -x[1])
+                        for g_spk, _ in candidates:
+                            if g_spk not in used_globals:
+                                map_l2g[l_spk] = g_spk
+                                used_globals.add(g_spk)
+                                break
+
+                # для не сопоставленных локальных — новые глобальные имена
+                for l_spk in {s["speaker"] for s in local}:
+                    if l_spk not in map_l2g:
+                        map_l2g[l_spk] = f"spk_{next_spk_id}"
+                        next_spk_id += 1
+
+                # применяем карту и добавляем в глобальные
+                for s in local:
+                    s["speaker"] = map_l2g[s["speaker"]]
+                global_segments.extend(local)
+
+                # подготовим prev_tail на будущее
+                prev_tail = [s for s in global_segments if s["end"] > (core_end - TAIL_S)]
+
             except Exception as e:
-                logger.error(f"[{upload_id}] diarize chunk error: {e}", exc_info=True)
+                logger.error(f"[{upload_id}] chunk {chunk_idx} failed: {e}", exc_info=True)
             finally:
                 try: tmp.unlink(missing_ok=True)
                 except Exception: pass
                 try: del ann  # type: ignore
                 except Exception: pass
                 gc.collect()
-                if _torch and _torch.cuda.is_available(): _torch.cuda.empty_cache()
-                offset += this_len; chunk_idx += 1
-        r.delete(processed_key)
-    else:
-        logger.info(f"[{upload_id}] single diarization pass")
-        ann = _run_pyannote(str(wav))
-        for s, _, spk in ann.itertracks(yield_label=True):
-            raw.append({"start": float(s.start), "end": float(s.end), "speaker": spk})
-        try: del ann
-        except Exception: pass
-        gc.collect()
-        if _torch and _torch.cuda.is_available(): _torch.cuda.empty_cache()
+                if _torch and _torch.cuda.is_available():
+                    _torch.cuda.empty_cache()
 
-    # ---- sort by time
-    raw.sort(key=lambda x: (x["start"], x["end"]))
+            offset += core_len
+            chunk_idx += 1
 
-    # ---------- optional FS-EEND refinement (fixed CUDA handling) ----------
-    def _refine_with_fs_eend(_raw: List[Dict[str, Any]], _wav: Path) -> List[Dict[str, Any]]:
-        try:
-            if not bool(getattr(settings, "USE_FS_EEND", False)):
-                return _raw
-            model_id = getattr(settings, "FS_EEND_MODEL_PATH", None)
-            if not model_id: return _raw
-            from pyannote.audio import Pipeline as _TmpPipe
-            eend = _TmpPipe.from_pretrained(model_id,
-                                            use_auth_token=settings.HUGGINGFACE_TOKEN,
-                                            cache_dir=settings.DIARIZER_CACHE_DIR)
-            try:
-                if _torch and _torch.cuda.is_available(): eend = eend.to("cuda")
-            except Exception: pass
-            with (_torch.inference_mode() if _torch else contextlib.nullcontext()):
-                ann = eend(str(_wav))
-            refined = [{"start": float(s.start), "end": float(s.end), "speaker": spk}
-                       for s, _, spk in ann.itertracks(yield_label=True)]
-            refined.sort(key=lambda x: (x["start"], x["end"]))
-            return refined
-        except Exception as e:
-            logger.warning(f"[{upload_id}] FS-EEND refinement failed: {e}")
-            return _raw
+        diar_segments = global_segments
 
-    raw = _refine_with_fs_eend(raw, wav)
+    # ---- минимальная пост-обработка (аккуратно)
+    MIN_SEG = float(getattr(settings, "DIARIZATION_MIN_SEGMENT_S", 0.40))
+    GAP_MERGE = float(getattr(settings, "DIARIZATION_MERGE_GAP_S", 0.10))
 
-    # ---------- gentle post-processing ----------
-    MIN_SEG = float(getattr(settings, "DIARIZATION_MIN_SEGMENT_S", 0.50))  # ↑ рекомендуем 0.5s
-    GAP_MERGE = float(getattr(settings, "DIARIZATION_MERGE_GAP_S", 0.15))
-    raw = [s for s in raw if (s["end"] - s["start"]) >= MIN_SEG]
+    diar_segments = [s for s in diar_segments if (s["end"] - s["start"]) >= MIN_SEG]
+    diar_segments.sort(key=lambda x: (x["start"], x["end"]))
 
     merged: List[Dict[str, Any]] = []
-    cur = None
-    for s in raw:
-        if cur and cur["speaker"] == s["speaker"] and (s["start"] - cur["end"]) <= GAP_MERGE and s["start"] >= cur["end"]:
+    cur: Optional[Dict[str, Any]] = None
+    for s in diar_segments:
+        if cur and cur["speaker"] == s["speaker"] and s["start"] - cur["end"] <= GAP_MERGE and s["start"] >= cur["end"]:
             cur["end"] = max(cur["end"], s["end"])
         else:
             if cur: merged.append(cur)
             cur = dict(s)
     if cur: merged.append(cur)
-    raw = merged
 
-    raw = _fix_sandwich_flips(raw, max_len=float(getattr(settings, "DIARIZATION_FIX_SANDWICH_S", 1.0)))
-    raw = _glue_stray_shorts(raw,
-                             max_len=float(getattr(settings, "DIARIZATION_GLUE_MAX_S", 0.6)),
-                             max_gap=float(getattr(settings, "DIARIZATION_GLUE_GAP_S", 0.15)))
-
-    # ---------- GLOBAL RE-CLUSTER (новое, ключевое) ----------
-    def global_recluster_segments(segments: List[Dict[str, Any]], wav_path: Path) -> List[Dict[str, Any]]:
-        """
-        1) Считаем ECAPA эмбеддинги на середине каждого сегмента.
-        2) AHC по косинусной дистанции на всём файле → стабильные метки.
-        """
-        if len(segments) <= 1: return segments
-        try:
-            from speechbrain.inference.speaker import EncoderClassifier
-            import torchaudio, torch
-            import numpy as np
-            try:
-                from sklearn.cluster import AgglomerativeClustering
-            except Exception as e:
-                logger.warning(f"[{upload_id}] sklearn not installed for recluster: {e}")
-                return segments
-
-            # load audio
-            wav_t, sr = torchaudio.load(str(wav_path))
-            if sr != 16000:
-                from torchaudio.transforms import Resample
-                wav_t = Resample(sr, 16000)(wav_t); sr = 16000
-            if wav_t.size(0) > 1: wav_t = wav_t.mean(dim=0, keepdim=True)
-
-            # model
-            run_opts = {}
-            if torch.cuda.is_available(): run_opts = {"device":"cuda"}
-            enc = EncoderClassifier.from_hparams(source="speechbrain/spkrec-ecapa-voxceleb",
-                                                 savedir=str(Path(settings.DIARIZER_CACHE_DIR)/"spkrec-ecapa"),
-                                                 run_opts=run_opts)
-
-            # embed each segment (1.5 s вокруг середины; с безопасным клиппингом)
-            win = float(getattr(settings, "RECLUSTER_WINDOW_S", 1.5))
-            embs = []
-            for s in segments:
-                mid = 0.5*(s["start"]+s["end"])
-                s0 = max(0, int((mid - win/2)*sr))
-                s1 = min(wav_t.size(1), s0 + int(win*sr))
-                if s1 <= s0: s1 = min(wav_t.size(1), s0+int(0.8*win*sr))
-                x = wav_t[:, s0:s1]
-                with torch.no_grad():
-                    e = enc.encode_batch(x if x.numel()>0 else torch.zeros_like(wav_t[:, :int(win*sr)]))
-                e = torch.nn.functional.normalize(e.squeeze(0).squeeze(0), p=2, dim=0).cpu().numpy()
-                embs.append(e)
-            X = np.stack(embs, axis=0)
-
-            # AHC (кол-во кластеров оценим из pyannote-меток, иначе дадим волю порогу)
-            labels_hint = sorted(set(s["speaker"] for s in segments))
-            n_hint = len(labels_hint)
-            # Порог косинуса → расстояние (1 - cos)
-            thr = float(getattr(settings, "RECLUSTER_COS_THRESHOLD", 0.30))  # 0.30 → cos≈0.70
-            cl = AgglomerativeClustering(
-                n_clusters=None,
-                affinity="cosine", linkage="average",
-                distance_threshold=thr
-            )
-            new_ids = cl.fit_predict(X).tolist()
-
-            # стабилизируем имена по «якорю» первых 10 минут
-            anchor_horizon = float(getattr(settings, "STITCH_ANCHOR_HORIZON_S", 600.0))
-            order = sorted(range(len(segments)),
-                           key=lambda i: max(0.0, min(anchor_horizon, segments[i]["end"]) - segments[i]["start"]),
-                           reverse=True)
-            canon = {}
-            for i in order:
-                k = new_ids[i]
-                if k not in canon: canon[k] = f"spk_{len(canon)}"
-            for i, s in enumerate(segments):
-                s["speaker"] = canon[new_ids[i]]
-            return segments
-        except Exception as e:
-            logger.warning(f"[{upload_id}] global recluster failed: {e}")
-            return segments
-
-    raw = global_recluster_segments(raw, wav)
-
-    # ---------- contiguous collapse (без склейки overlap)
-    diar_sentences: List[Dict[str, Any]] = []
-    buf: Optional[Dict[str, Any]] = None
-    for seg in raw:
-        if buf and buf["speaker"] == seg["speaker"] and (seg["start"] - buf["end"]) < 0.10 and seg["start"] >= buf["end"]:
-            buf["end"] = max(buf["end"], seg["end"])
-        else:
-            if buf: diar_sentences.append(buf)
-            buf = dict(seg)
-    if buf: diar_sentences.append(buf)
-
-    # ---------- save ----------
+    # ---- save
     out = Path(settings.RESULTS_FOLDER) / upload_id
     out.mkdir(parents=True, exist_ok=True)
-    (out / "diarization.json").write_text(json.dumps(diar_sentences, ensure_ascii=False, indent=2))
+    (out / "diarization.json").write_text(json.dumps(merged, ensure_ascii=False, indent=2))
 
-    speakers = sorted({seg["speaker"] for seg in diar_sentences if seg.get("speaker") is not None})
-    logger.info(f"[{upload_id}] diarization_done, total segments: {len(diar_sentences)}, speakers_detected={len(speakers)}")
+    speakers = sorted({seg["speaker"] for seg in merged if seg.get("speaker") is not None})
+    logger.info(f"[{upload_id}] diarization_done (minimal): segments={len(merged)} speakers={len(speakers)} single_pass={tried_single and 'yes' or 'no'}")
     if _torch and _torch.cuda.is_available():
-        logger.info(f"[{upload_id}] GPU memory reserved after diarization: {_torch.cuda.memory_reserved()}")
+        logger.info(f"[{upload_id}] GPU reserved after: {_torch.cuda.memory_reserved()}")
 
-    # ---------- align speakers to transcript ----------
+    # align to transcript (как было)
     try:
         tx_path = out / "transcript.json"
         if tx_path.exists():
-            try:
-                sentences = json.loads(tx_path.read_text())
-                if isinstance(sentences, list):
-                    aligned = merge_speakers(sentences, diar_sentences,
-                                             pad=float(getattr(settings, "ALIGN_PAD_S", 0.3)))
-                    tx_path.write_text(json.dumps(aligned, ensure_ascii=False, indent=2))
-                    logger.info(f"[{upload_id}] transcript.json overwritten with speakers ({len(aligned)} sentences)")
-            except Exception as e:
-                logger.warning(f"[{upload_id}] failed to align transcript.json: {e}")
-        else:
-            logger.info(f"[{upload_id}] transcript.json not found; skipping alignment")
+            sentences = json.loads(tx_path.read_text())
+            if isinstance(sentences, list):
+                aligned = merge_speakers(sentences, merged, pad=float(getattr(settings, "ALIGN_PAD_S", 0.3)))
+                tx_path.write_text(json.dumps(aligned, ensure_ascii=False, indent=2))
+                logger.info(f"[{upload_id}] transcript.json overwritten with speakers ({len(aligned)} sentences)")
     except Exception as e:
-        logger.warning(f"[{upload_id}] speaker-to-phrase alignment failed: {e}")
+        logger.warning(f"[{upload_id}] align transcript failed: {e}")
 
     r.publish(f"progress:{upload_id}", json.dumps({
         "status": "diarization_done",
-        "segments": len(diar_sentences),
+        "segments": len(merged),
         "speakers": len(speakers),
-        "total_chunks": total_chunks
+        "total_chunks": math.ceil(duration / (CHUNK_LEN_S or duration))
     }))
-    deliver_webhook.delay("diarization_completed", upload_id, {"diarization": diar_sentences})
+    deliver_webhook.delay("diarization_completed", upload_id, {"diarization": merged})
 
 
 @app.task(
