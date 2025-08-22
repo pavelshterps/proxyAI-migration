@@ -862,16 +862,17 @@ def transcribe_segments(self, upload_id, correlation_id):
         import torch
         logger.info(f"[{upload_id}] GPU memory reserved before transcription: {torch.cuda.memory_reserved() if torch.cuda.is_available() else 'n/a'}")
     except ImportError:
-        pass
+        torch = None  # не критично
 
-    # попытка авто-дауншифта на CPU если GPU перегружены
+    # авто-дауншифт на CPU, если GPU заняты
     try:
         inspector = app.control.inspect()
         active = inspector.active() or {}
         heavy = 0
         for node_tasks in active.values():
             for t in node_tasks:
-                if t["name"] in ("tasks.diarize_full", "tasks.transcribe_segments") and t["name"] != "tasks.transcribe_segments":
+                # считаем действительно "тяжёлые" (диаризация + другое ПАРАЛЛЕЛЬНОЕ распознавание)
+                if t["name"] in ("tasks.diarize_full", "tasks.transcribe_segments"):
                     heavy += 1
         if heavy >= 2 and self.request.delivery_info.get("routing_key") != "transcribe_cpu":
             logger.info(f"[{upload_id}] GPUs appear busy ({heavy} heavy tasks), rescheduling transcription to CPU")
@@ -890,10 +891,10 @@ def transcribe_segments(self, upload_id, correlation_id):
     model = get_whisper_model()
     raw_segs: List[Any] = []
 
-    # общие параметры декодера — чтобы совпадать по стилю с превью
+    # параметры декодера
     beam_size = int(getattr(settings, "WHISPER_BEAM_SIZE", 1))
     temperature = float(getattr(settings, "WHISPER_TEMPERATURE", 0.0))
-    use_vad = bool(USE_VAD_IN_FULL)  # по умолчанию False, как в превью
+    use_vad = bool(USE_VAD_IN_FULL)  # по умолчанию False
     vad_min_sil_ms = int(getattr(settings, "VAD_MIN_SIL_MS", int(settings.SENTENCE_MAX_GAP_S * 1000)))
     vad_pad_ms = int(getattr(settings, "VAD_SPEECH_PAD_MS", 200))
     overlap = max(0.0, float(TRANSCRIBE_OVERLAP_S))
@@ -914,12 +915,10 @@ def transcribe_segments(self, upload_id, correlation_id):
                     "speech_pad_ms": vad_pad_ms,
                 }
             )
-        # язык опционально
         if settings.WHISPER_LANGUAGE:
             kw.update(language=settings.WHISPER_LANGUAGE)
 
         segs_gen, _ = model.transcribe(source, **kw)
-
         out = []
         for s in segs_gen:
             s.start += start_shift
@@ -927,31 +926,57 @@ def transcribe_segments(self, upload_id, correlation_id):
             out.append(s)
         return out
 
-    if duration <= max(chunk_len, 1.0):
-        logger.info(f"[{upload_id}] short audio ({duration:.1f}s) → single pass (overlap={overlap}s)")
+    # 1) пробуем single-pass всегда (даже на длинных),
+    #    при OOM/ошибке уходим на «твой» chunked режим.
+    tried_single = False
+    try:
+        tried_single = True
+        logger.info(f"[{upload_id}] trying single-pass transcription on whole file")
         raw_segs = _decode(str(wav), 0.0)
-    else:
-        processed_key = f"transcribe:processed_chunks:{upload_id}"
-        processed = {int(x) for x in r.smembers(processed_key)}
+        logger.info(f"[{upload_id}] single-pass transcription ok: {len(raw_segs)} segments")
+    except RuntimeError as e:
+        msg = str(e)
+        if ("cuda" in msg.lower() or "out of memory" in msg.lower()) and self.request.delivery_info.get("routing_key") != "transcribe_cpu":
+            logger.warning(f"[{upload_id}] single-pass OOM on GPU, falling back to chunked transcription")
+            raw_segs = []
+            if torch and torch.cuda.is_available():
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
+        else:
+            logger.error(f"[{upload_id}] single-pass transcription failed: {e}", exc_info=True)
+            deliver_webhook.delay("processing_failed", upload_id, None)
+            return
+    except Exception as e:
+        logger.warning(f"[{upload_id}] single-pass transcription failed ({e}), will try chunked", exc_info=True)
+        raw_segs = []
+        try:
+            if torch and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
 
-        total_chunks = int(math.ceil((duration + overlap) / (chunk_len)))
+    # 2) fallback: chunked, если не получилось single-pass
+    if not raw_segs:
+        processed_key = f"transcribe:processed_chunks:{upload_id}"
+        processed = {int(x) for x in r.smembers(processed_key)} if r.exists(processed_key) else set()
+
+        total_chunks = int(math.ceil((duration + overlap) / max(chunk_len, 1e-6)))
         offset = 0.0
         chunk_idx = 0
 
         while offset < duration:
-            # ядро чанка и его «пэды» на вход ffmpeg
             core_len = min(chunk_len, duration - offset)
             left_pad = overlap if offset > 0 else 0.0
             right_pad = overlap if (offset + core_len) < duration else 0.0
 
-            # пропуск уже готовых
             if chunk_idx in processed:
                 logger.info(f"[{upload_id}] skip chunk {chunk_idx+1}/{total_chunks} (already done)")
                 offset += core_len
                 chunk_idx += 1
                 continue
 
-            # фактический временной срез, который режем в pipe
             cut_start = max(0.0, offset - left_pad)
             cut_dur = min(duration, offset + core_len + right_pad) - cut_start
 
@@ -973,17 +998,14 @@ def transcribe_segments(self, upload_id, correlation_id):
                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
                 )
 
-                # декодируем и смещаем таймкоды к абсолютным
                 segs = _decode(p.stdout, cut_start)
                 p.stdout.close(); p.wait()
 
-                # оставляем только сегменты, пересекающие ядро чанка
                 core_start = offset
                 core_end = offset + core_len
                 for s in segs:
                     if s.end <= core_start or s.start >= core_end:
                         continue
-                    # подрезаем к границам ядра, чтобы убрать влияние перекрытий
                     s.start = max(s.start, core_start)
                     s.end = min(s.end, core_end)
                     raw_segs.append(s)
@@ -993,8 +1015,9 @@ def transcribe_segments(self, upload_id, correlation_id):
             except Exception as e:
                 logger.error(f"[{upload_id}] error in transcribe chunk {chunk_idx+1}/{total_chunks}: {e}", exc_info=True)
                 try:
-                    import torch; torch.cuda.empty_cache()
-                except ImportError:
+                    if torch and torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                except Exception:
                     pass
             finally:
                 offset += core_len
@@ -1010,15 +1033,16 @@ def transcribe_segments(self, upload_id, correlation_id):
     out = Path(settings.RESULTS_FOLDER) / upload_id
     out.mkdir(parents=True, exist_ok=True)
     (out / "transcript.json").write_text(json.dumps(sentences, ensure_ascii=False, indent=2))
-    logger.info(f"[{upload_id}] transcription completed ({len(sentences)} sentences)")
+    logger.info(f"[{upload_id}] transcription completed ({len(sentences)} sentences) single_pass={('yes' if tried_single and raw_segs else 'no')}")
     r.publish(f"progress:{upload_id}", json.dumps({"status": "transcript_done"}))
     deliver_webhook.delay("transcription_completed", upload_id, {"transcript": sentences})
 
     try:
-        import torch
-        logger.info(f"[{upload_id}] GPU memory reserved after transcription: {torch.cuda.memory_reserved() if torch.cuda.is_available() else 'n/a'}")
-    except ImportError:
+        if torch:
+            logger.info(f"[{upload_id}] GPU memory reserved after transcription: {torch.cuda.memory_reserved() if torch.cuda.is_available() else 'n/a'}")
+    except Exception:
         pass
+
 
 @app.task(bind=True, queue="diarize_gpu")
 def diarize_full(self, upload_id, correlation_id):
