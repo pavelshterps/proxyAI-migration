@@ -1,6 +1,3 @@
-name: proxyai-migration
-version: '3.8'
-
 services:
   db:
     image: postgres:14-alpine
@@ -59,10 +56,9 @@ services:
       - WEBHOOK_SECRET=${WEBHOOK_SECRET}
     volumes:
       - ./:/app:delegated
-      # bind-mount для рабочих директорий (как раньше)
-      - ./data/uploads:${UPLOAD_FOLDER}
-      - ./data/results:${RESULTS_FOLDER}
-      - ./data/diarizer_cache:${DIARIZER_CACHE_DIR}
+      - upload_data:${UPLOAD_FOLDER}
+      - results_data:${RESULTS_FOLDER}
+      - diarizer_cache:${DIARIZER_CACHE_DIR}
       - /root/proxyAI-migration/data/hf_cache:/hf_cache
     ports:
       - "8000:8000"
@@ -85,7 +81,7 @@ services:
       - celery_app:app
       - worker
       - --loglevel=info
-      - --pool=solo
+      - --pool=solo          # <-- ВАЖНО
       - --concurrency=1
       - --queues=transcribe_cpu
     environment:
@@ -104,9 +100,9 @@ services:
       - WEBHOOK_SECRET=${WEBHOOK_SECRET}
     volumes:
       - ./:/app:delegated
-      - ./data/uploads:${UPLOAD_FOLDER}
-      - ./data/results:${RESULTS_FOLDER}
-      - ./data/diarizer_cache:${DIARIZER_CACHE_DIR}
+      - upload_data:${UPLOAD_FOLDER}
+      - results_data:${RESULTS_FOLDER}
+      - diarizer_cache:${DIARIZER_CACHE_DIR}
       - /root/proxyAI-migration/data/hf_cache:/hf_cache
     depends_on:
       - api
@@ -121,7 +117,6 @@ services:
       dockerfile: Dockerfile.gpu
     container_name: proxyai_worker_gpu_1
     runtime: nvidia
-    mem_limit: 8g
     env_file: .env
     command:
       - celery
@@ -150,9 +145,9 @@ services:
       - WEBHOOK_SECRET=${WEBHOOK_SECRET}
     volumes:
       - ./:/app:delegated
-      - ./data/uploads:${UPLOAD_FOLDER}
-      - ./data/results:${RESULTS_FOLDER}
-      - ./data/diarizer_cache:${DIARIZER_CACHE_DIR}
+      - upload_data:${UPLOAD_FOLDER}
+      - results_data:${RESULTS_FOLDER}
+      - diarizer_cache:${DIARIZER_CACHE_DIR}
       - /root/proxyAI-migration/data/hf_cache:/hf_cache
     depends_on:
       - api
@@ -164,6 +159,7 @@ services:
   worker_webhooks:
     build:
       context: .
+      dockerfile: Dockerfile
     container_name: proxyai_worker_webhooks
     env_file: .env
     command:
@@ -182,7 +178,6 @@ services:
       - REDIS_URL=${REDIS_URL}
       - WEBHOOK_URL=${WEBHOOK_URL}
       - WEBHOOK_SECRET=${WEBHOOK_SECRET}
-      # webhooks строго на CPU, без CUDA
       - WHISPER_DEVICE=cpu
       - CT2_FORCE_CPU=1
       - CUDA_VISIBLE_DEVICES=
@@ -338,20 +333,13 @@ services:
     restart: unless-stopped
 
 volumes:
-  # системные — оставляем named volumes
   postgres_data:
-    external: true
-    name: proxyai-migration_postgres_data
   redis_data:
-    external: true
-    name: proxyai-migration_redis_data
+  upload_data:
+  results_data:
+  diarizer_cache:
   flower_db:
-    external: true
-    name: proxyai-migration_flower_db
   grafana_data:
-    external: true
-    name: proxyai-migration_grafana_data
 
 networks:
   proxyai_net:
-    driver: bridge
