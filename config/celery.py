@@ -16,11 +16,16 @@ task_queues = [
     Queue("transcribe_cpu"),
     Queue("transcribe_gpu"),
     Queue("diarize_gpu"),
+    Queue("webhooks"),  # очередь для отправки вебхуков
 ]
+
 task_routes = {
     "tasks.preview_transcribe":  {"queue": "transcribe_gpu"},
     "tasks.transcribe_segments": {"queue": "transcribe_gpu"},
     "tasks.diarize_full":        {"queue": "diarize_gpu"},
+    # Явная маршрутизация webhook-задачи
+    "tasks.deliver_webhook":     {"queue": "webhooks"},
+    "deliver_webhook":           {"queue": "webhooks"},  # на случай вызова по короткому имени
 }
 
 broker_transport_options = {

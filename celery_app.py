@@ -52,11 +52,15 @@ app.conf.update(
         Queue("transcribe_cpu"),
         Queue("transcribe_gpu"),
         Queue("diarize_gpu"),
+        Queue("webhooks"),  # очередь для вебхуков
     ],
     task_routes={
         "tasks.preview_transcribe": {"queue": "transcribe_gpu"},
         "tasks.transcribe_segments": {"queue": "transcribe_gpu"},
         "tasks.diarize_full": {"queue": "diarize_gpu"},
+        # Явная маршрутизация вебхуков
+        "tasks.deliver_webhook": {"queue": "webhooks"},
+        "deliver_webhook": {"queue": "webhooks"},
     },
     beat_schedule={
         "daily-cleanup-old-files": {
@@ -69,14 +73,25 @@ app.conf.update(
 
 @worker_process_init.connect
 def preload_models(**kwargs):
-    # локальный импорт, чтобы избежать circular import
+    """
+    Аккуратно предзагружаем модели ТОЛЬКО на нужных ролях воркеров.
+    Это предотвращает попытки грузить CUDA/модели на webhooks-воркере и т.п.
+    """
+    role = str(getattr(settings, "WORKER_ROLE", "")).lower()
     try:
         from tasks import get_whisper_model, get_diarization_pipeline
-        get_whisper_model()
-        get_diarization_pipeline()
-        logger.info(f"[{datetime.utcnow().isoformat()}] [PRELOAD] models loaded")
+
+        # Whisper — на транскрайберах/гпу-воркерах
+        if role in ("cpu", "gpu", "transcribe", "transcribe_cpu", "transcribe_gpu"):
+            get_whisper_model()
+
+        # Диаризация — на диаризационных/гпу-воркерах
+        if role in ("diarize", "gpu", "gpu_diarize", "diarize_gpu"):
+            get_diarization_pipeline()
+
+        logger.info(f"[{datetime.utcnow().isoformat()}] [PRELOAD] models loaded for role='{role}'")
     except Exception as e:
         logger.error(
-            f"[{datetime.utcnow().isoformat()}] [PRELOAD] error loading models: {e}",
+            f"[{datetime.utcnow().isoformat()}] [PRELOAD] error loading models for role='{role}': {e}",
             exc_info=True,
         )

@@ -65,7 +65,6 @@ def _asbool(v, default=False):
 SPEAKER_STITCH_ENABLED = _asbool(getattr(settings, "SPEAKER_STITCH_ENABLED", False))
 USE_VAD_IN_FULL        = _asbool(getattr(settings, "USE_VAD_IN_FULL", False))
 AUDIO_USE_LOUDNORM     = _asbool(getattr(settings, "AUDIO_USE_LOUDNORM", True))
-SPEAKER_STITCH_ENABLED = getattr(settings, "SPEAKER_STITCH_ENABLED", False)
 SPEAKER_STITCH_THRESHOLD = float(getattr(settings, "SPEAKER_STITCH_THRESHOLD", 0.80))
 SPEAKER_STITCH_POOL_SIZE = int(getattr(settings, "SPEAKER_STITCH_POOL_SIZE", 14))
 SPEAKER_STITCH_EMA_ALPHA = float(getattr(settings, "SPEAKER_STITCH_EMA_ALPHA", 0.5))
