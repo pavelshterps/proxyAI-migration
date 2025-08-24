@@ -54,7 +54,17 @@ _PN_AVAILABLE = False
 _whisper_model = None
 _diarization_pipeline = None
 
+def _asbool(v, default=False):
+    if isinstance(v, bool):
+        return v
+    if v is None:
+        return default
+    return str(v).strip().lower() in ("1","true","yes","y","on")
+
 # --- Speaker stitching / embedding ---
+SPEAKER_STITCH_ENABLED = _asbool(getattr(settings, "SPEAKER_STITCH_ENABLED", False))
+USE_VAD_IN_FULL        = _asbool(getattr(settings, "USE_VAD_IN_FULL", False))
+AUDIO_USE_LOUDNORM     = _asbool(getattr(settings, "AUDIO_USE_LOUDNORM", True))
 SPEAKER_STITCH_ENABLED = getattr(settings, "SPEAKER_STITCH_ENABLED", False)
 SPEAKER_STITCH_THRESHOLD = float(getattr(settings, "SPEAKER_STITCH_THRESHOLD", 0.80))
 SPEAKER_STITCH_POOL_SIZE = int(getattr(settings, "SPEAKER_STITCH_POOL_SIZE", 14))
@@ -62,7 +72,6 @@ SPEAKER_STITCH_EMA_ALPHA = float(getattr(settings, "SPEAKER_STITCH_EMA_ALPHA", 0
 SPEAKER_STITCH_MERGE_THRESHOLD = float(getattr(settings, "SPEAKER_STITCH_MERGE_THRESHOLD", 0.98))
 _speaker_embedding_model = None  # type: ignore
 
-USE_VAD_IN_FULL = bool(getattr(settings, "USE_VAD_IN_FULL", False))
 TRANSCRIBE_OVERLAP_S = float(getattr(settings, "TRANSCRIBE_OVERLAP_S", 0.5))
 
 try:
@@ -657,9 +666,13 @@ def stitch_speakers(raw: List[Dict[str, Any]], wav: Path, upload_id: str) -> Lis
 
 @worker_process_init.connect
 def preload_on_startup(**kwargs):
-    if _HF_AVAILABLE:
+    role = getattr(settings, "WORKER_ROLE", "").lower()
+    # Транскриберам – да
+    if _HF_AVAILABLE and role in ("cpu","gpu","transcribe","transcribe_cpu","transcribe_gpu"):
         get_whisper_model()
-    if _PN_AVAILABLE:
+    # ДИАРИЗАЦИЯ – только на явных диаризационных ролях/гпу-воркерах
+    if _PN_AVAILABLE and role in ("diarize","gpu","gpu_diarize"):
+        # если не хочешь грузить заранее на gpu-воркере — оставь только ("diarize","gpu_diarize")
         get_diarization_pipeline()
 
 # ---------------------- Post-processing for diarization ----------------------

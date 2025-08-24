@@ -83,9 +83,12 @@ services:
       - celery_app:app
       - worker
       - --loglevel=info
-      - --concurrency=${CPU_CONCURRENCY}
+      - --pool=solo          # <-- ВАЖНО
+      - --concurrency=1
       - --queues=transcribe_cpu
     environment:
+      - WORKER_ROLE=cpu
+      - SPEAKER_STITCH_ENABLED=false
       - CELERY_BROKER_URL=${CELERY_BROKER_URL}
       - CELERY_RESULT_BACKEND=${CELERY_RESULT_BACKEND}
       - REDIS_URL=${REDIS_URL}
@@ -116,7 +119,6 @@ services:
       dockerfile: Dockerfile.gpu
     container_name: proxyai_worker_gpu_1
     runtime: nvidia
-    mem_limit: 8g
     env_file: .env
     command:
       - celery
@@ -130,6 +132,7 @@ services:
       - --max-tasks-per-child=10
       - --queues=transcribe_gpu,diarize_gpu
     environment:
+      - WORKER_ROLE=gpu
       - CELERY_BROKER_URL=${CELERY_BROKER_URL}
       - CELERY_RESULT_BACKEND=${CELERY_RESULT_BACKEND}
       - REDIS_URL=${REDIS_URL}
@@ -170,6 +173,8 @@ services:
       - --concurrency=2
       - --queues=webhooks
     environment:
+      - WORKER_ROLE=webhooks
+      - SPEAKER_STITCH_ENABLED=false
       - CELERY_BROKER_URL=${CELERY_BROKER_URL}
       - CELERY_RESULT_BACKEND=${CELERY_RESULT_BACKEND}
       - REDIS_URL=${REDIS_URL}
