@@ -823,21 +823,27 @@ def convert_to_wav_and_preview(self, upload_id, correlation_id):
 @app.task(bind=True, queue="transcribe_gpu")
 def preview_transcribe(self, upload_id, correlation_id):
     logger.info(f"[{upload_id}] preview_transcribe received")
-    try:
-        inspector = app.control.inspect()
-        active = inspector.active() or {}
-        heavy = 0
-        for node_tasks in active.values():
-            for t in node_tasks:
-                if t["name"] in ("tasks.diarize_full", "tasks.transcribe_segments"):
-                    heavy += 1
-        # ВАЖНО: если GPU заняты — перекидываем ИМЕННО превью на CPU, а не запускаем полную транскрипцию
-        if heavy >= 2 and self.request.delivery_info.get("routing_key") != "transcribe_cpu":
-            logger.info(f"[{upload_id}] GPUs busy ({heavy} heavy tasks), requeueing PREVIEW to CPU")
-            preview_transcribe.apply_async((upload_id, correlation_id), queue="transcribe_cpu")
-            return
-    except Exception:
-        logger.warning(f"[{upload_id}] failed to inspect workers, proceeding on current worker")
+    # --- GPU busy guard (configurable & safer) ---
+    DISABLE_GPU_BUSY_CHECK = _asbool(getattr(settings, "DISABLE_GPU_BUSY_CHECK", False))
+    GPU_BUSY_HEAVY_THRESHOLD = int(getattr(settings, "GPU_BUSY_HEAVY_THRESHOLD", 999))
+    if not DISABLE_GPU_BUSY_CHECK:
+        try:
+            inspector = app.control.inspect()
+            active = inspector.active() or {}
+            heavy = 0
+            for node, node_tasks in active.items():
+                for t in node_tasks:
+                    # считаем только задачи, реально предназначенные для GPU-очередей
+                    rk = (t.get("delivery_info") or {}).get("routing_key", "")
+                    if t.get("name") in ("tasks.diarize_full", "tasks.transcribe_segments") and rk in ("transcribe_gpu",
+                                                                                                       "diarize_gpu"):
+                        heavy += 1
+            if heavy >= GPU_BUSY_HEAVY_THRESHOLD and self.request.delivery_info.get("routing_key") != "transcribe_cpu":
+                logger.info(f"[{upload_id}] GPUs busy ({heavy} heavy GPU tasks), requeueing PREVIEW to CPU")
+                preview_transcribe.apply_async((upload_id, correlation_id), queue="transcribe_cpu")
+                return
+        except Exception:
+            logger.warning(f"[{upload_id}] failed to inspect workers, proceeding on current worker")
 
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
     proc = prepare_preview_segment(upload_id)
@@ -883,21 +889,28 @@ def transcribe_segments(self, upload_id, correlation_id):
         torch = None  # не критично
 
     # авто-дауншифт на CPU, если GPU заняты
-    try:
-        inspector = app.control.inspect()
-        active = inspector.active() or {}
-        heavy = 0
-        for node_tasks in active.values():
-            for t in node_tasks:
-                # считаем действительно "тяжёлые" (диаризация + другое ПАРАЛЛЕЛЬНОЕ распознавание)
-                if t["name"] in ("tasks.diarize_full", "tasks.transcribe_segments"):
-                    heavy += 1
-        if heavy >= 2 and self.request.delivery_info.get("routing_key") != "transcribe_cpu":
-            logger.info(f"[{upload_id}] GPUs appear busy ({heavy} heavy tasks), rescheduling transcription to CPU")
-            transcribe_segments.apply_async((upload_id, correlation_id), queue="transcribe_cpu")
-            return
-    except Exception:
-        logger.warning(f"[{upload_id}] failed to inspect workers for fallback logic")
+        # --- GPU busy guard (configurable & safer) ---
+        DISABLE_GPU_BUSY_CHECK = _asbool(getattr(settings, "DISABLE_GPU_BUSY_CHECK", False))
+        GPU_BUSY_HEAVY_THRESHOLD = int(getattr(settings, "GPU_BUSY_HEAVY_THRESHOLD", 999))
+        if not DISABLE_GPU_BUSY_CHECK:
+            try:
+                inspector = app.control.inspect()
+                active = inspector.active() or {}
+                heavy = 0
+                for node, node_tasks in active.items():
+                    for t in node_tasks:
+                        # считаем только задачи, реально предназначенные для GPU-очередей
+                        rk = (t.get("delivery_info") or {}).get("routing_key", "")
+                        if t.get("name") in ("tasks.diarize_full", "tasks.transcribe_segments") and rk in (
+                                "transcribe_gpu", "diarize_gpu"):
+                            heavy += 1
+                if heavy >= GPU_BUSY_HEAVY_THRESHOLD and self.request.delivery_info.get(
+                        "routing_key") != "transcribe_cpu":
+                    logger.info(f"[{upload_id}] GPUs busy ({heavy} heavy GPU tasks), requeueing PREVIEW to CPU")
+                    preview_transcribe.apply_async((upload_id, correlation_id), queue="transcribe_cpu")
+                    return
+            except Exception:
+                logger.warning(f"[{upload_id}] failed to inspect workers, proceeding on current worker")
 
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
     wav, duration = prepare_wav(upload_id)
