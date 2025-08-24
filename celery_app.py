@@ -75,12 +75,20 @@ app.conf.update(
 def preload_models(**kwargs):
     """
     Аккуратно предзагружаем модели ТОЛЬКО на нужных ролях воркеров.
-    Это предотвращает попытки грузить CUDA/модели на webhooks-воркере и т.п.
+    Роль берём надёжно: env -> settings -> эвристика по WHISPER_DEVICE.
     """
-    role = str(getattr(settings, "WORKER_ROLE", "")).lower()
-    try:
-        from tasks import get_whisper_model, get_diarization_pipeline
+    import os
+    role = (os.getenv("WORKER_ROLE") or getattr(settings, "WORKER_ROLE", "") or "").lower()
+    if not role:
+        dev = (os.getenv("WHISPER_DEVICE") or getattr(settings, "WHISPER_DEVICE", "") or "").lower()
+        if dev.startswith("cuda"):
+            role = "gpu"
+        elif dev == "cpu":
+            role = "cpu"
 
+    from tasks import get_whisper_model, get_diarization_pipeline
+
+    try:
         # Whisper — на транскрайберах/гпу-воркерах
         if role in ("cpu", "gpu", "transcribe", "transcribe_cpu", "transcribe_gpu"):
             get_whisper_model()
@@ -89,7 +97,8 @@ def preload_models(**kwargs):
         if role in ("diarize", "gpu", "gpu_diarize", "diarize_gpu"):
             get_diarization_pipeline()
 
-        logger.info(f"[{datetime.utcnow().isoformat()}] [PRELOAD] models loaded for role='{role}'")
+        logger.info(f"[{datetime.utcnow().isoformat()}] [PRELOAD] models loaded for role='{role}' "
+                    f"(env.WORKER_ROLE='{os.getenv('WORKER_ROLE','')}', settings.WORKER_ROLE='{getattr(settings,'WORKER_ROLE','')}')")
     except Exception as e:
         logger.error(
             f"[{datetime.utcnow().isoformat()}] [PRELOAD] error loading models for role='{role}': {e}",

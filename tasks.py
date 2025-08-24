@@ -665,14 +665,34 @@ def stitch_speakers(raw: List[Dict[str, Any]], wav: Path, upload_id: str) -> Lis
 
 @worker_process_init.connect
 def preload_on_startup(**kwargs):
-    role = getattr(settings, "WORKER_ROLE", "").lower()
-    # Транскриберам – да
-    if _HF_AVAILABLE and role in ("cpu","gpu","transcribe","transcribe_cpu","transcribe_gpu"):
-        get_whisper_model()
-    # ДИАРИЗАЦИЯ – только на явных диаризационных ролях/гпу-воркерах
-    if _PN_AVAILABLE and role in ("diarize","gpu","gpu_diarize"):
-        # если не хочешь грузить заранее на gpu-воркере — оставь только ("diarize","gpu_diarize")
-        get_diarization_pipeline()
+    import os
+    # Читаем роль надёжно: сначала из окружения, затем из settings, затем эвристика
+    role = (os.getenv("WORKER_ROLE") or getattr(settings, "WORKER_ROLE", "") or "").lower()
+
+    if not role:
+        # эвристика: если устройство cuda — считаем gpu, если cpu — cpu
+        dev = (os.getenv("WHISPER_DEVICE") or getattr(settings, "WHISPER_DEVICE", "") or "").lower()
+        if dev.startswith("cuda"):
+            role = "gpu"
+        elif dev == "cpu":
+            role = "cpu"
+
+    logger.info(f"[{datetime.utcnow().isoformat()}] [PRELOAD/tasks] resolved role='{role}' "
+                f"(env.WORKER_ROLE='{os.getenv('WORKER_ROLE','')}', settings.WORKER_ROLE='{getattr(settings,'WORKER_ROLE','')}')")
+
+    # Транскриберам — Whisper
+    if _HF_AVAILABLE and role in ("cpu", "gpu", "transcribe", "transcribe_cpu", "transcribe_gpu"):
+        try:
+            get_whisper_model()
+        except Exception as e:
+            logger.error(f"[PRELOAD/tasks] whisper preload failed: {e}", exc_info=True)
+
+    # Диаризация — только на явных диаризационных/гпу-ролях
+    if _PN_AVAILABLE and role in ("diarize", "gpu", "gpu_diarize", "diarize_gpu"):
+        try:
+            get_diarization_pipeline()
+        except Exception as e:
+            logger.error(f"[PRELOAD/tasks] diarization preload failed: {e}", exc_info=True)
 
 # ---------------------- Post-processing for diarization ----------------------
 # NEW: если короткий сегмент B зажат между A и A — перекрашиваем в A
@@ -884,33 +904,32 @@ def transcribe_segments(self, upload_id, correlation_id):
     logger.info(f"[{upload_id}] transcribe_segments received")
     try:
         import torch
-        logger.info(f"[{upload_id}] GPU memory reserved before transcription: {torch.cuda.memory_reserved() if torch.cuda.is_available() else 'n/a'}")
+        logger.info(f"[{upload_id}] GPU memory reserved before transcription: "
+                    f"{torch.cuda.memory_reserved() if torch.cuda.is_available() else 'n/a'}")
     except ImportError:
         torch = None  # не критично
 
-    # авто-дауншифт на CPU, если GPU заняты
-        # --- GPU busy guard (configurable & safer) ---
-        DISABLE_GPU_BUSY_CHECK = _asbool(getattr(settings, "DISABLE_GPU_BUSY_CHECK", False))
-        GPU_BUSY_HEAVY_THRESHOLD = int(getattr(settings, "GPU_BUSY_HEAVY_THRESHOLD", 999))
-        if not DISABLE_GPU_BUSY_CHECK:
-            try:
-                inspector = app.control.inspect()
-                active = inspector.active() or {}
-                heavy = 0
-                for node, node_tasks in active.items():
-                    for t in node_tasks:
-                        # считаем только задачи, реально предназначенные для GPU-очередей
-                        rk = (t.get("delivery_info") or {}).get("routing_key", "")
-                        if t.get("name") in ("tasks.diarize_full", "tasks.transcribe_segments") and rk in (
-                                "transcribe_gpu", "diarize_gpu"):
-                            heavy += 1
-                if heavy >= GPU_BUSY_HEAVY_THRESHOLD and self.request.delivery_info.get(
-                        "routing_key") != "transcribe_cpu":
-                    logger.info(f"[{upload_id}] GPUs busy ({heavy} heavy GPU tasks), requeueing PREVIEW to CPU")
-                    preview_transcribe.apply_async((upload_id, correlation_id), queue="transcribe_cpu")
-                    return
-            except Exception:
-                logger.warning(f"[{upload_id}] failed to inspect workers, proceeding on current worker")
+    # --- GPU busy guard (конфигурируемый) ---
+    DISABLE_GPU_BUSY_CHECK = _asbool(getattr(settings, "DISABLE_GPU_BUSY_CHECK", False))
+    GPU_BUSY_HEAVY_THRESHOLD = int(getattr(settings, "GPU_BUSY_HEAVY_THRESHOLD", 2))
+    if not DISABLE_GPU_BUSY_CHECK:
+        try:
+            inspector = app.control.inspect()
+            active = inspector.active() or {}
+            heavy = 0
+            for _, node_tasks in active.items():
+                for t in node_tasks:
+                    # считаем только реально «тяжёлые» задачи на GPU-очередях
+                    rk = (t.get("delivery_info") or {}).get("routing_key", "")
+                    if t.get("name") in ("tasks.diarize_full", "tasks.transcribe_segments") and rk in ("transcribe_gpu", "diarize_gpu"):
+                        heavy += 1
+            if heavy >= GPU_BUSY_HEAVY_THRESHOLD and self.request.delivery_info.get("routing_key") != "transcribe_cpu":
+                logger.info(f"[{upload_id}] GPUs busy ({heavy} heavy GPU tasks), rescheduling TRANSCRIBE to CPU")
+                # Перекидываем ЭТУ ЖЕ задачу на CPU-очередь
+                transcribe_segments.apply_async((upload_id, correlation_id), queue="transcribe_cpu")
+                return
+        except Exception:
+            logger.warning(f"[{upload_id}] failed to inspect workers for fallback logic")
 
     r = Redis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
     wav, duration = prepare_wav(upload_id)
@@ -966,19 +985,17 @@ def transcribe_segments(self, upload_id, correlation_id):
         logger.info(f"[{upload_id}] single-pass transcription ok: {len(raw_segs)} segments")
     except Exception as e:
         msg = str(e).lower()
-        is_gpu_oom = any(s in msg for s in (
-            "cuda", "out of memory", "cublas", "cudnn", "failed to allocate"
-        ))
+        is_gpu_oom = any(s in msg for s in ("cuda", "out of memory", "cublas", "cudnn", "failed to allocate"))
         # torch-specific OOM класс (если доступен)
         try:
-            import torch
-            is_gpu_oom = is_gpu_oom or isinstance(e, getattr(torch.cuda, "OutOfMemoryError", ()))
+            import torch as _t
+            is_gpu_oom = is_gpu_oom or isinstance(e, getattr(_t.cuda, "OutOfMemoryError", ()))
         except Exception:
             pass
         # ctranslate2 OOM
         try:
-            import ctranslate2
-            is_gpu_oom = is_gpu_oom or isinstance(e, getattr(ctranslate2, "RuntimeError", ()))
+            import ctranslate2 as _ct2
+            is_gpu_oom = is_gpu_oom or isinstance(e, getattr(_ct2, "RuntimeError", ()))
         except Exception:
             pass
 
@@ -992,9 +1009,9 @@ def transcribe_segments(self, upload_id, correlation_id):
     finally:
         # на всякий случай освобождаем память
         try:
-            import torch
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            import torch as _t
+            if _t.cuda.is_available():
+                _t.cuda.empty_cache()
         except Exception:
             pass
 
@@ -1080,7 +1097,8 @@ def transcribe_segments(self, upload_id, correlation_id):
 
     try:
         if torch:
-            logger.info(f"[{upload_id}] GPU memory reserved after transcription: {torch.cuda.memory_reserved() if torch.cuda.is_available() else 'n/a'}")
+            logger.info(f"[{upload_id}] GPU memory reserved after transcription: "
+                        f"{torch.cuda.memory_reserved() if torch.cuda.is_available() else 'n/a'}")
     except Exception:
         pass
 
