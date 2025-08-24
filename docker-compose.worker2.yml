@@ -1,0 +1,90 @@
+name: proxyai-migration
+
+services:
+  worker_cpu_2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: proxyai_worker_cpu_2
+    env_file: .env
+    command: [ "celery", "-A", "celery_app:app", "worker", "--loglevel=info", "--pool=solo", "--concurrency=1", "--queues=transcribe_cpu" ]
+    environment:
+      - WORKER_ROLE=cpu
+      - SPEAKER_STITCH_ENABLED=false
+      - CELERY_BROKER_URL=${CELERY_BROKER_URL}           # redis://:***@192.168.20.2:6379/0
+      - CELERY_RESULT_BACKEND=${CELERY_RESULT_BACKEND}   # redis://:***@192.168.20.2:6379/1
+      - REDIS_URL=${REDIS_URL}                           # redis://:***@192.168.20.2:6379/0
+      - UPLOAD_FOLDER=${UPLOAD_FOLDER}                   # /data/uploads
+      - RESULTS_FOLDER=${RESULTS_FOLDER}                 # /data/results
+      - DIARIZER_CACHE_DIR=${DIARIZER_CACHE_DIR}         # /data/diarizer_cache
+      - HUGGINGFACE_CACHE_DIR=${HUGGINGFACE_CACHE_DIR}   # /hf_cache
+      - WHISPER_MODEL_PATH=${WHISPER_MODEL_PATH}
+      - WHISPER_DEVICE=cpu
+      - WEBHOOK_URL=${WEBHOOK_URL}
+      - WEBHOOK_SECRET=${WEBHOOK_SECRET}
+      - DISABLE_GPU_BUSY_CHECK=true
+    volumes:
+      - upload_data:${UPLOAD_FOLDER}
+      - results_data:${RESULTS_FOLDER}
+      - diarizer_cache:${DIARIZER_CACHE_DIR}
+      - hf_cache:${HUGGINGFACE_CACHE_DIR}
+    restart: unless-stopped
+
+  worker_gpu_2:
+    build:
+      context: .
+      dockerfile: Dockerfile.gpu
+    container_name: proxyai_worker_gpu_2
+    runtime: nvidia
+    env_file: .env
+    command: [ "celery", "-A", "celery_app:app", "worker", "-E", "--loglevel=info", "--concurrency=${GPU_CONCURRENCY}", "--prefetch-multiplier=1", "--max-tasks-per-child=10", "--queues=transcribe_gpu,diarize_gpu" ]
+    environment:
+      - WORKER_ROLE=gpu
+      - CELERY_BROKER_URL=${CELERY_BROKER_URL}
+      - CELERY_RESULT_BACKEND=${CELERY_RESULT_BACKEND}
+      - REDIS_URL=${REDIS_URL}
+      - UPLOAD_FOLDER=${UPLOAD_FOLDER}
+      - RESULTS_FOLDER=${RESULTS_FOLDER}
+      - DIARIZER_CACHE_DIR=${DIARIZER_CACHE_DIR}
+      - HUGGINGFACE_CACHE_DIR=${HUGGINGFACE_CACHE_DIR}
+      - WHISPER_MODEL_PATH=${WHISPER_MODEL_PATH}
+      - WHISPER_DEVICE=cuda
+      - NVIDIA_VISIBLE_DEVICES=0
+      - WEBHOOK_URL=${WEBHOOK_URL}
+      - WEBHOOK_SECRET=${WEBHOOK_SECRET}
+      - DISABLE_GPU_BUSY_CHECK=true
+    volumes:
+      - upload_data:${UPLOAD_FOLDER}
+      - results_data:${RESULTS_FOLDER}
+      - diarizer_cache:${DIARIZER_CACHE_DIR}
+      - hf_cache:${HUGGINGFACE_CACHE_DIR}
+    restart: unless-stopped
+
+volumes:
+  upload_data:
+    driver: local
+    driver_opts:
+      type: nfs
+      o: addr=192.168.20.2,nfsvers=4.2,proto=tcp,rw,timeo=600,retrans=2
+      device: ":/var/lib/docker/volumes/proxyai-migration_upload_data/_data"
+
+  results_data:
+    driver: local
+    driver_opts:
+      type: nfs
+      o: addr=192.168.20.2,nfsvers=4.2,proto=tcp,rw,timeo=600,retrans=2
+      device: ":/var/lib/docker/volumes/proxyai-migration_results_data/_data"
+
+  diarizer_cache:
+    driver: local
+    driver_opts:
+      type: nfs
+      o: addr=192.168.20.2,nfsvers=4.2,proto=tcp,rw,timeo=600,retrans=2
+      device: ":/var/lib/docker/volumes/proxyai-migration_diarizer_cache/_data"
+
+  hf_cache:
+    driver: local
+    driver_opts:
+      type: nfs
+      o: addr=192.168.20.2,nfsvers=4.2,proto=tcp,rw,timeo=600,retrans=2
+      device: ":/root/proxyAI-migration/data/hf_cache"
