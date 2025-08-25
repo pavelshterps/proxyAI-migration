@@ -845,7 +845,7 @@ def preview_transcribe(self, upload_id, correlation_id):
     logger.info(f"[{upload_id}] preview_transcribe received")
     # --- GPU busy guard (configurable & safer) ---
     DISABLE_GPU_BUSY_CHECK = _asbool(getattr(settings, "DISABLE_GPU_BUSY_CHECK", False))
-    GPU_BUSY_HEAVY_THRESHOLD = int(getattr(settings, "GPU_BUSY_HEAVY_THRESHOLD", 999))
+    GPU_BUSY_HEAVY_THRESHOLD = int(getattr(settings, "GPU_BUSY_HEAVY_THRESHOLD", 3))
     if not DISABLE_GPU_BUSY_CHECK:
         try:
             inspector = app.control.inspect()
@@ -911,7 +911,7 @@ def transcribe_segments(self, upload_id, correlation_id):
 
     # --- GPU busy guard (конфигурируемый) ---
     DISABLE_GPU_BUSY_CHECK = _asbool(getattr(settings, "DISABLE_GPU_BUSY_CHECK", False))
-    GPU_BUSY_HEAVY_THRESHOLD = int(getattr(settings, "GPU_BUSY_HEAVY_THRESHOLD", 2))
+    GPU_BUSY_HEAVY_THRESHOLD = int(getattr(settings, "GPU_BUSY_HEAVY_THRESHOLD", 3))
     if not DISABLE_GPU_BUSY_CHECK:
         try:
             inspector = app.control.inspect()
