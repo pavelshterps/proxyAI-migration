@@ -81,7 +81,7 @@ services:
       - celery_app:app
       - worker
       - --loglevel=info
-      - --pool=solo          # <-- ВАЖНО
+      - --pool=threads          # <-- ВАЖНО
       - --concurrency=1
       - --queues=transcribe_cpu
     environment:

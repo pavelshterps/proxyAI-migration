@@ -1137,7 +1137,7 @@ def diarize_full(self, upload_id, correlation_id):
     # офиц. способ переноса на GPU — отдельно .to("cuda")
     try:
         if _torch and _torch.cuda.is_available():
-            pipeline = pipeline.to("cuda")
+            pipeline = pipeline.to(torch.device("cuda"))
     except Exception as e:
         logger.warning(f"[{upload_id}] pipeline.to(cuda) failed: {e}")
 

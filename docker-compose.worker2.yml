@@ -7,7 +7,7 @@ services:
       dockerfile: Dockerfile
     container_name: proxyai_worker_cpu_2
     env_file: .env
-    command: [ "celery", "-A", "celery_app:app", "worker", "--loglevel=info", "--pool=solo", "--concurrency=1", "--queues=transcribe_cpu" ]
+    command: [ "celery", "-A", "celery_app:app", "worker", "--loglevel=info", "--pool=threads", "--concurrency=1", "--queues=transcribe_cpu" ]
     environment:
       - WORKER_ROLE=cpu
       - SPEAKER_STITCH_ENABLED=false
